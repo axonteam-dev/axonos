@@ -125,7 +125,7 @@ void gdt_init() {
         gdt_desc.base = (uint64_t)&gdt[0];
 
         lgdt_load(&gdt_desc);
-        
+
         // Load TR with TSS selector (index 5 -> selector 0x28)
         ltr_load(0x28);
 
@@ -137,13 +137,13 @@ void gdt_init() {
            сравнение идёт уже по новому TLS -> ложный "*** stack smashing detected ***".
            Пока у нас нет полноценного TLS/TCB, держим CR4.FSGSBASE выключенным и
            эмулируем нужные инструкции через #UD (см. cpu/idt.c). */
-        
+
         // Check if FSGSBASE is supported via CPUID
         uint32_t eax, ebx, ecx, edx;
         asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
         int fsgsbase_supported = (ebx & (1 << 0)) != 0;
         /* no debug prints */
-        
+
         if (fsgsbase_supported) {
                 uint64_t cr4;
                 asm volatile("mov %%cr4, %0" : "=r"(cr4));
@@ -212,7 +212,7 @@ void tss_set_ist(int idx, uint64_t rsp_top) {
 
 void enter_user_mode(uint64_t user_entry, uint64_t user_stack_top) {
         enter_user_mode_asm(user_entry, user_stack_top, USER_DS, USER_CS);
-} 
+}
 
 // Set the user FS base MSR for the CPU. Used when switching a thread into user mode.
 void set_user_fs_base(uint64_t base) {

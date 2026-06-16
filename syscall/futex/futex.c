@@ -1,12 +1,3 @@
-
-/*
- * syscall64/futex/futex.c
- * Minimal futex: FUTEX_WAIT, FUTEX_WAKE, FUTEX_REQUEUE, FUTEX_CMP_REQUEUE,
- * FUTEX_WAIT_BITSET, FUTEX_WAKE_BITSET (private). Supports pthread mutex/cond.
- * FUTEX_WAIT_BITSET timeout treated as infinite. No robust lists.
- * Author: fcexx
-*/
-
 #include <axonos.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -36,7 +27,6 @@
 #define EAGAIN  11
 #define ENOSYS  38
 
-/* Simple hash table of wait queues keyed by user address. */
 #define FUTEX_BUCKETS 256
 
 typedef struct futex_waiter {

@@ -217,9 +217,9 @@ static void ud_fault_handler(cpu_registers_t* regs) {
         for (;;) {
             kprint("Reboot? [Y/N]: ");
             choice = kgetc();
-            if (choice == 'Y' | choice == 'y') reboot_system(); 
+            if (choice == 'Y' | choice == 'y') reboot_system();
             if (choice == 'N' | choice == 'n') break;
-        }        
+        }
         kprint("Halt.");
         for(;;){ asm volatile("sti; hlt":::"memory"); }
 }
@@ -624,18 +624,18 @@ void isr_dispatch(cpu_registers_t* regs) {
                 pic_send_eoi(vec - 32);
                 return;
                 }
-                
+
         // Any other vector: call registered handler if present (e.g., int 0x80)
         if (isr_handlers[vec]) {
                 isr_handlers[vec](regs);
                 return;
         }
-        
+
         // Exceptions 0..31 without specific handler: print and halt
         if (vec < 32) {
                 for (;;);
         }
-        
+
         // Unknown vector
         qemu_debug_printf("Unknown interrupt %d (0x%x)\n", vec, vec);
         qemu_debug_printf("RIP: 0x%x, RSP: 0x%x\n", regs->rip, regs->rsp);
@@ -661,11 +661,11 @@ void idt_set_handler(uint8_t num, void (*handler)(cpu_registers_t*)) {
 void idt_init() {
         idt_ptr.limit = sizeof(idt) - 1;
         idt_ptr.base = (uint64_t)&idt;
-        
+
         for (int i = 0; i < 256; i++) {
                 idt_set_gate(i, isr_stub_table[i], 0x08, 0x8E);
         }
-        
+
         // Register detailed page fault handler
         idt_set_handler(14, page_fault_handler);
         // Register divide-by-zero handler (#0)
@@ -678,7 +678,7 @@ void idt_init() {
         idt_set_handler(8, df_fault_handler);
         // Пометим IST=1 у вектора 8
         idt[8].ist = 1;
-        
+
         // Register RTC handler (IRQ 8 = vector 40)
         idt_set_handler(40, rtc_handler);
 

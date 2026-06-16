@@ -570,7 +570,7 @@ void set_cursor_y(uint16_t y) {
 void hex_to_str(uint32_t num, char *str);
 void hex_to_str(uint32_t num, char *str) {
 	int i = 0;
-	
+
 	if (num == 0) {
 		str[i++] = '0';
 		str[i] = '\0';
@@ -604,7 +604,7 @@ void hex_to_str(uint32_t num, char *str) {
 static uint8_t parse_color_code(char bg, char fg) {
 	uint8_t background = 0;
 	uint8_t foreground = 0;
-	
+
 	// Преобразование шестнадцатеричного символа в число
 	if (bg >= '0' && bg <= '9') {
 		background = bg - '0';
@@ -621,7 +621,7 @@ static uint8_t parse_color_code(char bg, char fg) {
 	} else if (fg >= 'A' && fg <= 'F') {
 		foreground = fg - 'A' + 0xa;
 	}
-	
+
 	return (background << 4) | foreground;
 }
 

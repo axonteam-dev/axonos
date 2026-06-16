@@ -1,7 +1,7 @@
 #include <pit.h>
 #include <apic_timer.h>
 #include <klog.h>
-#include <debug.h> 
+#include <debug.h>
 #include <pic.h>
 #include <idt.h>
 #include <serial.h>
@@ -43,7 +43,7 @@ void pit_handler(cpu_registers_t* regs) {
                         thread_ring3_preempt_if_waiters();
                 return;
         }
-        
+
         /* SMP: never thread_schedule() from IRQ — nested scheduler + sched_lock corrupts state.
            Idle loops + IPI wake other CPUs; BSP is driven by syscalls/yield. */
         if ((pit_ticks % 10) == 0 && smp_cpu_count() <= 1) {
@@ -59,7 +59,7 @@ void pit_handler(cpu_registers_t* regs) {
 
 // Initialize PIT with default frequency (100 Hz)
 void pit_init() {
-        
+
         // Set default frequency (1000 Hz)
         int freq = 1000;
         pit_enabled = 1;
@@ -76,25 +76,25 @@ void pit_disable(void) {
     outb(PIT_COMMAND, PIT_CMD_CHANNEL0 | PIT_CMD_ACCESS_BOTH | PIT_CMD_MODE0 | PIT_CMD_BINARY);
     outb(PIT_CHANNEL0, 0);   // Low byte = 0
     outb(PIT_CHANNEL0, 0);   // High byte = 0
-    
+
     kprintf("PIT: Disabled\n");
 }
 
 // Set PIT frequency in Hz
 void pit_set_frequency(uint32_t frequency) {
         if (frequency == 0) return;
-        
+
         // Calculate divisor
         uint32_t divisor = PIT_FREQUENCY / frequency;
-        
+
         // Ensure divisor is in valid range (1-65535)
         if (divisor < 1) divisor = 1;
         if (divisor > 65535) divisor = 65535;
-        
+
         // Recalculate actual frequency
         pit_frequency = PIT_FREQUENCY / divisor;
         timer_frequency = pit_frequency;
-        
+
         // Set the divisor
         pit_set_divisor((uint16_t)divisor);
 }
@@ -105,7 +105,7 @@ void pit_set_divisor(uint16_t divisor) {
         // Use MODE2 (rate generator) to have linear down-counting, which simplifies
         // reading the current counter value for time interpolation
         outb(PIT_COMMAND, PIT_CMD_CHANNEL0 | PIT_CMD_ACCESS_BOTH | PIT_CMD_MODE2 | PIT_CMD_BINARY);
-        
+
         // Send divisor (low byte first, then high byte)
         outb(PIT_CHANNEL0, divisor & 0xFF);
         outb(PIT_CHANNEL0, (divisor >> 8) & 0xFF);

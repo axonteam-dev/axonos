@@ -784,7 +784,7 @@ int vfs_fstat(struct fs_file *file, struct stat *st) {
     }
     /* fallback: fill from fs_file fields */
     st->st_mode = (file->type == FS_TYPE_DIR) ? (S_IFDIR | 0755) : (S_IFREG | 0644);
-    
+
     goto done;
 fix_mode:
     /* Add type bits only when driver left them zero. Do not overwrite existing type

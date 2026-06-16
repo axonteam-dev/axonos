@@ -287,7 +287,7 @@ static ssize_t sysfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         while (child) {
             size_t namelen = strlen(child->name);
             size_t rec_len = 8 + namelen;
-            
+
             /* if entry lies entirely before offset, skip */
             if (pos + rec_len <= (size_t)offset) {
                 pos += rec_len;

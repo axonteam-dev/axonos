@@ -1,2 +1,4 @@
+build/
+.build/
 iso/boot/initfs.cpio
 iso/boot/axonos.elf

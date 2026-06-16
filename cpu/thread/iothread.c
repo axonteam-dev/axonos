@@ -27,10 +27,10 @@ void iothread_init() {
             klogprintf("iothread_init: already initialized\n");
                 return;
         }
-        
+
         // Инициализируем спинлок
         io_lock.lock = 0;
-        
+
         // Создаем I/O поток
         io_thread = thread_create(io_worker_thread, "io_worker");
         if (io_thread) {
@@ -42,7 +42,7 @@ void iothread_init() {
 static void io_worker_thread(void) {
         while (1) {
                 io_request_t* request = NULL;
-                
+
                 unsigned long _flags = 0;
                 acquire_irqsave(&io_lock, &_flags);
                 if (pending_queue) {
@@ -51,10 +51,10 @@ static void io_worker_thread(void) {
                         if (request) request->next = NULL;
                 }
                 release_irqrestore(&io_lock, _flags);
-                
+
                 if (request) {
                         process_io_request(request);
-                        
+
                         unsigned long _flags2 = 0;
                         acquire_irqsave(&io_lock, &_flags2);
                         // push to head is fine for completed; consumer takes specific id
@@ -100,10 +100,10 @@ static void process_io_request(io_request_t* request) {
 // Добавить I/O запрос в очередь (FIFO)
 int iothread_schedule_request(io_op_type_t type, uint8_t device_id, uint32_t offset, uint8_t* buffer, uint32_t size) {
         if (!iothread_initialized) return -1;
-        
+
         io_request_t* request = (io_request_t*)kmalloc(sizeof(io_request_t));
         if (!request) return -1;
-        
+
         request->type = type;
         request->device_id = device_id;
         request->offset = offset;
@@ -112,7 +112,7 @@ int iothread_schedule_request(io_op_type_t type, uint8_t device_id, uint32_t off
         request->requesting_thread = thread_current();
         request->status = 0; // pending
         request->next = NULL;
-        
+
         unsigned long _flags3 = 0;
         acquire_irqsave(&io_lock, &_flags3);
         request->id = ++request_count;
@@ -126,7 +126,7 @@ int iothread_schedule_request(io_op_type_t type, uint8_t device_id, uint32_t off
         }
         int rid = request->id;
         release_irqrestore(&io_lock, _flags3);
-        
+
         return rid;
 }
 
@@ -163,7 +163,7 @@ int iothread_wait_completion(int request_id) {
 // Проверить число готовых операций
 int iothread_check_completed() {
         if (!iothread_initialized) return 0;
-        
+
         unsigned long _flags5 = 0;
         acquire_irqsave(&io_lock, &_flags5);
         int count = 0;
@@ -194,12 +194,12 @@ void iothread_drain(void) {
 // Получить завершенную операцию (любую)
 io_request_t* iothread_get_completed() {
         if (!iothread_initialized) return NULL;
-        
+
         unsigned long _flags6 = 0;
         acquire_irqsave(&io_lock, &_flags6);
         io_request_t* request = completed_queue;
         io_request_t* prev = NULL;
-        
+
         while (request) {
                 if (request->status != 0) {
                         if (prev) prev->next = request->next;

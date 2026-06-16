@@ -373,16 +373,16 @@ static void thread_trampoline(void) {
         int _tid = _self ? _self->tid : -1;
         //qemu_debug_printf("thread_trampoline: tid=%d start RFLAGS=0x%x\n", _tid, (unsigned int)_rflags);
         entry();
-        
+
         // Поток завершился - помечаем как завершенный
         thread_t* self = thread_current();
         if (self) {
                 self->state = THREAD_TERMINATED;
         }
-        
+
         // Переключаемся на другой поток
         thread_yield();
-        
+
         // На всякий случай - если что-то пошло не так
         for (;;) {
                 asm volatile("hlt");

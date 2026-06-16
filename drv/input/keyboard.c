@@ -359,7 +359,7 @@ void ps2_keyboard_init() {
         ctrl_pressed = false;
         alt_pressed = false;
         ctrlc_pending = false;
-        
+
         // Устанавливаем обработчик прерывания
         idt_set_handler(33, keyboard_handler);
         // Ensure PIC delivers IRQ1
@@ -471,33 +471,33 @@ char* kgets(char* buffer, int max_length) {
         if (!buffer || max_length <= 0) {
                 return NULL;
         }
-        
+
         int buffer_pos = 0;
         int cursor_pos = 0;
         memset(buffer, 0, max_length);
 
         uint32_t start_x = 0, start_y = 0; vga_get_cursor(&start_x, &start_y);
-        
+
         vga_set_cursor(start_x, start_y);
-        
+
         while (1) {
                 char c = kgetc();
                 // qemu_debug_printf("kgets got char: %d\n", c);
-                
+
                 if (c == 0) {
                         continue;
                 }
-                
+
                 if (c == '\n') {
                         // VGA hw cursor: nothing to erase; we'll rewrite line
                         buffer[buffer_pos] = '\0';
                         kprint("\n");
                         return buffer;
                 }
-                
+
                 // Скрываем курсор перед любым изменением
                 // VGA hw cursor: nothing to erase
-                
+
                 if ((c == '\b' || c == 127) && cursor_pos > 0) {
                         // Backspace
                         for (int i = cursor_pos - 1; i < buffer_pos; i++) {
@@ -537,24 +537,24 @@ char* kgets(char* buffer, int max_length) {
                         buffer_pos++;
                         cursor_pos++;
                 }
-                
+
                 // Всегда перерисовываем всю строку заново
                 // 1. Очищаем всю строку от промпта до конца
                 vga_set_cursor(start_x, start_y);
-                
+
                 for (int i = 0; i < buffer_pos + 10; i++) { // Очищаем с запасом
                 kprint(" ");
                 }
-                
+
                 // 2. Перерисовываем строку с начала
                 vga_set_cursor(start_x, start_y);
                 for (int i = 0; i < buffer_pos; i++) {
                         kputchar((uint8_t)buffer[i], GRAY_ON_BLACK);
                 }
-                
+
                 // 3. Устанавливаем курсор в правильную позицию
                 vga_set_cursor(start_x + (uint32_t)cursor_pos, start_y);
         }
-        
+
         return buffer;
 }

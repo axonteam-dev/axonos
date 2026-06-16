@@ -346,15 +346,15 @@ void vbefb_putchar_literal(uint8_t ch, uint8_t attr) {
 void draw_cursor(void) {
 	if (!vbe_is_available() || !textbuf) return;
 	if (cursor_x >= cols || cursor_y >= rows) return;
-	
+
 	uint8_t *front = (uint8_t*)vbe_get_frontbuffer();
 	if (!front) return;
-	
+
 	uint32_t px = cursor_x * font_w;
 	uint32_t py = cursor_y * font_h;
 	uint32_t pitch = vbe_get_pitch();
 	uint32_t bytespp = (vbe_get_bpp() + 7) / 8;
-	
+
 	/* get cell colors */
 	uint8_t attr = textbuf[cursor_y * cols + cursor_x].attr;
 	uint32_t fg = vga_attr_to_rgb(attr, 1);

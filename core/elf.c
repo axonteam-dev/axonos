@@ -1,7 +1,5 @@
 /*
- * core/elf.c
  * ELF file parser
- * Author: fcexx
 */
 
 #include <axonos.h>
@@ -1373,7 +1371,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
        Otherwise syscalls run on the TSS RSP0 stack but the scheduler saves/restores
        `thread_current()->context` for a different stack, and vfork/fork will corrupt
        kernel context (seen as user-mode #GP with non-canonical pointers after vfork).
-       
+
        Strategy:
        - If we are already in a user thread (thread_get_current_user()!=NULL), perform an
          in-place exec: update current user thread metadata and jump to user entry.

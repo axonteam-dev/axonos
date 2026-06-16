@@ -44,4 +44,4 @@ int iothread_pending(void);
 /* Block until pending_queue is empty (yields to io_worker). */
 void iothread_drain(void);
 
-#endif // IOTHREAD_H 
+#endif // IOTHREAD_H

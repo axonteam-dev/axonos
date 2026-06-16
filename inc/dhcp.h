@@ -14,7 +14,7 @@ typedef struct {
 
 /*
  * Perform DHCP discovery and obtain a lease.
- * 
+ *
  * @param mac       MAC address of the interface (6 bytes)
  * @param out_lease Output lease information
  * @return 0 on success, -1 on failure

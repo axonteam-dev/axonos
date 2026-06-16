@@ -28,13 +28,13 @@ static uint8_t find_best_divider(uint32_t target_freq, uint32_t base_freq, uint3
     for (int i = 0; i < 8; i++) {
         uint32_t div = divider_values[i];
         uint32_t count = (base_freq / div) / target_freq;
-        
+
         if (count > 0 && count <= 0xFFFFF) {
             *out_count = count;
             return apic_dividers[i];
         }
     }
-    
+
     // Fallback to divider 16
     *out_count = base_freq / 16 / target_freq;
     return 0x3;
@@ -112,15 +112,15 @@ static void uint_to_str(uint64_t value, char* buffer) {
         buffer[1] = '\0';
         return;
     }
-    
+
     char temp[20];
     int i = 0;
-    
+
     while (value > 0) {
         temp[i++] = '0' + (value % 10);
         value /= 10;
     }
-    
+
     for (int j = 0; j < i; j++) {
         buffer[j] = temp[i - j - 1];
     }
@@ -138,27 +138,27 @@ static void str_copy(char* dest, const char* src) {
 // Format uptime into human readable string
 void apic_timer_format_uptime(char* buffer, size_t buffer_size) {
     uint64_t seconds = apic_timer_get_uptime_seconds();
-    
+
     if (seconds == 0) {
         str_copy(buffer, "00:00:00");
         return;
     }
-    
+
     uint64_t days = seconds / (24 * 3600);
     uint64_t hours = (seconds % (24 * 3600)) / 3600;
     uint64_t minutes = (seconds % 3600) / 60;
     uint64_t secs = seconds % 60;
-    
+
     char days_str[10];
     char hours_str[3];
     char minutes_str[3];
     char secs_str[3];
-    
+
     // Format hours, minutes, seconds with leading zeros
     uint_to_str(hours, hours_str);
     uint_to_str(minutes, minutes_str);
     uint_to_str(secs, secs_str);
-    
+
     // Ensure two digits
     if (hours < 10) {
         char temp[3];
@@ -167,7 +167,7 @@ void apic_timer_format_uptime(char* buffer, size_t buffer_size) {
         temp[2] = '\0';
         str_copy(hours_str, temp);
     }
-    
+
     if (minutes < 10) {
         char temp[3];
         temp[0] = '0';
@@ -175,7 +175,7 @@ void apic_timer_format_uptime(char* buffer, size_t buffer_size) {
         temp[2] = '\0';
         str_copy(minutes_str, temp);
     }
-    
+
     if (secs < 10) {
         char temp[3];
         temp[0] = '0';
@@ -183,7 +183,7 @@ void apic_timer_format_uptime(char* buffer, size_t buffer_size) {
         temp[2] = '\0';
         str_copy(secs_str, temp);
     }
-    
+
     if (days > 0) {
         uint_to_str(days, days_str);
         // Format: Xd HH:MM:SS
@@ -245,7 +245,7 @@ void apic_timer_handler(cpu_registers_t* regs) {
     apic_eoi();
 }
 
-void apic_timer_init(void) {    
+void apic_timer_init(void) {
     // Initialize state
     apic_timer_ticks = 0;
     apic_timer_state.ticks = 0;
@@ -253,15 +253,15 @@ void apic_timer_init(void) {
     apic_timer_state.running = false;
     apic_timer_state.calibrated = false;
     apic_timer_state.mode = APIC_TIMER_PERIODIC;
-    
+
     // Perform quick calibration
     apic_timer_state.base_frequency = quick_calibrate();
     apic_timer_state.calibration_value = apic_timer_state.base_frequency / 100;
     apic_timer_state.calibrated = true;
-    
+
     // Stop timer initially
     apic_timer_stop();
-    
+
     klogprintf("APIC: Ready (base freq: %u Hz)\n", apic_timer_state.base_frequency);
 }
 
@@ -270,25 +270,25 @@ void apic_timer_start(uint32_t freq_hz) {
         klogprintf("APIC: Not calibrated, cannot start\n");
         return;
     }
-    
+
     if (apic_timer_state.running) {
         apic_timer_stop();
     }
-    
+
     kprintf("APIC: Starting at %u Hz\n", freq_hz);
-    
+
     uint32_t count;
     uint8_t divider = find_best_divider(freq_hz, apic_timer_state.base_frequency, &count);
-    
+
     // Apply limits
     if (count < 10) count = 10;
     if (count > 0xFFFFF) count = 0xFFFFF;
-    
+
     // Configure timer (program LVT first, then load initial count)
     apic_write(LAPIC_TIMER_DIV_REG, divider);
     apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_PERIODIC, false);
     apic_write(LAPIC_TIMER_INIT_REG, count);
-    
+
     // Update state
     apic_timer_state.frequency = freq_hz;
     if (!pit_is_enabled())
@@ -300,14 +300,14 @@ void apic_timer_start(uint32_t freq_hz) {
 
 void apic_timer_start_oneshot(uint32_t microseconds) {
     if (!apic_timer_state.calibrated) return;
-    
+
     uint32_t count = (apic_timer_state.base_frequency * microseconds) / 1000000;
     if (count < 10) count = 10;
-    
+
     apic_write(LAPIC_TIMER_DIV_REG, 0x3); // Divider 16
     apic_write(LAPIC_TIMER_INIT_REG, count);
     apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_ONESHOT, false);
-    
+
     apic_timer_state.running = true;
     apic_timer_state.mode = APIC_TIMER_ONESHOT;
 }
@@ -358,7 +358,7 @@ void apic_timer_sleep_ms(uint32_t ms) {
         pit_sleep_ms(ms);
         return;
     }
-    
+
     uint64_t target_ticks = apic_timer_ticks + (ms * apic_timer_state.frequency) / 1000;
     while (apic_timer_ticks < target_ticks) {
         asm volatile("pause");
@@ -373,7 +373,7 @@ void apic_timer_sleep_us(uint32_t us) {
         }
         return;
     }
-    
+
     uint64_t target_ticks = apic_timer_ticks + (us * apic_timer_state.frequency) / 1000000;
     while (apic_timer_ticks < target_ticks) {
         asm volatile("pause");

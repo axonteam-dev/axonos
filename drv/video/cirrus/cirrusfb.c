@@ -306,7 +306,7 @@ static void hwcursor_init(void) {
 		g_hwcursor_ok = 0;
 		return;
 	}
-	
+
 	/* Cursor address: bits come from SR12[3:2] and SR14[3]
 	   Address = bits * 256KB. We'll use address near end of 4MB VRAM.
 	   For simplicity, put cursor at offset 0x3FC00 (255KB mark) which gives
@@ -314,10 +314,10 @@ static void hwcursor_init(void) {
 	g_hwcursor_offset = g_fb_size - HW_CURSOR_BYTES;
 	g_hwcursor_offset &= ~0x3FFu; /* align to 1KB */
 	g_hwcursor_data = (uint8_t*)g_fb + g_hwcursor_offset;
-	
+
 	/* Clear cursor bitmap to transparent (10 pattern = 0xAA) */
 	memset(g_hwcursor_data, 0xAA, HW_CURSOR_BYTES);
-	
+
 	/* Draw a vertical bar cursor: 2 pixels wide, 16 pixels tall
 	   Each byte = 4 pixels, 2bpp each
 	   We'll draw at top-left of 64x64 cursor image */
@@ -329,48 +329,48 @@ static void hwcursor_init(void) {
 		   01 01 10 10 = 0x5A for visible + transparent */
 		rowptr[0] = 0x5A; /* 2 white pixels + 2 transparent */
 	}
-	
+
 	/* Set cursor colors: white foreground, black background */
 	seq_write(SR10_CURSOR_FG, 0xFF); /* Cursor color 1 = white (index 15) */
 	seq_write(SR11_CURSOR_BG, 0x00); /* Cursor color 0 = black (index 0) */
-	
+
 	/* Calculate address bits for SR12 and SR14
 	   Cursor address = (SR12[3:2] << 18) | (SR14[3] << 20)
 	   Our offset in VRAM / 1024 gives the 1KB block number.
 	   But Cirrus uses different addressing - let's use simpler approach:
 	   Put cursor at a fixed location that we can address easily. */
-	
+
 	/* For QEMU Cirrus emulation, cursor memory starts at VRAM end - 16KB
 	   and address bits select which 1KB block within that 16KB region */
 	uint8_t addr_bits = (uint8_t)((g_hwcursor_offset >> 10) & 0x3F);
-	
+
 	/* SR12: bit 0 = enable, bit 1 = 64x64, bits 3:2 = address low */
 	uint8_t sr12 = 0x03 | ((addr_bits & 0x03) << 2); /* Enable + 64x64 + addr bits */
-	
+
 	/* SR14: bits 2:0 = X position high, bit 3 = address bit */
 	/* We'll set position separately, just set address bit here */
-	
+
 	seq_write(SR12_CURSOR_CTL, sr12);
-	
+
 	g_hwcursor_ok = 1;
 	klogprintf("fbcon: hardware cursor (VGA seq) at offset 0x%x\n", g_hwcursor_offset);
 }
 
 static void hwcursor_set_pos(uint32_t x, uint32_t y) {
 	if (!g_hwcursor_ok) return;
-	
+
 	/* Pixel position for cursor hotspot */
 	uint32_t px = x * FONT_W;
 	uint32_t py = y * FONT_H + FONT_H - 2; /* Position at bottom of cell (underscore style) */
-	
+
 	/* SR13: X position bits 7:0 */
 	seq_write(SR13_CURSOR_X_LO, (uint8_t)(px & 0xFF));
-	
+
 	/* SR14: X position bits 10:8 in bits 2:0, plus address in bit 3 */
 	uint8_t sr14_val = seq_read(SR14_CURSOR_X_HI);
 	sr14_val = (sr14_val & 0xF8) | ((px >> 8) & 0x07);
 	seq_write(SR14_CURSOR_X_HI, sr14_val);
-	
+
 	/* Y position via Graphics Controller registers */
 	/* GR10: Y position low, GR11: Y position high */
 	outb(0x3CE, 0x10);
@@ -434,7 +434,7 @@ int cirrusfb_init(void *fb, uint32_t width, uint32_t height, uint32_t pitch, uin
 	if (!g_hwcursor_ok && g_swcursor_visible) {
 		swcursor_draw_at(g_cursor_x, g_cursor_y);
 	}
-	
+
 	klogprintf("fbcon: linear text console %ux%u cols=%u rows=%u bpp=%u hwcursor=%d\n",
 	           width, height, g_cols, g_rows, bpp, g_hwcursor_ok);
 	return 0;
@@ -525,7 +525,7 @@ void cirrusfb_set_cursor(uint32_t x, uint32_t y) {
 	}
 	g_cursor_x = x;
 	g_cursor_y = y;
-	
+
 	if (g_hwcursor_ok) {
 		hwcursor_set_pos(x, y);
 	} else {

@@ -54,7 +54,7 @@ typedef struct thread {
 
         /* attached tty index or -1 */
         int attached_tty;
-        
+
         /* vfork parent PID: if >=0 then this thread was created by vfork and parent is blocked;
            on execve/exit child must unblock parent. */
         int vfork_parent_tid;
@@ -91,7 +91,7 @@ typedef struct thread {
 
         /* parent thread id (for wait/waitpid) */
         int parent_tid;
-        
+
         /* saved syscall return site for current syscall (per-thread) */
         uint64_t saved_user_rip;
         uint64_t saved_user_rsp;
@@ -139,7 +139,7 @@ typedef struct thread {
         int waiter_tid;
         /* fork/clone3: unblock child after parent syscall returns (avoid clobbering per-CPU syscall stack). */
         int defer_unblock_tid;
-        
+
         /* exit status encoded like wait(2) returns (status word) */
         int exit_status;
         /* process address space descriptor (CR3 + page-table root). */
@@ -222,4 +222,4 @@ int thread_fd_dup(int oldfd);
 int thread_fd_dup2(int oldfd, int newfd);
 int thread_fd_isatty(int fd);
 
-#endif // THREAD_H 
+#endif // THREAD_H

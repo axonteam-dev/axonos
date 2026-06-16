@@ -41,7 +41,7 @@ int user_check_password(const char *name, const char *password);
 /* Find user by name; returns pointer or NULL */
 struct user* user_find(const char *name);
 
-/* Export /etc/passwd content into newly allocated buffer (kmalloc). 
+/* Export /etc/passwd content into newly allocated buffer (kmalloc).
    Caller must kfree(*out). Returns 0 on success. */
 int user_export_passwd(char **out, size_t *out_len);
 

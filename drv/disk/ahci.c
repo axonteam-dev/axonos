@@ -691,7 +691,7 @@ static int ahci_register_disk(int controller_idx, int port_no, hba_mem_t *hba, u
 				if (ok == 0 && st->sectors != 0) break;
 				/* dump basic port state for diagnosis */
 				hba_port_t *p = &st->hba->ports[st->port_no];
-				
+
 				ahci_port_stop(p);
 				(void)ahci_port_comreset(p);
 				(void)ahci_port_start(p);

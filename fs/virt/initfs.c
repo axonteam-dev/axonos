@@ -1,7 +1,5 @@
 /*
- * fs/virt/initfs.c
  * Initfs: initrd region from Linux boot_params (ramdisk_image/size + ext_*), cpio newc → VFS
- * Author: fcexx
 */
 
 #include <stdint.h>

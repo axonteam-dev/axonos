@@ -1,7 +1,5 @@
 /*
- * drv/disk/disk.c
  * Main kernel disk interface
- * Author: fcexx
 */
 
 #include <disk.h>

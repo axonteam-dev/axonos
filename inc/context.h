@@ -21,4 +21,4 @@ void context_switch_with_prev(context_t *old_ctx, context_t *new_ctx, void *prev
 }
 #endif
 
-#endif // CONTEXT_H 
+#endif // CONTEXT_H

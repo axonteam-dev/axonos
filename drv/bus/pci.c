@@ -392,13 +392,13 @@ static void create_attr_file(const char *base, const char *name, const struct sy
 
 void pci_sysfs_init(void) {
     if (pci_sysfs_initialized) return;
-    
+
     sysfs_mkdir("/sys/bus");
     sysfs_mkdir("/sys/bus/pci");
     sysfs_mkdir("/sys/bus/pci/devices");
     pci_device_t *devs = pci_get_devices();
     int count = pci_get_device_count();
-    
+
     for (int i = 0; i < count; i++) {
         pci_device_t *dev = &devs[i];
         char dir_path[64];

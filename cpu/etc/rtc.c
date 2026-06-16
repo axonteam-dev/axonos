@@ -1,5 +1,4 @@
 /*
- * cpu/rtc.c
  * RTC driver
  * Author: kotazz
 */
@@ -59,7 +58,7 @@ void rtc_read_datetime(rtc_datetime_t* dt) {
         dt->month = bcd_to_binary(dt->month);
         dt->year = bcd_to_binary(dt->year);
     }
-    
+
     // Обработка 12-часового формата, если он включен
     if (!(reg_b & 0x02) && (dt->hour & 0x80)) {
         dt->hour = ((dt->hour & 0x7F) + 12) % 24;
@@ -72,13 +71,13 @@ void rtc_read_datetime(rtc_datetime_t* dt) {
 // Обработчик прерывания от RTC (IRQ 8)
 void rtc_handler(cpu_registers_t* regs) {
     (void)regs; // Неиспользуемый параметр
-    
+
     rtc_ticks++;
-    
+
     // ВАЖНО: Прочитать регистр C, чтобы разрешить следующее прерывание
     outb(RTC_COMMAND_PORT, RTC_REG_STATUS_C);
     inb(RTC_DATA_PORT);
-    
+
     // Отправляем EOI (End of Interrupt) контроллеру прерываний
     // IRQ 8 находится на ведомом (slave) PIC
     pic_send_eoi(8);
@@ -91,9 +90,9 @@ void rtc_init() {
     asm volatile("cli");
 
     // Выбираем регистр B и отключаем NMI
-    outb(RTC_COMMAND_PORT, 0x8B); 
+    outb(RTC_COMMAND_PORT, 0x8B);
     uint8_t prev = inb(RTC_DATA_PORT); // Читаем текущее значение
-    
+
     // Устанавливаем бит 6 (PIE - Periodic Interrupt Enable)
     outb(RTC_COMMAND_PORT, 0x8B);
     outb(RTC_DATA_PORT, prev | 0x40);
@@ -104,17 +103,17 @@ void rtc_init() {
     // rate 6 -> 1024 Hz
     uint8_t rate = 15; // 2 Гц, хорошая частота для начала
     rate &= 0x0F;
-    
+
     outb(RTC_COMMAND_PORT, 0x8A);
     prev = inb(RTC_DATA_PORT);
     outb(RTC_COMMAND_PORT, 0x8A);
     outb(RTC_DATA_PORT, (prev & 0xF0) | rate);
-    
+
     // Размаскируем IRQ 8 на PIC
     pic_unmask_irq(8);
-    
+
     // Разрешаем прерывания
     asm volatile("sti");
-    
+
     klogprintf("RTC: initialized with 2 Hz periodic interrupt.\n");
 }

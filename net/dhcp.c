@@ -110,11 +110,11 @@ static uint32_t dhcp_read_be32(const uint8_t *p) {
 }
 
 /* Send DHCP packet */
-static int dhcp_send_packet(const uint8_t mac[6], uint8_t msg_type, uint32_t xid, 
+static int dhcp_send_packet(const uint8_t mac[6], uint8_t msg_type, uint32_t xid,
                             uint32_t req_ip_be, uint32_t server_id_be) {
     uint8_t pkt[548];
     memset(pkt, 0, sizeof(pkt));
-    
+
     /* BOOTP fixed header */
     pkt[0] = 1;  /* op: request */
     pkt[1] = 1;  /* htype: ethernet */
@@ -126,16 +126,16 @@ static int dhcp_send_packet(const uint8_t mac[6], uint8_t msg_type, uint32_t xid
     pkt[7] = (uint8_t)xid;
     pkt[10] = 0x80; pkt[11] = 0x00; /* flags: broadcast */
     memcpy(&pkt[28], mac, 6); /* chaddr */
-    
+
     /* DHCP magic cookie */
     pkt[236] = 99; pkt[237] = 130; pkt[238] = 83; pkt[239] = 99;
-    
+
     /* DHCP options */
     size_t o = 240;
     pkt[o++] = 53; pkt[o++] = 1; pkt[o++] = msg_type; /* message type */
     pkt[o++] = 61; pkt[o++] = 7; pkt[o++] = 1; /* client id */
     memcpy(&pkt[o], mac, 6); o += 6;
-    
+
     if (msg_type == 1) { /* DISCOVER */
         pkt[o++] = 55; pkt[o++] = 4; /* parameter request list */
         pkt[o++] = 1;  /* subnet mask */
@@ -155,19 +155,19 @@ static int dhcp_send_packet(const uint8_t mac[6], uint8_t msg_type, uint32_t xid
         pkt[o++] = (uint8_t)(server_id_be);
     }
     pkt[o++] = 255; /* end */
-    
+
     /* Build Ethernet + IP + UDP frame */
     size_t ip_len = sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t) + o;
     size_t frm_len = sizeof(eth_hdr_t) + ip_len;
     uint8_t *frm = (uint8_t *)kmalloc(frm_len);
     if (!frm) return -1;
-    
+
     /* Ethernet header */
     eth_hdr_t *eth = (eth_hdr_t *)frm;
     memset(eth->dst, 0xFF, 6); /* broadcast */
     memcpy(eth->src, mac, 6);
     eth->ethertype = be16(ETH_TYPE_IPV4);
-    
+
     /* IP header */
     ipv4_hdr_t *ip = (ipv4_hdr_t *)(frm + sizeof(eth_hdr_t));
     memset(ip, 0, sizeof(*ip));
@@ -179,7 +179,7 @@ static int dhcp_send_packet(const uint8_t mac[6], uint8_t msg_type, uint32_t xid
     ip->src = 0;
     ip->dst = 0xFFFFFFFFu;
     ip_put_csum(ip, sizeof(*ip));
-    
+
     /* UDP header */
     udp_hdr_t *udp = (udp_hdr_t *)(frm + sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t));
     udp->src_port = be16(UDP_PORT_DHCP_CLIENT);
@@ -187,7 +187,7 @@ static int dhcp_send_packet(const uint8_t mac[6], uint8_t msg_type, uint32_t xid
     udp->len = be16((uint16_t)(sizeof(udp_hdr_t) + o));
     udp->csum = 0;
     memcpy((uint8_t *)udp + sizeof(udp_hdr_t), pkt, o);
-    
+
     int sr = -1;
     for (int t = 0; t < 4 && sr < 0; t++)
         sr = e1000_send_frame(frm, frm_len);
@@ -343,7 +343,7 @@ static int dhcp_try_ack_frame(const uint8_t *frame, int n, uint32_t xid) {
 
 int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
     if (!mac || !out_lease) return -1;
-    
+
     memset(out_lease, 0, sizeof(*out_lease));
 
     /* Wait for link (VMware bridged WiFi can take many seconds after host roam). */
@@ -360,12 +360,12 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
         thread_yield();
 
     e1000_flush_rx();
-    
+
     uint32_t xid = (uint32_t)(pit_get_ticks() ^ 0xA5F0C31Du);
     uint32_t offered_ip = 0, server_id = 0, netmask = 0, router = 0, dns = 0;
     uint8_t *frame = kmalloc(DHCP_FRAME_BUF);
     if (!frame) return -1;
-    
+
     /* PHASE 1: DISCOVER -> OFFER (with retries) */
     int rx_count = 0;
     for (int disc_try = 0; disc_try < DHCP_DISCOVER_TRIES && !offered_ip; disc_try++) {
@@ -375,7 +375,7 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
             for (int w = 0; w < 500; w++) thread_yield();
             continue;
         }
-        
+
         /* Busy-poll RX right after TX (VMware often answers in <1ms). */
         for (int burst = 0; burst < 8000; burst++) {
             e1000_poll();
@@ -387,7 +387,7 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
                     goto discover_done;
             }
         }
-        
+
         uint64_t start = pit_get_time_ms();
         while ((pit_get_time_ms() - start) < DHCP_RX_TIMEOUT_MS) {
             e1000_poll();
@@ -410,7 +410,7 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
 discover_done:
         (void)rx_count;
     }
-    
+
     if (!offered_ip) {
         klogprintf("dhcp: failed - no OFFER\n");
         kfree(frame);
@@ -418,7 +418,7 @@ discover_done:
     }
     if (!server_id)
         server_id = router ? router : offered_ip;
-    
+
     /* PHASE 2: REQUEST -> ACK (with retries) */
     for (int req_try = 0; req_try < DHCP_REQUEST_TRIES; req_try++) {
         int send_rc = dhcp_send_packet(mac, 3, xid, offered_ip, server_id);
@@ -426,7 +426,7 @@ discover_done:
             for (int w = 0; w < 500; w++) thread_yield();
             continue;
         }
-        
+
         for (int burst = 0; burst < 8000; burst++) {
             e1000_poll();
             int n = e1000_recv_frame(frame, DHCP_FRAME_BUF);
@@ -464,7 +464,7 @@ discover_done:
                 thread_yield();
         }
     }
-    
+
     klogprintf("dhcp: failed - no ACK\n");
     kfree(frame);
     return -1;

@@ -1,0 +1,424 @@
+#include <heap.h>
+#include <string.h>
+#include <stdint.h>
+#include <vga.h>
+#include <spinlock.h>
+
+// Very simple kernel heap: first-fit free list with headers, 16-byte alignment,
+// coalescing on free.
+//
+// IMPORTANT:
+// Callers in this kernel are not serialized (IRQs + multiple threads can call
+// kmalloc/kfree concurrently). Without a lock the free list corrupts easily,
+// causing non-deterministic failures (e.g. initfs extraction "breaks on any change").
+// Protect heap operations with a spinlock + IRQ-save to avoid reentrancy.
+
+typedef struct heap_block_header {
+    size_t size;                 // payload size (bytes)
+    struct heap_block_header* next;
+    struct heap_block_header* prev;
+    uint32_t magic;
+    uint32_t free;
+    size_t req_size;             // requested size (before alignment), for diagnostics
+    void *alloc_caller;          // return address of allocator (best-effort)
+} heap_block_header_t;
+
+#define ALIGN16(x)   (((x) + 15) & ~((size_t)15))
+
+static uint8_t* heap_base = 0;
+static size_t   heap_capacity = 0;
+static heap_block_header_t* head = 0;
+
+static size_t heap_used_now = 0;
+static size_t heap_peak     = 0;
+
+static spinlock_t heap_lock = { 0 };
+
+extern uint8_t _end[]; // provided by linker as end of kernel image
+
+#ifndef HEAP_GUARD
+#define HEAP_GUARD 1
+#endif
+
+#define HEAP_MAGIC_FREE  0xC0FFEE00u
+#define HEAP_MAGIC_ALLOC 0xC0FFEE01u
+#define HEAP_CANARY_QWORD 0xDEADBEEFCAFEBABEULL
+
+static int heap_ptr_in_range(const void *p) {
+    if (!heap_base || heap_capacity == 0) return 0;
+    uintptr_t a = (uintptr_t)p;
+    uintptr_t lo = (uintptr_t)heap_base;
+    uintptr_t hi = (uintptr_t)heap_base + heap_capacity;
+    return (a >= lo && a < hi);
+}
+
+static int heap_range_in_range(const void *p, size_t n) {
+    if (!heap_base || heap_capacity == 0) return 0;
+    if (n == 0) return heap_ptr_in_range(p);
+    uintptr_t a = (uintptr_t)p;
+    uintptr_t lo = (uintptr_t)heap_base;
+    uintptr_t hi = (uintptr_t)heap_base + heap_capacity;
+    /* check [a, a+n) fits in [lo, hi) without overflow */
+    if (a < lo) return 0;
+    if (a >= hi) return 0;
+    if (n > (size_t)(hi - a)) return 0;
+    return 1;
+}
+
+void heap_init(uintptr_t heap_start, size_t heap_size) {
+    if (heap_start == 0) {
+        // Default: place heap right after kernel end, align to 16 bytes
+        uintptr_t base = ((uintptr_t)_end + 0xFFF) & ~((uintptr_t)0xFFF);
+        heap_start = base;
+    }
+    if (heap_size == 0) {
+        /* Fallback when kernel_main does not pass a size; use available RAM if known. */
+        heap_size = 512ULL * 1024 * 1024;
+    }
+
+    heap_base = (uint8_t*)heap_start;
+    heap_capacity = heap_size;
+
+    head = (heap_block_header_t*)heap_base;
+    head->size = heap_capacity - sizeof(heap_block_header_t);
+    head->next = 0;
+    head->prev = 0;
+    head->free = 1;
+    head->magic = HEAP_MAGIC_FREE;
+    head->req_size = 0;
+    head->alloc_caller = 0;
+
+    heap_used_now = 0;
+    heap_peak = 0;
+}
+
+static void split_block(heap_block_header_t* blk, size_t size) {
+    size_t remaining = blk->size - size;
+    if (remaining <= sizeof(heap_block_header_t) + 16) return; // too small to split
+    heap_block_header_t* newblk = (heap_block_header_t*)((uint8_t*)blk + sizeof(heap_block_header_t) + size);
+    newblk->size = remaining - sizeof(heap_block_header_t);
+    newblk->free = 1;
+    newblk->magic = HEAP_MAGIC_FREE;
+    newblk->req_size = 0;
+    newblk->alloc_caller = 0;
+    newblk->next = blk->next;
+    newblk->prev = blk;
+    if (newblk->next) newblk->next->prev = newblk;
+    blk->next = newblk;
+    blk->size = size;
+}
+
+static void coalesce(heap_block_header_t* blk) {
+    // merge with next
+    if (blk->next && blk->next->free) {
+        blk->size += sizeof(heap_block_header_t) + blk->next->size;
+        blk->next = blk->next->next;
+        if (blk->next) blk->next->prev = blk;
+    }
+    // merge with prev
+    if (blk->prev && blk->prev->free) {
+        blk->prev->size += sizeof(heap_block_header_t) + blk->size;
+        blk->prev->next = blk->next;
+        if (blk->next) blk->next->prev = blk->prev;
+        blk = blk->prev;
+    }
+    blk->magic = HEAP_MAGIC_FREE;
+    blk->req_size = 0;
+    blk->alloc_caller = 0;
+}
+
+/* forward declarations for diagnostic helpers used by krealloc */
+static size_t heap_largest_free_block(void);
+static size_t heap_total_free_bytes(void);
+
+static void* kmalloc_nolock(size_t size) {
+    if (!head || size == 0) return 0;
+    size_t req = size;
+#if HEAP_GUARD
+    size = ALIGN16(req + sizeof(uint64_t));
+#else
+    size = ALIGN16(req);
+#endif
+    heap_block_header_t* cur = head;
+    while (cur) {
+        if (cur->free && cur->size >= size) {
+            split_block(cur, size);
+            cur->free = 0;
+            cur->magic = HEAP_MAGIC_ALLOC;
+            cur->req_size = req;
+            /* best-effort: capture external caller of kmalloc(), not kmalloc_nolock() */
+            cur->alloc_caller = __builtin_return_address(1);
+            heap_used_now += cur->size;
+            if (heap_used_now > heap_peak) heap_peak = heap_used_now;
+            uint8_t *p = (uint8_t*)cur + sizeof(heap_block_header_t);
+#if HEAP_GUARD
+            /* Write canary right after requested bytes. */
+            uint64_t v = (uint64_t)HEAP_CANARY_QWORD;
+            memcpy(p + req, &v, sizeof(v));
+#endif
+            return p;
+        }
+        cur = cur->next;
+    }
+    /* OOM: do not kprintf here — kmalloc() holds heap_lock and kprintf may kmalloc → deadlock. */
+    return 0; /* out of memory */
+}
+
+static void kfree_nolock(void* ptr) {
+    if (!ptr) return;
+    if (!heap_ptr_in_range(ptr)) {
+        kprintf("heap: invalid free ptr=%p (out of heap range)\n", ptr);
+        return;
+    }
+    heap_block_header_t* blk = (heap_block_header_t*)((uint8_t*)ptr - sizeof(heap_block_header_t));
+    if (!heap_ptr_in_range(blk)) {
+        kprintf("heap: invalid free header ptr=%p\n", (void*)blk);
+        return;
+    }
+    if (blk->magic != HEAP_MAGIC_ALLOC || blk->free) {
+        kprintf("heap: double free / corrupt header ptr=%p magic=0x%x free=%u\n",
+                ptr, (unsigned)blk->magic, (unsigned)blk->free);
+        /* print caller address to help locate the double-free site */
+        void *caller = __builtin_return_address(0);
+        kprintf("    caller: %p\n", caller);
+        /* print header diagnostics */
+        kprintf("    hdr: addr=%p size=%u req=%u prev=%p next=%p\n",
+                (void*)blk, (unsigned)blk->size, (unsigned)blk->req_size,
+                (void*)blk->prev, (void*)blk->next);
+        return;
+    }
+#if HEAP_GUARD
+    {
+        uint8_t *p = (uint8_t*)ptr;
+        const uint8_t *canp = (const uint8_t*)(p + blk->req_size);
+        uint64_t got = 0;
+        if (!heap_range_in_range(canp, sizeof(uint64_t))) got = 0;
+        else memcpy(&got, canp, sizeof(got));
+        if (got != (uint64_t)HEAP_CANARY_QWORD) {
+            kprintf("heap: overflow detected ptr=%p req=%u can=%p\n",
+                    ptr, (unsigned)blk->req_size, (void*)canp);
+            void *caller = __builtin_return_address(0);
+            kprintf("    caller: %p\n", caller);
+            kprintf("    alloc_caller: %p\n", blk->alloc_caller);
+            kprintf("    hdr: addr=%p size=%u req=%u prev=%p next=%p\n",
+                    (void*)blk, (unsigned)blk->size, (unsigned)blk->req_size,
+                    (void*)blk->prev, (void*)blk->next);
+        }
+    }
+#endif
+    blk->free = 1;
+    blk->magic = HEAP_MAGIC_FREE;
+    if (heap_used_now >= blk->size) heap_used_now -= blk->size; else heap_used_now = 0;
+    coalesce(blk);
+}
+
+static void* krealloc_nolock(void* ptr, size_t new_size) {
+    if (!ptr) return kmalloc_nolock(new_size);
+    if (new_size == 0) { kfree_nolock(ptr); return 0; }
+    if (!heap_ptr_in_range(ptr)) {
+        kprintf("heap: invalid realloc ptr=%p\n", ptr);
+        return 0;
+    }
+    heap_block_header_t* blk = (heap_block_header_t*)((uint8_t*)ptr - sizeof(heap_block_header_t));
+    if (!heap_ptr_in_range(blk) || blk->magic != HEAP_MAGIC_ALLOC || blk->free) {
+        kprintf("heap: invalid realloc header ptr=%p magic=0x%x free=%u\n",
+                ptr, (unsigned)(blk ? blk->magic : 0), (unsigned)(blk ? blk->free : 0));
+        return 0;
+    }
+    size_t old_size = blk->size;
+    size_t old_req = blk->req_size;
+    size_t new_req = new_size;
+#if HEAP_GUARD
+    new_size = ALIGN16(new_req + sizeof(uint64_t));
+#else
+    new_size = ALIGN16(new_req);
+#endif
+    if (new_size <= old_size) {
+        split_block(blk, new_size);
+        /* split_block() may leave the block unchanged when the tail cannot hold
+           a free header. Account the actual allocated payload size, not the
+           requested rounded size, or repeated small shrinks underflow heap_used. */
+        size_t new_alloc_size = blk->size;
+        if (old_size > new_alloc_size) {
+            size_t diff = old_size - new_alloc_size;
+            if (heap_used_now >= diff) heap_used_now -= diff; else heap_used_now = 0;
+        }
+#if HEAP_GUARD
+        /* refresh canary at the new requested end */
+        blk->req_size = new_req;
+        blk->alloc_caller = __builtin_return_address(1);
+        uint8_t *p = (uint8_t*)blk + sizeof(heap_block_header_t);
+        uint64_t v = (uint64_t)HEAP_CANARY_QWORD;
+        memcpy(p + new_req, &v, sizeof(v));
+#else
+        blk->req_size = new_req;
+        blk->alloc_caller = __builtin_return_address(1);
+#endif
+        return ptr;
+    }
+    /* try to grow in place by absorbing one or more consecutive next free blocks */
+    if (blk->next && blk->next->free) {
+        heap_block_header_t *scan = blk->next;
+        heap_block_header_t *last_absorbed = 0;
+        size_t accumulated = old_size;
+        /* accumulate sizes of consecutive free blocks (including their headers) */
+        while (scan && scan->free) {
+            /* defensive check: ensure header looks like a free block */
+            if (scan->magic != HEAP_MAGIC_FREE) break;
+            accumulated += sizeof(heap_block_header_t) + scan->size;
+            last_absorbed = scan;
+            if (accumulated >= new_size) break;
+            scan = scan->next;
+        }
+        if (accumulated >= new_size) {
+            /* scan points to last absorbed free block; link to the first non-absorbed one. */
+            heap_block_header_t *after = last_absorbed ? last_absorbed->next : NULL;
+            /* set blk to cover the entire accumulated region */
+            blk->size = accumulated;
+            blk->next = after;
+            if (after) after->prev = blk;
+            split_block(blk, new_size);
+            size_t diff = new_size - old_size;
+            heap_used_now += diff;
+            if (heap_used_now > heap_peak) heap_peak = heap_used_now;
+#if HEAP_GUARD
+            blk->req_size = new_req;
+            blk->alloc_caller = __builtin_return_address(1);
+            uint8_t *p = (uint8_t*)blk + sizeof(heap_block_header_t);
+            uint64_t v = (uint64_t)HEAP_CANARY_QWORD;
+            memcpy(p + new_req, &v, sizeof(v));
+#else
+            blk->req_size = new_req;
+            blk->alloc_caller = __builtin_return_address(1);
+#endif
+            return ptr;
+        }
+    }
+    void* n = kmalloc_nolock(new_req);
+    if (!n) {
+        /* Same as kmalloc_nolock OOM: no kprintf under heap_lock. */
+        return 0;
+    }
+    size_t to_copy = old_req < new_req ? old_req : new_req;
+    memcpy(n, ptr, to_copy);
+    kfree_nolock(ptr);
+    /* record realloc caller on the new block too */
+    {
+        heap_block_header_t* nblk = (heap_block_header_t*)((uint8_t*)n - sizeof(heap_block_header_t));
+        if (heap_ptr_in_range(nblk)) nblk->alloc_caller = __builtin_return_address(1);
+    }
+    return n;
+}
+
+void* kmalloc(size_t size) {
+    unsigned long flags = 0;
+    acquire_irqsave(&heap_lock, &flags);
+    void *p = kmalloc_nolock(size);
+    release_irqrestore(&heap_lock, flags);
+    if (!p && size != 0) {
+        acquire_irqsave(&heap_lock, &flags);
+        size_t largest = heap_largest_free_block();
+        size_t total_free = heap_total_free_bytes();
+        size_t used = heap_used_now;
+        size_t cap = heap_capacity;
+        release_irqrestore(&heap_lock, flags);
+        void *caller = __builtin_return_address(0);
+        kprintf("heap OOM: kmalloc(%llu) failed heap_used=%llu heap_total=%llu "
+                "largest_free=%llu total_free=%llu caller=%p\n",
+                (unsigned long long)size, (unsigned long long)used,
+                (unsigned long long)cap, (unsigned long long)largest,
+                (unsigned long long)total_free, caller);
+    }
+    return p;
+}
+
+void kfree(void* ptr) {
+    unsigned long flags = 0;
+    acquire_irqsave(&heap_lock, &flags);
+    kfree_nolock(ptr);
+    release_irqrestore(&heap_lock, flags);
+}
+
+void* krealloc(void* ptr, size_t new_size) {
+    unsigned long flags = 0;
+    acquire_irqsave(&heap_lock, &flags);
+    void *p = krealloc_nolock(ptr, new_size);
+    release_irqrestore(&heap_lock, flags);
+    if (!p && ptr != NULL && new_size != 0) {
+        acquire_irqsave(&heap_lock, &flags);
+        size_t largest = heap_largest_free_block();
+        size_t total_free = heap_total_free_bytes();
+        size_t used = heap_used_now;
+        size_t cap = heap_capacity;
+        release_irqrestore(&heap_lock, flags);
+        kprintf("heap: krealloc(%p, %llu) failed heap_used=%llu heap_total=%llu "
+                "largest_free=%llu total_free=%llu\n",
+                ptr, (unsigned long long)new_size, (unsigned long long)used,
+                (unsigned long long)cap, (unsigned long long)largest,
+                (unsigned long long)total_free);
+    }
+    return p;
+}
+
+void* kcalloc(size_t num, size_t size) {
+    size_t total = num * size;
+    void* p = kmalloc(total);
+    if (p) memset(p, 0, total);
+    return p;
+}
+
+size_t heap_total_bytes(void) { return heap_capacity; }
+size_t heap_used_bytes(void)  { return heap_used_now; }
+size_t heap_peak_bytes(void)  { return heap_peak; }
+
+size_t heap_free_bytes(void) {
+    unsigned long flags = 0;
+    acquire_irqsave(&heap_lock, &flags);
+    size_t n = heap_total_free_bytes();
+    release_irqrestore(&heap_lock, flags);
+    return n;
+}
+
+size_t heap_largest_free(void) {
+    unsigned long flags = 0;
+    acquire_irqsave(&heap_lock, &flags);
+    size_t n = heap_largest_free_block();
+    release_irqrestore(&heap_lock, flags);
+    return n;
+}
+
+uintptr_t heap_base_addr(void) { return (uintptr_t)heap_base; }
+
+uintptr_t heap_region_end_exclusive(void) {
+    if (!heap_base || heap_capacity == 0)
+        return (uintptr_t)heap_base;
+    uintptr_t lo = (uintptr_t)heap_base;
+    uintptr_t hi = lo + (uintptr_t)heap_capacity;
+    if (hi < lo)
+        return (uintptr_t)-1;
+    return hi;
+}
+
+/* Return largest single free payload size currently available (doesn't include header). */
+static size_t heap_largest_free_block(void) {
+    size_t max = 0;
+    heap_block_header_t *cur = head;
+    while (cur) {
+        if (cur->free && cur->size > max) max = cur->size;
+        cur = cur->next;
+    }
+    return max;
+}
+
+/* Sum of all free payload bytes (for diagnostics). */
+static size_t heap_total_free_bytes(void) {
+    size_t total = 0;
+    heap_block_header_t *cur = head;
+    while (cur) {
+        if (cur->free) total += cur->size;
+        cur = cur->next;
+    }
+    return total;
+}
+
+

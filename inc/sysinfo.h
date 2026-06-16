@@ -1,0 +1,33 @@
+#pragma once
+
+#include <stdint.h>
+
+// Простая структура/переменные для информации о системе
+extern char sys_cpu_name[64];
+extern int sys_ram_mb; // -1 если неизвестно
+// pc_type: 1 - BIOS/legacy boot, 0 - UEFI/other/unknown
+extern int sys_pc_type;
+
+// Инициализация — вызывается из kernel_main
+void sysinfo_init(uint32_t multiboot_magic, uint64_t multiboot_info_ptr);
+
+void sysinfo_print_e820(uint32_t multiboot_magic, uint64_t multiboot_info_ptr);
+
+/* Print SMBIOS/DMI system vendor/product info if available. */
+void sysinfo_print_dmi(void);
+void sysinfo_print_platform(void);
+
+/* Detect hypervisor and read TSC info (CPUID-based). */
+void detect_hv_and_read_tsc(void);
+
+// Получатели
+const char* sysinfo_cpu_name(void);
+int sysinfo_ram_mb(void);
+int sysinfo_pc_type(void);
+const char* sysinfo_boot_mode(void);
+const char* sysinfo_hypervisor_name(void);
+int sysinfo_is_hypervisor(void);
+uint64_t sysinfo_tsc_hz_hint(void);
+int sysinfo_tsc_hz_hint_is_exact(void);
+
+

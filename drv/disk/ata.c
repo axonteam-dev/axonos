@@ -1,0 +1,545 @@
+/*
+   ATA PIO driver with basic IDENTIFY and PIO read/write (LBA28).
+   This is written to be readable and follow POSIX-like semantics where
+   possible: functions return 0 on success and -1 on error, and public
+   initialization is provided via ata_dma_init().
+
+   TODO: ATA DMA
+
+   Notes:
+   - Only legacy IDE I/O ports are probed (primary/secondary channels).
+   - ATAPI probing/registration is delegated to drv/disk/atapi.c.
+   - Read/write implement PIO (commands 0x20/0x30) for 512-byte sectors.
+   - Error handling is conservative: operations return -1 on any failure.
+*/
+
+#include <axonos.h>
+#include <disk.h>
+#include <serial.h>
+#include <string.h>
+#include <idt.h>
+#include <pic.h>
+#include <devfs.h>
+#include <keyboard.h>
+#include <heap.h>
+#include <vga.h>
+#include <ramfs.h>
+#include <pci.h>
+
+#include <fat32.h>
+
+#include <ahci.h>
+#include <scsi.h>
+#include <atapi.h>
+
+#define ATA_PRIMARY_IO      0x1F0
+#define ATA_PRIMARY_CTRL    0x3F6
+#define ATA_SECONDARY_IO    0x170
+#define ATA_SECONDARY_CTRL  0x376
+
+#define ATA_REG_DATA(base)      (base + 0)
+#define ATA_REG_ERROR(base)     (base + 1)
+#define ATA_REG_SECCOUNT(base)  (base + 2)
+#define ATA_REG_LBA_LOW(base)   (base + 3)
+#define ATA_REG_LBA_MID(base)   (base + 4)
+#define ATA_REG_LBA_HIGH(base)  (base + 5)
+#define ATA_REG_DEVSEL(base)    (base + 6)
+#define ATA_REG_STATUS(base)    (base + 7)
+#define ATA_REG_COMMAND(base)   (base + 7)
+#define ATA_REG_ALTSTATUS(ctrl) (ctrl)
+#define ATA_REG_CONTROL(ctrl)   (ctrl)
+
+/* status bits */
+#define ATA_SR_BSY  0x80
+#define ATA_SR_DRDY 0x40
+#define ATA_SR_DF   0x20
+#define ATA_SR_DRQ  0x08
+#define ATA_SR_ERR  0x01
+
+/* commands */
+#define ATA_CMD_IDENTIFY    0xEC
+#define ATA_CMD_READ_PIO    0x20
+#define ATA_CMD_WRITE_PIO   0x30
+
+typedef struct {
+	uint16_t io_base;
+	uint16_t ctrl_base;
+	int is_slave; /* 0 = master, 1 = slave */
+	char model[41];
+	int exists;
+} ata_device_t;
+
+/* indexed by disk registration id */
+static ata_device_t ata_devices[DISK_MAX_DEVICES];
+static int ata_device_count = 0;
+
+typedef struct {
+	uint16_t io_base;
+	uint16_t ctrl_base;
+} ata_channel_t;
+
+#define ATA_MAX_CHANNELS 16
+
+/* helper: short io delay (read altstatus 4 times) */
+static void ata_io_delay(uint16_t ctrl) {
+	(void)inb(ATA_REG_ALTSTATUS(ctrl));
+	(void)inb(ATA_REG_ALTSTATUS(ctrl));
+	(void)inb(ATA_REG_ALTSTATUS(ctrl));
+	(void)inb(ATA_REG_ALTSTATUS(ctrl));
+}
+
+/* Software reset (SRST) pulse on given channel.
+   Writes SRST=1 to control, delays, then clears SRST and waits for BSY clear. */
+static void ata_software_reset(uint16_t io_base, uint16_t ctrl_base) {
+	/* assert SRST */
+	outb(ATA_REG_CONTROL(ctrl_base), 0x04);
+	/* short delay while asserted */
+	ata_io_delay(ctrl_base);
+	ata_io_delay(ctrl_base);
+	/* deassert SRST */
+	outb(ATA_REG_CONTROL(ctrl_base), 0x00);
+	/* wait until device clears BSY or timeout */
+	for (int i = 0; i < 1000; i++) {
+		uint8_t st = inb(ATA_REG_STATUS(io_base));
+		if (st != 0 && !(st & ATA_SR_BSY)) break;
+		ata_io_delay(ctrl_base);
+	}
+}
+
+/* wait until BSY cleared or timeout (simple) */
+static int ata_wait_ready(uint16_t io_base, uint16_t ctrl_base, int timeout_ms) {
+	int loops = timeout_ms * 100; /* rough approximation */
+	while (loops--) {
+		/* allow user to abort long waits with Ctrl-C */
+		if (keyboard_ctrlc_pending()) {
+			keyboard_consume_ctrlc();
+			return -1;
+		}
+		uint8_t status = inb(ATA_REG_STATUS(io_base));
+		if (!(status & ATA_SR_BSY)) return 0;
+		/* small pause */
+		ata_io_delay(ctrl_base);
+	}
+	return -1;
+}
+
+/* Read IDENTIFY data (512 bytes) into buffer; returns 0 on success */
+static int ata_identify(uint16_t io_base, uint16_t ctrl_base, int is_slave, uint16_t *out_buf) {
+	/* select drive */
+	outb(ATA_REG_DEVSEL(io_base), 0xA0 | (is_slave ? 0x10 : 0x00));
+	/* short delay after selecting drive (some virtual hw needs it) */
+	ata_io_delay(ctrl_base);
+	/* clear registers */
+	outb(ATA_REG_SECCOUNT(io_base), 0);
+	outb(ATA_REG_LBA_LOW(io_base), 0);
+	outb(ATA_REG_LBA_MID(io_base), 0);
+	outb(ATA_REG_LBA_HIGH(io_base), 0);
+
+	/* send IDENTIFY */
+	outb(ATA_REG_COMMAND(io_base), ATA_CMD_IDENTIFY);
+	/* read status */
+	uint8_t status = 0;
+	/* wait a short while for device to set status != 0 (some VMware builds are slow) */
+	for (int i = 0; i < 2000; i++) {
+		status = inb(ATA_REG_STATUS(io_base));
+		if (status != 0) break;
+		ata_io_delay(ctrl_base);
+	}
+	if (status == 0) return -1; /* no device */
+
+	/* poll until DRQ or ERR, but protect with timeout to avoid infinite hang */
+	{
+		int poll = 0;
+		const int POLL_MAX = 500000; /* tuned empirically */
+		for (;;) {
+			/* allow user to abort IDENTIFY with Ctrl-C */
+			if (keyboard_ctrlc_pending()) { keyboard_consume_ctrlc(); return -1; }
+			status = inb(ATA_REG_STATUS(io_base));
+			if (status & ATA_SR_ERR) {
+				return -1;
+			}
+			if (status & ATA_SR_DRQ) break;
+			if (!(status & ATA_SR_BSY)) {
+				/* still waiting */
+			}
+			if (++poll > POLL_MAX) {
+				return -1;
+			}
+		}
+	}
+
+	/* read 256 words */
+	insw(ATA_REG_DATA(io_base), out_buf, 256);
+	return 0;
+}
+
+/* Convert model string from identify buffer (words 27..46). */
+static void ata_model_from_ident(const uint16_t *ident, char *out, size_t outlen) {
+	/* model is words 27..46 (20 words, 40 chars) in big-endian words */
+	int pos = 0;
+	for (int i = 27; i <= 46 && pos + 1 < (int)outlen; i++) {
+		uint16_t w = ident[i];
+		/* ATA stores strings as words with bytes swapped */
+		char a = (char)(w >> 8);
+		char b = (char)(w & 0xFF);
+		out[pos++] = a ? a : ' ';
+		if (pos < (int)outlen - 1) out[pos++] = b ? b : ' ';
+	}
+	out[outlen - 1] = '\0';
+	/* trim trailing spaces */
+	for (int i = (int)strlen(out) - 1; i >= 0; i--) {
+		if (out[i] == ' ') out[i] = '\0';
+		else break;
+	}
+}
+
+
+/* PIO read of sectors (LBA28). buf must be at least sectors*512 bytes.
+   Returns 0 on success. */
+static int ata_pio_read(int device_id, uint32_t lba, void *buf, uint32_t sectors) {
+	if (device_id < 0 || device_id >= ata_device_count) return -1;
+	ata_device_t *dev = &ata_devices[device_id];
+	if (!dev->exists) return -1;
+	if (sectors == 0) return -1;
+
+	while (sectors > 0) {
+		uint8_t to_read = sectors > 255 ? 255 : (uint8_t)sectors;
+		/* wait not busy */
+		if (ata_wait_ready(dev->io_base, dev->ctrl_base, 500) != 0) return -1;
+
+		outb(ATA_REG_SECCOUNT(dev->io_base), to_read);
+		outb(ATA_REG_LBA_LOW(dev->io_base), (uint8_t)(lba & 0xFF));
+		outb(ATA_REG_LBA_MID(dev->io_base), (uint8_t)((lba >> 8) & 0xFF));
+		outb(ATA_REG_LBA_HIGH(dev->io_base), (uint8_t)((lba >> 16) & 0xFF));
+		outb(ATA_REG_DEVSEL(dev->io_base), 0xE0 | (dev->is_slave ? 0x10 : 0x00) | ((lba >> 24) & 0x0F));
+		outb(ATA_REG_COMMAND(dev->io_base), ATA_CMD_READ_PIO);
+
+		/* for each sector */
+		for (int s = 0; s < to_read; s++) {
+			/* wait for DRQ */
+			int pollloops = 100000;
+			{
+				int poll = 0;
+				const int POLL_MAX = 200000;
+				for (;;) {
+					/* allow abort via Ctrl-C while polling */
+					if (keyboard_ctrlc_pending()) { keyboard_consume_ctrlc(); return -1; }
+					uint8_t st = inb(ATA_REG_STATUS(dev->io_base));
+					if (st & ATA_SR_ERR) {
+						klogprintf("ata: read error dev=%d io=0x%x lba=%u\n", device_id, dev->io_base, lba);
+						return -1;
+					}
+					if (st & ATA_SR_DRQ) break;
+					if (++poll > POLL_MAX) {
+						klogprintf("ata: read timeout dev=%d io=0x%x lba=%u status=0x%x\n", device_id, dev->io_base, lba, st);
+						return -1;
+					}
+				}
+			}
+			/* copy 256 words -> 512 bytes */
+			insw(ATA_REG_DATA(dev->io_base), buf, 256);
+			buf = (void *)((char *)buf + 512);
+			lba++;
+		}
+		sectors -= to_read;
+	}
+	return 0;
+}
+
+/* PIO write of sectors (LBA28). */
+static int ata_pio_write(int device_id, uint32_t lba, const void *buf, uint32_t sectors) {
+	if (device_id < 0 || device_id >= ata_device_count) return -1;
+	ata_device_t *dev = &ata_devices[device_id];
+	if (!dev->exists) return -1;
+	if (sectors == 0) return -1;
+
+	while (sectors > 0) {
+		uint8_t to_write = sectors > 255 ? 255 : (uint8_t)sectors;
+		if (ata_wait_ready(dev->io_base, dev->ctrl_base, 500) != 0) return -1;
+
+		outb(ATA_REG_SECCOUNT(dev->io_base), to_write);
+		outb(ATA_REG_LBA_LOW(dev->io_base), (uint8_t)(lba & 0xFF));
+		outb(ATA_REG_LBA_MID(dev->io_base), (uint8_t)((lba >> 8) & 0xFF));
+		outb(ATA_REG_LBA_HIGH(dev->io_base), (uint8_t)((lba >> 16) & 0xFF));
+		outb(ATA_REG_DEVSEL(dev->io_base), 0xE0 | (dev->is_slave ? 0x10 : 0x00) | ((lba >> 24) & 0x0F));
+		outb(ATA_REG_COMMAND(dev->io_base), ATA_CMD_WRITE_PIO);
+
+		for (int s = 0; s < to_write; s++) {
+			/* wait for DRQ */
+			{
+				int poll = 0;
+				const int POLL_MAX = 200000;
+				for (;;) {
+					/* allow abort via Ctrl-C while polling */
+					if (keyboard_ctrlc_pending()) { keyboard_consume_ctrlc(); return -1; }
+					uint8_t st = inb(ATA_REG_STATUS(dev->io_base));
+					if (st & ATA_SR_ERR) {
+						klogprintf("ata: write error dev=%d io=0x%x lba=%u\n", device_id, dev->io_base, lba);
+						return -1;
+					}
+					if (st & ATA_SR_DRQ) break;
+					if (++poll > POLL_MAX) {
+						klogprintf("ata: write timeout dev=%d io=0x%x lba=%u status=0x%x\n", device_id, dev->io_base, lba, st);
+						return -1;
+					}
+				}
+			}
+			/* write 256 words */
+			outsw(ATA_REG_DATA(dev->io_base), buf, 256);
+			buf = (const void *)((const char *)buf + 512);
+			lba++;
+		}
+		sectors -= to_write;
+	}
+	return 0;
+}
+
+static uint32_t ata_le32(const uint8_t *p) {
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void ata_publish_mbr_partitions(int device_id, char letter, uint32_t disk_sectors) {
+	uint8_t mbr[512];
+	if (disk_read_sectors(device_id, 0, mbr, 1) != 0) return;
+	if (mbr[510] != 0x55 || mbr[511] != 0xAA) return;
+	for (int i = 0; i < 4; i++) {
+		const uint8_t *e = &mbr[446 + i * 16];
+		uint8_t part_type = e[4];
+		uint32_t start_lba = ata_le32(e + 8);
+		uint32_t part_sectors = ata_le32(e + 12);
+		if (part_type == 0 || part_sectors == 0) continue;
+		if (start_lba >= disk_sectors) continue;
+		if (start_lba + part_sectors < start_lba) continue; /* overflow */
+		if (start_lba + part_sectors > disk_sectors) part_sectors = disk_sectors - start_lba;
+		char ppath[32];
+		snprintf(ppath, sizeof(ppath), "/dev/sd%c%d", letter, i + 1);
+		devfs_create_block_node_lba(ppath, device_id, start_lba, part_sectors);
+	}
+}
+
+/* Register discovered ATA device into disk layer and remember mapping */
+static void ata_register_device(uint16_t io_base, uint16_t ctrl_base, int is_slave, const char *model, uint32_t sectors) {
+	disk_ops_t *ops = (disk_ops_t *)kmalloc(sizeof(disk_ops_t));
+	if (!ops) return;
+	memset(ops, 0, sizeof(*ops));
+	char namebuf[32];
+	snprintf(namebuf, sizeof(namebuf), "ata_%u%s", (unsigned)ata_device_count, is_slave ? "s" : "m");
+	ops->name = (const char *)kmalloc(strlen(namebuf) + 1);
+	if (ops->name) strcpy((char *)ops->name, namebuf);
+	ops->init = NULL;
+	ops->read = ata_pio_read;
+	ops->write = ata_pio_write;
+
+	int id = disk_register(ops);
+	if (id < 0) {
+		klogprintf("ata: error: failed to register device %s\n", namebuf);
+		kfree((void *)ops->name);
+		kfree(ops);
+		return;
+	}
+	if (id < 0 || id >= DISK_MAX_DEVICES) {
+		klogprintf("ata: error: disk id %d out of ATA map bounds\n", id);
+		return;
+	}
+	/* store mapping by registration id (id equals current ata_device_count) */
+	ata_devices[id].io_base = io_base;
+	ata_devices[id].ctrl_base = ctrl_base;
+	ata_devices[id].is_slave = is_slave;
+	ata_devices[id].exists = 1;
+	strncpy(ata_devices[id].model, model, sizeof(ata_devices[id].model)-1);
+	ata_devices[id].model[sizeof(ata_devices[id].model)-1] = '\0';
+	ata_device_count = id + 1;
+	/* concise output per user request */
+	uint32_t size_mb = sectors / 2048; /* sectors * 512 / (1024*1024) */
+	char devpath[32];
+	snprintf(devpath, sizeof(devpath), "/dev/hd%d", id);
+	devfs_create_block_node(devpath, id, sectors);
+	if (id >= 0 && id < 26) {
+		char devpath2[32];
+		char letter = (char)('a' + id);
+		snprintf(devpath2, sizeof(devpath2), "/dev/sd%c", letter);
+		devfs_create_block_node(devpath2, id, sectors);
+		ata_publish_mbr_partitions(id, letter, sectors);
+	}
+	/* Do not auto-probe/auto-mount FAT32 here.
+	   Manual mount(2) should control which block device is attached as vfat. */
+	klogprintf("ATA: Found pio disk: \"%s\" model: \"%s\" size: %u mb\n", ata_devices[id].model, ata_devices[id].model, size_mb);
+	(void)scsi_register_disk_as_lun(id, sectors, "ATA    ", ata_devices[id].model, "1.0 ");
+}
+
+static int ata_channel_seen(const ata_channel_t *channels, int count, uint16_t io_base, uint16_t ctrl_base) {
+	for (int i = 0; i < count; i++) {
+		if (channels[i].io_base == io_base && channels[i].ctrl_base == ctrl_base) return 1;
+	}
+	return 0;
+}
+
+static void ata_channel_add_unique(ata_channel_t *channels, int *count, uint16_t io_base, uint16_t ctrl_base) {
+	if (!channels || !count) return;
+	if (*count >= ATA_MAX_CHANNELS) return;
+	if (io_base == 0 || ctrl_base == 0) return;
+	if (ata_channel_seen(channels, *count, io_base, ctrl_base)) return;
+	channels[*count].io_base = io_base;
+	channels[*count].ctrl_base = ctrl_base;
+	(*count)++;
+}
+
+static int ata_collect_pci_channels(ata_channel_t *channels, int max_channels) {
+	if (!channels || max_channels <= 0) return 0;
+	int count = 0;
+
+	pci_device_t *devs = pci_get_devices();
+	int dev_count = pci_get_device_count();
+
+	for (int i = 0; i < dev_count; i++) {
+		pci_device_t *pdev = &devs[i];
+		if (pdev->class_code != 0x01 || pdev->subclass != 0x01) continue; /* IDE */
+
+		if (pdev->vendor_id == 0x8086 &&
+		    (pdev->device_id == 0x2920 || pdev->device_id == 0x2921 || pdev->device_id == 0x2926)) {
+			klogprintf("ata: intel ICH9 storage controller detected (device=%04x)\n", pdev->device_id);
+		}
+
+		/* Enable IO + bus master before touching PCI IDE BARs. */
+		uint32_t cmd = pci_config_read_dword(pdev->bus, pdev->device, pdev->function, 0x04);
+		cmd |= (1u << 0) | (1u << 2); /* IO | BUS MASTER */
+		pci_config_write_dword(pdev->bus, pdev->device, pdev->function, 0x04, cmd);
+
+		/* Default compatibility ranges. */
+		uint16_t p_io = ATA_PRIMARY_IO;
+		uint16_t p_ctrl = ATA_PRIMARY_CTRL;
+		uint16_t s_io = ATA_SECONDARY_IO;
+		uint16_t s_ctrl = ATA_SECONDARY_CTRL;
+
+		int p_native = (pdev->prog_if & 0x01) != 0; /* primary native mode */
+		int s_native = (pdev->prog_if & 0x04) != 0; /* secondary native mode */
+
+		/* In native mode PCI BAR0..BAR3 define channel ranges.
+		   BAR1/BAR3 are control blocks; control register is BAR + 2. */
+		if (p_native) {
+			if ((pdev->bar[0] & 0x1u) && pdev->bar[0] != 0) p_io = (uint16_t)(pdev->bar[0] & ~0x3u);
+			if ((pdev->bar[1] & 0x1u) && pdev->bar[1] != 0) p_ctrl = (uint16_t)((pdev->bar[1] & ~0x3u) + 2u);
+		}
+		if (s_native) {
+			if ((pdev->bar[2] & 0x1u) && pdev->bar[2] != 0) s_io = (uint16_t)(pdev->bar[2] & ~0x3u);
+			if ((pdev->bar[3] & 0x1u) && pdev->bar[3] != 0) s_ctrl = (uint16_t)((pdev->bar[3] & ~0x3u) + 2u);
+		}
+
+		klogprintf("ata: pci ide %02x:%02x.%x vendor=%04x device=%04x prog_if=%02x p=%s io=0x%x ctrl=0x%x s=%s io=0x%x ctrl=0x%x\n",
+		           pdev->bus, pdev->device, pdev->function,
+		           pdev->vendor_id, pdev->device_id, pdev->prog_if,
+		           p_native ? "native" : "compat", p_io, p_ctrl,
+		           s_native ? "native" : "compat", s_io, s_ctrl);
+
+		ata_channel_add_unique(channels, &count, p_io, p_ctrl);
+		ata_channel_add_unique(channels, &count, s_io, s_ctrl);
+		if (count >= max_channels) break;
+	}
+
+	/* Log common Intel SATA RAID IDs that need a real AHCI/RAID path. */
+	for (int i = 0; i < dev_count; i++) {
+		pci_device_t *pdev = &devs[i];
+		if (pdev->class_code == 0x01 && pdev->subclass == 0x04 && pdev->vendor_id == 0x8086) {
+			klogprintf("ata: intel storage in RAID mode found %02x:%02x.%x device=%04x (IDE/AHCI path won't bind)\n",
+			           pdev->bus, pdev->device, pdev->function, pdev->device_id);
+		}
+	}
+
+	return count;
+}
+
+void ata_dma_init(void) {
+	/* Probe PCI IDE channels first (includes Intel ICHx in IDE/native mode). */
+	ata_channel_t channels[ATA_MAX_CHANNELS];
+	memset(channels, 0, sizeof(channels));
+	int channel_count = ata_collect_pci_channels(channels, ATA_MAX_CHANNELS);
+
+	/* Fallback to legacy ports if no PCI IDE controller was exposed. */
+	if (channel_count == 0) {
+		ata_channel_add_unique(channels, &channel_count, ATA_PRIMARY_IO, ATA_PRIMARY_CTRL);
+		ata_channel_add_unique(channels, &channel_count, ATA_SECONDARY_IO, ATA_SECONDARY_CTRL);
+		klogprintf("ata: no pci ide controller, fallback legacy channels\n");
+	}
+
+	/* Reset discovered channels to mimic cold-boot behavior. */
+	for (int ch = 0; ch < channel_count; ch++) {
+		ata_software_reset(channels[ch].io_base, channels[ch].ctrl_base);
+	}
+	/* register IRQ handlers for primary (14) and secondary (15) ATA IRQs
+	   before probing so any interrupts generated during IDENTIFY are handled. */
+	idt_set_handler(32 + 14, (void (*)(cpu_registers_t*))(&ata_io_delay)); /* placeholder to set vector now */
+	/* replace with real handler below */
+	idt_set_handler(32 + 14, (void (*)(cpu_registers_t*))0);
+	/* set proper handler and unmask IRQs */
+	extern void ata_irq_dispatch_wrapper(); /* forward declaration for casting convenience */
+	idt_set_handler(32 + 14, (void (*)(cpu_registers_t*))ata_irq_dispatch_wrapper);
+	pic_unmask_irq(14);
+	idt_set_handler(32 + 15, (void (*)(cpu_registers_t*))ata_irq_dispatch_wrapper);
+	pic_unmask_irq(15);
+
+	/* Probe all discovered channels. */
+	for (int ch = 0; ch < channel_count; ch++) {
+		for (int sl = 0; sl < 2; sl++) {
+			uint16_t identbuf[256];
+			if (ata_identify(channels[ch].io_base, channels[ch].ctrl_base, sl, identbuf) == 0) {
+				char model[41] = {0};
+				ata_model_from_ident(identbuf, model, sizeof(model));
+				/* compute total sectors:
+				   - prefer 48-bit LBA result in words 100..103 if present
+				   - fallback to 28-bit result in words 60..61
+				   - cap to 32-bit because disk layer uses 32-bit LBAs */
+				uint64_t sectors64 = 0;
+				/* words 100..103 hold total number of user-addressable sectors for 48-bit LBA */
+				sectors64 = (uint64_t)(uint32_t)identbuf[100]
+					| ((uint64_t)(uint32_t)identbuf[101] << 16)
+					| ((uint64_t)(uint32_t)identbuf[102] << 32)
+					| ((uint64_t)(uint32_t)identbuf[103] << 48);
+				uint32_t sectors;
+				if (sectors64 != 0) {
+					/* cap to 32-bit since upper layers use uint32_t LBAs */
+					if (sectors64 > 0xFFFFFFFFULL) sectors = 0xFFFFFFFFU;
+					else sectors = (uint32_t)sectors64;
+				} else {
+					/* fallback to LBA28 words 60..61 */
+					sectors = (uint32_t)identbuf[60] | ((uint32_t)identbuf[61] << 16);
+				}
+				ata_register_device(channels[ch].io_base, channels[ch].ctrl_base, sl, model, sectors);
+			} else {
+				/* If IDENTIFY DEVICE failed, let ATAPI module probe/register packet device. */
+				(void)atapi_try_register_device(channels[ch].io_base, channels[ch].ctrl_base, sl);
+			}
+		}
+	}
+
+	if (ata_device_count == 0) {
+		klogprintf("ata: No devices detected.\n");
+	} else {
+		klogprintf("ata: devices: %d\n", ata_device_count);
+	}
+
+	/* Then probe AHCI SATA. */
+	int ahci_count = ahci_probe_and_register();
+	if (ahci_count > 0) {
+		klogprintf("ahci: devices: %d (after legacy ATA)\n", ahci_count);
+	}
+
+}
+
+/* IRQ handler: clear status on devices to acknowledge IRQ.
+   idt_dispatch will send EOI after calling this handler. */
+static void ata_irq_handler(cpu_registers_t *regs) {
+	(void)regs;
+	for (int i = 0; i < ata_device_count; i++) {
+		if (ata_devices[i].exists) {
+			/* read status to clear interrupt */
+			(void)inb(ATA_REG_STATUS(ata_devices[i].io_base));
+		}
+	}
+	atapi_irq_ack_all();
+}
+
+/* wrapper with C linkage used for idt_set_handler cast compatibility */
+void ata_irq_dispatch_wrapper(cpu_registers_t *regs) {
+	ata_irq_handler(regs);
+}
+

@@ -1,0 +1,157 @@
+#include <pit.h>
+#include <apic_timer.h>
+#include <klog.h>
+#include <debug.h> 
+#include <pic.h>
+#include <idt.h>
+#include <serial.h>
+#include <vga.h>
+#include <thread.h>
+#include <vbe.h>
+#include <cirrusfb.h>
+#include <smp.h>
+#include <loadavg.h>
+#include <power.h>
+
+// Global variables
+volatile uint64_t pit_ticks = 0;
+volatile uint32_t pit_frequency = 1000; // Default 100 Hz
+volatile int pit_enabled = 0;
+/* Common tick source used by scheduler/userspace timeouts (monotonic). */
+volatile uint64_t timer_ticks = 0;
+volatile uint32_t timer_frequency = 1000;
+
+// PIT handler - called on IRQ 0
+void pit_handler(cpu_registers_t* regs) {
+        pit_ticks++;
+        timer_ticks++;
+
+        /* Ensure ACPI/power requests progress even when system is otherwise idle at a prompt. */
+        if (power_is_pending() && (!regs || ((regs->cs & 3) == 0))) {
+                power_poll();
+        }
+
+        if (init && smp_sched_cpu_id() == 0 && pit_ticks > 0 &&
+            pit_frequency > 0 && (pit_ticks % pit_frequency) == 0)
+                loadavg_second_tick();
+
+        if (!init) return;
+        thread_wake_expired_timeouts();
+        /* Avoid full schedule from ring-3 IRQ on SMP; on UP, yield spinners when others wait. */
+        if (regs && ((regs->cs & 3) == 3)) {
+                if (smp_cpu_count() <= 1)
+                        thread_ring3_preempt_if_waiters();
+                return;
+        }
+        
+        /* SMP: never thread_schedule() from IRQ — nested scheduler + sched_lock corrupts state.
+           Idle loops + IPI wake other CPUs; BSP is driven by syscalls/yield. */
+        if ((pit_ticks % 10) == 0 && smp_cpu_count() <= 1) {
+                thread_schedule();
+        }
+        if (cirrusfb_is_ready()) {
+                cirrusfb_update_cursor();
+        } else {
+                vbe_flush_full();
+                vbefb_update_cursor();
+        }
+}
+
+// Initialize PIT with default frequency (100 Hz)
+void pit_init() {
+        
+        // Set default frequency (1000 Hz)
+        int freq = 1000;
+        pit_enabled = 1;
+        pit_set_frequency(freq);
+        // Set up PIT handler for IRQ 0
+        idt_set_handler(32, pit_handler); // IRQ 0 = vector 32
+}
+
+// Disable PIT - stop timer interrupts
+void pit_disable(void) {
+    pit_enabled = 0;
+    // Stop PIT by setting channel 0 to mode 0 (interrupt on terminal count)
+    // with maximum divisor (0 = 65536) which effectively stops the timer
+    outb(PIT_COMMAND, PIT_CMD_CHANNEL0 | PIT_CMD_ACCESS_BOTH | PIT_CMD_MODE0 | PIT_CMD_BINARY);
+    outb(PIT_CHANNEL0, 0);   // Low byte = 0
+    outb(PIT_CHANNEL0, 0);   // High byte = 0
+    
+    kprintf("PIT: Disabled\n");
+}
+
+// Set PIT frequency in Hz
+void pit_set_frequency(uint32_t frequency) {
+        if (frequency == 0) return;
+        
+        // Calculate divisor
+        uint32_t divisor = PIT_FREQUENCY / frequency;
+        
+        // Ensure divisor is in valid range (1-65535)
+        if (divisor < 1) divisor = 1;
+        if (divisor > 65535) divisor = 65535;
+        
+        // Recalculate actual frequency
+        pit_frequency = PIT_FREQUENCY / divisor;
+        timer_frequency = pit_frequency;
+        
+        // Set the divisor
+        pit_set_divisor((uint16_t)divisor);
+}
+
+// Set PIT divisor directly
+void pit_set_divisor(uint16_t divisor) {
+        // Send command byte
+        // Use MODE2 (rate generator) to have linear down-counting, which simplifies
+        // reading the current counter value for time interpolation
+        outb(PIT_COMMAND, PIT_CMD_CHANNEL0 | PIT_CMD_ACCESS_BOTH | PIT_CMD_MODE2 | PIT_CMD_BINARY);
+        
+        // Send divisor (low byte first, then high byte)
+        outb(PIT_CHANNEL0, divisor & 0xFF);
+        outb(PIT_CHANNEL0, (divisor >> 8) & 0xFF);
+}
+
+// Get current PIT count
+uint16_t pit_get_current_count() {
+        // Latch current count (counter latch command: channel0 + access=00)
+        outb(PIT_COMMAND, PIT_CMD_CHANNEL0);
+        // Read latched count (low then high)
+        uint16_t lo = inb(PIT_CHANNEL0);
+        uint16_t hi = inb(PIT_CHANNEL0);
+        return (uint16_t)((hi << 8) | lo);
+}
+
+// Sleep for specified number of milliseconds
+void pit_sleep_ms(uint32_t milliseconds) {
+        /* Use common ticks so this keeps working even if PIT is disabled later. */
+        uint64_t target_ticks = timer_ticks + (milliseconds * pit_frequency / 1000);
+        /* If timer_ticks never advance (mis-routed IRQ / SMP oddity), do not hang forever. */
+        uint64_t spins = 0;
+        uint64_t spin_limit = (uint64_t)milliseconds * 50000000ull + 500000000ull;
+        while (timer_ticks < target_ticks) {
+                if (++spins > spin_limit)
+                        break;
+                asm volatile("pause" ::: "memory");
+        }
+}
+
+// Get current tick count
+uint64_t pit_get_ticks() {
+        return pit_ticks;
+}
+
+// Get time in milliseconds since boot
+uint64_t pit_get_time_ms() {
+        uint64_t freq = timer_frequency;
+        if (freq == 0)
+                return 0;
+        return (timer_ticks * 1000) / freq;
+}
+
+uint64_t pit_get_frequency() {
+        return timer_frequency ? timer_frequency : pit_frequency;
+}
+
+int pit_is_enabled(void) {
+        return pit_enabled;
+}

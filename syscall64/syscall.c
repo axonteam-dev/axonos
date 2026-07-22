@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <thread.h>
+#include <fpu.h>
 #include <fs.h>
 #include <mmio.h>
 #include <heap.h>
@@ -45,8 +46,6 @@
 
 #define mark_user_identity_range_2m_sys user_map_mark_identity_2m
 
-static void syscall_adopt_thread(thread_t *t);
-
 #ifndef S_IFSOCK
 #define S_IFSOCK 0140000
 #endif
@@ -64,6 +63,7 @@ static void syscall_adopt_thread(thread_t *t);
 #define ECONNRESET 104
 
 extern void kprintf(const char *fmt, ...);
+extern int syscall_pipe_watch_active;
 
 /* Helper exported from core/elf.c */
 extern uint64_t virt_to_phys(uint64_t va);
@@ -187,6 +187,10 @@ void syscall_user_fatal_exit(int signo) {
         }
         if (cur->waiter_tid >= 0)
             thread_unblock(cur->waiter_tid);
+        if (cur->mm_ptemplate) {
+            mm_release(cur->mm_ptemplate);
+            cur->mm_ptemplate = NULL;
+        }
         if (cur->mm && cur->mm != mm_kernel()) {
             mm_t *dead_mm = cur->mm;
             cur->mm = NULL;
@@ -221,6 +225,10 @@ static void thread_close_all_fds(thread_t *cur) {
         for (int j = i; j < THREAD_MAX_FD; j++) {
             if (cur->fds[j] == f) {
                 cur->fds[j] = NULL;
+                if (cur->process && cur->process->fds[j] == f) {
+                    cur->process->fds[j] = NULL;
+                    cur->process->fd_cloexec[j] = 0;
+                }
                 n++;
             }
         }
@@ -275,7 +283,8 @@ static void fork_build_gpr_snap_from_thread(thread_t *t) {
     t->fork_gpr_snap[9] = t->saved_user_rsi;
     t->fork_gpr_snap[10] = t->saved_user_rbp;
     t->fork_gpr_snap[11] = t->saved_user_rbx;
-    t->fork_gpr_snap[12] = t->saved_user_rdx;
+    t->saved_user_rdx = 0;
+    t->fork_gpr_snap[12] = 0;
     t->fork_gpr_snap[13] = t->fork_child_user_rip ? t->fork_child_user_rip : t->saved_user_rcx;
     t->fork_gpr_snap[14] = 0;
     t->fork_gpr_snap[15] = t->saved_user_rsp;
@@ -301,7 +310,9 @@ static void fork_copy_child_regs_from_snapshot(thread_t *child, thread_t *parent
     child->saved_user_rsi = snap[9];
     child->saved_user_rbp = snap[10];
     child->saved_user_rbx = snap[11];
-    child->saved_user_rdx = snap[12];
+    /* glibc's _Fork wrapper carries the child result through EDX across its
+     * set_robust_list syscall. Keep both authoritative copies at zero. */
+    child->saved_user_rdx = 0;
     child->saved_user_rcx = child_rip;
     child->saved_user_rsp = snap[15];
     memcpy(child->fork_gpr_snap, snap, 16 * sizeof(uint64_t));
@@ -331,7 +342,7 @@ static void fork_assign_child_return_rip(thread_t *parent, thread_t *child) {
     fork_copy_child_regs_from_snapshot(child, parent, rip);
     child->user_rip = rip;
     if (parent->name[0] && strstr(parent->name, "openrc")) {
-        kprintf("fork-parent-rip: child=%llu rip=0x%llx trap=0x%llx rsp=0x%llx rbp=0x%llx kbuf_rbp=0x%llx\n",
+        devel_printf("fork-parent-rip: child=%llu rip=0x%llx trap=0x%llx rsp=0x%llx rbp=0x%llx kbuf_rbp=0x%llx\n",
             (unsigned long long)(child->tid ? child->tid : 1),
             (unsigned long long)rip,
             (unsigned long long)parent->fork_child_trap_rip,
@@ -351,7 +362,7 @@ static void fork_sync_after_robust_list(thread_t *child) {
         uint64_t resume_rip = child->saved_user_rcx;
         if (child->syscall_frame_kbuf)
             resume_rip = child->syscall_frame_kbuf[13];
-        kprintf("fork-post-robust-sync: child=%llu robust=0x%llx cleartid=0x%llx resume_rip=0x%llx\n",
+        devel_printf("fork-post-robust-sync: child=%llu robust=0x%llx cleartid=0x%llx resume_rip=0x%llx\n",
             (unsigned long long)(child->tid ? child->tid : 1),
             (unsigned long long)child->robust_list_head,
             (unsigned long long)child->clear_child_tid,
@@ -383,12 +394,26 @@ static void fork_child_finish_post_robust(thread_t *child) {
             child->syscall_frame_kbuf[12] = 0;
         static int edx0_left = 32;
         if (edx0_left-- > 0)
-            kprintf("fork-child-edx0: tid=%llu live_rdx=0x%llx rip=0x%llx rsp=0x%llx name=%s\n",
+            devel_printf("fork-child-edx0: tid=%llu live_rdx=0x%llx rip=0x%llx rsp=0x%llx name=%s\n",
                 (unsigned long long)(child->tid ? child->tid : 1),
                 (unsigned long long)live[12],
                 (unsigned long long)live[13],
                 (unsigned long long)live[15],
                 child->name[0] ? child->name : "?");
+    }
+    if (syscall_pipe_watch_active && child->mm) {
+        uint64_t bss = 0x63e978ULL, stk = child->saved_user_rsp;
+        uint64_t bss_pa = 0, stk_pa = 0, bss_w = 0, stk_w = 0;
+        int bss_r = mm_va_leaf_pa(child->mm, bss, &bss_pa);
+        int stk_r = mm_va_leaf_pa(child->mm, stk, &stk_pa);
+        int bss_wr = mm_user_leaf_pa(child->mm, bss, 1, &bss_w);
+        int stk_wr = mm_user_leaf_pa(child->mm, stk, 1, &stk_w);
+        devel_printf("fork-child-pte: tid=%llu bss_r=%d pa=0x%llx wr=%d "
+                "stk_r=%d pa=0x%llx wr=%d cr3=0x%llx\n",
+            (unsigned long long)(child->tid ? child->tid : 1),
+            bss_r, (unsigned long long)bss_pa, bss_wr,
+            stk_r, (unsigned long long)stk_pa, stk_wr,
+            (unsigned long long)(child->mm->cr3 ? child->mm->cr3 : 0));
     }
 
     /*
@@ -411,7 +436,7 @@ static void fork_child_finish_post_robust(thread_t *child) {
                 can_ok = (user_read_u64((const void *)(uintptr_t)(fs + 0x28ULL), &canary) == 0);
             if (rip >= 0x200000ULL && rip + 8ULL < (uint64_t)MMIO_IDENTITY_LIMIT)
                 insn_ok = (user_read_u64((const void *)(uintptr_t)rip, &insn) == 0);
-            kprintf("fork-child-pre-ret: tid=%llu rip=0x%llx rsp=0x%llx fs=0x%llx can=0x%llx can_ok=%d insn=0x%llx insn_ok=%d cr3=0x%llx\n",
+            devel_printf("fork-child-pre-ret: tid=%llu rip=0x%llx rsp=0x%llx fs=0x%llx can=0x%llx can_ok=%d insn=0x%llx insn_ok=%d cr3=0x%llx\n",
                 (unsigned long long)(child->tid ? child->tid : 1),
                 (unsigned long long)rip,
                 (unsigned long long)ursp,
@@ -420,12 +445,10 @@ static void fork_child_finish_post_robust(thread_t *child) {
                 (unsigned long long)insn, insn_ok,
                 (unsigned long long)(child->mm ? child->mm->cr3 : 0));
         }
-        syscall_adopt_thread(child);
         return;
     }
 
     child->fork_child_user_rip = 0;
-    syscall_adopt_thread(child);
 }
 
 __attribute__((noreturn)) static void fork_child_return_entry(void) {
@@ -433,7 +456,7 @@ __attribute__((noreturn)) static void fork_child_return_entry(void) {
     if (self) {
         static int fork_child_entry_dbg_left = 24;
         if (fork_child_entry_dbg_left-- > 0) {
-            kprintf("fork-child-entry: tid=%llu name=%s parent=%d state=%d\n",
+            devel_printf("fork-child-entry: tid=%llu name=%s parent=%d state=%d\n",
                 (unsigned long long)(self->tid ? self->tid : 1),
                 self->name[0] ? self->name : "(noname)",
                 self->parent_tid, self->state);
@@ -442,7 +465,7 @@ __attribute__((noreturn)) static void fork_child_return_entry(void) {
     if (self && self->name[0] && strstr(self->name, "openrc")) {
         static int fork_child_run_dbg_left = 16;
         if (fork_child_run_dbg_left-- > 0) {
-            kprintf("fork-child-run: tid=%llu rip=0x%llx rsp=0x%llx fs=0x%llx\n",
+            devel_printf("fork-child-run: tid=%llu rip=0x%llx rsp=0x%llx fs=0x%llx\n",
                 (unsigned long long)(self->tid ? self->tid : 1),
                 (unsigned long long)self->fork_child_user_rip,
                 (unsigned long long)self->saved_user_rsp,
@@ -475,7 +498,7 @@ __attribute__((noreturn)) static void fork_child_return_entry(void) {
     {
         static int fork_child_iretq_dbg_left = 4;
         if (fork_child_iretq_dbg_left-- > 0)
-            kprintf("fork-child-iretq: tid=%llu rip=0x%llx rsp=0x%llx fs=0x%llx cr3=0x%llx\n",
+            devel_printf("fork-child-iretq: tid=%llu rip=0x%llx rsp=0x%llx fs=0x%llx cr3=0x%llx\n",
                 (unsigned long long)(self->tid ? self->tid : 1),
                 (unsigned long long)self->fork_gpr_snap[13],
                 (unsigned long long)self->fork_gpr_snap[15],
@@ -486,7 +509,7 @@ __attribute__((noreturn)) static void fork_child_return_entry(void) {
     if (self->name[0] && strstr(self->name, "openrc")) {
         static int fork_child_enter_dbg_left = 16;
         if (fork_child_enter_dbg_left-- > 0) {
-            kprintf("fork-child-enter: tid=%llu name=%s rip=0x%llx rsp=0x%llx rbp=0x%llx fs=0x%llx mmcr3=0x%llx\n",
+            devel_printf("fork-child-enter: tid=%llu name=%s rip=0x%llx rsp=0x%llx rbp=0x%llx fs=0x%llx mmcr3=0x%llx\n",
                 (unsigned long long)(self->tid ? self->tid : 1),
                 self->name,
                 (unsigned long long)self->fork_gpr_snap[13],
@@ -500,7 +523,7 @@ __attribute__((noreturn)) static void fork_child_return_entry(void) {
             uint64_t tcb_ptr = 0;
             if (self->user_fs_base >= 0x200000ULL)
                 (void)user_read_u64((const void *)(uintptr_t)(self->user_fs_base + 0x10ULL), &tcb_ptr);
-            kprintf("fork-child-syscall-ret: tid=%llu rip=0x%llx rsp=0x%llx r14=0x%llx tcb=0x%llx rax=0\n",
+            devel_printf("fork-child-syscall-ret: tid=%llu rip=0x%llx rsp=0x%llx r14=0x%llx tcb=0x%llx rax=0\n",
                 (unsigned long long)(self->tid ? self->tid : 1),
                 (unsigned long long)self->fork_gpr_snap[13],
                 (unsigned long long)self->fork_gpr_snap[15],
@@ -769,7 +792,7 @@ void syscall_deferred_unblocks(void) {
                     child->fork_child_user_rip = 0;
             }
             if (cur->name[0] && strstr(cur->name, "openrc")) {
-                kprintf("fork-defer-rip: child=%d rip=0x%llx tramp=0x%llx rsp=0x%llx rbp=0x%llx kbuf_rbp=0x%llx\n",
+                devel_printf("fork-defer-rip: child=%d rip=0x%llx tramp=0x%llx rsp=0x%llx rbp=0x%llx kbuf_rbp=0x%llx\n",
                     tid,
                     (unsigned long long)rip,
                     (unsigned long long)(child ? child->user_rip : 0),
@@ -814,7 +837,7 @@ uint64_t syscall_maybe_vfork_wait(uint64_t parent_ret) {
         cur->vfork_saved_ret = parent_ret;
     int parent_tid = (int)(cur->tid ? cur->tid : 1);
     if (cur->name[0] && strstr(cur->name, "linuxrc"))
-        kprintf("vfork-wait: parent=%d ret=%llu rdi=0x%llx\n", parent_tid,
+        devel_printf("vfork-wait: parent=%d ret=%llu rdi=0x%llx\n", parent_tid,
                 (unsigned long long)parent_ret,
                 (unsigned long long)cur->saved_user_rdi);
 
@@ -850,7 +873,7 @@ uint64_t syscall_maybe_vfork_wait(uint64_t parent_ret) {
         set_user_fs_base(cur->user_fs_base);
 
     if (cur->name[0] && strstr(cur->name, "linuxrc"))
-        kprintf("vfork-resume: parent=%d ret=%llu rdi=0x%llx rip=0x%llx\n",
+        devel_printf("vfork-resume: parent=%d ret=%llu rdi=0x%llx rip=0x%llx\n",
                 parent_tid,
                 (unsigned long long)parent_ret,
                 (unsigned long long)cur->saved_user_rdi,
@@ -878,13 +901,56 @@ void syscall_restore_user_fs_before_iretq(void) {
         set_user_fs_base(cur->user_fs_base);
 }
 
+/*
+ * Final syscall-return ABI fixup. syscall_entry64's live frame is authoritative
+ * for iretq, while fork/signal code updates the owning thread's saved register
+ * image. Reconcile the non-clobbered third argument register after every C
+ * helper has run. Linux SYSCALL only clobbers rax, rcx and r11; in particular,
+ * rdx must survive set_robust_list so glibc's clone child remains on the child
+ * branch.
+ */
+void syscall_finalize_user_frame(uint64_t *frame) {
+    if (!frame)
+        return;
+    thread_t *cur = thread_current();
+    if (!cur || cur->ring != 3)
+        cur = thread_get_current_user();
+    if (!cur || cur->ring != 3)
+        return;
+    frame[12] = cur->saved_user_rdx;
+    if (cur->saved_syscall_frame)
+        cur->saved_syscall_frame[12] = cur->saved_user_rdx;
+    if (cur->syscall_frame_kbuf)
+        cur->syscall_frame_kbuf[12] = cur->saved_user_rdx;
+}
+
+void syscall_epilogue_probe(uint64_t *frame) {
+    if (!frame || !syscall_pipe_watch_active)
+        return;
+    thread_t *cur = thread_current();
+    if (!cur || cur->ring != 3 || cur->parent_tid < 0)
+        return;
+    static int probes_left = 8;
+    if (probes_left-- <= 0)
+        return;
+    kprintf("sysret-probe: tid=%d rip=0x%llx rsp=0x%llx "
+            "rflags=0x%llx rax=0x%llx rdx=0x%llx cr3=0x%llx\n",
+            (int)(cur->tid ? cur->tid : 1),
+            (unsigned long long)frame[13],
+            (unsigned long long)frame[15],
+            (unsigned long long)frame[4],
+            (unsigned long long)frame[14],
+            (unsigned long long)frame[12],
+            (unsigned long long)paging_read_cr3());
+}
+
 /* Debug only — never poke BusyBox .data (dielock/syslog) by absolute VA. */
 static void linuxrc_trace_post_getpid(thread_t *t, uint64_t ret) {
     if (!t || !t->name[0] || !strstr(t->name, "linuxrc"))
         return;
     if (!t->fork_child_user_rip)
         return;
-    kprintf("linuxrc-post-getpid: tid=%llu ret=0x%llx rsp=0x%llx\n",
+    devel_printf("linuxrc-post-getpid: tid=%llu ret=0x%llx rsp=0x%llx\n",
         (unsigned long long)(t->tid ? t->tid : 1),
         (unsigned long long)ret,
         (unsigned long long)t->saved_user_rsp);
@@ -996,7 +1062,7 @@ static uint64_t fork_caller_user_rip(thread_t *cur) {
     else
         rip = fork_child_ret_rip(cur);
     if (cur->name[0] && strstr(cur->name, "openrc")) {
-        kprintf("fork-ret-rip: pick=0x%llx trap=0x%llx frame13=0x%llx kbuf13=0x%llx tid=%d\n",
+        devel_printf("fork-ret-rip: pick=0x%llx trap=0x%llx frame13=0x%llx kbuf13=0x%llx tid=%d\n",
             (unsigned long long)rip,
             (unsigned long long)cur->fork_child_trap_rip,
             (unsigned long long)(cur->saved_syscall_frame ? cur->saved_syscall_frame[13] : 0),
@@ -1263,10 +1329,6 @@ static void fork_stop_child(thread_t *child) {
     (void)thread_reap(tid);
 }
 
-#ifndef AXON_FORK_DEBUG
-#define AXON_FORK_DEBUG 0
-#endif
-
 void axon_user_dbg(thread_t *cur, const char *tag, int step, const char *msg,
     unsigned long long a, unsigned long long b, unsigned long long c) {
 #if AXON_FORK_DEBUG
@@ -1486,9 +1548,11 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define ECONNRESET 104
 #endif
 
-/* Pipe: kernel buffer + two fd ends. driver_private = pipe_t*, fs_private = 0 read / 1 write */
+/* Pipe: kernel buffer + two fd ends. driver_private = pipe_t*,
+ * fs_private = PIPE_END_READ / PIPE_END_WRITE (see fs.h). */
 #define PIPE_BUF_SIZE 4096
 typedef struct pipe {
+    uint64_t id;
     uint8_t *buf;
     size_t size;
     size_t head;   /* write position */
@@ -1498,6 +1562,10 @@ typedef struct pipe {
     int writer_waiter_tid;
     spinlock_t lock;
 } pipe_t;
+static uint64_t pipe_next_id;
+static int pipe_trace_left = 160;
+int syscall_pipe_watch_active;
+int syscall_pipe_watch_owner_tid;
 
 static ssize_t pipe_read_bytes(pipe_t *p, void *buf, size_t cnt, thread_t *cur);
 static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t *cur);
@@ -1509,13 +1577,22 @@ void pipe_release_end(struct fs_file *f) {
     acquire_irqsave(&p->lock, &fl);
     p->refcount--;
     int ref = p->refcount;
+    uint64_t id = p->id;
     /* Wake waiter on the other end so they see EOF or EPIPE */
     if (p->reader_waiter_tid >= 0) { thread_unblock(p->reader_waiter_tid); p->reader_waiter_tid = -1; }
     if (p->writer_waiter_tid >= 0) { thread_unblock(p->writer_waiter_tid); p->writer_waiter_tid = -1; }
     release_irqrestore(&p->lock, fl);
+    if (pipe_trace_left-- > 0)
+        devel_printf("pipe: release id=%llu end=%c file=%p fref=%d pref=%d\n",
+                (unsigned long long)id,
+                fs_pipe_is_write_end(f) ? 'W' : 'R',
+                (void *)f, f->refcount, ref);
     if (ref == 0) {
+        f->driver_private = NULL;
         kfree(p->buf);
         kfree(p);
+    } else {
+        f->driver_private = NULL; /* end closed; pipe still held by peer */
     }
 }
 
@@ -1536,15 +1613,33 @@ static ssize_t pipe_read_bytes(pipe_t *p, void *buf, size_t cnt, thread_t *cur) 
             p->tail = (tail + n) % p->size;
             if (p->writer_waiter_tid >= 0) { thread_unblock(p->writer_waiter_tid); p->writer_waiter_tid = -1; }
             release_irqrestore(&p->lock, fl);
+            if (pipe_trace_left-- > 0)
+                devel_printf("pipe: read id=%llu tid=%d n=%zu\n",
+                        (unsigned long long)p->id,
+                        cur ? (int)(cur->tid ? cur->tid : 1) : -1, n);
             return (ssize_t)n;
         }
-        if (p->refcount < 2) { release_irqrestore(&p->lock, fl); return 0; } /* EOF */
-        p->reader_waiter_tid = cur ? (int)cur->tid : -1;
-        release_irqrestore(&p->lock, fl);
-        if (p->reader_waiter_tid >= 0) {
-            thread_block(p->reader_waiter_tid);
-            thread_yield();
+        if (p->refcount < 2) {
+            int ref = p->refcount;
+            release_irqrestore(&p->lock, fl);
+            if (pipe_trace_left-- > 0)
+                devel_printf("pipe: EOF id=%llu tid=%d pref=%d\n",
+                        (unsigned long long)p->id,
+                        cur ? (int)(cur->tid ? cur->tid : 1) : -1, ref);
+            return 0;
         }
+        p->reader_waiter_tid = cur ? (int)cur->tid : -1;
+        int waiter = p->reader_waiter_tid;
+        int ref = p->refcount;
+        uint64_t id = p->id;
+        if (waiter >= 0)
+            thread_block(waiter);
+        release_irqrestore(&p->lock, fl);
+        if (pipe_trace_left-- > 0)
+            devel_printf("pipe: read-wait id=%llu tid=%d pref=%d\n",
+                    (unsigned long long)id, waiter, ref);
+        if (waiter >= 0)
+            thread_yield();
     }
 }
 
@@ -1569,17 +1664,24 @@ static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t
             }
             p->head = (head + n) % p->size;
             written += n;
+            uint64_t id = p->id;
             if (p->reader_waiter_tid >= 0) { thread_unblock(p->reader_waiter_tid); p->reader_waiter_tid = -1; }
             release_irqrestore(&p->lock, fl);
+            if (pipe_trace_left-- > 0)
+                devel_printf("pipe: write id=%llu tid=%d n=%zu total=%zu\n",
+                        (unsigned long long)id,
+                        cur ? (int)(cur->tid ? cur->tid : 1) : -1,
+                        n, written);
             continue;
         }
         if (p->refcount < 2) { release_irqrestore(&p->lock, fl); return written > 0 ? (ssize_t)written : -EPIPE; }
         p->writer_waiter_tid = cur ? (int)cur->tid : -1;
+        int waiter = p->writer_waiter_tid;
+        if (waiter >= 0)
+            thread_block(waiter);
         release_irqrestore(&p->lock, fl);
-        if (p->writer_waiter_tid >= 0) {
-            thread_block(p->writer_waiter_tid);
+        if (waiter >= 0)
             thread_yield();
-        }
     }
     return (ssize_t)written;
 }
@@ -6314,260 +6416,27 @@ static thread_t *syscall_thread_from_kstack(void) {
     return NULL;
 }
 
-/* Ring-3 task whose mm is loaded in CR3 (prefer RUNNING). */
-static thread_t *syscall_thread_from_cr3(void) {
-    uint64_t live = paging_read_cr3() & ~0xFFFULL;
-    if (!live) return NULL;
-    thread_t *any = NULL;
-    int n = thread_get_count();
-    for (int i = 0; i < n; i++) {
-        thread_t *t = thread_get_by_index(i);
-        if (!t || t->ring != 3 || t->state == THREAD_TERMINATED)
-            continue;
-        if (!t->mm || !t->mm->cr3)
-            continue;
-        if ((t->mm->cr3 & ~0xFFFULL) != live)
-            continue;
-        if (t->state == THREAD_RUNNING)
-            return t;
-        if (!any)
-            any = t;
-    }
-    return any;
-}
-
-static thread_t *syscall_running_user(void) {
-    thread_t *cur = thread_current();
-    if (cur && cur->ring == 3 && cur->state == THREAD_RUNNING &&
-        cur->state != THREAD_TERMINATED)
-        return cur;
-    int n = thread_get_count();
-    for (int i = 0; i < n; i++) {
-        thread_t *t = thread_get_by_index(i);
-        if (t && t->ring == 3 && t->state == THREAD_RUNNING)
-            return t;
-    }
-    return NULL;
-}
-
-static void syscall_adopt_thread(thread_t *t) {
-    if (!t || t->ring != 3) return;
-    thread_set_current(t);
-    thread_set_current_user(t);
-    if (t->mm)
-        mm_switch(t->mm);
-    /* Fix stale APIC bind so the *next* SYSCALL lands on this thread's kstack.
-     * Do not move RSP — this syscall's frame already lives where entry put it. */
-    syscall_bind_kstack_for_thread(t);
-    if (t->user_fs_base)
-        set_user_fs_base(t->user_fs_base);
-}
-
-static int syscall_is_vfork_share(thread_t *child, thread_t *parent) {
-    if (!child || !parent)
-        return 0;
-    if (parent->vfork_waiting)
-        return 1;
-    if (child->process && child->process->vfork_parent_blocked)
-        return 1;
-    if (child->mm && parent->mm && child->mm == parent->mm &&
-        child->parent_tid == (int)(parent->tid ? parent->tid : 1))
-        return 1;
-    return 0;
-}
-
-/* Parent frozen in wait_for_vfork_done — state may be wrong if READY leaked. */
-static int syscall_vfork_parent_frozen(thread_t *parent) {
-    return parent && parent->vfork_waiting;
-}
-
 static thread_t *syscall_resolve_thread(void) {
     /*
-     * OpenRC hang: after set_robust_list, child's next rt_sigaction was handled
-     * as tid=parent (openrc-sa tid=12 handler=0x403370). Prefer a RUNNING fork
-     * child over its parent's kstack/CR3 whenever they disagree.
+     * Task identity is scheduler state, not an inference from the active CR3
+     * or kernel-stack address.  In particular, fork_store_child_tid() may
+     * inspect a child's mm while the parent is still executing its clone
+     * syscall.  Adopting that child here corrupts both syscall return frames.
      */
-    thread_t *stack_owner = syscall_thread_from_kstack();
-    thread_t *cr3_owner = syscall_thread_from_cr3();
-    thread_t *runner = syscall_running_user();
-
-    /*
-     * Linux vfork: parent BLOCKED, child RUNNING, same mm (CR3 looks like
-     * parent). Soft_COW "stale kstack/cr3" recovery must not run — it
-     * re-adopts forever (syscall-stale-kstack spam) and blocks exec.
-     */
-    if (runner && runner->ring == 3 && runner->state == THREAD_RUNNING) {
-        thread_t *vfork_par = NULL;
-        if (stack_owner && stack_owner != runner &&
-            syscall_is_vfork_share(runner, stack_owner) &&
-            (syscall_vfork_parent_frozen(stack_owner) ||
-             stack_owner->state == THREAD_BLOCKED ||
-             stack_owner->state == THREAD_SLEEPING))
-            vfork_par = stack_owner;
-        else if (cr3_owner && cr3_owner != runner &&
-                 syscall_is_vfork_share(runner, cr3_owner) &&
-                 (syscall_vfork_parent_frozen(cr3_owner) ||
-                  cr3_owner->state == THREAD_BLOCKED ||
-                  cr3_owner->state == THREAD_SLEEPING))
-            vfork_par = cr3_owner;
-        if (vfork_par) {
-            /* Identity: child. Re-bind child's private syscall kstack so a
-             * leaked parent READY cannot leave APIC rsp0 on the parent. */
-            if (vfork_par->state == THREAD_READY ||
-                vfork_par->state == THREAD_RUNNING)
-                vfork_par->state = THREAD_BLOCKED;
-            thread_set_current(runner);
-            thread_set_current_user(runner);
-            syscall_bind_kstack_for_thread(runner);
-            if (runner->user_fs_base)
-                set_user_fs_base(runner->user_fs_base);
-            return runner;
-        }
-    }
-
-    /* Soft_COW fork only: RUNNING child with fork_child_user_rip whose parent
-     * still owns kstack/CR3 (mis-bind after _Fork). Linux vfork/CLONE_VM shares
-     * the parent's mm — parent CR3/stack is expected; treating it as "child wins"
-     * re-adopts forever (spam syscall-fork-child-wins) and hangs pre-exec. */
-    {
-        int n = thread_get_count();
-        for (int i = 0; i < n; i++) {
-            thread_t *t = thread_get_by_index(i);
-            if (!t || t->ring != 3 || t->state != THREAD_RUNNING)
-                continue;
-            if (!t->fork_child_user_rip)
-                continue;
-            int ptid = t->parent_tid;
-            thread_t *pt = (ptid > 0) ? thread_get(ptid) : NULL;
-            if (pt && t->mm && pt->mm && t->mm == pt->mm)
-                continue; /* CLONE_VM / vfork — not a Soft_COW identity bug */
-            if (t->process && t->process->vfork_parent_blocked)
-                continue;
-            int stack_is_parent = stack_owner &&
-                (int)(stack_owner->tid ? stack_owner->tid : 1) == ptid;
-            int cr3_is_parent = cr3_owner &&
-                (int)(cr3_owner->tid ? cr3_owner->tid : 1) == ptid;
-            int stack_is_self = stack_owner == t;
-            if (stack_is_parent || cr3_is_parent ||
-                (runner == t && stack_owner && stack_owner != t)) {
-                static int fork_child_wins_left = 48;
-                if (fork_child_wins_left-- > 0) {
-                    kprintf("syscall-fork-child-wins: child=%d parent=%d stack=%d cr3=%d run=%d\n",
-                        (int)(t->tid ? t->tid : 1), ptid,
-                        stack_owner ? (int)(stack_owner->tid ? stack_owner->tid : 1) : -1,
-                        cr3_owner ? (int)(cr3_owner->tid ? cr3_owner->tid : 1) : -1,
-                        runner ? (int)(runner->tid ? runner->tid : 1) : -1);
-                    debug_serial_marker("syscall-fork-child-wins");
-                }
-                syscall_adopt_thread(t);
-                return t;
-            }
-            if (stack_is_self) {
-                syscall_adopt_thread(t);
-                return t;
-            }
-        }
-    }
-
-    if (stack_owner && runner && runner != stack_owner &&
-        runner->ring == 3 && runner->state == THREAD_RUNNING &&
-        runner->parent_tid == (int)(stack_owner->tid ? stack_owner->tid : 1) &&
-        !syscall_is_vfork_share(runner, stack_owner)) {
-        static int child_stack_left = 48;
-        if (child_stack_left-- > 0) {
-            kprintf("syscall-child-on-parent-stack: parent=%d(state=%d)→child=%d cr3=%d\n",
-                (int)(stack_owner->tid ? stack_owner->tid : 1),
-                (int)stack_owner->state,
-                (int)(runner->tid ? runner->tid : 1),
-                cr3_owner ? (int)(cr3_owner->tid ? cr3_owner->tid : 1) : -1);
-            debug_serial_marker("syscall-child-on-parent-stack");
-        }
-        syscall_adopt_thread(runner);
-        return runner;
-    }
-
-    if (stack_owner &&
-        (stack_owner->state == THREAD_BLOCKED ||
-         stack_owner->state == THREAD_SLEEPING)) {
-        thread_t *pick = NULL;
-        int ptid = (int)(stack_owner->tid ? stack_owner->tid : 1);
-        if (runner && runner != stack_owner && runner->ring == 3 &&
-            runner->state == THREAD_RUNNING)
-            pick = runner;
-        if (!pick || pick == stack_owner) {
-            int n = thread_get_count();
-            for (int i = 0; i < n; i++) {
-                thread_t *t = thread_get_by_index(i);
-                if (!t || t->ring != 3 || t->state != THREAD_RUNNING)
-                    continue;
-                if (t->parent_tid == ptid) {
-                    pick = t;
-                    break;
-                }
-            }
-        }
-        if (pick && pick != stack_owner &&
-            !syscall_is_vfork_share(pick, stack_owner)) {
-            static int stale_left = 48;
-            if (stale_left-- > 0) {
-                kprintf("syscall-stale-kstack: blocked=%d→run=%d cr3=%d\n",
-                    ptid,
-                    (int)(pick->tid ? pick->tid : 1),
-                    cr3_owner ? (int)(cr3_owner->tid ? cr3_owner->tid : 1) : -1);
-            }
-            syscall_adopt_thread(pick);
-            return pick;
-        }
-    }
-
-    if (cr3_owner && cr3_owner->state != THREAD_TERMINATED) {
-        if ((cr3_owner->state == THREAD_BLOCKED ||
-             cr3_owner->state == THREAD_SLEEPING) &&
-            runner && runner != cr3_owner && runner->state == THREAD_RUNNING &&
-            !syscall_is_vfork_share(runner, cr3_owner)) {
-            static int cr3_stale_left = 32;
-            if (cr3_stale_left-- > 0)
-                kprintf("syscall-cr3-stale: cr3=%d(blocked)→run=%d\n",
-                    (int)(cr3_owner->tid ? cr3_owner->tid : 1),
-                    (int)(runner->tid ? runner->tid : 1));
-            syscall_adopt_thread(runner);
-            return runner;
-        }
-        if (stack_owner && stack_owner != cr3_owner) {
-            static int cr3_wins_left = 32;
-            if (cr3_wins_left-- > 0)
-                kprintf("syscall-cr3-wins: stack=%d(state=%d)→cr3=%d(state=%d) run=%d\n",
-                    (int)(stack_owner->tid ? stack_owner->tid : 1),
-                    (int)stack_owner->state,
-                    (int)(cr3_owner->tid ? cr3_owner->tid : 1),
-                    (int)cr3_owner->state,
-                    runner ? (int)(runner->tid ? runner->tid : 1) : -1);
-        }
-        syscall_adopt_thread(cr3_owner);
-        return cr3_owner;
-    }
-
-    if (stack_owner && stack_owner->state != THREAD_TERMINATED) {
-        syscall_adopt_thread(stack_owner);
-        return stack_owner;
-    }
-
-    if (runner) {
-        syscall_adopt_thread(runner);
-        return runner;
-    }
-
     thread_t *cur = thread_current();
-    if (!(cur && cur->ring == 3 && cur->state != THREAD_TERMINATED)) {
-        thread_t *u = thread_get_current_user();
-        if (u && u->ring == 3 && u->state != THREAD_TERMINATED)
-            cur = u;
-        else
-            return NULL;
-    }
-    if (cur)
-        syscall_adopt_thread(cur);
-    return cur;
+    if (cur && cur->ring == 3 && cur->state == THREAD_RUNNING)
+        return cur;
+
+    /* Diagnostic fallback for early entry paths; never mutate scheduler state. */
+    thread_t *stack_owner = syscall_thread_from_kstack();
+    if (stack_owner && stack_owner->ring == 3 &&
+        stack_owner->state == THREAD_RUNNING)
+        return stack_owner;
+
+    thread_t *u = thread_get_current_user();
+    if (u && u->ring == 3 && u->state == THREAD_RUNNING)
+        return u;
+    return NULL;
 }
 
 static uint64_t linux_task_tid(const thread_t *task) {
@@ -6582,22 +6451,39 @@ static int fork_store_child_tid(thread_t *child, mm_t *parent_mm,
     if (!child || !child->mm || !parent_mm ||
         !user_range_ok((const void *)(uintptr_t)child_tid_ptr, sizeof(value)))
         return -1;
-    mm_switch(child->mm);
     /*
      * Fork has already marked TLS/stack private-COW. A ring-0 store cannot use
      * the user-mode COW #PF path, so break COW explicitly before implementing
-     * CLONE_CHILD_SETTID. Ignoring this failure left the child's pthread TCB
-     * carrying its parent's TID.
+     * CLONE_CHILD_SETTID. Write through the child's translated physical
+     * address: switching CR3 and calling the ordinary current-task uaccess
+     * path used to make syscall identity change from parent to child.
      */
     int cow_rc = mm_cow_fault_page(child->mm, child_tid_ptr,
         child->mm_ptemplate ? child->mm_ptemplate : parent_mm);
+    int end_cow_rc = cow_rc;
+    if ((child_tid_ptr & ~0xFFFULL) !=
+        ((child_tid_ptr + sizeof(value) - 1) & ~0xFFFULL))
+        end_cow_rc = mm_cow_fault_page(child->mm,
+            child_tid_ptr + sizeof(value) - 1,
+            child->mm_ptemplate ? child->mm_ptemplate : parent_mm);
     int rc = 0;
-    if (cow_rc != 0 && cow_rc != -2)
+    if ((cow_rc != 0 && cow_rc != -2) ||
+        (end_cow_rc != 0 && end_cow_rc != -2))
         rc = -1;
-    else if (copy_to_user_safe((void *)(uintptr_t)child_tid_ptr,
-                               &value, sizeof(value)) != 0)
-        rc = -1;
-    mm_switch(parent_mm);
+    else {
+        const uint8_t *src = (const uint8_t *)&value;
+        uint64_t child_pa[sizeof(value)];
+        for (size_t i = 0; i < sizeof(value); i++) {
+            if (mm_user_leaf_pa(child->mm, child_tid_ptr + i, 1,
+                                &child_pa[i]) != 0) {
+                rc = -1;
+                break;
+            }
+        }
+        if (rc == 0)
+            for (size_t i = 0; i < sizeof(value); i++)
+                *(volatile uint8_t *)(uintptr_t)child_pa[i] = src[i];
+    }
     return rc;
 }
 
@@ -6661,8 +6547,18 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             uint64_t tls = a5;
             if ((flags & CLONE_VM_OLD) || child_stack != 0)
                 return ret_err(ENOSYS);
-            /* Capture before inner fork runs deep COW on the syscall stack. */
-            uint64_t clone_ret_rip = fork_caller_user_rip(cur);
+            /*
+             * Capture the architectural SYSCALL return RIP before the nested
+             * SYS_fork mutates fork bookkeeping.  This must be the instruction
+             * immediately after libc's clone syscall (e.g. 0x472353), not a
+             * scanned caller such as the parent-only post-fork hook.
+             */
+            uint64_t clone_ret_rip =
+                (cur->saved_syscall_frame && cur->saved_syscall_frame[13])
+                    ? cur->saved_syscall_frame[13]
+                    : (cur->syscall_frame_kbuf ? cur->syscall_frame_kbuf[13] : 0);
+            if (!clone_ret_rip)
+                return ret_err(EINVAL);
             if (cur->name[0] && strstr(cur->name, "openrc")) {
                 uint64_t live_rip = cur->saved_syscall_frame ? cur->saved_syscall_frame[13] : 0;
                 klogprintf("clone-ret-rip: kbuf=0x%llx global=0x%llx live=0x%llx rip=0x%llx tid=%d\n",
@@ -6680,7 +6576,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             thread_t *child = child_process ? child_process->leader : NULL;
             if (!child)
                 return child_pid_u;
-            fork_assign_child_return_rip(cur, child);
+            fork_copy_child_regs_from_snapshot(child, cur, clone_ret_rip);
             if ((flags & CLONE_SETTLS_OLD) && tls >= 0x1000 && tls < (uint64_t)MMIO_IDENTITY_LIMIT) {
                 child->user_fs_base = tls;
             }
@@ -6699,7 +6595,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 uint32_t child_user_tid = (uint32_t)linux_task_tid(child);
                 if (fork_store_child_tid(child, parent_mm, child_tid_ptr,
                                          child_user_tid) != 0)
-                    kprintf("clone child-settid failed: child=%llu ptr=0x%llx\n",
+                    devel_printf("clone child-settid failed: child=%llu ptr=0x%llx\n",
                         (unsigned long long)child_user_tid,
                         (unsigned long long)child_tid_ptr);
             }
@@ -6818,6 +6714,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 child_name[sizeof(child_name) - 1] = '\0';
                 thread_t *child = thread_create_blocked(fork_child_return_entry, child_name);
                 if (!child) return ret_err(ENOMEM);
+                fpu_thread_fork(cur, child);
                 if (child->mm) mm_release(child->mm);
                 child->mm = mm_retain(cur->mm ? cur->mm : mm_kernel());
                 clone3_dbg(cur, 2, "child created",
@@ -6928,7 +6825,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             {
                 /* glibc fork() uses clone3 with stack==0 → inner SYS_fork. Capture the
                    return RIP before deep COW and patch the child after (same as SYS_clone). */
-                uint64_t clone3_ret_rip = fork_caller_user_rip(cur);
+                uint64_t clone3_ret_rip =
+                    (cur->saved_syscall_frame && cur->saved_syscall_frame[13])
+                        ? cur->saved_syscall_frame[13]
+                        : (cur->syscall_frame_kbuf ? cur->syscall_frame_kbuf[13] : 0);
                 if (clone3_ret_rip == 0) return ret_err(EINVAL);
                 uint64_t child_pid_u = syscall_do_inner(SYS_fork, 0, 0, 0, 0, 0, 0);
                 if ((int64_t)child_pid_u < 0)
@@ -6938,7 +6838,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 thread_t *child = child_process ? child_process->leader : NULL;
                 if (!child)
                     return child_pid_u;
-                fork_assign_child_return_rip(cur, child);
+                fork_copy_child_regs_from_snapshot(child, cur, clone3_ret_rip);
                 return child_pid_u;
             }
         }
@@ -7001,7 +6901,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (cur->name[0] &&
                 (strstr(cur->name, "linuxrc") || strstr(cur->name, "init") ||
                  strstr(cur->name, "/bin/sh")))
-                kprintf("vfork: parent=%d child=%llu rdi=0x%llx rip=0x%llx\n",
+                devel_printf("vfork: parent=%d child=%llu rdi=0x%llx rip=0x%llx\n",
                     parent_tid, (unsigned long long)nr,
                     (unsigned long long)cur->saved_user_rdi,
                     (unsigned long long)cur->saved_user_rcx);
@@ -7304,7 +7204,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (tcur && tcur->name[0] && strstr(tcur->name, "linuxrc")) {
                 static int linuxrc_robust_enter_left = 24;
                 if (linuxrc_robust_enter_left-- > 0)
-                    kprintf("robust-enter: tid=%llu head=0x%llx len=%llu owner=%llu\n",
+                    devel_printf("robust-enter: tid=%llu head=0x%llx len=%llu owner=%llu\n",
                         (unsigned long long)(tcur->tid ? tcur->tid : 1),
                         (unsigned long long)a1,
                         (unsigned long long)a2,
@@ -7333,7 +7233,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (tcur && tcur->name[0] && strstr(tcur->name, "linuxrc")) {
                 static int linuxrc_robust_done_left = 24;
                 if (linuxrc_robust_done_left-- > 0)
-                    kprintf("robust-done: tid=%llu\n",
+                    devel_printf("robust-done: tid=%llu\n",
                         (unsigned long long)(tcur->tid ? tcur->tid : 1));
             }
             return 0;
@@ -7364,7 +7264,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     strstr(ft->name, "linuxrc") && op == 0 /* FUTEX_WAIT */) {
                     static int futex_wait_dbg = 16;
                     if (futex_wait_dbg-- > 0)
-                        kprintf("linuxrc-futex-wait: tid=%llu uaddr=0x%llx val=%d rip=0x%llx\n",
+                        devel_printf("linuxrc-futex-wait: tid=%llu uaddr=0x%llx val=%d rip=0x%llx\n",
                             (unsigned long long)(ft->tid ? ft->tid : 1),
                             (unsigned long long)a1, (int)a3,
                             (unsigned long long)ft->saved_user_rip);
@@ -8220,7 +8120,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (!tmp && chunk > 512) { chunk = 512; tmp = copy_from_user_safe((const uint8_t*)base + off, chunk, 512, &copied); }
                     if (!tmp) return (total > 0) ? (uint64_t)total : ret_err(EFAULT);
                     ssize_t wr;
-                    if (f->type == FS_TYPE_PIPE && f->fs_private == (void *)1 && f->driver_private) {
+                    if (f->type == FS_TYPE_PIPE && fs_pipe_is_write_end(f) && f->driver_private) {
                         wr = pipe_write_bytes((pipe_t *)f->driver_private, tmp, copied, cur);
                     } else {
                         wr = fs_write(f, tmp, copied, f->pos);
@@ -8745,7 +8645,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             unsigned long fl = 0;
                             acquire_irqsave(&p->lock, &fl);
                             size_t used = (p->head >= p->tail) ? (p->head - p->tail) : (p->size - p->tail + p->head);
-                            int is_write_end = (f->fs_private == (void *)1);
+                            int is_write_end = fs_pipe_is_write_end(f);
                             release_irqrestore(&p->lock, fl);
                             if (!is_write_end && (used > 0 || p->refcount < 2)) can_r = 1;
                         } else {
@@ -8790,7 +8690,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             acquire_irqsave(&p->lock, &fl);
                             size_t used = (p->head >= p->tail) ? (p->head - p->tail) : (p->size - p->tail + p->head);
                             size_t free = (p->size > 1) ? ((p->size - 1) - used) : 0;
-                            int is_write_end = (f->fs_private == (void *)1);
+                            int is_write_end = fs_pipe_is_write_end(f);
                             release_irqrestore(&p->lock, fl);
                             if (is_write_end && free > 0) can_w = 1;
                         } else {
@@ -10396,7 +10296,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (which != PRIO_PROCESS) return ret_err(EINVAL);
             thread_t *t = (who == 0) ? cur : thread_get(who);
             if (!t) return ret_err(ESRCH);
-            return (uint64_t)(int64_t)t->nice;
+            /* Linux's raw syscall returns 20 - nice (1..40), avoiding
+             * ambiguity between nice 0 and an error return. libc converts
+             * this back to the public -20..19 API. */
+            return (uint64_t)(20 - t->nice);
         }
         case SYS_setpriority: { /* setpriority(which, who, prio) — Linux nice -20..19 */
             int which = (int)a1;
@@ -10438,7 +10341,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 cur->wait4_last_echild = 0;
             if (cur->process) {
                 if (sig == 21 && cur->name[0] && strstr(cur->name, "/bin/sh"))
-                    kprintf("ash-jobctl: kill pid=%d sig=SIGTTIN pgid=%d sid=%d\n",
+                    devel_printf("ash-jobctl: kill pid=%d sig=SIGTTIN pgid=%d sid=%d\n",
                             pid, cur->process->pgid, cur->process->sid);
                 int count = process_signal_targets(cur->process, pid, sig);
                 return count > 0 ? 0 : ret_err(ESRCH);
@@ -10693,7 +10596,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (openrc_sa) {
                 static int openrc_sa_left = 32;
                 if (openrc_sa_left-- > 0) {
-                    kprintf("openrc-sa: enter tid=%llu sig=%d act=0x%llx old=0x%llx ssz=%zu live_cr3=0x%llx mm_cr3=0x%llx child=%d\n",
+                    devel_printf("openrc-sa: enter tid=%llu sig=%d act=0x%llx old=0x%llx ssz=%zu live_cr3=0x%llx mm_cr3=0x%llx child=%d\n",
                         (unsigned long long)(cur->tid ? cur->tid : 1),
                         signum,
                         (unsigned long long)(uintptr_t)act_u,
@@ -10737,7 +10640,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 memset(&sa, 0, sizeof(sa));
                 if (copy_from_user_raw(&sa, act_u, act_sz) != 0) {
                     if (openrc_sa)
-                        kprintf("openrc-sa: EFAULT act sig=%d\n", signum);
+                        devel_printf("openrc-sa: EFAULT act sig=%d\n", signum);
                     return ret_err(EFAULT);
                 }
                 have_new = 1;
@@ -10758,7 +10661,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 if (copy_to_user_safe(old_u, &old_sa, act_sz) != 0) {
                     if (openrc_sa)
-                        kprintf("openrc-sa: EFAULT oldact sig=%d\n", signum);
+                        devel_printf("openrc-sa: EFAULT oldact sig=%d\n", signum);
                     return ret_err(EFAULT);
                 }
             }
@@ -10770,7 +10673,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                      sig_ra_after < MM_ASH_WATCH_HI)) {
                     uint64_t heap_pa = 0;
                     (void)mm_va_leaf_pa(cur->mm, MM_ASH_WATCH_VA, &heap_pa);
-                    kprintf("ash-sa-trace: tid=%d sig=%d ursp=0x%llx act=0x%llx "
+                    devel_printf("ash-sa-trace: tid=%d sig=%d ursp=0x%llx act=0x%llx "
                             "old=0x%llx ra_va=0x%llx ra_pa=0x%llx "
                             "before=0x%llx after=0x%llx heap_pa=0x%llx alias=%d\n",
                             (int)(cur->tid ? cur->tid : 1), signum,
@@ -10804,7 +10707,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (openrc_sa) {
                 static int openrc_sa_done_left = 32;
                 if (openrc_sa_done_left-- > 0) {
-                    kprintf("openrc-sa: ok tid=%llu sig=%d handler=0x%llx restorer=0x%llx child=%d\n",
+                    devel_printf("openrc-sa: ok tid=%llu sig=%d handler=0x%llx restorer=0x%llx child=%d\n",
                         (unsigned long long)(cur->tid ? cur->tid : 1),
                         signum,
                         (unsigned long long)(act_u ? sa.handler : 0),
@@ -10824,7 +10727,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (pt && pt->name[0] && strstr(pt->name, "openrc")) {
                         int parent_waiting = (pt->state == THREAD_BLOCKED ||
                             pt->state == THREAD_SLEEPING);
-                        kprintf("openrc-sa: done-WINCH tid=%llu parent=%d pwait=%d mmcr3=0x%llx ret_rip=0x%llx handler=0x%llx\n",
+                        devel_printf("openrc-sa: done-WINCH tid=%llu parent=%d pwait=%d mmcr3=0x%llx ret_rip=0x%llx handler=0x%llx\n",
                             (unsigned long long)(cur->tid ? cur->tid : 1),
                             cur->parent_tid,
                             parent_waiting,
@@ -10985,24 +10888,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             return ret_err(EINTR);
         }
         case SYS_execve: {
-            /*
-             * Never run exec as a frozen vfork parent. If resolve bound the
-             * parent's kstack, the RUNNING child with vfork_parent_blocked is
-             * the real caller — otherwise tid=parent becomes /bin/mount and
-             * iretq lands at RIP=0x4ffffff.
-             */
-            if (cur && cur->vfork_waiting) {
-                thread_t *runner = syscall_running_user();
-                if (runner && runner != cur && runner->ring == 3 &&
-                    runner->state == THREAD_RUNNING &&
-                    syscall_is_vfork_share(runner, cur)) {
-                    kprintf("execve-rebind: parent=%d→child=%d\n",
-                        (int)(cur->tid ? cur->tid : 1),
-                        (int)(runner->tid ? runner->tid : 1));
-                    syscall_adopt_thread(runner);
-                    cur = runner;
-                }
-            }
             /* copy path, argv, envp from user and call kernel_execve_from_path */
             if (cur->name[0] && (strstr(cur->name, "linuxrc") || strstr(cur->name, "openrc"))) {
                 char peek[96];
@@ -11013,7 +10898,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         copy_from_user_raw(peek, (const void *)(uintptr_t)a1, n) == 0)
                         peek[n] = 0;
                 }
-                kprintf("openrc-exec-enter: tid=%llu path=%s\n",
+                devel_printf("openrc-exec-enter: tid=%llu path=%s\n",
                     (unsigned long long)(cur->tid ? cur->tid : 1),
                     peek[0] ? peek : "?");
             }
@@ -11172,7 +11057,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (cur && cur->name[0] && strstr(cur->name, "openrc")) {
                 static int openrc_pm_left = 24;
                 if (openrc_pm_left-- > 0)
-                    kprintf("openrc-sigprocmask: tid=%llu how=%d set=0x%llx old=0x%llx child=%d\n",
+                    devel_printf("openrc-sigprocmask: tid=%llu how=%d set=0x%llx old=0x%llx child=%d\n",
                         (unsigned long long)(cur->tid ? cur->tid : 1),
                         how,
                         (unsigned long long)(uintptr_t)set_u,
@@ -11212,7 +11097,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (cur->name[0] && strstr(cur->name, "linuxrc")) {
                 static int linuxrc_fork_begin_left = 24;
                 if (linuxrc_fork_begin_left-- > 0)
-                    kprintf("fork-begin: tid=%llu rip=0x%llx rsp=0x%llx heap=%llu largest=%llu share=%d\n",
+                    devel_printf("fork-begin: tid=%llu rip=0x%llx rsp=0x%llx heap=%llu largest=%llu share=%d\n",
                         (unsigned long long)(cur->tid ? cur->tid : 1),
                         (unsigned long long)saved_rcx,
                         (unsigned long long)saved_rsp,
@@ -11256,6 +11141,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return ret_err(ENOMEM);
                 }
             }
+            fpu_thread_fork(cur, child);
             fork_dbg(cur, 3, "child created",
                 (unsigned long long)(child->tid ? child->tid : 0), 0, 0);
             /* Linux: CLONE_VM for vfork (g_fork_share_mm | fork_request_vfork). */
@@ -11302,7 +11188,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     (uint64_t)(child->tid ? child->tid : 1));
                 if (cur->name[0] &&
                     (strstr(cur->name, "linuxrc") || strstr(cur->name, "init")))
-                    kprintf("fork-vfork-share: child=%llu mm_cr3=0x%llx brk=0x%llx-0x%llx\n",
+                    devel_printf("fork-vfork-share: child=%llu mm_cr3=0x%llx brk=0x%llx-0x%llx\n",
                         (unsigned long long)(child->tid ? child->tid : 1),
                         (unsigned long long)(child->mm->cr3 ? child->mm->cr3 : 0),
                         (unsigned long long)child->user_brk_base,
@@ -11427,7 +11313,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (cur->name[0] && strstr(cur->name, "linuxrc")) {
                 static int init_fork_parent_dbg_left = 16;
                 if (init_fork_parent_dbg_left-- > 0) {
-                    kprintf("fork-parent: cpu=%d parent=%llu child=%llu parent_tid=%d\n",
+                    devel_printf("fork-parent: cpu=%d parent=%llu child=%llu parent_tid=%d\n",
                         smp_sched_cpu_id(),
                         (unsigned long long)(cur->tid ? cur->tid : 1),
                         (unsigned long long)(child->tid ? child->tid : 1),
@@ -11543,12 +11429,12 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                 if (waiter->saved_user_rsp >= 0x200000ULL &&
                                     waiter->saved_user_rsp + 8ULL < (uint64_t)MMIO_IDENTITY_LIMIT)
                                     retaddr = *(volatile uint64_t *)(uintptr_t)waiter->saved_user_rsp;
-                                kprintf("wait4-reap-pid: parent=%llu child_pid=%d status=0x%x rip=0x%llx rsp=0x%llx\n",
+                                devel_printf("wait4-reap-pid: parent=%llu child_pid=%d status=0x%x rip=0x%llx rsp=0x%llx\n",
                                     (unsigned long long)(waiter->tid ? waiter->tid : 1),
                                     dead_pid, (unsigned)status,
                                     (unsigned long long)waiter->saved_user_rip,
                                     (unsigned long long)waiter->saved_user_rsp);
-                                kprintf("wait4-post: ret=[rsp]=0x%llx act=0x%llx utmp_fd=%d utmp_lock=%u\n",
+                                devel_printf("wait4-post: ret=[rsp]=0x%llx act=0x%llx utmp_fd=%d utmp_lock=%u\n",
                                     (unsigned long long)retaddr,
                                     (unsigned long long)act,
                                     (int)utmp_fd, (unsigned)utmp_lock);
@@ -11586,7 +11472,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                 process_mark_zombie(zombie_by_tid->process, st);
                             (void)thread_reap((int)(zombie_by_tid->tid ?
                                                     zombie_by_tid->tid : 1));
-                            kprintf("wait4-reap-tid: parent=%llu child_pid=%d (via parent_tid)\n",
+                            devel_printf("wait4-reap-tid: parent=%llu child_pid=%d (via parent_tid)\n",
                                 (unsigned long long)(waiter->tid ? waiter->tid : 1),
                                 dead_pid);
                             return (uint64_t)(unsigned)dead_pid;
@@ -11596,7 +11482,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                 static int wait4_echild_left = 12;
                                 if (wait4_echild_left-- > 0) {
                                     uint64_t me = process_pid(waiter);
-                                    kprintf("wait4-ECHILD: tid=%llu me_pid=%llu pid_arg=%d opts=0x%x\n",
+                                    devel_printf("wait4-ECHILD: tid=%llu me_pid=%llu pid_arg=%d opts=0x%x\n",
                                         (unsigned long long)(waiter->tid ? waiter->tid : 1),
                                         (unsigned long long)me, pid_arg, options);
                                     for (int i = 0; i < thread_get_count(); i++) {
@@ -11617,7 +11503,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         if (waiter->name[0] && strstr(waiter->name, "linuxrc")) {
                             static int wait4_repair_left = 8;
                             if (wait4_repair_left-- > 0)
-                                kprintf("wait4-repair: tid=%llu blocking on parent_tid children\n",
+                                devel_printf("wait4-repair: tid=%llu blocking on parent_tid children\n",
                                     (unsigned long long)(waiter->tid ? waiter->tid : 1));
                         }
                     }
@@ -11702,7 +11588,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         if (is_init_user(tcur) || (tcur->name[0] && strstr(tcur->name, "linuxrc"))) {
                             static int wait4_echild_dbg_left = 8;
                             if (wait4_echild_dbg_left-- > 0) {
-                                kprintf("wait4-ECHILD: parent_tid=%llu name=%s w4_pid=%d sc_a1=%lld\n",
+                                devel_printf("wait4-ECHILD: parent_tid=%llu name=%s w4_pid=%d sc_a1=%lld\n",
                                     (unsigned long long)(tcur->tid ? tcur->tid : 1),
                                     tcur->name[0] ? tcur->name : "(noname)",
                                     w4_pid, (long long)tcur->sc_a1);
@@ -11755,7 +11641,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                               strstr(tcur->name, "openrc"))) {
                             static int wait4_block_dbg_left = 24;
                             if (wait4_block_dbg_left-- > 0) {
-                                kprintf("wait4-block: parent=%llu name=%s pid_arg=%d opts=0x%llx\n",
+                                devel_printf("wait4-block: parent=%llu name=%s pid_arg=%d opts=0x%llx\n",
                                     (unsigned long long)(tcur->tid ? tcur->tid : 1),
                                     tcur->name,
                                     w4_pid,
@@ -11805,13 +11691,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             uint64_t frame_rip = 0;
                             if (tcur->saved_syscall_frame)
                                 frame_rip = tcur->saved_syscall_frame[13];
-                            kprintf("wait4-reap: parent=%llu name=%s child=%d status=0x%x status_u=0x%llx\n",
+                            devel_printf("wait4-reap: parent=%llu name=%s child=%d status=0x%x status_u=0x%llx\n",
                                 (unsigned long long)(tcur->tid ? tcur->tid : 1),
                                 tcur->name,
                                 dead_pid,
                                 (unsigned)st,
                                 (unsigned long long)tcur->sc_a2);
-                            kprintf("wait4-reap-frame: parent=%llu rcx_slot=0x%llx saved_rip=0x%llx rsp=0x%llx\n",
+                            devel_printf("wait4-reap-frame: parent=%llu rcx_slot=0x%llx saved_rip=0x%llx rsp=0x%llx\n",
                                 (unsigned long long)(tcur->tid ? tcur->tid : 1),
                                 (unsigned long long)frame_rip,
                                 (unsigned long long)tcur->saved_user_rip,
@@ -11860,7 +11746,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 cur->fork_child_user_rip) {
                 static int openrc_ioctl_left = 16;
                 if (openrc_ioctl_left-- > 0)
-                    kprintf("openrc-ioctl: tid=%llu fd=%d req=0x%llx arg=0x%llx\n",
+                    devel_printf("openrc-ioctl: tid=%llu fd=%d req=0x%llx arg=0x%llx\n",
                         (unsigned long long)(cur->tid ? cur->tid : 1),
                         fd, (unsigned long long)req,
                         (unsigned long long)(uintptr_t)argp);
@@ -12120,7 +12006,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (cur && cur->name[0] && strstr(cur->name, "/bin/sh")) {
                     static int ash_jobctl_left = 8;
                     if (ash_jobctl_left-- > 0)
-                        kprintf("ash-jobctl: tcgetpgrp fd=%d fg=%d live=%d "
+                        devel_printf("ash-jobctl: tcgetpgrp fd=%d fg=%d live=%d "
                                 "my_pgid=%d my_sid=%d tty_sid=%d\n",
                                 fd, pgrp, fg_live, my_pgid, my_sid, tty_sid);
                 }
@@ -12133,7 +12019,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 uint32_t p = 0;
                 if (copy_from_user_raw(&p, argp, sizeof(p)) != 0) return ret_err(EFAULT);
                 if (cur && cur->name[0] && strstr(cur->name, "linuxrc"))
-                    kprintf("linuxrc-tiocspgrp: tid=%llu fd=%d pgrp=%u\n",
+                    devel_printf("linuxrc-tiocspgrp: tid=%llu fd=%d pgrp=%u\n",
                         (unsigned long long)(cur->tid ? cur->tid : 1), fd, (unsigned)p);
                 /* Be permissive: allow any pgrp for now to avoid shells exiting
                    due to strict job-control checks in this minimal tty model. */
@@ -12553,7 +12439,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (wr < 0) return ret_err((int)-wr);
                 return (uint64_t)wr;
             }
-            if (f->type == FS_TYPE_PIPE && f->fs_private == (void *)1) {
+            if (f->type == FS_TYPE_PIPE && fs_pipe_is_write_end(f)) {
                 pipe_t *p = (pipe_t *)f->driver_private;
                 if (!p) return ret_err(EBADF);
                 size_t copied = 0;
@@ -12634,7 +12520,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     void *tmp = kmalloc(chunk);
                     if (!tmp) return (total > 0) ? total : ret_err(ENOMEM);
                     ssize_t rr;
-                    if (f->type == FS_TYPE_PIPE && !f->fs_private && f->driver_private) {
+                    if (f->type == FS_TYPE_PIPE && fs_pipe_is_read_end(f) && f->driver_private) {
                         rr = pipe_read_bytes((pipe_t *)f->driver_private, tmp, chunk, cur);
                     } else {
                         rr = fs_read(f, tmp, chunk, f->pos);
@@ -12721,7 +12607,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             size_t cnt = (size_t)a3;
             int64_t off_in = (int64_t)a4;
             if (fd == g_dl_libeinfo_fd)
-                kprintf("dl-watch: pread64 libeinfo fd=%d off=%lld cnt=0x%zx\n",
+                devel_printf("dl-watch: pread64 libeinfo fd=%d off=%lld cnt=0x%zx\n",
                     fd, (long long)off_in, cnt);
             boot_io_log(cur, "pread64", fd, (uint64_t)off_in);
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
@@ -12804,7 +12690,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             void *bufp = (void*)(uintptr_t)a2;
             size_t cnt = (size_t)a3;
             if (fd == g_dl_libeinfo_fd)
-                kprintf("dl-watch: read libeinfo fd=%d cnt=0x%zx\n", fd, cnt);
+                devel_printf("dl-watch: read libeinfo fd=%d cnt=0x%zx\n", fd, cnt);
             boot_io_log(cur, "read", fd, (uint64_t)cnt);
             if (is_init_user(cur))
                 g_dl_read_seen++;
@@ -12815,7 +12701,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 static int openrc_read_dbg_left = 24;
                 if (openrc_read_dbg_left-- > 0) {
                     const char *rp = thread_fd_path(cur, fd);
-                    kprintf("openrc-read: tid=%llu fd=%d path=%s buf=0x%llx cnt=0x%zx type=%u\n",
+                    devel_printf("openrc-read: tid=%llu fd=%d path=%s buf=0x%llx cnt=0x%zx type=%u\n",
                         (unsigned long long)(cur->tid ? cur->tid : 1),
                         fd, rp ? rp : "?",
                         (unsigned long long)(uintptr_t)bufp, cnt,
@@ -12827,7 +12713,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (r < 0) return ret_err((int)-r);
                 return (uint64_t)r;
             }
-            if (f->type == FS_TYPE_PIPE && !f->fs_private) {
+            if (f->type == FS_TYPE_PIPE && fs_pipe_is_read_end(f)) {
                 pipe_t *p = (pipe_t *)f->driver_private;
                 if (!p) return ret_err(EBADF);
                 if (!bufp || !user_range_ok(bufp, cnt)) return ret_err(EFAULT);
@@ -13173,7 +13059,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                 acquire_irqsave(&p->lock, &fl);
                                 size_t used = (p->head >= p->tail) ? (p->head - p->tail) : (p->size - p->tail + p->head);
                                 size_t free = (p->size > 1) ? ((p->size - 1) - used) : 0;
-                                int is_write_end = (f->fs_private == (void *)1);
+                                int is_write_end = fs_pipe_is_write_end(f);
                                 release_irqrestore(&p->lock, fl);
                                 if (is_write_end) {
                                     if ((events & POLLOUT) && free > 0) revents |= POLLOUT;
@@ -13254,27 +13140,17 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         }
                     }
                     if (n_tty_waiting > 0 && !has_net_socket) {
-                        uint32_t redraw_ms = user_itimer_interval_ms;
-                        if (redraw_ms > 0)
-                            thread_block_with_timeout(cur_tid, redraw_ms);
-                        else
-                            thread_block(cur_tid);
+                        /*
+                         * A tty waiter is event driven.  Never reuse the
+                         * process interval timer as a redraw/poll timeout:
+                         * user_itimer_interval_ms is still global, so Xvfb's
+                         * 500ms setitimer made every shell tty wake in 500ms
+                         * batches. Keyboard input and signals unblock this
+                         * waiter directly.
+                         */
+                        thread_block(cur_tid);
                         thread_yield(); /* must yield so keyboard ISR can run and unblock */
                         for (int w = 0; w < n_tty_waiting; w++) devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
-                        if (redraw_ms > 0) {
-                            int input_ready = 0;
-                            for (int w = 0; w < n_tty_waiting; w++) {
-                                if (devfs_tty_available(tty_waiting[w]) > 0) {
-                                    input_ready = 1;
-                                    break;
-                                }
-                            }
-                            if (!input_ready) {
-                                if (copy_to_user_safe((void*)ufds, kbuf, bytes) != 0) { kfree(kbuf); return ret_err(EFAULT); }
-                                kfree(kbuf);
-                                return 0;
-                            }
-                        }
                         goto auto_check;
                     }
                     if (n_tty_waiting > 0 && has_net_socket) {
@@ -13438,7 +13314,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     (cur && cur->name[0] && strstr(cur->name, "openrc"))))) {
                     if (!trace_all_so)
                         pid1_openat_trace_left--;
-                    kprintf("pid1 openat path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
+                    devel_printf("pid1 openat path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
                 }
             }
             if (strcmp(path, "/etc/inittab") == 0) {
@@ -13471,7 +13347,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     f = fs_create_file(path);
                     if (!f) {
                         if (is_init_user(cur) || (cur && cur->name[0] && strstr(cur->name, "openrc")))
-                            kprintf("pid1 openat ENOENT create path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
+                            devel_printf("pid1 openat ENOENT create path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
                         return ret_err(ENOENT);
                     }
                 } else {
@@ -13479,7 +13355,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (is_init_user(cur) || (cur && cur->name[0] &&
                         (strstr(cur->name, "openrc") || strstr(cur->name, "busybox") ||
                          strstr(cur->name, "/sh") || strstr(cur->name, "linuxrc"))))
-                        kprintf("pid1 openat ENOENT path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
+                        devel_printf("pid1 openat ENOENT path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
                     if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(path))
                         kprintf("dl-trace openat ENOENT path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
                     return ret_err(ENOENT);
@@ -13546,7 +13422,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         unsigned char magic[4] = {0};
                         ssize_t mr = fs_read(f, magic, sizeof(magic), 0);
                         if (mr > 0) f->pos = 0;
-                        kprintf("pid1 openat ok path=%s fd=%d size=%lld mode=0%o magic=%02x%02x%02x%02x\n",
+                        devel_printf("pid1 openat ok path=%s fd=%d size=%lld mode=0%o magic=%02x%02x%02x%02x\n",
                             path, fd, (long long)st.st_size, (unsigned)(st.st_mode & 0777777),
                             magic[0], magic[1], magic[2], magic[3]);
                     }
@@ -13631,15 +13507,19 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         }
         case SYS_pipe:
         case SYS_pipe2: {
-            /* pipe(int pipefd[2]); pipe2(int pipefd[2], int flags). flags (e.g. O_CLOEXEC) ignored for now. */
+            /* pipe(int pipefd[2]); pipe2(int pipefd[2], int flags). */
             void *pipefd_u = (void*)(uintptr_t)a1;
-            (void)a2; /* flags for pipe2 */
+            int flags = (num == SYS_pipe2) ? (int)a2 : 0;
+            const int O_CLOEXEC = 02000000;
+            const int O_NONBLOCK = 00004000;
+            if (flags & ~(O_CLOEXEC | O_NONBLOCK)) return ret_err(EINVAL);
             if (!pipefd_u || (uintptr_t)pipefd_u + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             pipe_t *p = (pipe_t *)kmalloc(sizeof(pipe_t));
             if (!p) { qemu_debug_printf("OOM: pipe pipe_t alloc\n"); return ret_err(ENOMEM); }
             p->buf = (uint8_t *)kmalloc(PIPE_BUF_SIZE);
             if (!p->buf) { qemu_debug_printf("OOM: pipe buf alloc %u\n", (unsigned)PIPE_BUF_SIZE); kfree(p); return ret_err(ENOMEM); }
             p->size = PIPE_BUF_SIZE;
+            p->id = ++pipe_next_id;
             p->head = p->tail = 0;
             p->refcount = 2;
             p->reader_waiter_tid = p->writer_waiter_tid = -1;
@@ -13651,7 +13531,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             memset(r, 0, sizeof(*r)); memset(w, 0, sizeof(*w));
             r->type = w->type = FS_TYPE_PIPE;
             r->driver_private = w->driver_private = p;
-            r->fs_private = NULL; w->fs_private = (void *)1; /* 0=read end, 1=write end */
+            /* End markers must not collide with VFS driver_data (NULL) or
+             * small integers that a buggy matcher could treat as mounts. */
+            r->fs_private = PIPE_END_READ;
+            w->fs_private = PIPE_END_WRITE;
             r->refcount = w->refcount = 1;
 
             int fd0 = thread_fd_alloc(r);
@@ -13659,9 +13542,24 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (fd0 < 0 || fd1 < 0) {
                 if (fd0 >= 0) thread_fd_close(fd0);
                 if (fd1 >= 0) thread_fd_close(fd1);
+                if (fd0 < 0) fs_file_free(r);
+                if (fd1 < 0) fs_file_free(w);
                 return ret_err(EMFILE);
             }
+            if (cur->process && (flags & O_CLOEXEC)) {
+                cur->process->fd_cloexec[fd0] = 1;
+                cur->process->fd_cloexec[fd1] = 1;
+            }
             int fds[2] = { fd0, fd1 };
+#if DEVEL_DEBUG
+            syscall_pipe_watch_active = 1;
+            syscall_pipe_watch_owner_tid = (int)(cur->tid ? cur->tid : 1);
+            if (pipe_trace_left-- > 0)
+                devel_printf("pipe: create id=%llu tid=%d rfd=%d wfd=%d r=%p w=%p\n",
+                        (unsigned long long)p->id,
+                        (int)(cur->tid ? cur->tid : 1),
+                        fd0, fd1, (void *)r, (void *)w);
+#endif
             if (copy_to_user_safe(pipefd_u, fds, 8) != 0) {
                 thread_fd_close(fd0);
                 thread_fd_close(fd1);
@@ -13673,7 +13571,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             int fd = (int)a1;
             boot_io_log(cur, "close", fd, 0);
             if (fd == g_dl_libeinfo_fd) {
-                kprintf("dl-watch: close libeinfo fd=%d\n", fd);
+                devel_printf("dl-watch: close libeinfo fd=%d\n", fd);
                 g_dl_libeinfo_fd = -1;
             }
             dl_fd_clear(fd);
@@ -13876,7 +13774,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (pid1_fstatat_trace_left > 0 && (is_init_user(cur) ||
                         (cur && cur->name[0] && strstr(cur->name, "openrc")))) {
                         pid1_fstatat_trace_left--;
-                        kprintf("pid1 newfstatat path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
+                        devel_printf("pid1 newfstatat path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
                     }
                     if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(path))
                         pid1_dl_log_stat("newfstatat-req", path);
@@ -13889,7 +13787,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 int sr = (flags & AT_SYMLINK_NOFOLLOW) ? vfs_lstat(path, &st) : vfs_stat(path, &st);
                 if (sr != 0) {
                     if (is_init_user(cur) || (cur && cur->name[0] && strstr(cur->name, "openrc")))
-                        kprintf("pid1 newfstatat ENOENT path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
+                        devel_printf("pid1 newfstatat ENOENT path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
                     if (pid1_dl_trace_thread(cur))
                         kprintf("dl-trace newfstatat ENOENT path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
                     return ret_err(ENOENT);
@@ -14626,7 +14524,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         }
         case SYS_mmap: {
             if (g_dl_libeinfo_fd >= 0 && (int)(int64_t)a5 == g_dl_libeinfo_fd) {
-                kprintf("dl-watch: mmap libeinfo fd=%d addr=0x%llx len=0x%llx prot=0x%x flags=0x%x off=0x%llx\n",
+                devel_printf("dl-watch: mmap libeinfo fd=%d addr=0x%llx len=0x%llx prot=0x%x flags=0x%x off=0x%llx\n",
                     g_dl_libeinfo_fd,
                     (unsigned long long)a1, (unsigned long long)a2, (int)a3, (int)a4,
                     (unsigned long long)a6);
@@ -14663,7 +14561,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         case SYS_exit: {
             (void)a1;
             if (cur && cur->name[0] && strstr(cur->name, "linuxrc"))
-                kprintf("linuxrc-exit-enter: tid=%llu code=%llu parent=%d waiter=%d\n",
+                devel_printf("linuxrc-exit-enter: tid=%llu code=%llu parent=%d waiter=%d\n",
                     (unsigned long long)(cur->tid ? cur->tid : 1),
                     (unsigned long long)a1, cur->parent_tid, cur->waiter_tid);
             qemu_debug_printf("sys_exit: pid=%llu name=%s called exit(code=%llu)\n",
@@ -14781,7 +14679,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         case SYS_exit_group: {
             (void)a1;
             if (cur && cur->name[0] && strstr(cur->name, "linuxrc"))
-                kprintf("linuxrc-exit-group-enter: tid=%llu code=%llu parent=%d waiter=%d\n",
+                devel_printf("linuxrc-exit-group-enter: tid=%llu code=%llu parent=%d waiter=%d\n",
                     (unsigned long long)(cur->tid ? cur->tid : 1),
                     (unsigned long long)a1, cur->parent_tid, cur->waiter_tid);
             if (cur && pid1_dl_trace_thread(cur))
@@ -14975,7 +14873,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             linuxrc_parent_enter_armed = 1;
         if (linuxrc_parent_enter_armed && linuxrc_parent_enter_left-- > 0 &&
             num != SYS_wait4)
-            kprintf("linuxrc-parent-enter: tid=%llu nr=%llu rip=0x%llx a1=0x%llx\n",
+            devel_printf("linuxrc-parent-enter: tid=%llu nr=%llu rip=0x%llx a1=0x%llx\n",
                 (unsigned long long)(trace_t->tid ? trace_t->tid : 1),
                 (unsigned long long)num,
                 (unsigned long long)trace_t->saved_user_rip,
@@ -14989,14 +14887,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         int is_waitkill = (num == SYS_wait4 || num == 62);
         if (is_waitkill) {
             if (linuxrc_waitkill_left-- > 0)
-                kprintf("fork-child-next: tid=%llu nr=%llu rip=0x%llx rsp=0x%llx a1=%lld a2=%lld\n",
+                devel_printf("fork-child-next: tid=%llu nr=%llu rip=0x%llx rsp=0x%llx a1=%lld a2=%lld\n",
                     (unsigned long long)(trace_t->tid ? trace_t->tid : 1),
                     (unsigned long long)num,
                     (unsigned long long)trace_t->saved_user_rip,
                     (unsigned long long)trace_t->saved_user_rsp,
                     (long long)a1, (long long)a2);
         } else if (linuxrc_child_next_left-- > 0) {
-            kprintf("fork-child-next: tid=%llu nr=%llu rip=0x%llx rsp=0x%llx\n",
+            devel_printf("fork-child-next: tid=%llu nr=%llu rip=0x%llx rsp=0x%llx\n",
                 (unsigned long long)(trace_t->tid ? trace_t->tid : 1),
                 (unsigned long long)num,
                 (unsigned long long)trace_t->saved_user_rip,
@@ -15009,7 +14907,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         else if (trace_t->syscall_frame_kbuf)
             trace_t->fork_child_trap_rip = trace_t->syscall_frame_kbuf[13];
         if (trace_t->name[0] && strstr(trace_t->name, "openrc")) {
-            kprintf("fork-trap-rip: n=%llu trap=0x%llx frame13=0x%llx kbuf13=0x%llx tid=%d\n",
+            devel_printf("fork-trap-rip: n=%llu trap=0x%llx frame13=0x%llx kbuf13=0x%llx tid=%d\n",
                 (unsigned long long)num,
                 (unsigned long long)trace_t->fork_child_trap_rip,
                 (unsigned long long)(trace_t->saved_syscall_frame ? trace_t->saved_syscall_frame[13] : 0),
@@ -15062,7 +14960,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
     if (!trace_this && trace_t && trace_t->ring == 3 && trace_t->name[0] &&
         (strstr(trace_t->name, "busybox") || strstr(trace_t->name, "/sh") ||
          strstr(trace_t->name, "openrc"))) {
-        static int shell_syscall_dbg_left = 0; /* off: spam desyncs tty cursor / buries PS1 */
+        static int shell_syscall_dbg_left = 256;
         /* Separate budget for openrc fork-child after _Fork: parent wait4/sigmask
          * otherwise burns the shared 160 and hides rt_sigaction→exec progress. */
         static int openrc_child_sc_left = 128;
@@ -15095,7 +14993,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 if (is_openrc_child && openrc_child_sc_left-- > 0) {
                     trace_this = 1;
                     trace_shell = 1;
-                } else if (!is_openrc_child && shell_syscall_dbg_left-- > 0) {
+                } else if (!is_openrc_child && syscall_pipe_watch_active &&
+                           shell_syscall_dbg_left-- > 0) {
                     trace_this = 1;
                     trace_shell = 1;
                 }
@@ -15105,7 +15004,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         }
     }
     if (trace_this) {
-        kprintf("%s syscall enter: tid=%llu name=%s n=%llu a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx a6=0x%llx\n",
+        devel_printf("%s syscall enter: tid=%llu name=%s n=%llu a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx a6=0x%llx\n",
             trace_shell ? "shell" : "pid1",
             (unsigned long long)(trace_t && trace_t->tid ? trace_t->tid : 1),
             trace_t ? trace_t->name : "?",
@@ -15122,7 +15021,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         strstr(trace_t->name, "linuxrc")) {
         static int linuxrc_child_done_left = 48;
         if (linuxrc_child_done_left-- > 0)
-            kprintf("fork-child-done: tid=%llu nr=%llu ret=0x%llx\n",
+            devel_printf("fork-child-done: tid=%llu nr=%llu ret=0x%llx\n",
                 (unsigned long long)(trace_t->tid ? trace_t->tid : 1),
                 (unsigned long long)num,
                 (unsigned long long)ret);
@@ -15141,14 +15040,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 if (a1 && user_range_ok((const void *)(uintptr_t)a1, 1))
                     resolve_user_path(trace_t, (const char *)(uintptr_t)a1,
                         apath, sizeof(apath));
-                kprintf("linuxrc-parent: tid=%llu nr=%llu ret=0x%llx rip=0x%llx path=%s\n",
+                devel_printf("linuxrc-parent: tid=%llu nr=%llu ret=0x%llx rip=0x%llx path=%s\n",
                     (unsigned long long)(trace_t->tid ? trace_t->tid : 1),
                     (unsigned long long)num,
                     (unsigned long long)ret,
                     (unsigned long long)trace_t->saved_user_rip,
                     apath[0] ? apath : "?");
             } else {
-                kprintf("linuxrc-parent: tid=%llu nr=%llu ret=0x%llx rip=0x%llx rsp=0x%llx\n",
+                devel_printf("linuxrc-parent: tid=%llu nr=%llu ret=0x%llx rip=0x%llx rsp=0x%llx\n",
                     (unsigned long long)(trace_t->tid ? trace_t->tid : 1),
                     (unsigned long long)num,
                     (unsigned long long)ret,
@@ -15159,13 +15058,13 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
     }
     if (num == SYS_set_robust_list && trace_t && trace_t->name[0] &&
         strstr(trace_t->name, "linuxrc"))
-        kprintf("robust-inner-return: tid=%llu ret=0x%llx\n",
+        devel_printf("robust-inner-return: tid=%llu ret=0x%llx\n",
             (unsigned long long)(trace_t->tid ? trace_t->tid : 1),
             (unsigned long long)ret);
     if (!trace_t || trace_t->ring != 3)
         trace_t = syscall_resolve_thread();
     if (trace_this) {
-        kprintf("%s syscall exit: tid=%llu n=%llu ret=0x%llx\n",
+        devel_printf("%s syscall exit: tid=%llu n=%llu ret=0x%llx\n",
             trace_shell ? "shell" : "pid1",
             (unsigned long long)(trace_t && trace_t->tid ? trace_t->tid : 1),
             (unsigned long long)num,
@@ -15207,19 +15106,19 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
     }
     if (trace_t && trace_t->ring == 3 && trace_t->fork_child_user_rip) {
         if (num == SYS_set_robust_list) {
-            kprintf("fork-child-robust: tid=%llu head=0x%llx len=0x%llx\n",
+            devel_printf("fork-child-robust: tid=%llu head=0x%llx len=0x%llx\n",
                 (unsigned long long)(trace_t->tid ? trace_t->tid : 1),
                 (unsigned long long)a1,
                 (unsigned long long)a2);
             fork_child_finish_post_robust(trace_t);
-            kprintf("fork-child-robust-done: tid=%llu\n",
+            devel_printf("fork-child-robust-done: tid=%llu\n",
                 (unsigned long long)(trace_t->tid ? trace_t->tid : 1));
         }
     }
     syscall_deferred_unblocks();
     if (num == SYS_set_robust_list && trace_t && trace_t->name[0] &&
         strstr(trace_t->name, "linuxrc"))
-        kprintf("robust-dispatch-return: tid=%llu\n",
+        devel_printf("robust-dispatch-return: tid=%llu\n",
             (unsigned long long)(trace_t->tid ? trace_t->tid : 1));
     {
         uint64_t out = syscall_sanitize_user_ret(ret);
@@ -15231,7 +15130,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
              num == SYS_openat || num == SYS_open)) {
             static int linuxrc_child_retuser_left = 8;
             if (linuxrc_child_retuser_left-- > 0)
-                kprintf("fork-child-retuser: tid=%llu nr=%llu ret=0x%llx rip=0x%llx pending=0x%llx\n",
+                devel_printf("fork-child-retuser: tid=%llu nr=%llu ret=0x%llx rip=0x%llx pending=0x%llx\n",
                     (unsigned long long)(trace_t->tid ? trace_t->tid : 1),
                     (unsigned long long)num,
                     (unsigned long long)out,

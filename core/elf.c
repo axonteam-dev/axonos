@@ -31,6 +31,28 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
 
+static int exec_stdio_is_dev_null(const struct fs_file *f) {
+    if (!f || !f->path)
+        return 0;
+    return strcmp(f->path, "/dev/null") == 0 ||
+           strcmp(f->path, "null") == 0;
+}
+
+/* Intentional redirects (pipes, sockets, regular files) must survive exec.
+ * Only closed fds or /dev/null need the boot console rebind. */
+static int exec_stdio_needs_console(const struct fs_file *f) {
+    if (!f)
+        return 1;
+    if (f->type == FS_TYPE_PIPE || f->type == FS_TYPE_SOCKET)
+        return 0;
+    if (devfs_is_tty_file((struct fs_file *)f))
+        return 0;
+    if (exec_stdio_is_dev_null(f))
+        return 1;
+    /* Keep open non-tty files (redirections to regular paths). */
+    return 0;
+}
+
 void exec_boot_ensure_stdio(thread_t *ut) {
     if (!ut)
         return;
@@ -41,15 +63,17 @@ void exec_boot_ensure_stdio(thread_t *ut) {
      *
      * BusyBox bb_sanitize_stdio() opens /dev/null when stdio is closed. With
      * an empty inittab console id, spawn never reopens a real tty — ash then
-     * sees EOF on stdin and exits, and ::respawn loops forever. Replace any
-     * non-tty stdio with /dev/console.
+     * sees EOF on stdin and exits, and ::respawn loops forever.
+     *
+     * Only rebind closed /dev/null stdio. Never replace pipes/sockets: that
+     * destroyed `echo test | cat` (stdin pipe freed on execve → no "test").
      *
      * fds 0/1/2 often alias the same fs_file; free each unique pointer once
      * per aliased slot (refcount may be wrong after fork/exec).
      */
     int need_console = 0;
     for (int fd = 0; fd <= 2; fd++) {
-        if (!ut->fds[fd] || !devfs_is_tty_file(ut->fds[fd])) {
+        if (exec_stdio_needs_console(ut->fds[fd])) {
             need_console = 1;
             break;
         }
@@ -59,10 +83,16 @@ void exec_boot_ensure_stdio(thread_t *ut) {
         if (!console)
             return;
         struct fs_file *old[3] = { ut->fds[0], ut->fds[1], ut->fds[2] };
-        ut->fds[0] = ut->fds[1] = ut->fds[2] = NULL;
+        /* Replace only slots that need a console; keep pipes/redirections. */
+        for (int fd = 0; fd <= 2; fd++) {
+            if (exec_stdio_needs_console(old[fd]))
+                ut->fds[fd] = NULL;
+        }
         for (int i = 0; i < 3; i++) {
             struct fs_file *f = old[i];
             if (!f || f == console)
+                continue;
+            if (!exec_stdio_needs_console(f))
                 continue;
             int first = 1;
             for (int j = 0; j < i; j++) {
@@ -75,17 +105,23 @@ void exec_boot_ensure_stdio(thread_t *ut) {
                 continue;
             int n = 0;
             for (int j = 0; j < 3; j++) {
-                if (old[j] == f)
+                if (old[j] == f && exec_stdio_needs_console(f))
                     n++;
             }
             for (int k = 0; k < n; k++)
                 fs_file_free(f);
         }
-        ut->fds[0] = console;
-        ut->fds[1] = console;
-        ut->fds[2] = console;
-        /* Three stdio slots share one description. */
-        console->refcount = 3;
+        int adopted = 0;
+        for (int fd = 0; fd <= 2; fd++) {
+            if (!ut->fds[fd]) {
+                ut->fds[fd] = console;
+                adopted++;
+            }
+        }
+        if (adopted == 0)
+            fs_file_free(console);
+        else
+            console->refcount = adopted;
     } else {
         for (int fd = 1; fd <= 2; fd++) {
             if (!ut->fds[fd]) {
@@ -107,7 +143,7 @@ void exec_boot_ensure_stdio(thread_t *ut) {
         (void)devfs_tty_attach_thread(ut->fds[0], ut);
         if (ut->pgid > 0)
             devfs_set_tty_fg_pgrp(tty, ut->pgid);
-        kprintf("stdio-console: tid=%llu path=%s tty=%d sid=%d pgid=%d\n",
+        devel_printf("stdio-console: tid=%llu path=%s tty=%d sid=%d pgid=%d\n",
             (unsigned long long)(ut->tid ? ut->tid : 1),
             ut->fds[0]->path ? ut->fds[0]->path : "?",
             tty, ut->sid, ut->pgid);

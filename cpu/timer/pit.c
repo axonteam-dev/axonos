@@ -15,11 +15,11 @@
 
 // Global variables
 volatile uint64_t pit_ticks = 0;
-volatile uint32_t pit_frequency = 1000; // Default 100 Hz
+volatile uint32_t pit_frequency = 250;
 volatile int pit_enabled = 0;
 /* Common tick source used by scheduler/userspace timeouts (monotonic). */
 volatile uint64_t timer_ticks = 0;
-volatile uint32_t timer_frequency = 1000;
+volatile uint32_t timer_frequency = 250;
 
 // PIT handler - called on IRQ 0
 void pit_handler(cpu_registers_t* regs) {
@@ -37,10 +37,17 @@ void pit_handler(cpu_registers_t* regs) {
 
         if (!init) return;
         thread_wake_expired_timeouts();
-        /* Avoid full schedule from ring-3 IRQ on SMP; on UP, yield spinners when others wait. */
+        /* Userspace is BSP-only even when APs exist; preempt ring-3 on cpu0. */
         if (regs && ((regs->cs & 3) == 3)) {
-                if (smp_cpu_count() <= 1)
-                        thread_ring3_preempt_if_waiters();
+                if (smp_sched_cpu_id() == 0) {
+                        /* Match LAPIC: timer accounting may run at 250 Hz, but
+                           forced scheduling must not happen on every IRQ. */
+                        uint32_t quantum = pit_frequency / 64u;
+                        if (quantum < 1u)
+                                quantum = 1u;
+                        if ((pit_ticks % quantum) == 0)
+                                thread_ring3_preempt_if_waiters();
+                }
                 return;
         }
         
@@ -60,8 +67,9 @@ void pit_handler(cpu_registers_t* regs) {
 // Initialize PIT with default frequency (100 Hz)
 void pit_init() {
         
-        // Set default frequency (1000 Hz)
-        int freq = 1000;
+        /* Linux-like HZ=250: enough scheduler resolution without IRQ livelock
+           on virtualized hardware. */
+        int freq = 250;
         pit_enabled = 1;
         pit_set_frequency(freq);
         // Set up PIT handler for IRQ 0

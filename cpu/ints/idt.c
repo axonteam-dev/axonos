@@ -28,6 +28,7 @@
 // Forward declare C-linkage helpers from other compilation units
 uint64_t dbg_saved_rbx_in;
 uint64_t dbg_saved_rbx_out;
+extern int syscall_pipe_watch_active;
 
 // локальные таблицы обработчиков (неиспользуемые предупреждения устраним использованием ниже)
 static void (*irq_handlers[16])() = {NULL};
@@ -228,6 +229,26 @@ static void ud_fault_handler(cpu_registers_t* regs) {
         for(;;){ asm volatile("sti; hlt":::"memory"); }
 }
 
+static void debug_fault_handler(cpu_registers_t *regs) {
+        /* Temporary single-step probe for the glibc _Fork child return path. */
+        regs->rflags &= ~0x100ULL;
+        if ((regs->cs & 3) == 3 && syscall_pipe_watch_active) {
+                static int steps_left = 12;
+                if (steps_left > 0) {
+                        steps_left--;
+                        devel_printf("user-step: rip=0x%llx rsp=0x%llx rax=0x%llx "
+                                "rdx=0x%llx rflags=0x%llx\n",
+                                (unsigned long long)regs->rip,
+                                (unsigned long long)regs->rsp,
+                                (unsigned long long)regs->rax,
+                                (unsigned long long)regs->rdx,
+                                (unsigned long long)regs->rflags);
+                        if (steps_left > 0)
+                                regs->rflags |= 0x100ULL;
+                }
+        }
+}
+
 // Handle Divide-by-zero (INT 0). For user faults: kill process and return to idle;
 // for kernel faults: print diagnostics and halt.
 static void div_zero_handler(cpu_registers_t* regs) {
@@ -380,24 +401,24 @@ static void page_fault_handler(cpu_registers_t* regs) {
         uint64_t cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
         int user = (regs->cs & 3) == 3;
+        if (user && syscall_pipe_watch_active) {
+                static int pf_all_left = 24;
+                if (pf_all_left-- > 0)
+                        devel_printf("user-pf-any: tid=%d va=0x%llx rip=0x%llx err=0x%llx cr3=0x%llx\n",
+                                thread_current() ? (int)(thread_current()->tid
+                                    ? thread_current()->tid : 1) : -1,
+                                (unsigned long long)cr2,
+                                (unsigned long long)regs->rip,
+                                (unsigned long long)regs->error_code,
+                                (unsigned long long)paging_read_cr3());
+        }
         if (user && (regs->error_code & 1u) && fault_try_fix_ldso_kernel_phdr(regs, cr2))
                 return;
         if (user && fault_try_user_stack_page(cr2, regs->error_code))
                 return;
         if (user && fault_try_user_identity_us(cr2, regs->error_code))
                 return;
-        /* Large anonymous mmap: PTEs were installed then removed so we do not memset
-         * hundreds of MiB in syscall; fill each 2MiB chunk on first access. */
-        if (user && (regs->error_code & 1u) == 0u && fault_try_mmap_lazy_anon(cr2))
-                return;
-        if (user && fault_try_user_vma_nonpresent(cr2, regs->error_code))
-                return;
-        if (user && fault_try_grow_user_heap(cr2)) return;
-        if (user && cr2 >= 0x10000ULL && cr2 < 0x200000ULL) {
-                if (map_page_2m(0, 0, PG_PRESENT | PG_RW | PG_US) == 0)
-                        return;
-        }
-        /* fork COW: first write to a still-shared writable page (Linux-style). */
+        /* fork COW / do_wp_page: present write-protect before any demand-fill. */
         if (user && (regs->error_code & 0x7u) == 0x7u) {
                 extern thread_t *thread_current(void);
                 extern thread_t *thread_get_current_user(void);
@@ -405,6 +426,16 @@ static void page_fault_handler(cpu_registers_t* regs) {
                 if (!ut || ut->ring != 3) ut = thread_get_current_user();
                 if (ut && ut->mm && ut->mm != mm_kernel()) {
                         mm_t *share = ut->mm_ptemplate ? ut->mm_ptemplate : mm_kernel();
+                        if (syscall_pipe_watch_active) {
+                                static int cow_enter_left = 16;
+                                if (cow_enter_left-- > 0)
+                                        devel_printf("cow-enter: tid=%llu va=0x%llx rip=0x%llx cr3=0x%llx tmpl=%d\n",
+                                                (unsigned long long)(ut->tid ? ut->tid : 1),
+                                                (unsigned long long)cr2,
+                                                (unsigned long long)regs->rip,
+                                                (unsigned long long)paging_read_cr3(),
+                                                ut->mm_ptemplate ? 1 : 0);
+                        }
                         int cow_rc = mm_cow_fault_page(ut->mm, cr2, share);
                         /* Detect silent infinite COW: same CR2 succeeding forever
                          * (bad PTE/CR3) freezes openrc after set_robust_list with
@@ -422,7 +453,7 @@ static void page_fault_handler(cpu_registers_t* regs) {
                                         storm_count = (cow_rc == 0) ? 1 : 0;
                                 }
                                 if (storm_count >= 8) {
-                                        kprintf("cow-storm: tid=%d name=%s va=0x%llx rip=0x%llx rc=%d n=%d — force private\n",
+                                        devel_printf("cow-storm: tid=%d name=%s va=0x%llx rip=0x%llx rc=%d n=%d — force private\n",
                                                 tid,
                                                 ut->name[0] ? ut->name : "?",
                                                 (unsigned long long)cr2,
@@ -436,7 +467,7 @@ static void page_fault_handler(cpu_registers_t* regs) {
                         {
                                 static int boot_cow_left = 24;
                                 if (boot_cow_left-- > 0)
-                                        kprintf("cow-fault: tid=%llu name=%s va=0x%llx rip=0x%llx rc=%d\n",
+                                        devel_printf("cow-fault: tid=%llu name=%s va=0x%llx rip=0x%llx rc=%d\n",
                                                 (unsigned long long)(ut->tid ? ut->tid : 1),
                                                 ut->name[0] ? ut->name : "?",
                                                 (unsigned long long)cr2,
@@ -447,6 +478,16 @@ static void page_fault_handler(cpu_registers_t* regs) {
                                 return;
                 }
         }
+        /* Demand-fill only for !present (after do_wp_page above). */
+        if (user && (regs->error_code & 1u) == 0u && fault_try_mmap_lazy_anon(cr2))
+                return;
+        if (user && fault_try_user_vma_nonpresent(cr2, regs->error_code))
+                return;
+        if (user && fault_try_grow_user_heap(cr2)) return;
+        if (user && cr2 >= 0x10000ULL && cr2 < 0x200000ULL) {
+                if (map_page_2m(0, 0, PG_PRESENT | PG_RW | PG_US) == 0)
+                        return;
+        }
         /* Any other user fault: always visible (budget-limited). */
         if (user) {
                 extern thread_t *thread_current(void);
@@ -456,7 +497,7 @@ static void page_fault_handler(cpu_registers_t* regs) {
                 if (ut) {
                         static int boot_pf_left = 48;
                         if (boot_pf_left-- > 0)
-                                kprintf("user-pf: tid=%llu name=%s va=0x%llx rip=0x%llx err=0x%llx fs=0x%llx\n",
+                                devel_printf("user-pf: tid=%llu name=%s va=0x%llx rip=0x%llx err=0x%llx fs=0x%llx\n",
                                         (unsigned long long)(ut->tid ? ut->tid : 1),
                                         ut->name[0] ? ut->name : "?",
                                         (unsigned long long)cr2,
@@ -487,7 +528,7 @@ static void page_fault_handler(cpu_registers_t* regs) {
                         if (++kcow_retries < 16)
                             return;
                         kcow_retries = 0;
-                        kprintf("kcow-storm: tid=%llu va=0x%llx — abort uaccess\n",
+                        devel_printf("kcow-storm: tid=%llu va=0x%llx — abort uaccess\n",
                                 (unsigned long long)(ut->tid ? ut->tid : 1),
                                 (unsigned long long)cr2);
                     } else {
@@ -514,6 +555,7 @@ static void page_fault_handler(cpu_registers_t* regs) {
                 uint64_t rbp = regs->rbp;
                 klogprintf("pf: in libc/string area, rbp=0x%llx\n", (unsigned long long)rbp);
                 qemu_debug_printf("pf: in libc/string area, rbp=0x%llx\n", (unsigned long long)rbp);
+
                 for (int depth = 0; depth < 6; depth++) {
                     if (rbp == 0) break;
                     if (rbp < 0x1000ULL || rbp + 16 > (uint64_t)MMIO_IDENTITY_LIMIT) break;
@@ -538,8 +580,10 @@ static void page_fault_handler(cpu_registers_t* regs) {
         uint64_t fsbase_lo = 0, fsbase_hi = 0;
         asm volatile("rdmsr" : "=a"(fsbase_lo), "=d"(fsbase_hi) : "c"(0xC0000100u));
         uint64_t fsbase = ((uint64_t)fsbase_hi << 32) | fsbase_lo;
+        
         klogprintf("page fault MSR_FS_BASE=0x%016llx\n", (unsigned long long)fsbase);
         klogprintf("page fault details: CR2=0x%llx err=0x%llx user=%d\n", (unsigned long long)cr2, (unsigned long long)regs->error_code, user);
+
         qemu_debug_printf("page fault: MSR_FS_BASE=0x%016llx CR2=0x%llx err=0x%llx user=%d\n",
                           (unsigned long long)fsbase,
                           (unsigned long long)cr2,
@@ -919,6 +963,7 @@ void idt_init() {
         idt_set_handler(14, page_fault_handler);
         // Register divide-by-zero handler (#0)
         idt_set_handler(0, div_zero_handler);
+        idt_set_handler(1, debug_fault_handler);
         // Register UD handler (#6)
         idt_set_handler(6, ud_fault_handler);
         // Register GP fault handler (#13)

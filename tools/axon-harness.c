@@ -176,6 +176,51 @@ static void test_mmap_large(void) {
 	} else fail("mmap 4MiB", "ENOMEM or bad addr");
 }
 
+static void test_munmap_removes_pte(void) {
+	const long len = 3L * 4096;
+	long map = sys6(SYS_mmap, 0, len, PROT_READ | PROT_WRITE,
+		MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (map <= 0) {
+		skip("munmap removes PTE", "mmap failed");
+		return;
+	}
+	volatile int *first = (volatile int *)(uintptr_t)map;
+	volatile int *middle = (volatile int *)(uintptr_t)(map + 4096);
+	volatile int *last = (volatile int *)(uintptr_t)(map + 8192);
+	*first = 0x1111;
+	*middle = 0x2222;
+	*last = 0x3333;
+	if (sys2(SYS_munmap, map + 4096, 4096) != 0) {
+		fail("munmap removes PTE", "partial munmap failed");
+		(void)sys2(SYS_munmap, map, len);
+		return;
+	}
+	if (*first != 0x1111 || *last != 0x3333) {
+		fail("munmap preserves neighbours", "adjacent page changed");
+		(void)sys2(SYS_munmap, map, len);
+		return;
+	}
+	long child = sys0(SYS_fork);
+	if (child < 0) {
+		fail("munmap removes PTE", "fork failed");
+		(void)sys2(SYS_munmap, map, len);
+		return;
+	}
+	if (child == 0) {
+		volatile int value = *middle;
+		(void)value;
+		sys1(SYS_exit, 0);
+	}
+	int status = 0;
+	(void)sys3(SYS_wait4, child, (long)(uintptr_t)&status, 0);
+	if ((status & 0x7f) == 11)
+		pass("munmap removes PTE");
+	else
+		fail("munmap removes PTE", "unmapped page remained readable");
+	(void)sys2(SYS_munmap, map, 4096);
+	(void)sys2(SYS_munmap, map + 8192, 4096);
+}
+
 static void test_mprotect(void) {
 	long p = sys6(SYS_mmap, 0, 0x2000, PROT_READ | PROT_WRITE,
 		MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -185,6 +230,43 @@ static void test_mprotect(void) {
 	if (sys3(SYS_mprotect, p, 0x2000, PROT_READ | PROT_WRITE) == 0) pass("mprotect RW restore");
 	else fail("mprotect RW restore", "syscall error");
 	sys2(SYS_munmap, p, 0x2000);
+}
+
+static void test_fork_readonly_mprotect_cow(void) {
+	long map = sys6(SYS_mmap, 0, 4096, PROT_READ | PROT_WRITE,
+		MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (map <= 0) {
+		skip("fork RO then mprotect COW", "mmap failed");
+		return;
+	}
+	volatile int *p = (volatile int *)(uintptr_t)map;
+	*p = 0x13579bdf;
+	if (sys3(SYS_mprotect, map, 4096, PROT_READ) != 0) {
+		fail("fork RO then mprotect COW", "initial mprotect failed");
+		(void)sys2(SYS_munmap, map, 4096);
+		return;
+	}
+	long child = sys0(SYS_fork);
+	if (child < 0) {
+		fail("fork RO then mprotect COW", "fork failed");
+		(void)sys2(SYS_munmap, map, 4096);
+		return;
+	}
+	if (child == 0) {
+		if (sys3(SYS_mprotect, map, 4096,
+		         PROT_READ | PROT_WRITE) != 0)
+			sys1(SYS_exit, 2);
+		*p = 0x2468ace0;
+		sys1(SYS_exit, 0);
+	}
+	int status = 0;
+	(void)sys3(SYS_wait4, child, (long)(uintptr_t)&status, 0);
+	if (sys3(SYS_mprotect, map, 4096, PROT_READ | PROT_WRITE) == 0 &&
+	    status == 0 && *p == 0x13579bdf)
+		pass("fork RO then mprotect COW");
+	else
+		fail("fork RO then mprotect COW", "private page was shared");
+	(void)sys2(SYS_munmap, map, 4096);
 }
 
 static void test_fork_basic(void) {
@@ -200,6 +282,40 @@ static void test_fork_basic(void) {
 	long w = sys3(SYS_wait4, pid, (long)(uintptr_t)&status, 0);
 	if (w == pid && g_fork_probe == 0) pass("fork/wait child exit");
 	else fail("fork/wait", "parent state wrong");
+}
+
+static void test_pipe_eof_after_fork(void) {
+	int fds[2] = { -1, -1 };
+	if (sys2(SYS_pipe2, (long)(uintptr_t)fds, 0) != 0) {
+		fail("pipe EOF after fork", "pipe2 failed");
+		return;
+	}
+	long pid = sys0(SYS_fork);
+	if (pid == 0) {
+		static const char payload[] = "ok";
+		(void)sys1(SYS_close, fds[0]);
+		(void)sys3(SYS_write, fds[1], (long)(uintptr_t)payload, 2);
+		(void)sys1(SYS_close, fds[1]);
+		sys1(SYS_exit, 0);
+		for (;;) { }
+	}
+	if (pid < 0) {
+		(void)sys1(SYS_close, fds[0]);
+		(void)sys1(SYS_close, fds[1]);
+		fail("pipe EOF after fork", "fork failed");
+		return;
+	}
+	(void)sys1(SYS_close, fds[1]);
+	char buf[4] = { 0, 0, 0, 0 };
+	long n1 = sys3(SYS_read, fds[0], (long)(uintptr_t)buf, sizeof(buf));
+	long n2 = sys3(SYS_read, fds[0], (long)(uintptr_t)buf, sizeof(buf));
+	(void)sys1(SYS_close, fds[0]);
+	long status = 0;
+	(void)sys3(SYS_wait4, pid, (long)(uintptr_t)&status, 0);
+	if (n1 == 2 && n2 == 0 && buf[0] == 'o' && buf[1] == 'k')
+		pass("pipe EOF after fork");
+	else
+		fail("pipe EOF after fork", "expected payload followed by EOF");
 }
 
 static volatile unsigned int g_isolation_magic = 0xBEEF0001U;
@@ -542,8 +658,11 @@ int main(int argc, char **argv) {
 	run_one("brk", test_brk_grow, flt);
 	run_one("mmap", test_mmap_anon, flt);
 	run_one("mmap-large", test_mmap_large, flt);
+	run_one("munmap-pte", test_munmap_removes_pte, flt);
 	run_one("mprotect", test_mprotect, flt);
+	run_one("fork-ro-mprotect-cow", test_fork_readonly_mprotect_cow, flt);
 	run_one("fork", test_fork_basic, flt);
+	run_one("pipe-eof", test_pipe_eof_after_fork, flt);
 	run_one("parent-link", test_parent_child_linkage, flt);
 	run_one("wait-zombie", test_wait_wnohang_zombie, flt);
 	run_one("isolation", test_fork_memory_isolation, flt);

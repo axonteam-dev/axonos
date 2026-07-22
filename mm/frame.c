@@ -66,7 +66,7 @@ void *frame_alloc_zero(void) {
 }
 
 int frame_adopt(uint64_t pa) {
-    pa &= ~0xFFFULL;
+    pa &= PG_ADDR_MASK;
     if (!pa)
         return -1;
     unsigned long flags;
@@ -85,7 +85,7 @@ int frame_adopt(uint64_t pa) {
 }
 
 int frame_retain(uint64_t pa) {
-    pa &= ~0xFFFULL;
+    pa &= PG_ADDR_MASK;
     unsigned long flags;
     acquire_irqsave(&frame_lock, &flags);
     int slot = frame_slot_locked(pa);
@@ -101,7 +101,7 @@ int frame_retain(uint64_t pa) {
 }
 
 void frame_release(uint64_t pa) {
-    pa &= ~0xFFFULL;
+    pa &= PG_ADDR_MASK;
     void *raw = NULL;
     unsigned long flags;
     acquire_irqsave(&frame_lock, &flags);
@@ -116,7 +116,7 @@ void frame_release(uint64_t pa) {
 }
 
 unsigned frame_refcount(uint64_t pa) {
-    pa &= ~0xFFFULL;
+    pa &= PG_ADDR_MASK;
     unsigned refs = 0;
     unsigned long flags;
     acquire_irqsave(&frame_lock, &flags);

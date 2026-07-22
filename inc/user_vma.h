@@ -37,7 +37,8 @@ int user_vma_add(uint64_t tid, uintptr_t addr, size_t len, int prot, int kind);
 int user_vma_add_mm(mm_t *mm, uintptr_t addr, size_t len, int prot, int kind);
 int user_vma_is_shared_page_mm(mm_t *mm, uintptr_t va);
 int user_vma_clone_mm(mm_t *dst, mm_t *src);
-void user_vma_unmap_range(uint64_t tid, uintptr_t addr, size_t len);
+int user_vma_can_unmap_range(uint64_t tid, uintptr_t addr, size_t len);
+int user_vma_unmap_range(uint64_t tid, uintptr_t addr, size_t len);
 int user_vma_set_prot(uint64_t tid, uintptr_t addr, size_t len, int prot);
 int user_vma_is_fully_mapped(uint64_t tid, uintptr_t addr, size_t len);
 

@@ -4,6 +4,7 @@
 #include <string.h>
 #include <spinlock.h>
 #include <vga.h>
+#include <debug.h>
 #include <mm.h>
 #include <paging.h>
 #include <exec.h>
@@ -312,7 +313,7 @@ void process_release_vfork_parent(process_t *child,
         if (wake->name[0] &&
             (strstr(wake->name, "linuxrc") || strstr(wake->name, "/bin/sh") ||
              strstr(wake->name, "busybox") || strstr(wake->name, "init")))
-            kprintf("vfork-release: parent=%d child_pid=%llu reason=%d\n",
+            devel_printf("vfork-release: parent=%d child_pid=%llu reason=%d\n",
                 (int)(wake->tid ? wake->tid : 1),
                 (unsigned long long)child->pid,
                 (int)reason);

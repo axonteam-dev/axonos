@@ -1,5 +1,6 @@
 #include <paging.h>
 #include <mm.h>
+#include <debug.h>
 
 // Simple page-table allocator for creating new PDPT/PD tables for 2MiB mappings
 static uint64_t* next_free_table(void) {
@@ -132,8 +133,7 @@ static int map_page_2m_on_l4(uint64_t *l4, uint64_t va, uint64_t pa, uint64_t fl
 
 int map_page_2m(uint64_t va, uint64_t pa, uint64_t flags) {
     if (mm_dbg_ash_overlaps(va, va + 1)) {
-        extern void kprintf(const char *fmt, ...);
-        kprintf("ash-touch: map_page_2m va=0x%llx pa=0x%llx flags=0x%llx live=0x%llx\n",
+        devel_printf("ash-touch: map_page_2m va=0x%llx pa=0x%llx flags=0x%llx live=0x%llx\n",
                 (unsigned long long)va, (unsigned long long)pa,
                 (unsigned long long)flags,
                 (unsigned long long)(paging_read_cr3() & ~0xFFFULL));

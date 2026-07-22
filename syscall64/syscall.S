@@ -25,6 +25,7 @@
 .extern syscall_snapshot_user_regs
 .extern syscall_fork_parent_pre_iretq
 .extern syscall_restore_user_fs_before_iretq
+.extern syscall_finalize_user_frame
 .extern syscall_maybe_vfork_wait
 .extern maybe_deliver_pending_signal
 
@@ -201,6 +202,15 @@ syscall_entry64:
      * across a schedule while the parent runs; BusyBox then dies in tcsetpgrp
      * canary loads (%fs:0x28) with no further syscall logs. */
     call    syscall_restore_user_fs_before_iretq
+    /* C helpers above may use caller-saved registers, but Linux syscall return
+     * preserves every GPR except rax/rcx/r11. Re-apply the owning thread's
+     * authoritative saved register image to the live frame immediately before
+     * the pops. This is required by glibc clone: its child keeps clone's zero in
+     * rdx across set_robust_list and then executes `mov %edx,%eax`. */
+    movq    %rsp, %rdi
+    call    syscall_finalize_user_frame
+    movq    %rsp, %rdi
+    call    syscall_epilogue_probe
 
     // Restore registers.
     popq    %r15

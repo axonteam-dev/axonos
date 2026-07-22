@@ -20,7 +20,13 @@
 #define PG_GLOBAL                (1ULL << 8)
 #define PG_SOFT_RESERVED         (1ULL << 9)   // software-only marker for non-present reserved PTEs
 #define PG_SOFT_COW              (1ULL << 10)  // present user PTE write-protected for fork COW
+#define PG_SOFT_OWNED            (1ULL << 11)  // this PTE owns one frame allocator reference
 #define PG_NX                    (1ULL << 63)  // if EFER.NXE is enabled
+/* Architectural physical-address field (MAXPHYADDR <= 52 on x86-64).
+ * Never use `pte & ~0xfff`: that incorrectly treats NX as address bit 63. */
+#define PG_ADDR_MASK              0x000FFFFFFFFFF000ULL
+#define PG_ADDR_MASK_2M           (PG_ADDR_MASK & ~(PAGE_SIZE_2M - 1ULL))
+#define PG_ADDR_MASK_1G           (PG_ADDR_MASK & ~((1ULL << 30) - 1ULL))
 
 // Initialize paging helpers (assumes bootstrap tables are already active)
 void paging_init(void);

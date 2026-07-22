@@ -23,7 +23,9 @@ STUB_SRC := boot/kzip_stub.c
 STUB_OBJ := $(BUILD_DIR)/$(STUB_SRC:.c=.c.o)
 
 CC := gcc -m64
-CFLAGS := -g -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel -Iinc -MMD -MP
+# Optional: make CFLAGS_EXTRA='-DDEVEL_DEBUG=1' for COW/pipe/fork console traces.
+CFLAGS_EXTRA ?=
+CFLAGS := -g -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel -Iinc -MMD -MP $(CFLAGS_EXTRA)
 
 CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -path './userland' -prune -o -path './core/nss_dns_shim' -prune -o -path './core/nss_files_shim' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
 COBJS := $(patsubst %.c,$(BUILD_DIR)/%.c.o,$(CSRCS))

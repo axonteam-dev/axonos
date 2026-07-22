@@ -19,10 +19,7 @@
 #include <stdio.h>
 #include <syscall.h>
 #include <process.h>
-
-#ifndef AXON_FORK_DEBUG
-#define AXON_FORK_DEBUG 1
-#endif
+#include <fpu.h>
 
 #define MAX_THREADS 512
 thread_t* threads[MAX_THREADS];
@@ -111,13 +108,13 @@ thread_t *thread_idle_for_cpu(int cpu) {
         return idle_thread_by_cpu[cpu];
 }
 
-static int thread_static_prio(const thread_t *t) {
-        int p = 20 - t->nice;
-        if (p < 1)
-                p = 1;
-        if (p > 40)
-                p = 40;
-        return p;
+static uint64_t thread_vruntime_delta(const thread_t *t) {
+        int nice = t ? t->nice : 0;
+        if (nice < -20) nice = -20;
+        if (nice > 19) nice = 19;
+        /* Lower nice grows more slowly and therefore receives a larger share.
+         * Every runnable task still advances and remains eligible. */
+        return (uint64_t)(nice + 21);
 }
 
 static inline void sched_set_current(thread_t *t) {
@@ -146,6 +143,7 @@ static void thread_note_ready_nolock(thread_t *t) {
  * Unlocks only — IF must stay 0 until asm restores next thread (avoid IRQ during switch tail). */
 void thread_schedule_prev_saved(thread_t *t) {
         if (t && t->state == THREAD_RUNNING) {
+                t->sched_vruntime += thread_vruntime_delta(t);
                 if (t->vfork_waiting)
                         t->state = THREAD_BLOCKED;
                 else
@@ -237,6 +235,7 @@ static void thread_free_resources(thread_t *t) {
                 kfree(t->syscall_frame_kbuf);
                 t->syscall_frame_kbuf = NULL;
         }
+        fpu_thread_destroy(t);
         thread_proc_env_free(t);
         kfree(t);
 }
@@ -345,6 +344,7 @@ void thread_init() {
         mm_init();
         process_init();
         memset(&main_thread, 0, sizeof(main_thread));
+        (void)fpu_thread_init(&main_thread);
         main_thread.sched_target_cpu = -1;
         main_thread.state = THREAD_RUNNING;
         main_thread.tid = 0;
@@ -463,15 +463,20 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
                 if (!t) return NULL;
         }
         memset(t, 0, sizeof(thread_t));
+        if (fpu_thread_init(t) != 0) {
+                kfree(t);
+                return NULL;
+        }
         t->bound_cpu = -1;
         t->sched_target_cpu = -1;
         void *stack_mem = kmalloc(KERNEL_STACK_SIZE + 16);
-        if (!stack_mem) { kprintf("OOM thread: kmalloc(stack %u) failed\n", (unsigned)(KERNEL_STACK_SIZE + 16)); kfree(t); return NULL; }
+        if (!stack_mem) { kprintf("OOM thread: kmalloc(stack %u) failed\n", (unsigned)(KERNEL_STACK_SIZE + 16)); fpu_thread_destroy(t); kfree(t); return NULL; }
         t->kernel_stack = (uint64_t)stack_mem + KERNEL_STACK_SIZE;
         {
                 void *sc_mem = kmalloc(SYSCALL_KSTACK_SIZE + 16);
                 if (!sc_mem) {
                         kfree(stack_mem);
+                        fpu_thread_destroy(t);
                         kfree(t);
                         return NULL;
                 }
@@ -483,6 +488,7 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
                 if (!kbuf) {
                         kfree(t->syscall_kstack_raw);
                         kfree((void *)((uintptr_t)t->kernel_stack - KERNEL_STACK_SIZE));
+                        fpu_thread_destroy(t);
                         kfree(t);
                         return NULL;
                 }
@@ -496,8 +502,10 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->context.r12 = (uint64_t)entry; // entry передаётся через r12
         t->context.rflags = 0x202;
         t->state = st;
-        t->nice = 0;
+        thread_t *creator = thread_current();
+        t->nice = creator ? creator->nice : 0;
         t->sched_fifo_seq = 0;
+        t->sched_vruntime = creator ? creator->sched_vruntime : 0;
         t->start_ticks = timer_ticks;
         t->sleep_until = 0;
         strncpy(t->name, name, sizeof(t->name));
@@ -589,6 +597,10 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         thread_t* t = (thread_t*)kmalloc(sizeof(thread_t));
         if (!t) { kprintf("OOM thread_register_user: kmalloc(thread_t) failed\n"); return NULL; }
         memset(t, 0, sizeof(thread_t));
+        if (fpu_thread_init(t) != 0) {
+                kfree(t);
+                return NULL;
+        }
         {
                 void *sc_mem = kmalloc(SYSCALL_KSTACK_SIZE + 16);
                 if (sc_mem) {
@@ -622,6 +634,8 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         /* inherit credentials, file descriptors and attached tty from current thread if available */
         thread_t *tc = thread_current();
         if (tc) {
+                t->nice = tc->nice;
+                t->sched_vruntime = tc->sched_vruntime;
                 t->uid = tc->uid;
                 t->euid = tc->euid;
                 t->suid = tc->suid;
@@ -799,9 +813,14 @@ int thread_fd_alloc(struct fs_file *file) {
             cur->fds[i] = file;
             if (cur->process)
                     cur->process->fds[i] = file;
-            /* take ownership - increase refcount */
-            if (file->refcount <= 0) file->refcount = 1;
-            else file->refcount++;
+            /*
+             * Adopt the creator's existing open-file reference. Creating a
+             * descriptor is not dup(): callers pass a newly opened/allocated
+             * fs_file with refcount 1. Incrementing here left an unowned
+             * reference behind, leaking every open and preventing pipe EOF.
+             */
+            if (file->refcount <= 0)
+                    file->refcount = 1;
             return i;
         }
     }
@@ -809,14 +828,22 @@ int thread_fd_alloc(struct fs_file *file) {
 }
 
 int thread_fd_close(int fd) {
+    static int pipe_fd_trace_left = 160;
     thread_t *cur = thread_get_current_user();
     if (!cur) cur = thread_current();
     if (!cur || fd < 0 || fd >= THREAD_MAX_FD) return -1;
     struct fs_file *f = cur->process ? cur->process->fds[fd] : cur->fds[fd];
     if (!f) return -1;
+    if (f->type == FS_TYPE_PIPE && pipe_fd_trace_left-- > 0)
+        devel_printf("pipe-fd: close tid=%d fd=%d end=%c file=%p ref=%d pipe=%p\n",
+                (int)(cur->tid ? cur->tid : 1), fd,
+                fs_pipe_is_write_end(f) ? 'W' : 'R',
+                (void *)f, f->refcount, f->driver_private);
     cur->fds[fd] = NULL;
-    if (cur->process)
+    if (cur->process) {
         cur->process->fds[fd] = NULL;
+        cur->process->fd_cloexec[fd] = 0;
+    }
     fs_file_free(f);
     return 0;
 }
@@ -842,6 +869,7 @@ int thread_fd_dup(int oldfd) {
 }
 
 int thread_fd_dup2(int oldfd, int newfd) {
+    static int pipe_dup_trace_left = 80;
     thread_t *cur = thread_get_current_user();
     if (!cur) cur = thread_current();
     if (!cur || oldfd < 0 || oldfd >= THREAD_MAX_FD || newfd < 0 || newfd >= THREAD_MAX_FD) return -1;
@@ -849,10 +877,21 @@ int thread_fd_dup2(int oldfd, int newfd) {
     struct fs_file *f = cur->process ?
         cur->process->fds[oldfd] : cur->fds[oldfd];
     if (!f) return -1;
-    /* close newfd if open */
-    if (cur->fds[newfd]) {
-        fs_file_free(cur->fds[newfd]);
-        cur->fds[newfd] = NULL;
+    if (f->type == FS_TYPE_PIPE && pipe_dup_trace_left-- > 0)
+        devel_printf("pipe-fd: dup2 tid=%d old=%d new=%d end=%c file=%p ref=%d pipe=%p\n",
+                (int)(cur->tid ? cur->tid : 1), oldfd, newfd,
+                fs_pipe_is_write_end(f) ? 'W' : 'R',
+                (void *)f, f->refcount, f->driver_private);
+    /* close newfd if open; process->fds is authoritative for a process. */
+    struct fs_file *replaced = cur->process ?
+        cur->process->fds[newfd] : cur->fds[newfd];
+    if (replaced)
+        fs_file_free(replaced);
+    cur->fds[newfd] = NULL;
+    if (cur->process) {
+        cur->process->fds[newfd] = NULL;
+        /* Linux dup2 clears close-on-exec on the new descriptor. */
+        cur->process->fd_cloexec[newfd] = 0;
     }
     cur->fds[newfd] = f;
     if (cur->process)
@@ -1047,10 +1086,10 @@ void thread_schedule() {
                 return;
         }
 
-        /* Unix-ish: highest static priority (from nice) first; FIFO within same priority.
-           Two passes: prefer any non-idle READY thread, then this CPU's idle only. */
+        /* CFS-like fairness: lowest weighted runtime first, FIFO as a tie
+           breaker. nice affects CPU share, never absolute eligibility. */
         thread_t *pick = NULL;
-        int best_pri = -1;
+        uint64_t best_vruntime = 0;
         uint32_t best_seq = 0;
         int my_cpu = smp_sched_cpu_id();
         thread_t *my_idle = NULL;
@@ -1102,11 +1141,12 @@ void thread_schedule() {
                                 t->state = THREAD_TERMINATED;
                                 continue;
                         }
-                        int pri = thread_static_prio(t);
-                        if (pick == NULL || pri > best_pri ||
-                            (pri == best_pri && t->sched_fifo_seq < best_seq)) {
+                        if (pick == NULL ||
+                            t->sched_vruntime < best_vruntime ||
+                            (t->sched_vruntime == best_vruntime &&
+                             t->sched_fifo_seq < best_seq)) {
                                 pick = t;
-                                best_pri = pri;
+                                best_vruntime = t->sched_vruntime;
                                 best_seq = t->sched_fifo_seq;
                         }
                 }
@@ -1161,6 +1201,7 @@ void thread_schedule() {
                         release_irqrestore(&sched_lock, irqf);
                         return;
                 }
+                fpu_switch(prev, cur);
                 context_switch_with_prev(&prev->context, &cur->context, prev);
                 restore_irqflags(irqf);
                 return;
@@ -1179,6 +1220,7 @@ void thread_schedule() {
                 cur->sched_target_cpu = -1;
                 cur->state = THREAD_RUNNING;
                 mm_switch(cur->mm);
+                fpu_switch(prev, cur);
                 context_switch_with_prev(&prev->context, &cur->context, prev);
                 restore_irqflags(irqf);
                 return;
@@ -1223,8 +1265,6 @@ void thread_unblock_fork_child(int pid) {
                         t->sleep_until = 0;
                         thread_note_ready_nolock(t);
                 }
-                if (t->state == THREAD_READY)
-                        t->sched_fifo_seq = 0;
                 break;
         }
         release_irqrestore(&sched_lock, irqf);

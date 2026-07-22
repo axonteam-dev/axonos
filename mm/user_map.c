@@ -108,8 +108,12 @@ int user_map_mprotect_range(uint64_t va_begin, uint64_t va_end, int prot) {
                 invlpg((void *)(uintptr_t)va);
                 continue;
             }
-            uint64_t pa = l2e & ~(PAGE_SIZE_2M - 1) & ~0xFFFULL;
-            l2[l2i] = pa | new_flags;
+            uint64_t pa = l2e & PG_ADDR_MASK_2M;
+            uint64_t f = new_flags |
+                (l2e & (PG_SOFT_COW | PG_SOFT_OWNED));
+            if (f & PG_SOFT_COW)
+                f &= ~PG_RW;
+            l2[l2i] = pa | f;
         } else {
             uint64_t *l1 = (uint64_t *)(uintptr_t)(l2e & ~0xFFFULL);
             uint64_t chunk_lo = va;
@@ -122,8 +126,11 @@ int user_map_mprotect_range(uint64_t va_begin, uint64_t va_end, int prot) {
                  * BusyBox slab/stack after vfork detach (ash GPF at RIP=="ls"). */
                 if (!(l1[l1i] & PG_PRESENT))
                     continue;
-                uint64_t pa = l1[l1i] & ~0xFFFULL;
-                uint64_t f = new_flags & ~PG_PS_2M;
+                uint64_t pa = l1[l1i] & PG_ADDR_MASK;
+                uint64_t f = (new_flags & ~PG_PS_2M) |
+                    (l1[l1i] & (PG_SOFT_COW | PG_SOFT_OWNED));
+                if (f & PG_SOFT_COW)
+                    f &= ~PG_RW;
                 l1[l1i] = pa | f;
                 invlpg((void *)(uintptr_t)v);
             }

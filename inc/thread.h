@@ -149,6 +149,9 @@ typedef struct thread {
         int nice;
         /* Monotonic ticket when entering THREAD_READY; lower runs earlier at same priority. */
         uint32_t sched_fifo_seq;
+        /* CFS-like weighted runtime. Scheduler picks the smallest value;
+         * nice changes growth rate, never absolute eligibility. */
+        uint64_t sched_vruntime;
         /* If >= 0, runnable only on that logical CPU; -1 = any CPU (SMP). */
         int bound_cpu;
         /* Logical CPU that owns this thread while THREAD_READY (-1 if not ready / running). */
@@ -168,6 +171,10 @@ typedef struct thread {
          * BEFORE enter_user_mode (which never returns). */
         mm_t *exec_discard_mm;
         mm_t *exec_discard_template;
+        /* Eager x87/SSE/AVX context. raw owns the allocation; state is
+         * 64-byte aligned for XSAVE/XRSTOR. */
+        void *fpu_state_raw;
+        void *fpu_state;
 } thread_t;
 
 extern int init;

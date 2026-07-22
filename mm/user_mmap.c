@@ -33,6 +33,24 @@ enum {
     MAP_FIXED_NOREPLACE = 0x100000,
 };
 
+static int user_mmap_unmap_pages(thread_t *t, uintptr_t addr, size_t len) {
+    if (!t || !t->mm)
+        return user_map_unmap_range((uint64_t)addr,
+                                    (uint64_t)addr + (uint64_t)len);
+    mm_t *kernel_mm = mm_kernel();
+    if (t->mm == kernel_mm || !t->mm->pml4)
+        return user_map_unmap_range((uint64_t)addr,
+                                    (uint64_t)addr + (uint64_t)len);
+    mm_t *share = (t->mm_ptemplate && t->mm_ptemplate != t->mm &&
+                   t->mm_ptemplate->pml4) ?
+        t->mm_ptemplate : kernel_mm;
+    if (!share || !share->pml4)
+        return -1;
+    return mm_unmap_user_range(t->mm, share->pml4,
+                               (uint64_t)addr,
+                               (uint64_t)addr + (uint64_t)len);
+}
+
 static int user_mmap_install_pages(uintptr_t addr, size_t len, uintptr_t top_limit) {
     if ((uint64_t)addr + (uint64_t)len > (uint64_t)top_limit)
         return -1;
@@ -78,6 +96,7 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     uint64_t len_u64 = (uint64_t)a2;
     int prot = (int)a3;
     int flags = (int)a4;
+    int shared_mapping = (flags & MAP_SHARED) != 0;
     (void)prot;
 
     if (len_u64 == 0) return user_mm_ret_err(USER_MM_EINVAL);
@@ -236,7 +255,12 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     if (fixed_mapping) {
         if ((flags & MAP_FIXED_NOREPLACE) && user_vma_mmap_range_overlaps(tcur, addr, len))
             return user_mm_ret_err(USER_MM_ENOMEM);
-        user_vma_unmap_range(vtid, addr, len);
+        if (!(flags & MAP_FIXED_NOREPLACE)) {
+            if (user_vma_can_unmap_range(vtid, addr, len) != 0 ||
+                user_mmap_unmap_pages(tcur, addr, len) != 0 ||
+                user_vma_unmap_range(vtid, addr, len) != 0)
+                return user_mm_ret_err(USER_MM_ENOMEM);
+        }
     }
 
     if (addr < 0x200000 ||
@@ -251,12 +275,12 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     if (flags & MAP_ANONYMOUS) {
         flags &= ~(MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED | MAP_FIXED | MAP_FIXED_NOREPLACE);
         if (flags != 0) return user_mm_ret_err(USER_MM_ENOSYS);
-        const int lazy_anon = (len_u64 > (96ull << 20)) &&
+        const int lazy_anon = !shared_mapping &&
+            (len_u64 > (96ull << 20)) &&
             ((addr & ((uintptr_t)PAGE_SIZE_2M - 1)) == 0) &&
             ((len_u64 & ((uint64_t)PAGE_SIZE_2M - 1)) == 0);
         if (lazy_anon) {
-            if (!(flags & MAP_SHARED))
-                mmap_vma_kind = USER_VMA_KIND_MMAP_LAZY;
+            mmap_vma_kind = USER_VMA_KIND_MMAP_LAZY;
             user_as_mmap_lazy_drop_present_pages(addr, len);
         } else {
             user_as_mmap_memset_zero_chunked(addr, len);
@@ -362,16 +386,24 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
 uint64_t user_syscall_munmap(uint64_t a1, uint64_t a2) {
     uintptr_t addr = (uintptr_t)a1;
     size_t len = (size_t)a2;
-    if (len == 0) return 0;
+    if (len == 0) return user_mm_ret_err(USER_MM_EINVAL);
+    if ((uint64_t)len > UINT64_MAX - 4095ULL)
+        return user_mm_ret_err(USER_MM_EINVAL);
     len = (size_t)user_mm_align_up((uintptr_t)len, 4096);
     if (addr < 0x200000) return user_mm_ret_err(USER_MM_EINVAL);
-    if (addr + len >= (uintptr_t)MMIO_IDENTITY_LIMIT) return user_mm_ret_err(USER_MM_EINVAL);
+    if ((uint64_t)addr + (uint64_t)len < (uint64_t)addr ||
+        (uint64_t)addr + (uint64_t)len > (uint64_t)MMIO_IDENTITY_LIMIT)
+        return user_mm_ret_err(USER_MM_EINVAL);
     if ((addr & 0xFFF) != 0) return user_mm_ret_err(USER_MM_EINVAL);
 
     thread_t *tcur = thread_get_current_user();
     if (!tcur) tcur = thread_current();
     uint64_t tid = (uint64_t)(tcur ? (tcur->tid ? tcur->tid : 1) : 1);
-    user_vma_unmap_range(tid, addr, len);
+    if (user_vma_can_unmap_range(tid, addr, len) != 0 ||
+        user_mmap_unmap_pages(tcur, addr, len) != 0)
+        return user_mm_ret_err(USER_MM_ENOMEM);
+    if (user_vma_unmap_range(tid, addr, len) != 0)
+        return user_mm_ret_err(USER_MM_ENOMEM);
     uintptr_t max_end = tcur ? user_vma_max_mmap_like_end_for_mm(tcur) : user_vma_max_mmap_like_end(tid);
     if (tcur) {
         uintptr_t floor = user_mm_align_up(
@@ -385,11 +417,11 @@ uint64_t user_syscall_munmap(uint64_t a1, uint64_t a2) {
                 if (pt->user_mmap_next > max_end) pt->user_mmap_next = max_end;
                 if (pt->user_mmap_hi > pt->user_mmap_next) pt->user_mmap_hi = pt->user_mmap_next;
             }
+            if (tcur->mm->mmap_cursor > max_end)
+                tcur->mm->mmap_cursor = max_end;
         } else {
             if (tcur->user_mmap_next > max_end) tcur->user_mmap_next = max_end;
             if (tcur->user_mmap_hi > tcur->user_mmap_next) tcur->user_mmap_hi = tcur->user_mmap_next;
-            if (tcur->mm && tcur->mm->mmap_cursor > max_end)
-                tcur->mm->mmap_cursor = max_end;
         }
     }
     return 0;
@@ -409,10 +441,19 @@ uint64_t user_syscall_mprotect(uint64_t a1, uint64_t a2, uint64_t a3) {
     thread_t *tcur = thread_get_current_user();
     if (!tcur) tcur = thread_current();
     uint64_t tid = (uint64_t)(tcur ? (tcur->tid ? tcur->tid : 1) : 1);
+    if ((prot & 2) && tcur && tcur->mm) {
+        mm_t *share = tcur->mm_ptemplate ?
+            tcur->mm_ptemplate : mm_kernel();
+        if (mm_break_cow_range_for_write(tcur->mm, share,
+                                         (uint64_t)addr,
+                                         (uint64_t)addr + len) != 0)
+            return user_mm_ret_err(USER_MM_ENOMEM);
+    }
     if (!user_vma_is_fully_mapped(tid, addr, len)) {
         if (user_map_ensure_present_us_2m((uint64_t)addr, (uint64_t)addr + len) != 0)
             return user_mm_ret_err(USER_MM_EFAULT);
-        user_vma_unmap_range(tid, addr, len);
+        if (user_vma_unmap_range(tid, addr, len) != 0)
+            return user_mm_ret_err(USER_MM_ENOSPC);
         if (user_vma_add(tid, addr, len, prot & 7, USER_VMA_KIND_MMAP) != 0)
             return user_mm_ret_err(USER_MM_ENOSPC);
     } else if (user_vma_set_prot(tid, addr, len, prot & 7) != 0) {

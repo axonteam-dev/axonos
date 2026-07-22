@@ -177,9 +177,13 @@ struct fs_driver *fs_get_mount_driver(const char *path) {
 }
 
 /* helper: returns true if file is associated with driver 'drv'.
-   file->fs_private may point to drv->driver_data or to drv itself. */
+   file->fs_private may point to drv->driver_data or to drv itself.
+   Never treat NULL==NULL as a match: pipe ends and unset mounts must not
+   be claimed by drivers with driver_data==NULL (ext2). */
 static int fs_file_matches_driver(const struct fs_driver *drv, const struct fs_file *file) {
-    if (!drv || !file) return 0;
+    if (!drv || !file || !file->fs_private) return 0;
+    if (file->type == FS_TYPE_PIPE || file->type == FS_TYPE_SOCKET)
+        return 0;
     if (file->fs_private == drv->driver_data) return 1;
     if (file->fs_private == (void*)drv) return 1;
     return 0;
@@ -668,7 +672,15 @@ void fs_file_free(struct fs_file *file) {
     file->refcount = 0;
     /* file->refcount was 1 -> release resources */
     if (file->type == FS_TYPE_PIPE) {
+        /* Linux: pipes have their own f_op->release; never fall through to
+         * filesystem drivers. ext2_release used to match NULL fs_private and
+         * kfree(driver_private) — double-freeing pipe_t after pipe_release_end. */
         pipe_release_end(file);
+        if (file->path)
+            kfree((void *)file->path);
+        file->path = NULL;
+        kfree(file);
+        return;
     }
     if (file->type == FS_TYPE_SOCKET) {
         net_fs_file_destroy(file);

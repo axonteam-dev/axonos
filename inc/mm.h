@@ -111,6 +111,8 @@ int mm_cow_mark_all_user_writable_child_l4(mm_t *child, uint64_t *parent_l4,
                                            uint64_t owner_tid);
 /* Linux-style COW on first user write after fork (single 4K page at cr2). */
 int mm_cow_fault_page(mm_t *mm, uint64_t va, mm_t *share_cmp_mm);
+int mm_break_cow_range_for_write(mm_t *mm, mm_t *share_cmp_mm,
+                                 uint64_t va_begin, uint64_t va_end);
 
 /* Fork child entry: copy up to max_pages live parent pages into child when parent
  * has diverged from shared read-only COW (parent writable or child already private).
@@ -124,6 +126,10 @@ int mm_fork_sync_page_from_parent(mm_t *child_mm, mm_t *parent_mm, uint64_t va);
 /* Clear [va_begin, va_end) in child mm without touching parent share_l4 mappings.
    Duplicates shared page-table pages one level at a time before clearing PTEs. */
 int mm_clear_range_private(mm_t *mm, uint64_t *share_l4, uint64_t va_begin, uint64_t va_end);
+/* Linux munmap: detach user PTEs from one mm and release tracked leaf frames.
+ * share_l4 is the fork/exec baseline used to break shared page-table paths. */
+int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
+                        uint64_t va_begin, uint64_t va_end);
 
 /* Replace identity leaves (pa==va) with private frames; copy old contents.
  * Prefer mm_privatize_identity_range_blank for user anon (do_brk_flags). */
@@ -131,7 +137,7 @@ int mm_privatize_identity_range(mm_t *mm, uint64_t va_begin, uint64_t va_end);
 /* Linux do_brk_flags / anon fault: identity→private with zero pages. */
 int mm_privatize_identity_range_blank(mm_t *mm, uint64_t va_begin, uint64_t va_end);
 
-/* ---- ash GPF watch (RIP=="ls" @ 0x801738): temporary verbose probes ---- */
+/* ---- ash GPF watch (RIP=="ls" @ 0x801738): DEVEL_DEBUG probes only ---- */
 #define MM_ASH_WATCH_VA     0x801738ULL
 #define MM_ASH_WATCH_LO     0x800000ULL
 #define MM_ASH_WATCH_HI     0xA00000ULL

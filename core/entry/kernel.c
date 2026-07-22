@@ -525,7 +525,12 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             apic_timer_stop();
             pit_disable();
             pic_mask_irq(0);
-            apic_timer_start(1000);
+            /*
+             * Linux commonly uses HZ=250.  A 1 kHz periodic LAPIC interrupt
+             * can remain continuously pending under VMware when the handler
+             * and context switch exceed 1 ms, starving ring-3 completely.
+             */
+            apic_timer_start(250);
             /* Confirm APIC is actually ticking at the new rate; otherwise revert to PIT. */
             uint64_t t0 = apic_timer_ticks;
             for (int i = 0; i < 100000; i++) {
@@ -533,7 +538,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 asm volatile("pause");
             }
             if (apic_timer_ticks == t0) {
-                kprintf("APIC: no ticks after 1000Hz start, falling back to PIT\n");
+                kprintf("APIC: no ticks after 250Hz start, falling back to PIT\n");
                 apic_timer_stop();
                 pic_unmask_irq(0);
                 pit_init();

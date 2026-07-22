@@ -1,9 +1,14 @@
 #pragma once
 
 #include <stdint.h>
+
+typedef struct syscall_frame {
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rdi, rsi, rbp, rbx, rdx, rcx, rax, rsp;
+} syscall_frame_t;
 #include <idt.h>
 
-/* Minimal syscall numbers (Linux-compatible where convenient) */
+/* Linux x86_64 syscall numbers used by the kernel ABI. */
 #define SYS_read    0
 #define SYS_write   1
 #define SYS_open    2
@@ -18,6 +23,7 @@
 #define SYS_munmap  11
 #define SYS_rt_sigaction 13
 #define SYS_rt_sigprocmask 14
+#define SYS_rt_sigsuspend 130
 #define SYS_ioctl   16
 #define SYS_readv   19
 #define SYS_writev  20
@@ -28,9 +34,11 @@
 #define SYS_getcwd  79
 #define SYS_chdir   80
 #define SYS_readlink 89
+#define SYS_readlinkat 267
 #define SYS_set_tid_address 218
 #define SYS_prlimit64 302
 #define SYS_set_robust_list 273
+#define SYS_get_robust_list 274
 #define SYS_rseq 334
 #define SYS_futex 202
 #define SYS_rt_sigaction 13
@@ -52,6 +60,7 @@
 #define SYS_setreuid 113
 #define SYS_setregid 114
 #define SYS_setsid  112
+#define SYS_kill    62
 #define SYS_syslog  103
 #define SYS_getpgrp 111
 #define SYS_setpgid 109
@@ -115,7 +124,7 @@
 
 /* initialize syscall subsystem (register handler) */
 void syscall_init(void);
-/* warm-up kernel net stack once during boot */
+/* Explicit DHCP (not at boot). Also: echo 1 > /proc/net/dhcp */
 int syscall_net_preinit(void);
 
 /* ISR-compatible handler (called by IDT dispatcher) */
@@ -125,15 +134,23 @@ void isr_syscall(cpu_registers_t* regs);
 uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);
 /* Refresh saved_user_* from live per-CPU syscall stack frame (before schedule in syscall). */
 void syscall_frame_refresh(thread_t *t);
-/* Run deferred thread_unblock after parent leaves syscall (fork child). */
+/* Run deferred fork child GPR refresh after parent syscall (before iretq unblock). */
 void syscall_deferred_unblocks(void);
+/* Linux ordering: unblock fork child immediately before parent SYSCALL iretq. */
+void syscall_fork_parent_pre_iretq(void);
+void syscall_restore_user_fs_before_iretq(void);
+/* Linux wait_for_vfork_done — after syscall_do, before iretq. */
+uint64_t syscall_maybe_vfork_wait(uint64_t parent_ret);
 /* Point this CPU's syscall_entry64 stack at t's private kstack (or global default). */
 void syscall_bind_kstack_for_thread(thread_t *t);
+/* Linux fork child: iretq from cloned syscall GPR frame with rax=0. */
+__attribute__((noreturn)) void syscall_child_return_from_frame(uint64_t *frame);
 
 /* Control flag and helper for syscall_entry64. */
 extern uint64_t syscall_exit_to_shell_flag;
 __attribute__((noreturn)) void syscall_return_to_shell(void);
 /* Terminate current user thread after fatal trap (GPF etc.); schedule parent/shell. */
 void syscall_user_fatal_exit(int signo);
+/* vfork child exec (or fatal exit): restore parent snapshot and unblock blocked parent. */
 
 

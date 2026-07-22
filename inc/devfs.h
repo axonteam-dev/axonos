@@ -96,10 +96,13 @@ void devfs_switch_tty(int index);
 /* Return number of virtual ttys available */
 int devfs_tty_count(void);
 
-/* Push input character into tty's input queue (called from keyboard) */
-void devfs_tty_push_input(int tty, char c);
+/* Kernel console output (kprintf): write through the active tty so cursor and
+ * screen backing stay aligned with userspace /dev/console I/O. */
+void devfs_tty_console_write(const char *s, size_t n);
 /* Return index of currently active tty */
 int devfs_get_active(void);
+/* Process-context input injection; may take the tty lock. */
+void devfs_tty_push_input(int tty, char c);
 /* Non-blocking push from ISR (tries to acquire lock, drops on failure) */
 void devfs_tty_push_input_noblock(int tty, char c);
 /* Non-blocking pop: returns -1 if none, or char (0-255) */

@@ -8,6 +8,7 @@
 #include <thread.h>
 #include <debug.h>
 #include <vga.h>
+#include <fpu.h>
 
 #define MSR_IA32_TSC_AUX 0xC0000103u
 
@@ -18,6 +19,14 @@ static int smp_ncpus = 1;
 static int smp_early_done;
 static uint8_t smp_apic_per_cpu[SMP_MAX_CPUS];
 static int smp_topology_from_madt;
+
+/*
+ * User syscall entry and task handoff are not yet fully per-CPU.  Starting APs
+ * lets a fork child be marked RUNNING on an AP before its child-return context
+ * executes, stranding BusyBox init in wait4.  Keep the boot core uniprocessor
+ * until that ABI is completed; topology discovery remains available.
+ */
+#define AXON_BOOT_ENABLE_APS 0
 
 /* AP trampoline mailbox at fixed phys 0x9000 (see linker.payload.ld). */
 struct __attribute__((packed)) smp_mailbox {
@@ -235,6 +244,10 @@ static void smp_mdelay_tsc(unsigned ms) {
 }
 
 void smp_boot_aps(void) {
+#if !AXON_BOOT_ENABLE_APS
+        klogprintf("SMP: AP boot disabled while user syscall context is single-CPU\n");
+        return;
+#endif
         if (smp_ncpus <= 1)
                 return;
         if (!apic_is_initialized()) {
@@ -382,6 +395,9 @@ void smp_ap_entry(void) {
         wrmsr_u32(MSR_IA32_TSC_AUX, cpu, 0u);
 
         gdt_ltr_for_cpu((int)cpu);
+
+        /* Match BSP: OSFXSR/OSXSAVE + XCR0.AVX before any user/FPU work. */
+        fpu_init_cpu();
 
         thread_t *idle = thread_idle_for_cpu((int)cpu);
         if (idle && idle->kernel_stack)

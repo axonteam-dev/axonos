@@ -1,2 +1,5 @@
 iso/boot/initfs.cpio
 iso/boot/axonos.elf
+build/
+*.o
+*.deb

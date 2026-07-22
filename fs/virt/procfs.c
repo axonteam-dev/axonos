@@ -22,6 +22,7 @@
 #include <loadavg.h>
 #include <exec.h>
 #include <user_vma.h>
+#include <syscall.h>
 
 struct procfs_handle {
 	int kind; /* 1=root, 2=pid_dir, 3=pid_file, 4=symlink, 5=pid_fd_dir, 6=pid_fd_link, 7=plain, 8=proc_sys_dir, 9=proc_sys_file */
@@ -455,6 +456,25 @@ static ssize_t procfs_show_mounts(char *buf, size_t size, void *priv) {
     return (ssize_t)w;
 }
 
+/* Linux /proc/filesystems — OpenRC sysfs init greps for "sysfs" here. */
+static ssize_t procfs_show_filesystems(char *buf, size_t size, void *priv) {
+    (void)priv;
+    if (!buf || size == 0) return 0;
+    static const char text[] =
+        "nodev\tsysfs\n"
+        "nodev\tproc\n"
+        "nodev\tdevtmpfs\n"
+        "nodev\ttmpfs\n"
+        "nodev\tramfs\n"
+        "\tvfat\n"
+        "\tmsdos\n"
+        "\text2\n";
+    size_t len = sizeof(text) - 1;
+    if (len > size) len = size;
+    memcpy(buf, text, len);
+    return (ssize_t)len;
+}
+
 /* Linux-like /proc/scsi/scsi: Host, Channel, Id, Lun, Type, Vendor, Model, Rev */
 static ssize_t procfs_show_scsi(char *buf, size_t size, void *priv) {
 	(void)priv;
@@ -552,6 +572,15 @@ static ssize_t procfs_write(struct fs_file *file, const void *buf, size_t size, 
 		if (!ct || ct->euid != 0) return -1;
 		/* accept whole buffer (ignore offset semantics for simplicity) */
 		return procfs_store_hostname((const char*)buf, size, NULL);
+	}
+	/* echo 1 > /proc/net/dhcp — run DHCP when user asks (not at boot). */
+	if (h->kind == 7 && h->file_id == 60) {
+		thread_t *ct = thread_current();
+		if (!ct || ct->euid != 0) return -1;
+		(void)offset;
+		if (size == 0) return 0;
+		if (syscall_net_preinit() != 0) return -1;
+		return (ssize_t)size;
 	}
 	return -1;
 }
@@ -740,6 +769,14 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
                 *out_file = f;
                 return 0;
             }
+            if (first_len == 11 && strncmp(p, "filesystems", 11) == 0) {
+                h->kind = 7; f->type = FS_TYPE_REG;
+                f->size = 0;
+                f->driver_private = h;
+                h->file_id = 17; /* filesystems */
+                *out_file = f;
+                return 0;
+            }
 			if (first_len == 4 && strncmp(p, "stat", 4) == 0) {
 				h->kind = 7; f->type = FS_TYPE_REG;
 				f->size = 0;
@@ -853,6 +890,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
                 else if (strcmp(rest, "arp") == 0) fid = 57;
                 else if (strcmp(rest, "dev") == 0) fid = 58;
                 else if (strcmp(rest, "route") == 0) fid = 59;
+                else if (strcmp(rest, "dhcp") == 0) fid = 60;
                 if (fid >= 0) {
                     h->kind = 7;
                     h->file_id = fid;
@@ -969,7 +1007,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					}
 				}
 			} else {
-				/* other pid children: cmdline, stat, status, statm */
+				/* other pid children: cmdline, stat, status, statm, mounts */
 			if (strncmp(rest, "cmdline", 7) == 0 && rest[7] == '\0') {
 					h->kind = 3; h->pid = pid; h->file_id = 0; f->type = FS_TYPE_REG;
 				} else if (strncmp(rest, "stat", 4) == 0 && rest[4] == '\0') {
@@ -978,6 +1016,12 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					h->kind = 3; h->pid = pid; h->file_id = 2; f->type = FS_TYPE_REG;
 				} else if (strncmp(rest, "statm", 5) == 0 && rest[5] == '\0') {
 					h->kind = 3; h->pid = pid; h->file_id = 3; f->type = FS_TYPE_REG;
+				} else if (strncmp(rest, "mounts", 6) == 0 && rest[6] == '\0') {
+					/* /proc/self/mounts == /proc/mounts (Linux) */
+					h->kind = 7; h->file_id = 16; f->type = FS_TYPE_REG; f->size = 0;
+					f->driver_private = h;
+					*out_file = f;
+					return 0;
 				} else {
 					kfree(h); kfree(pp); kfree(f); return -1;
 				}
@@ -1014,7 +1058,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         size_t pos = 0;
         size_t written = 0;
         uint8_t *out = (uint8_t*)buf;
-        const char *top[] = { "meminfo", "cpuinfo", "uptime", "loadavg", "mounts", "stat", "partitions", "sys", "bus", "tty", "ttydebug", "net", "scsi" };
+        const char *top[] = { "meminfo", "cpuinfo", "uptime", "loadavg", "mounts", "filesystems", "stat", "partitions", "sys", "bus", "tty", "ttydebug", "net", "scsi" };
         for (size_t ti = 0; ti < sizeof(top)/sizeof(top[0]); ti++) {
             const char *name = top[ti];
             size_t namelen = strlen(name);
@@ -1218,7 +1262,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 
     /* /proc/net directory listing */
     if (h->kind == 14) {
-        static const char *names[] = { "tcp", "tcp6", "udp", "udp6", "raw", "raw6", "unix", "arp", "dev", "route" };
+        static const char *names[] = { "tcp", "tcp6", "udp", "udp6", "raw", "raw6", "unix", "arp", "dev", "route", "dhcp" };
         size_t pos = 0;
         size_t written = 0;
         uint8_t *out = (uint8_t *)buf;
@@ -1525,6 +1569,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 		else if (h->file_id == 14) full = procfs_show_loadavg(tmpbuf, cap, NULL);
 		else if (h->file_id == 15) full = procfs_show_kernel_stat(tmpbuf, cap, NULL);
         else if (h->file_id == 16) full = procfs_show_mounts(tmpbuf, cap, NULL);
+        else if (h->file_id == 17) full = procfs_show_filesystems(tmpbuf, cap, NULL);
 		else if (h->file_id == 40) full = procfs_show_scsi(tmpbuf, cap, NULL);
 		else if (h->file_id == 41 || h->file_id == 42) full = procfs_show_pci(tmpbuf, cap, NULL);
         else if (h->file_id == 30) full = usb_proc_bus_devices_show(tmpbuf, cap, NULL);
@@ -1539,6 +1584,11 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         else if (h->file_id == 57) full = procfs_net_snap_arp(tmpbuf, cap);
         else if (h->file_id == 58) full = procfs_net_snap_dev(tmpbuf, cap);
         else if (h->file_id == 59) full = procfs_net_snap_route(tmpbuf, cap);
+        else if (h->file_id == 60) {
+            full = (ssize_t)snprintf(tmpbuf, cap,
+                "write 1 to run DHCP (not at boot)\n"
+                "example: echo 1 > /proc/net/dhcp\n");
+        }
 		if (full < 0) { kfree(tmpbuf); return -1; }
 		size_t len = (size_t)full;
 		if ((size_t)offset >= len) { kfree(tmpbuf); return 0; }

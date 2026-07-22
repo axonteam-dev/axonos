@@ -86,6 +86,8 @@ struct fs_file *fs_open(const char *path);
 ssize_t fs_read(struct fs_file *file, void *buf, size_t size, size_t offset);
 ssize_t fs_write(struct fs_file *file, const void *buf, size_t size, size_t offset);
 void fs_file_free(struct fs_file *file);
+/* Retain user-facing path spelling on an open handle (openat). */
+int fs_file_set_user_path(struct fs_file *file, const char *user_path);
 /* Read next chunk from directory/file using and advancing file->pos */
 ssize_t fs_readdir_next(struct fs_file *file, void *buf, size_t size);
 

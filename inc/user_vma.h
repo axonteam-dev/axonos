@@ -27,10 +27,16 @@ void user_vma_remove_all_for_tid(uint64_t tid);
 void user_vma_teardown_unmap_for_exec(thread_t *runner);
 int user_vma_clone_for_tid(uint64_t from_tid, uint64_t to_tid);
 
-/* Deep-copy mapped anon mmap pages into child mm at fork (Linux MAP_PRIVATE COW semantics). */
-int user_vma_fork_privatize_mapped(mm_t *child_mm, uint64_t from_tid);
+/* Mark all writable private VMAs as parent/child COW at fork. */
+int user_vma_fork_privatize_mapped(mm_t *child_mm, mm_t *parent_mm,
+                                   uint64_t *parent_l4, uint64_t from_tid);
+/* True if VA falls in a MAP_SHARED / SysV SHM VMA for this tid (must not COW). */
+int user_vma_is_shared_page(uint64_t tid, uintptr_t va);
 
 int user_vma_add(uint64_t tid, uintptr_t addr, size_t len, int prot, int kind);
+int user_vma_add_mm(mm_t *mm, uintptr_t addr, size_t len, int prot, int kind);
+int user_vma_is_shared_page_mm(mm_t *mm, uintptr_t va);
+int user_vma_clone_mm(mm_t *dst, mm_t *src);
 void user_vma_unmap_range(uint64_t tid, uintptr_t addr, size_t len);
 int user_vma_set_prot(uint64_t tid, uintptr_t addr, size_t len, int prot);
 int user_vma_is_fully_mapped(uint64_t tid, uintptr_t addr, size_t len);

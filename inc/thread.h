@@ -5,6 +5,8 @@
 #include <fs.h>
 
 typedef struct mm_struct mm_t;
+typedef struct process process_t;
+typedef struct syscall_frame syscall_frame_t;
 
 typedef enum {
         THREAD_READY,
@@ -24,10 +26,12 @@ typedef struct thread {
         uint64_t user_stack_limit;     // high address (exclusive) of active user stack region
         uint64_t user_rip;             // user mode rip
         uint64_t user_fs_base;         // TLS base for userspace
+        uint64_t user_interp_base;     // AT_BASE (ld-linux-x86-64.so.2 load address)
         uint8_t ring;                  // user mode ring
         thread_state_t state;
         struct thread* next;
         uint64_t tid;
+        process_t *process;             /* Linux process identity/lifecycle owner */
         char name[32];                 // thread name (urmomissofaturmomissofaturmomiss)
         /* Process start tick for /proc/<pid>/stat starttime and utime approximation. */
         uint64_t start_ticks;
@@ -55,22 +59,6 @@ typedef struct thread {
         /* attached tty index or -1 */
         int attached_tty;
         
-        /* vfork parent PID: if >=0 then this thread was created by vfork and parent is blocked;
-           on execve/exit child must unblock parent. */
-        int vfork_parent_tid;
-
-        /* vfork parent stack snapshot (to restore parent's frames on child exit).
-           In our shared-address-space model, the vfork child can temporarily run on the
-           parent's userspace stack; we keep a copy of the active region starting at the
-           parent's saved RSP, and restore it right before waking the parent. */
-        uint64_t vfork_parent_saved_rsp;
-        void *vfork_parent_stack_backup;
-        uint64_t vfork_parent_stack_backup_len;
-        void *vfork_parent_mem_backup;
-        uint64_t vfork_parent_mem_backup_len;
-        uint64_t vfork_parent_mem_backup_base;
-        uint64_t vfork_parent_brk_saved;
-
         /* per-thread brk state (heap) */
         uintptr_t user_brk_base;
         uintptr_t user_brk_cur;
@@ -115,6 +103,7 @@ typedef struct thread {
 
         /* pointer to saved syscall frame (kmalloc copy; safe across thread_schedule). */
         uint64_t *saved_syscall_frame;
+        syscall_frame_t *active_syscall_frame;
         /* Private syscall stack (syscall_entry64 rsp); avoids sharing per-CPU stack. */
         uint64_t syscall_kstack_top;
         void *syscall_kstack_raw;
@@ -138,7 +127,17 @@ typedef struct thread {
         /* if non-negative, tid of thread waiting for this child (wait/waitpid) */
         int waiter_tid;
         /* fork/clone3: unblock child after parent syscall returns (avoid clobbering per-CPU syscall stack). */
-        int defer_unblock_tid;
+        struct thread *fork_child_to_publish;
+        /* Set by SYS_vfork; cleared when child exec/exits. Parent sleeps in
+         * syscall_maybe_vfork_wait() AFTER syscall_do returns (asm frame intact). */
+        int vfork_waiting;
+        /* Parent vfork retval (child pid) while waiting in SYS_vfork. */
+        uint64_t vfork_saved_ret;
+        /* Nested SYS_fork from SYS_vfork: share parent mm (Linux CLONE_VM). */
+        int fork_request_vfork;
+        /* Sticky: last wait4 returned ECHILD. Used to break BusyBox waitfor()
+         * when it then kill(own_pid,0) — which succeeds and spins forever. */
+        int wait4_last_echild;
         
         /* exit status encoded like wait(2) returns (status word) */
         int exit_status;
@@ -154,6 +153,21 @@ typedef struct thread {
         int bound_cpu;
         /* Logical CPU that owns this thread while THREAD_READY (-1 if not ready / running). */
         int sched_target_cpu;
+        /* Snapshot of exec environment for /proc/<pid>/environ (NUL-separated KEY=val). */
+        char **proc_environ;
+        /* Append-only extension fields; every object including thread.h rebuilds with this ABI. */
+        uint64_t syscall_entry_rip;   /* RCX/RIP at last SYSCALL entry (snapshot only). */
+        uint64_t fork_child_user_rip; /* Fork child iretq RIP; fork_child_return_entry. */
+        uint64_t fork_locked_syscall_rip; /* frame[13] captured at syscall entry (per-thread). */
+        uint64_t fork_child_trap_rip; /* frame[13] at fork/clone/clone3 syscall entry (immutable). */
+        uint64_t robust_list_head;    /* set_robust_list head (userspace VA). */
+        uint32_t robust_list_len;     /* set_robust_list len. */
+        uint64_t fork_libc_mt_r14;    /* glibc MT __fork: r14=rsp at d4160, snap at clone. */
+        uint64_t fork_gpr_snap[16];   /* syscall GPR frame at clone; restore for MT __fork ret. */
+        /* Successful execve: release pre-exec mm AFTER switching to new_mm but
+         * BEFORE enter_user_mode (which never returns). */
+        mm_t *exec_discard_mm;
+        mm_t *exec_discard_template;
 } thread_t;
 
 extern int init;
@@ -188,10 +202,14 @@ void thread_block_with_timeout(int pid, uint32_t timeout_ms);
    IRQ-safe and does not context-switch; timer handlers call this before returning. */
 void thread_wake_expired_timeouts(void);
 void thread_unblock(int pid);
+/* Unblock a fork/clone child and prefer it on the next schedule (after parent iretq). */
+void thread_unblock_fork_child(int pid);
 /* Send SIGINT to foreground process group (Ctrl+C → terminate blocking program) */
 void thread_send_sigint_to_pgrp(int pgrp);
 int thread_get_state(int pid);
 int thread_get_count();
+/* Reparent living children of exiting parent to init. Returns count reparented. */
+int thread_reparent_orphans(int dead_parent_tid);
 /* Remove TERMINATED zombies with no wait4 waiter (returns count reaped). */
 int thread_reap_unwaited_zombies(void);
 int thread_reap(int pid);
@@ -210,6 +228,8 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
 // access to current user thread
 thread_t* thread_get_current_user();
 void thread_set_current_user(thread_t* t);
+/* Force per-CPU scheduler current (syscall stack-owner fixup only). */
+void thread_set_current(thread_t *t);
 // find a user thread attached to given tty (or NULL)
 thread_t* thread_find_by_tty(int tty);
 // find any child of given parent tid, or NULL
@@ -221,5 +241,9 @@ int thread_fd_close(int fd);
 int thread_fd_dup(int oldfd);
 int thread_fd_dup2(int oldfd, int newfd);
 int thread_fd_isatty(int fd);
+
+void thread_proc_env_free(thread_t *t);
+void thread_proc_env_set(thread_t *t, const char *const envp[]);
+void thread_proc_env_inherit(thread_t *child, thread_t *parent);
 
 #endif // THREAD_H 

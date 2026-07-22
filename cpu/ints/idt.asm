@@ -68,21 +68,51 @@ isr%1:
 isr%1:
         ; For exceptions with CPU-pushed error code (e.g., #PF):
         ; entry stack layout: [error_code][RIP][CS][RFLAGS][RSP][SS]
-        ; Our cpu_registers_t expects:
+        ; cpu_registers_t expects:
         ;   interrupt_number, error_code, r15..rax, RIP, CS, RFLAGS, RSP, SS
         ;
-        ; To avoid shifting the layout by keeping TWO error codes on stack,
-        ; we remove the CPU error code first and re-push it in the expected place.
-        mov rax, [rsp]                  ; save CPU error code
-        add rsp, 8                      ; drop original error code (iretq frame now starts with RIP)
-        PUSH_REGS
-        push rax                        ; error_code
-        mov rax, %1
-        push rax                        ; interrupt_number
-        mov rdi, rsp                    ; rdi -> cpu_registers_t
-        call isr_dispatch
-        add rsp, 16                     ; pop interrupt_number + error_code
-        POP_REGS
+        ; CRITICAL: do not clobber user RAX with the error code before saving
+        ; GPRs. The old sequence (mov rax,[rsp] / PUSH_REGS) restored error_code
+        ; into RAX on iretq. After a COW fault at the vfork return site that
+        ; turned a fork child (rax=0) into a fake parent (rax=0x7) and deadlocked
+        ; BusyBox ash in rt_sigtimedwait with children=0.
+        xchg    rax, [rsp]              ; rax=error_code, [rsp]=saved user rax
+        push    rcx
+        push    rdx
+        push    rbx
+        push    rbp
+        push    rsi
+        push    rdi
+        push    r8
+        push    r9
+        push    r10
+        push    r11
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        ; stack: r15..rcx, user_rax, rip, cs, rflags, rsp, ss ; rax still holds error
+        push    rax                     ; error_code
+        mov     rax, %1
+        push    rax                     ; interrupt_number
+        mov     rdi, rsp                ; rdi -> cpu_registers_t
+        call    isr_dispatch
+        add     rsp, 16                 ; pop interrupt_number + error_code
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     r11
+        pop     r10
+        pop     r9
+        pop     r8
+        pop     rdi
+        pop     rsi
+        pop     rbp
+        pop     rbx
+        pop     rdx
+        pop     rcx
+        pop     rax                     ; restore original user rax
         iretq
 %endmacro
 

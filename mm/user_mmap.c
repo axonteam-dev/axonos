@@ -1,4 +1,5 @@
 #include <user_mmap.h>
+#include <mm.h>
 #include <user_vma.h>
 #include <user_as.h>
 #include <user_map.h>
@@ -35,6 +36,30 @@ enum {
 static int user_mmap_install_pages(uintptr_t addr, size_t len, uintptr_t top_limit) {
     if ((uint64_t)addr + (uint64_t)len > (uint64_t)top_limit)
         return -1;
+    uint64_t req_lo = (uint64_t)addr & ~0xFFFULL;
+    uint64_t req_hi = ((uint64_t)addr + (uint64_t)len + 0xFFFULL) & ~0xFFFULL;
+    if (req_hi > (uint64_t)top_limit)
+        req_hi = (uint64_t)top_limit;
+    if (req_lo >= req_hi)
+        return -1;
+    /*
+     * Linux MAP_PRIVATE anon: do_mmap → new zero pages. Never map_page_2m(va,va)
+     * on a private mm — that re-identities into the parent/sibling phys and
+     * causes ash GPF at RIP=="ls" after fork.
+     */
+    {
+        thread_t *t = thread_get_current_user();
+        if (!t)
+            t = thread_current();
+        mm_t *k = mm_kernel();
+        if (t && t->mm && k && t->mm->pml4 && k->pml4 &&
+            t->mm->pml4 != k->pml4) {
+            mm_t *share = t->mm_ptemplate ? t->mm_ptemplate : k;
+            if (mm_privatize_identity_range_blank(t->mm, req_lo, req_hi) != 0)
+                return -1;
+            return mm_make_private_range(t->mm, req_lo, req_hi, 0, share);
+        }
+    }
     uintptr_t map_begin = addr & ~((uintptr_t)PAGE_SIZE_2M - 1);
     uintptr_t map_end = (uintptr_t)(((uint64_t)addr + (uint64_t)len + PAGE_SIZE_2M - 1) &
                                     ~((uint64_t)PAGE_SIZE_2M - 1));
@@ -80,7 +105,8 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     if (top_limit > (uintptr_t)USER_STACK_TOP)
         top_limit = (uintptr_t)USER_STACK_TOP;
 
-    uintptr_t *p_mmap_next = tcur ? &tcur->user_mmap_next : &user_as_mmap_next;
+    uintptr_t *p_mmap_next = (tcur && tcur->mm) ? &tcur->mm->mmap_cursor :
+        (tcur ? &tcur->user_mmap_next : &user_as_mmap_next);
     uintptr_t shared_next = tcur ? user_as_shared_max_mmap_next(tcur, *p_mmap_next) : *p_mmap_next;
     if (shared_next > *p_mmap_next) *p_mmap_next = shared_next;
     if (*p_mmap_next >= top_limit) *p_mmap_next = 0;
@@ -220,7 +246,8 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     if (user_mmap_install_pages(addr, len, top_limit) != 0)
         return user_mm_ret_err(USER_MM_EFAULT);
 
-    int mmap_vma_kind = USER_VMA_KIND_MMAP;
+    int mmap_vma_kind = (flags & MAP_SHARED) ?
+        USER_VMA_KIND_SHM : USER_VMA_KIND_MMAP;
     if (flags & MAP_ANONYMOUS) {
         flags &= ~(MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED | MAP_FIXED | MAP_FIXED_NOREPLACE);
         if (flags != 0) return user_mm_ret_err(USER_MM_ENOSYS);
@@ -228,7 +255,8 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
             ((addr & ((uintptr_t)PAGE_SIZE_2M - 1)) == 0) &&
             ((len_u64 & ((uint64_t)PAGE_SIZE_2M - 1)) == 0);
         if (lazy_anon) {
-            mmap_vma_kind = USER_VMA_KIND_MMAP_LAZY;
+            if (!(flags & MAP_SHARED))
+                mmap_vma_kind = USER_VMA_KIND_MMAP_LAZY;
             user_as_mmap_lazy_drop_present_pages(addr, len);
         } else {
             user_as_mmap_memset_zero_chunked(addr, len);
@@ -360,6 +388,8 @@ uint64_t user_syscall_munmap(uint64_t a1, uint64_t a2) {
         } else {
             if (tcur->user_mmap_next > max_end) tcur->user_mmap_next = max_end;
             if (tcur->user_mmap_hi > tcur->user_mmap_next) tcur->user_mmap_hi = tcur->user_mmap_next;
+            if (tcur->mm && tcur->mm->mmap_cursor > max_end)
+                tcur->mm->mmap_cursor = max_end;
         }
     }
     return 0;

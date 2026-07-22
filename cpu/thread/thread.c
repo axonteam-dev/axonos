@@ -18,18 +18,25 @@
 #include <fs.h>
 #include <stdio.h>
 #include <syscall.h>
+#include <process.h>
 
 #ifndef AXON_FORK_DEBUG
 #define AXON_FORK_DEBUG 1
 #endif
 
-#define MAX_THREADS 128
+#define MAX_THREADS 512
 thread_t* threads[MAX_THREADS];
 int thread_count = 0;
 static thread_t *volatile current_cpu[SMP_MAX_CPUS];
 static spinlock_t sched_lock = { 0 };
 static uint32_t sched_fifo_counter;
-static thread_t* current_user = NULL; // регистрируемый юзер-процесс
+/*
+ * The active ring-3 task is CPU-local.  Keeping one global pointer lets a
+ * sibling CPU's fork/vfork child replace the caller seen by wait4(), signal
+ * delivery, and exec helpers.  In particular BusyBox init then observes
+ * ECHILD even though kill(child, 0) succeeds.
+ */
+static thread_t* current_user[SMP_MAX_CPUS] = { NULL };
 static thread_t* idle_thread_by_cpu[SMP_MAX_CPUS];
 int init = 0;
 static int init_user_tid = -1;
@@ -122,6 +129,15 @@ static void thread_note_ready_nolock(thread_t *t) {
                 return;
         if (t->state == THREAD_READY)
                 return;
+        /*
+         * Linux wait_for_vfork_done: parent stays unscheduled until
+         * complete_vfork_done(). If we READY a vfork parent early it can
+         * re-bind its syscall kstack; the child then SYSCALL's onto that
+         * stack, smashes the wait frame/TLS, and GPF's (seen at BusyBox
+         * locale setup rip=0x4b9375 with garbage RAX).
+         */
+        if (t->vfork_waiting)
+                return;
         t->sched_fifo_seq = ++sched_fifo_counter;
         t->state = THREAD_READY;
 }
@@ -129,8 +145,12 @@ static void thread_note_ready_nolock(thread_t *t) {
 /* Called from context_switch_with_prev after outgoing context is fully saved (SMP-safe).
  * Unlocks only — IF must stay 0 until asm restores next thread (avoid IRQ during switch tail). */
 void thread_schedule_prev_saved(thread_t *t) {
-        if (t && t->state == THREAD_RUNNING)
-                thread_note_ready_nolock(t);
+        if (t && t->state == THREAD_RUNNING) {
+                if (t->vfork_waiting)
+                        t->state = THREAD_BLOCKED;
+                else
+                        thread_note_ready_nolock(t);
+        }
         release(&sched_lock);
 }
 
@@ -162,6 +182,11 @@ int thread_nice_get(int tid) {
 
 void thread_mark_init_user(thread_t* t) {
         if (!t) return;
+        if (!t->process) {
+                process_t *p = process_create_init();
+                if (p)
+                        process_attach_thread(p, t);
+        }
         if (init_user_tid < 0) {
                 init_user_tid = (int)t->tid;
                 return;
@@ -212,17 +237,7 @@ static void thread_free_resources(thread_t *t) {
                 kfree(t->syscall_frame_kbuf);
                 t->syscall_frame_kbuf = NULL;
         }
-        /* free any vfork backups if still present */
-        if (t->vfork_parent_stack_backup) {
-                kfree(t->vfork_parent_stack_backup);
-                t->vfork_parent_stack_backup = NULL;
-                t->vfork_parent_stack_backup_len = 0;
-        }
-        if (t->vfork_parent_mem_backup) {
-                kfree(t->vfork_parent_mem_backup);
-                t->vfork_parent_mem_backup = NULL;
-                t->vfork_parent_mem_backup_len = 0;
-        }
+        thread_proc_env_free(t);
         kfree(t);
 }
 
@@ -253,7 +268,40 @@ int thread_reap(int pid) {
         return -1;
 }
 
-/* Drop zombies whose parent is not blocked in wait4 (httpd-style daemons). */
+/* True if a TERMINATED child may be freed without wait4 (matches thread_schedule auto-reap). */
+static int thread_zombie_autoreap_ok(thread_t *t) {
+        if (!t || t->state != THREAD_TERMINATED) return 0;
+        if (t == &main_thread || thread_is_any_idle(t)) return 0;
+        if (t->waiter_tid >= 0) return 0;
+        if (t->exit_status == (int)0x80000000) return 0;
+        if (t->parent_tid < 0) return 1;
+        thread_t *pt = thread_get(t->parent_tid);
+        if (!pt) return 1;
+        if (pt->state == THREAD_TERMINATED) return 1;
+        return 0;
+}
+
+/* Reparent living children of dead_parent to init (PID 1). Returns count moved. */
+int thread_reparent_orphans(int dead_parent_tid) {
+        int init_tid = thread_get_init_user_tid();
+        if (init_tid < 0 || dead_parent_tid < 0) return 0;
+        if (dead_parent_tid == init_tid) return 0;
+        int n = 0;
+        unsigned long irqf;
+        acquire_irqsave(&sched_lock, &irqf);
+        for (int i = 0; i < thread_count; ++i) {
+                thread_t *t = threads[i];
+                if (!t) continue;
+                if (t->parent_tid != dead_parent_tid) continue;
+                if (t->state == THREAD_TERMINATED) continue;
+                t->parent_tid = init_tid;
+                n++;
+        }
+        release_irqrestore(&sched_lock, irqf);
+        return n;
+}
+
+/* Drop zombies safe to reap without wait4 (httpd-style: parent exited, no living waiter). */
 int thread_reap_unwaited_zombies(void) {
         int n = 0;
         for (;;) {
@@ -263,9 +311,7 @@ int thread_reap_unwaited_zombies(void) {
                 for (int i = 1; i < thread_count; ++i) {
                         thread_t *t = threads[i];
                         if (!t) continue;
-                        if (t->state != THREAD_TERMINATED) continue;
-                        if (t == &main_thread || thread_is_any_idle(t)) continue;
-                        if (t->waiter_tid >= 0) continue;
+                        if (!thread_zombie_autoreap_ok(t)) continue;
                         threads[i] = NULL;
                         victim = t;
                         while (thread_count > 1 && threads[thread_count - 1] == NULL)
@@ -297,6 +343,7 @@ static void idle_task_entry(void) {
 
 void thread_init() {
         mm_init();
+        process_init();
         memset(&main_thread, 0, sizeof(main_thread));
         main_thread.sched_target_cpu = -1;
         main_thread.state = THREAD_RUNNING;
@@ -318,7 +365,6 @@ void thread_init() {
         main_thread.attached_tty = devfs_get_active();
         strncpy(main_thread.cwd, "/", sizeof(main_thread.cwd));
         main_thread.cwd[sizeof(main_thread.cwd) - 1] = '\0';
-        main_thread.vfork_parent_tid = -1;
         main_thread.rseq_ptr = NULL;
         main_thread.parent_tid = -1;
         main_thread.saved_user_rip = 0;
@@ -364,14 +410,17 @@ void thread_init() {
 
 // для старта потока
 static void thread_trampoline(void) {
-        void (*entry)(void);
-        __asm__ __volatile__("movq %%r12, %0" : "=r"(entry)); // entry = r12
+        register void (*entry)(void) __asm__("r12");
         // Log RFLAGS at thread start to ensure IF bit is set in thread context
         unsigned long long _rflags = 0;
         asm volatile("pushfq; pop %%rax" : "=a"(_rflags));
         thread_t* _self = thread_current();
         int _tid = _self ? _self->tid : -1;
-        //qemu_debug_printf("thread_trampoline: tid=%d start RFLAGS=0x%x\n", _tid, (unsigned int)_rflags);
+        if (_tid == thread_get_init_user_tid()) {
+                kprintf("thread_trampoline: PID1 entry=0x%llx rflags=0x%x\n",
+                        (unsigned long long)(uintptr_t)entry,
+                        (unsigned int)_rflags);
+        }
         entry();
         
         // Поток завершился - помечаем как завершенный
@@ -429,6 +478,16 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
                 t->syscall_kstack_raw = sc_mem;
                 t->syscall_kstack_top = (uint64_t)sc_mem + SYSCALL_KSTACK_SIZE;
         }
+        {
+                uint64_t *kbuf = (uint64_t *)kmalloc(16 * sizeof(uint64_t));
+                if (!kbuf) {
+                        kfree(t->syscall_kstack_raw);
+                        kfree((void *)((uintptr_t)t->kernel_stack - KERNEL_STACK_SIZE));
+                        kfree(t);
+                        return NULL;
+                }
+                t->syscall_frame_kbuf = kbuf;
+        }
         uint64_t* stack = (uint64_t*)t->kernel_stack;
         // Ensure 16-byte alignment for the stack pointer before ret
         uint64_t sp = ((uint64_t)&stack[-1]) & ~0xFULL;
@@ -447,14 +506,6 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->uid = t->euid = t->suid = 0;
         t->gid = t->egid = t->sgid = 0;
         t->attached_tty = -1;
-        t->vfork_parent_tid = -1;
-        t->vfork_parent_saved_rsp = 0;
-        t->vfork_parent_stack_backup = NULL;
-        t->vfork_parent_stack_backup_len = 0;
-        t->vfork_parent_mem_backup = NULL;
-        t->vfork_parent_mem_backup_len = 0;
-        t->vfork_parent_mem_backup_base = 0;
-        t->vfork_parent_brk_saved = 0;
         t->user_brk_base = 0;
         t->user_brk_cur = 0;
         t->user_mmap_next = 0;
@@ -478,10 +529,14 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->saved_user_r10 = 0;
         t->saved_user_r11 = 0;
         t->saved_user_rcx = 0;
+        t->syscall_entry_rip = 0;
+        t->fork_child_user_rip = 0;
+        t->fork_locked_syscall_rip = 0;
+        t->fork_child_trap_rip = 0;
         t->saved_syscall_frame = NULL;
-        t->syscall_frame_kbuf = NULL;
         t->sc_a1 = t->sc_a2 = t->sc_a3 = t->sc_a4 = t->sc_a5 = t->sc_a6 = 0;
-        t->defer_unblock_tid = -1;
+        t->fork_child_to_publish = NULL;
+        t->proc_environ = NULL;
         t->uaccess_begin = 0;
         t->uaccess_end = 0;
         t->uaccess_resume_rip = 0;
@@ -541,13 +596,19 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                         t->syscall_kstack_top = (uint64_t)sc_mem + SYSCALL_KSTACK_SIZE;
                 }
         }
+        {
+                uint64_t *kbuf = (uint64_t *)kmalloc(16 * sizeof(uint64_t));
+                if (kbuf)
+                        t->syscall_frame_kbuf = kbuf;
+        }
         t->bound_cpu = 0;
         t->sched_target_cpu = -1;
         //for (int i=0;i<THREAD_MAX_FD;i++) t->fds[i]=NULL;
         t->ring = 3;
         t->user_rip = user_rip;
         t->user_stack = user_rsp;
-        t->state = THREAD_RUNNING; // уже выполняется как текущее user‑задача
+        /* A registered task is not RUNNING until selected by thread_schedule(). */
+        t->state = THREAD_READY;
         t->nice = 0;
         t->sched_fifo_seq = 0;
         t->start_ticks = timer_ticks;
@@ -585,14 +646,6 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                 t->attached_tty = devfs_get_active();
         }
         if (!t->cwd[0]) { strncpy(t->cwd, "/", sizeof(t->cwd)); t->cwd[sizeof(t->cwd)-1] = '\0'; }
-        t->vfork_parent_tid = -1;
-        t->vfork_parent_saved_rsp = 0;
-        t->vfork_parent_stack_backup = NULL;
-        t->vfork_parent_stack_backup_len = 0;
-        t->vfork_parent_mem_backup = NULL;
-        t->vfork_parent_mem_backup_len = 0;
-        t->vfork_parent_mem_backup_base = 0;
-        t->vfork_parent_brk_saved = 0;
         t->user_brk_base = 0;
         t->user_brk_cur = 0;
         t->user_mmap_next = 0;
@@ -616,10 +669,14 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->saved_user_r10 = 0;
         t->saved_user_r11 = 0;
         t->saved_user_rcx = 0;
+        t->syscall_entry_rip = 0;
+        t->fork_child_user_rip = 0;
+        t->fork_locked_syscall_rip = 0;
+        t->fork_child_trap_rip = 0;
         t->saved_syscall_frame = NULL;
-        t->syscall_frame_kbuf = NULL;
         t->sc_a1 = t->sc_a2 = t->sc_a3 = t->sc_a4 = t->sc_a5 = t->sc_a6 = 0;
-        t->defer_unblock_tid = -1;
+        t->fork_child_to_publish = NULL;
+        t->proc_environ = NULL;
         t->uaccess_begin = 0;
         t->uaccess_end = 0;
         t->uaccess_resume_rip = 0;
@@ -638,7 +695,7 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                 else t->mm = mm_retain(mm_kernel());
         }
         threads[thread_count++] = t;
-        current_user = t;
+        t->sched_fifo_seq = ++sched_fifo_counter;
         return t;
 }
 
@@ -650,6 +707,14 @@ int thread_get_init_user_tid(void) {
 // then enter user mode at saved rip/rsp. This function is used as the entry point passed to thread_create().
 void user_thread_entry(void) {
 	thread_t *self = thread_current();
+	kprintf("user_thread_entry: entered self=0x%llx tid=%d init=%d\n",
+		(unsigned long long)(uintptr_t)self,
+		self ? (int)self->tid : -1,
+		thread_get_init_user_tid());
+	/* Если init_tid ещё не установлен (ранний PID1 или shebang-интерпретатор),
+	   фиксируем первым вошедшим в ring3 потоком. Это гарантирует трассировку syscalls. */
+	if (self && thread_get_init_user_tid() < 0)
+		thread_mark_init_user(self);
 	if (!self) {
 		for (;;) asm volatile("hlt");
 	}
@@ -668,9 +733,9 @@ void user_thread_entry(void) {
 		uintptr_t se = sb + (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE;
 		if (se > (uintptr_t)USER_STACK_TOP)
 			se = (uintptr_t)USER_STACK_TOP;
-		if (self->user_stack_base == 0 || self->user_stack < self->user_stack_base)
+		if (self->user_stack_base == 0)
 			self->user_stack_base = sb;
-		if (self->user_stack_limit == 0 || self->user_stack_limit < us + 0x1000u)
+		if (self->user_stack_limit == 0)
 			self->user_stack_limit = se;
 	}
 	tss_set_rsp0(self->kernel_stack);
@@ -704,6 +769,12 @@ void user_thread_entry(void) {
 			  (unsigned long long)self->user_rip,
 			  (unsigned long long)self->user_stack,
 			  (int)self->tid);
+	if (self->tid == (uint64_t)thread_get_init_user_tid()) {
+		kprintf("user_thread_entry: PID1 rip=0x%llx rsp=0x%llx fs=0x%llx\n",
+			(unsigned long long)self->user_rip,
+			(unsigned long long)self->user_stack,
+			(unsigned long long)self->user_fs_base);
+	}
 	/* Init path never calls mark_broad_user_ranges; ensure full user mappings before user mode.
 	   fork/vfork/clone3 children set user_stack_base; re-marking their private mm causes #PF. */
 	if (self->user_stack_base == 0 &&
@@ -717,13 +788,17 @@ void user_thread_entry(void) {
 
 int thread_fd_alloc(struct fs_file *file) {
     if (!file) return -1;
-    /* Prefer the registered user thread for syscall context; fall back to current kernel thread. */
-    thread_t *cur = thread_get_current_user();
-    if (!cur) cur = thread_current();
+    thread_t *cur = thread_current();
+    if (!cur || cur->ring != 3)
+        cur = thread_get_current_user();
     if (!cur) return -1;
     for (int i = 0; i < THREAD_MAX_FD; i++) {
-        if (cur->fds[i] == NULL) {
+        struct fs_file *existing = cur->process ?
+                cur->process->fds[i] : cur->fds[i];
+        if (existing == NULL) {
             cur->fds[i] = file;
+            if (cur->process)
+                    cur->process->fds[i] = file;
             /* take ownership - increase refcount */
             if (file->refcount <= 0) file->refcount = 1;
             else file->refcount++;
@@ -737,9 +812,11 @@ int thread_fd_close(int fd) {
     thread_t *cur = thread_get_current_user();
     if (!cur) cur = thread_current();
     if (!cur || fd < 0 || fd >= THREAD_MAX_FD) return -1;
-    struct fs_file *f = cur->fds[fd];
+    struct fs_file *f = cur->process ? cur->process->fds[fd] : cur->fds[fd];
     if (!f) return -1;
     cur->fds[fd] = NULL;
+    if (cur->process)
+        cur->process->fds[fd] = NULL;
     fs_file_free(f);
     return 0;
 }
@@ -748,11 +825,14 @@ int thread_fd_dup(int oldfd) {
     thread_t *cur = thread_get_current_user();
     if (!cur) cur = thread_current();
     if (!cur || oldfd < 0 || oldfd >= THREAD_MAX_FD) return -1;
-    struct fs_file *f = cur->fds[oldfd];
+    struct fs_file *f = cur->process ?
+        cur->process->fds[oldfd] : cur->fds[oldfd];
     if (!f) return -1;
     for (int i = 0; i < THREAD_MAX_FD; i++) {
-        if (cur->fds[i] == NULL) {
+        if ((cur->process ? cur->process->fds[i] : cur->fds[i]) == NULL) {
             cur->fds[i] = f;
+            if (cur->process)
+                cur->process->fds[i] = f;
             if (f->refcount <= 0) f->refcount = 1;
             else f->refcount++;
             return i;
@@ -766,7 +846,8 @@ int thread_fd_dup2(int oldfd, int newfd) {
     if (!cur) cur = thread_current();
     if (!cur || oldfd < 0 || oldfd >= THREAD_MAX_FD || newfd < 0 || newfd >= THREAD_MAX_FD) return -1;
     if (oldfd == newfd) return newfd;
-    struct fs_file *f = cur->fds[oldfd];
+    struct fs_file *f = cur->process ?
+        cur->process->fds[oldfd] : cur->fds[oldfd];
     if (!f) return -1;
     /* close newfd if open */
     if (cur->fds[newfd]) {
@@ -774,6 +855,8 @@ int thread_fd_dup2(int oldfd, int newfd) {
         cur->fds[newfd] = NULL;
     }
     cur->fds[newfd] = f;
+    if (cur->process)
+        cur->process->fds[newfd] = f;
     if (f->refcount <= 0) f->refcount = 1;
     else f->refcount++;
     return newfd;
@@ -783,7 +866,7 @@ int thread_fd_isatty(int fd) {
     thread_t *cur = thread_get_current_user();
     if (!cur) cur = thread_current();
     if (!cur || fd < 0 || fd >= THREAD_MAX_FD) return 0;
-    struct fs_file *f = cur->fds[fd];
+    struct fs_file *f = cur->process ? cur->process->fds[fd] : cur->fds[fd];
     if (!f) return 0;
     return devfs_is_tty_file(f);
 }
@@ -826,13 +909,18 @@ void thread_yield() {
 }
 
 void thread_stop(int pid) {
+        unsigned long irqf;
+        acquire_irqsave(&sched_lock, &irqf);
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->tid == pid && threads[i]->state != THREAD_TERMINATED) {
                         kprintf("thread_stop: stopping tid=%d name=%s\n", pid, threads[i]->name);
                         threads[i]->state = THREAD_TERMINATED;
+                    threads[i]->sleep_until = 0;
+                    release_irqrestore(&sched_lock, irqf);
                         return;
                 }
         }
+        release_irqrestore(&sched_lock, irqf);
         klogprintf("thread_stop: thread %d not found or already terminated\n", pid);
 }
 
@@ -840,15 +928,23 @@ void thread_block(int pid) {
         unsigned long irqf;
         acquire_irqsave(&sched_lock, &irqf);
         for (int i = 0; i < thread_count; ++i) {
-                if (threads[i] && threads[i]->tid == pid && threads[i]->state != THREAD_BLOCKED) {
+                if (!threads[i] || threads[i]->tid != (uint64_t)(unsigned)pid)
+                        continue;
+                if (threads[i]->state == THREAD_BLOCKED) {
+                        threads[i]->sleep_until = 0;
+                        release_irqrestore(&sched_lock, irqf);
+                        return; /* idempotent — vfork arms block twice */
+                }
+                if (threads[i]->state != THREAD_TERMINATED) {
                         threads[i]->state = THREAD_BLOCKED;
                         threads[i]->sleep_until = 0; /* no timeout */
                         release_irqrestore(&sched_lock, irqf);
                         return;
                 }
+                break;
         }
         release_irqrestore(&sched_lock, irqf);
-        klogprintf("<(0c)>thread_block: thread %d not found or already blocked\n", pid);
+        klogprintf("thread_block: thread %d not found or terminated\n", pid);
 }
 
 int thread_block_current_atomic(void) {
@@ -900,15 +996,11 @@ void thread_schedule() {
         unsigned long irqf;
         acquire_irqsave(&sched_lock, &irqf);
 
-        /* Auto-reap: no waiter in wait4, or already marked reaped. */
+        /* Auto-reap zombies that no living parent will wait4. */
         for (int i = 1; i < thread_count; ++i) {
                 thread_t *t = threads[i];
                 if (!t) continue;
-                if (t->state != THREAD_TERMINATED) continue;
-                if (thread_is_any_idle(t)) continue;
-                if (t->waiter_tid >= 0) continue;
-                if (t->parent_tid >= 0 && t->exit_status != (int)0x80000000)
-                        continue;
+                if (!thread_zombie_autoreap_ok(t)) continue;
                 /* Remove from table under lock; free after releasing lock. */
                 threads[i] = NULL;
                 /* shrink high-water mark when top slots are empty */
@@ -970,6 +1062,30 @@ void thread_schedule() {
                         thread_t *t = threads[i];
                         if (!t || t->state != THREAD_READY)
                                 continue;
+                        /* Frozen vfork parent must not run (see note_ready guard). */
+                        if (t->vfork_waiting)
+                                continue;
+                        /*
+                         * syscall_entry64 still has a legacy global register/RSP
+                         * snapshot used by the assembly prologue.  Two ring-3
+                         * tasks entering SYSCALL on separate CPUs overwrite that
+                         * snapshot before C can copy it to thread-local storage.
+                         * Keep userspace on BSP until that entry ABI is entirely
+                         * per-CPU; kernel/idle work may still run on APs.
+                         */
+                        if (t->ring == 3 && my_cpu != 0)
+                                continue;
+                        if ((int)(t->tid ? t->tid : 1) == thread_get_init_user_tid()) {
+                                static int pid1_see_left = 24;
+                                if (pid1_see_left-- > 0)
+                                        kprintf("sched: see PID1 pass=%d tid=%d state=%d rsp=0x%llx bound=%d cpu=%d\n",
+                                                pass,
+                                                (int)t->tid,
+                                                (int)t->state,
+                                                (unsigned long long)t->context.rsp,
+                                                t->bound_cpu,
+                                                my_cpu);
+                        }
                         if (t->bound_cpu >= 0 && t->bound_cpu != my_cpu)
                                 continue;
                         if (pass == 0 && thread_is_any_idle(t))
@@ -977,6 +1093,12 @@ void thread_schedule() {
                         if (pass == 1 && thread_is_any_idle(t) && t != my_idle)
                                 continue;
                         if (!thread_context_valid(t)) {
+                                if ((int)(t->tid ? t->tid : 1) == thread_get_init_user_tid()) {
+                                        kprintf("sched: PID1 context invalid t=0x%llx rsp=0x%llx kstack=0x%llx\n",
+                                                (unsigned long long)(uintptr_t)t,
+                                                (unsigned long long)t->context.rsp,
+                                                (unsigned long long)t->kernel_stack);
+                                }
                                 t->state = THREAD_TERMINATED;
                                 continue;
                         }
@@ -997,6 +1119,14 @@ void thread_schedule() {
 
         if (pick) {
                 thread_t *prev = cur;
+                if ((int)(pick->tid ? pick->tid : 1) == thread_get_init_user_tid()) {
+                        static int pid1_sw_left = 24;
+                        if (pid1_sw_left-- > 0)
+                                kprintf("sched: switching to PID1 from tid=%d prev_state=%d pick_rsp=0x%llx\n",
+                                        prev ? (int)prev->tid : -1,
+                                        prev ? (int)prev->state : -1,
+                                        (unsigned long long)pick->context.rsp);
+                }
                 if (!thread_context_valid(prev)) {
                         prev = &main_thread;
                         sched_set_current(&main_thread);
@@ -1004,6 +1134,8 @@ void thread_schedule() {
                 }
                 sched_set_current(pick);
                 cur = pick;
+                if (cur->bound_cpu == my_cpu && !thread_is_any_idle(cur))
+                        cur->bound_cpu = -1;
                 cur->sched_target_cpu = -1;
                 cur->state = THREAD_RUNNING;
                 if (cur->kernel_stack) {
@@ -1060,14 +1192,42 @@ void thread_schedule() {
 }
 
 void thread_unblock(int pid) {
+        unsigned long irqf;
+        acquire_irqsave(&sched_lock, &irqf);
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->tid == pid &&
                     (threads[i]->state == THREAD_BLOCKED || threads[i]->state == THREAD_SLEEPING)) {
                         threads[i]->sleep_until = 0;
-                        thread_note_ready(threads[i]);
+                        thread_note_ready_nolock(threads[i]);
+                        release_irqrestore(&sched_lock, irqf);
                         return;
                 }
         }
+        release_irqrestore(&sched_lock, irqf);
+}
+
+/* Wake a fork child only after the parent syscall frame is complete. */
+void thread_unblock_fork_child(int pid) {
+        unsigned long irqf;
+        int cpu = smp_sched_cpu_id();
+        acquire_irqsave(&sched_lock, &irqf);
+        for (int i = 0; i < thread_count; ++i) {
+                thread_t *t = threads[i];
+                if (!t || t->tid != (uint64_t)(unsigned)pid)
+                        continue;
+                /* Keep the first post-fork dispatch on the parent's CPU; another
+                   CPU can otherwise run the child before the parent has iretq'd. */
+                if (cpu >= 0 && cpu < SMP_MAX_CPUS)
+                        t->bound_cpu = cpu;
+                if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING) {
+                        t->sleep_until = 0;
+                        thread_note_ready_nolock(t);
+                }
+                if (t->state == THREAD_READY)
+                        t->sched_fifo_seq = 0;
+                break;
+        }
+        release_irqrestore(&sched_lock, irqf);
 }
 
 /* SIGINT (Ctrl+C): terminate all threads in the foreground process group. */
@@ -1150,11 +1310,99 @@ int thread_get_count() {
         return thread_count;
 }
 
-thread_t* thread_get_current_user(){ return current_user; }
-void thread_set_current_user(thread_t* t){ current_user = t; }
+thread_t* thread_get_current_user(void) {
+        int cpu = smp_sched_cpu_id();
+        if (cpu < 0 || cpu >= SMP_MAX_CPUS)
+                cpu = 0;
+        return current_user[cpu];
+}
+
+void thread_set_current_user(thread_t* t) {
+        int cpu = smp_sched_cpu_id();
+        if (cpu < 0 || cpu >= SMP_MAX_CPUS)
+                cpu = 0;
+        current_user[cpu] = t;
+}
+
+void thread_set_current(thread_t *t) {
+        if (!t) return;
+        sched_set_current(t);
+}
 thread_t* thread_find_by_tty(int tty) {
     for (int i = 0; i < thread_count; ++i) {
         if (threads[i] && threads[i]->attached_tty == tty) return threads[i];
     }
     return NULL;
+}
+
+void thread_proc_env_free(thread_t *t) {
+        if (!t || !t->proc_environ)
+                return;
+        for (int i = 0; t->proc_environ[i]; i++)
+                kfree(t->proc_environ[i]);
+        kfree(t->proc_environ);
+        t->proc_environ = NULL;
+}
+
+void thread_proc_env_set(thread_t *t, const char *const envp[]) {
+        if (!t)
+                return;
+        thread_proc_env_free(t);
+        if (!envp || !envp[0])
+                return;
+        int n = 0;
+        while (envp[n])
+                n++;
+        char **arr = (char **)kmalloc((size_t)(n + 1) * sizeof(char *));
+        if (!arr)
+                return;
+        for (int i = 0; i < n; i++) {
+                size_t l = strlen(envp[i]);
+                char *s = (char *)kmalloc(l + 1);
+                if (!s) {
+                        for (int j = 0; j < i; j++)
+                                kfree(arr[j]);
+                        kfree(arr);
+                        return;
+                }
+                memcpy(s, envp[i], l + 1);
+                arr[i] = s;
+        }
+        arr[n] = NULL;
+        t->proc_environ = arr;
+}
+
+void thread_proc_env_inherit(thread_t *child, thread_t *parent) {
+        if (!child || !parent)
+                return;
+        thread_proc_env_free(child);
+        if (!parent->proc_environ)
+                return;
+        int n = 0;
+        while (n < 512 && parent->proc_environ[n]) {
+                const char *e = parent->proc_environ[n];
+                uintptr_t eu = (uintptr_t)e;
+                if (!e || eu < 0x1000u || eu >= (uintptr_t)MMIO_IDENTITY_LIMIT)
+                        break;
+                n++;
+        }
+        if (n == 0)
+                return;
+        char **arr = (char **)kmalloc((size_t)(n + 1) * sizeof(char *));
+        if (!arr)
+                return;
+        for (int i = 0; i < n; i++) {
+                size_t l = strlen(parent->proc_environ[i]);
+                char *s = (char *)kmalloc(l + 1);
+                if (!s) {
+                        for (int j = 0; j < i; j++)
+                                kfree(arr[j]);
+                        kfree(arr);
+                        return;
+                }
+                memcpy(s, parent->proc_environ[i], l + 1);
+                arr[i] = s;
+        }
+        arr[n] = NULL;
+        child->proc_environ = arr;
 }

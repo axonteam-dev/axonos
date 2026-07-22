@@ -353,6 +353,28 @@ long_mode_start:
         or  rax, (1 << 10)           ; CR4.OSXMMEXCPT = 1 (SSE exceptions)
         mov cr4, rax
 
+        ; Enable x87+SSE (+AVX if present) in XCR0 so VEX user code does not #UD.
+        push rbx
+        mov eax, 1
+        xor ecx, ecx
+        cpuid
+        bt  ecx, 26                  ; CPUID.1.ECX.XSAVE
+        jnc .skip_xsetbv
+        mov rax, cr4
+        or  rax, (1 << 18)           ; CR4.OSXSAVE (only if XSAVE exists)
+        mov cr4, rax
+        mov r8d, ecx                 ; save feature flags
+        mov eax, 0x3                 ; XCR0: x87 | SSE
+        bt  r8d, 28                  ; CPUID.1.ECX.AVX
+        jnc .do_xsetbv
+        or  eax, 0x4                 ; XCR0.AVX (YMM)
+.do_xsetbv:
+        xor edx, edx
+        xor ecx, ecx                 ; XCR0
+        xsetbv
+.skip_xsetbv:
+        pop rbx
+
 	lea rsp, [rel stack_top]
 	and rsp, -16
 	sub rsp, 8

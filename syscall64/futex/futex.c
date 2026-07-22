@@ -34,6 +34,7 @@
 #define EINVAL  22
 #define ENOMEM  12
 #define EAGAIN  11
+#define EINTR   4
 #define ENOSYS  38
 
 /* Simple hash table of wait queues keyed by user address. */
@@ -117,6 +118,25 @@ int futex_syscall(uintptr_t uaddr, int op, int val, const void *timeout, uintptr
         /* If a waker raced and already moved us to READY, do not yield. */
         if (blocked)
             thread_yield();
+
+        if (cur->pending_signals & ~cur->saved_sig_mask) {
+            acquire(&futex_lock);
+            futex_node_t *n = futex_find_node(uaddr, 0);
+            if (n) {
+                futex_waiter_t **link = &n->waiters;
+                while (*link) {
+                    if ((*link)->tid == (int)(cur->tid ? cur->tid : 1)) {
+                        futex_waiter_t *dead = *link;
+                        *link = dead->next;
+                        kfree(dead);
+                        break;
+                    }
+                    link = &(*link)->next;
+                }
+            }
+            release(&futex_lock);
+            return -EINTR;
+        }
 
         /* when woken, return 0 */
         return 0;

@@ -23,10 +23,11 @@ STUB_SRC := boot/kzip_stub.c
 STUB_OBJ := $(BUILD_DIR)/$(STUB_SRC:.c=.c.o)
 
 CC := gcc -m64
-CFLAGS := -g -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel -Iinc
+CFLAGS := -g -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel -Iinc -MMD -MP
 
-CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -path './userland' -prune -o -path './core/nss_dns_shim' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
+CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -path './userland' -prune -o -path './core/nss_dns_shim' -prune -o -path './core/nss_files_shim' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
 COBJS := $(patsubst %.c,$(BUILD_DIR)/%.c.o,$(CSRCS))
+DEPS := $(COBJS:.o=.d)
 
 ASMSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -type f -name '*.asm' -print | sed 's|^\./||')
 ASMOBJS := $(patsubst %.asm,$(BUILD_DIR)/%.asm.o,$(ASMSRCS))
@@ -44,11 +45,13 @@ AP_TRAMP_BIN := $(BUILD_DIR)/ap_trampoline.bin
 AP_TRAMP_OBJ := $(BUILD_DIR)/ap_trampoline.bin.o
 AP_TRAMP_BIN_SYM := $(subst -,_,$(subst .,_,$(subst /,_,$(AP_TRAMP_BIN))))
 
-# Host-built glibc NSS shim; embedded into payload for /lib/libnss_dns.so.2
+# Host-built glibc NSS shims; embedded into payload.
 # Use a short path for ld -b binary so _binary_* symbols stay predictable; then
 # rename via nm-discovered names (handles absolute $< paths / different linkers).
 NSS_DNS_SHIM := $(BUILD_DIR)/nss_dns/shim
 NSS_DNS_BLOB_OBJ := $(BUILD_DIR)/nss_dns/shim_blob.o
+NSS_FILES_SHIM := $(BUILD_DIR)/nss_files/shim
+NSS_FILES_BLOB_OBJ := $(BUILD_DIR)/nss_files/shim_blob.o
 
 .PHONY: all kernel iso clean run
 
@@ -65,6 +68,8 @@ $(BUILD_DIR)/%.c.o: %.c
 	@mkdir -p $(dir $@)
 	@echo "CC		$<"
 	@$(CC) $(CFLAGS) -c -o $@ $<
+
+-include $(DEPS)
 
 # Build rule for GAS .S files (with C preprocessor)
 $(BUILD_DIR)/%.S.o: %.S
@@ -99,6 +104,22 @@ $(NSS_DNS_BLOB_OBJ): $(NSS_DNS_SHIM)
 	objcopy --redefine-sym $$START=nss_dns_so_blob_start --redefine-sym $$END=nss_dns_so_blob_end $@.tmp $@ && \
 	rm -f $@.tmp
 
+# nostdlib — must not NEEDED libc.so.6 (static busybox dlopen).
+$(NSS_FILES_SHIM): core/nss_files_shim/nss_files.c
+	@mkdir -p $(dir $@)
+	@echo "HOST CC [nss_files]	$<"
+	@gcc -shared -fPIC -O2 -nostdlib -nodefaultlibs -Wall -Wextra \
+		-Wl,-soname,libnss_files.so.2 -o $@ $<
+
+$(NSS_FILES_BLOB_OBJ): $(NSS_FILES_SHIM)
+	@echo "LD(BIN) [nss_files]	$<"
+	@ld -r -b binary -o $@.tmp $< && \
+	START=$$(nm $@.tmp | awk '$$3 ~ /^_binary_.*_start$$/ {print $$3; exit}') && \
+	END=$$(nm $@.tmp | awk '$$3 ~ /^_binary_.*_end$$/ {print $$3; exit}') && \
+	test -n "$$START" && test -n "$$END" && \
+	objcopy --redefine-sym $$START=nss_files_so_blob_start --redefine-sym $$END=nss_files_so_blob_end $@.tmp $@ && \
+	rm -f $@.tmp
+
 $(CA_TRUST_PEM): core/isrgrootx1.pem
 	@mkdir -p $(dir $@)
 	@cp $< $@
@@ -112,7 +133,7 @@ $(CA_TRUST_BLOB_OBJ): $(CA_TRUST_PEM)
 	objcopy --redefine-sym $$START=ca_trust_pem_start --redefine-sym $$END=ca_trust_pem_end $@.tmp $@ && \
 	rm -f $@.tmp
 
-$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(CA_TRUST_BLOB_OBJ) $(PAYLOAD_COBJS)
+$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(NSS_FILES_BLOB_OBJ) $(CA_TRUST_BLOB_OBJ) $(PAYLOAD_COBJS)
 	@mkdir -p $(BUILD_DIR)
 	@echo "LD		$@"
 	@ld -m elf_x86_64 -T linker.payload.ld -o $@ $^
@@ -155,6 +176,9 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg archive
 
 run: archive iso
 	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 2048M -smp 2 -serial stdio -boot d -hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0 -vga vmware
+
+test-boot:
+	@tools/headless-openrc-boot.sh
 
 # Run with bridged networking (real IP from router) - requires sudo and br0 bridge
 run-bridge: iso

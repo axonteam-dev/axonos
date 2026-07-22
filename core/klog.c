@@ -51,8 +51,11 @@ static void klog_console_write_sync_tty(const char *s, size_t n) {
 	}
 	for (size_t i = 0; i < n; i++) {
 		console_set_cursor(tty->cursor_x, tty->cursor_y);
-		/* ANSI-aware path: prevents raw tail like "[H" from ESC[H in logs. */
-		kputchar((uint8_t)s[i], tty->current_attr ? tty->current_attr : 0x07);
+		/* Literal cells only: klog timestamps start with '['.  Feeding them
+		 * through kputchar's ANSI FSM after a stale ESC leaves "[H" glued onto
+		 * boot lines (looks like a broken login clear). */
+		console_putc_tty_literal((uint8_t)s[i],
+			tty->current_attr ? tty->current_attr : 0x07);
 		console_get_cursor(&tty->cursor_x, &tty->cursor_y);
 	}
 }

@@ -263,6 +263,18 @@ void qemu_debug_printf(const char *format, ...) {
 #endif
 }
 
+void debug_serial_marker(const char *message) {
+    if (!message)
+        return;
+    while (*message) {
+        write_serial(*message);
+        outb(0xe9, (unsigned char)*message);
+        message++;
+    }
+    write_serial('\n');
+    outb(0xe9, '\n');
+}
+
 void oom_serial_notify(unsigned long long syscall_num, const char *name) {
     const char msg[] = "\r\n[OOM] syscall=";
     int i;

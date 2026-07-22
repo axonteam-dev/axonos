@@ -66,20 +66,62 @@ extern uint8_t _end[]; /* kernel end symbol from linker */
 extern const char nss_dns_so_blob_start[];
 extern const char nss_dns_so_blob_end[];
 
+/*
+ * Debian glibc ≥2.36 ships hollow libnss_{files,dns}.so.2 (NEEDED libc.so.6,
+ * no _nss_* exports). Static busybox __libc_dlopen of ANY such DSO then loads
+ * shared libc.so.6 into a static process → fatal
+ * ": error while loading shared libraries:".
+ *
+ * Policy for static early userspace (busybox mount/init):
+ *   - remove multiarch NSS stubs entirely (ENOENT → static builtins)
+ *   - do NOT install the dns shim under multiarch (it also NEEDs libc.so.6)
+ *   - keep a nostdlib libnss_files stub + dns only under /lib/ for later
+ */
+extern const char nss_files_so_blob_start[];
+extern const char nss_files_so_blob_end[];
+
+static int ramfs_write_blob(const char *path, const void *blob, size_t len)
+{
+    if (!path || !blob || len == 0U)
+        return -1;
+    (void)fs_unlink(path);
+    struct fs_file *lf = fs_create_file(path);
+    if (!lf)
+        lf = fs_open(path);
+    if (!lf)
+        return -1;
+    fs_write(lf, blob, len, 0);
+    fs_file_free(lf);
+    return 0;
+}
+
 static void ramfs_install_libnss_dns(void)
 {
-    size_t len = (size_t)(nss_dns_so_blob_end - nss_dns_so_blob_start);
-    if (len == 0U)
-        return;
+    size_t dns_len = (size_t)(nss_dns_so_blob_end - nss_dns_so_blob_start);
+    size_t files_len = (size_t)(nss_files_so_blob_end - nss_files_so_blob_start);
+    int u_files, u_dns_ma;
+
     (void)ramfs_mkdir("/lib");
+    (void)ramfs_mkdir("/lib/x86_64-linux-gnu");
+
+    u_files = fs_unlink("/lib/x86_64-linux-gnu/libnss_files.so.2");
+    u_dns_ma = fs_unlink("/lib/x86_64-linux-gnu/libnss_dns.so.2");
+    (void)fs_unlink("/lib/libnss_files.so.2");
     (void)fs_unlink("/lib/libnss_dns.so.2");
-    struct fs_file *lf = fs_create_file("/lib/libnss_dns.so.2");
-    if (!lf)
-        lf = fs_open("/lib/libnss_dns.so.2");
-    if (lf) {
-        fs_write(lf, nss_dns_so_blob_start, len, 0);
-        fs_file_free(lf);
-    }
+
+    /*
+     * Multiarch is what glibc searches first. Install ONLY the nostdlib
+     * files stub there (no NEEDED). Never put the libc-linked dns shim there.
+     */
+    if (files_len)
+        (void)ramfs_write_blob("/lib/x86_64-linux-gnu/libnss_files.so.2",
+                               nss_files_so_blob_start, files_len);
+    if (dns_len)
+        (void)ramfs_write_blob("/lib/libnss_dns.so.2",
+                               nss_dns_so_blob_start, dns_len);
+
+    kprintf("nss-fix: unlink files=%d dns_ma=%d files_stub=%zu dns_lib=%zu\n",
+            u_files, u_dns_ma, files_len, dns_len);
 }
 
 static inline uintptr_t align_up_uintptr(uintptr_t v, uintptr_t a) {
@@ -199,28 +241,85 @@ void kernel_sysfs_populate_default(void) {
 }
 
 static int boot_try_run_init(void) {
-    /* initramfs-style init selection: linuxrc, init, then classic paths */
+    /* OpenRC-first when shipped; otherwise standard Linux init paths from initfs. */
     static const char *candidates[] = {
         "/linuxrc",
-        "/init",
+        "/sbin/openrc-init",
         "/sbin/init",
+        "/bin/sh",
+        "/init",
         "/bin/init",
         NULL
     };
     for (int i = 0; candidates[i]; i++) {
         const char *p = candidates[i];
         struct stat st;
-        if (vfs_stat(p, &st) != 0) continue;
+        if (vfs_stat(p, &st) != 0) {
+            klogprintf("boot: skip init %s (not found)\n", p);
+            continue;
+        }
         /* Accept regular files and symlinks (symlinks already resolved by exec). */
         if (!((st.st_mode & S_IFREG) == S_IFREG || (st.st_mode & S_IFLNK) == S_IFLNK)) continue;
-        const char *argv0[2] = { p, NULL };
-        static const char *init_env[] = { "PS1=\\[\\033[1;31m\\]\\u\\033[0m@\\h \e[0;37m\\w\\033[0m\\$ ", NULL };
-        int rc = kernel_execve_from_path(p, argv0, init_env);
+        const char *argv0[3] = { p, NULL, NULL };
+        if (strcmp(p, "/bin/sh") == 0) {
+            argv0[1] = "-i";
+        }
+        static const char *init_env[] = {
+            "HOME=/root",
+            "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+            "SHELL=/bin/sh",
+            "TERM=linux",
+            "LC_ALL=C",
+            "LANG=C",
+            "USER=root",
+            "PS1=\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[0;37m\\w\\033[0m\\$ ",
+            NULL
+        };
+        if (strcmp(p, "/bin/sh") == 0) {
+            thread_t *t = thread_current();
+            if (t) {
+                int tty = devfs_get_active();
+                if (!t->fds[0] || !devfs_is_tty_file(t->fds[0])) {
+                    struct fs_file *console = devfs_open_direct("/dev/console");
+                    if (console) {
+                        if (t->fds[0]) fs_file_free(t->fds[0]);
+                        t->fds[0] = console;
+                    }
+                }
+                if (!t->fds[1] && t->fds[0]) { t->fds[1] = t->fds[0]; t->fds[1]->refcount++; }
+                if (!t->fds[2] && t->fds[0]) { t->fds[2] = t->fds[0]; t->fds[2]->refcount++; }
+                t->attached_tty = tty;
+                t->sid = (int)(t->tid ? t->tid : 1);
+                t->pgid = (int)(t->tid ? t->tid : 1);
+                devfs_set_tty_fg_pgrp(tty, t->pgid);
+                if (t->fds[0] && devfs_is_tty_file(t->fds[0])) {
+                    (void)devfs_set_tty_controlling_sid(t->fds[0], t->sid);
+                    (void)devfs_tty_attach_thread(t->fds[0], t);
+                }
+                klogprintf("boot: fallback shell tty=%d sid=%d pgid=%d\n",
+                    tty, t->sid, t->pgid);
+            }
+        }
+        klogprintf("boot: trying init %s\n", p);
+        {
+            thread_t *bt = thread_current();
+            if (bt)
+                exec_boot_ensure_stdio(bt);
+        }
+        int rc = kernel_execve_init_from_path(p, argv0, init_env);
         if (rc == -3) {
             /* Transient exec layout race: one bounded retry for early boot init path. */
-            rc = kernel_execve_from_path(p, argv0, init_env);
+            rc = kernel_execve_init_from_path(p, argv0, init_env);
         }
-        if (rc == 0) return 0;
+        if (rc == 0) {
+            klogprintf("boot: init %s exited, trying fallback\n", p);
+            if (strcmp(p, "/bin/sh") == 0) {
+                i--;
+                klogprintf("boot: emergency shell exited; respawning /bin/sh -i\n");
+                thread_sleep(500);
+            }
+            continue;
+        }
         klogprintf("boot: init %s returned rc=%d\n", p, rc);
 
     }
@@ -448,16 +547,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     smp_finalize_topology(multiboot_magic, multiboot_info);
 
     pci_init();
-    /* Fbcon before long PCI/disk logs: otherwise klog uses VGA 80x25 and lines wrap ~66 chars with timestamps. */
-    if (vmwgfx_kernel_init() == 0) {
-        devfs_tty_realloc_for_console();
-        boot_logo_show();
-        klogprintf("video: vmwgfx fbcon enabled early (wide console)\n");
-    } else if (cirrus_kernel_init() == 0) {
-        devfs_tty_realloc_for_console();
-        boot_logo_show();
-        klogprintf("video: cirrus fbcon enabled early\n");
-    }
     pci_dump_devices();
     intel_chipset_init();
     usb_init();
@@ -478,8 +567,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     if (e1000_init() != 0) {
         klogprintf("net: e1000 not found\n");
     } else {
-        int nrc = syscall_net_preinit();
-        klogprintf("net: preinit %s\n", (nrc == 0) ? "ok" : "failed");
+        klogprintf("e1000: ready (L2 only; configure IP later)\n");
     }
 
     
@@ -553,6 +641,17 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         klogprintf("devfs: failed to register\n");
     }
 
+    /* Fbcon before long PCI/disk logs: otherwise klog uses VGA 80x25 and lines wrap ~66 chars with timestamps. */
+    if (vmwgfx_kernel_init() == 0) {
+        devfs_tty_realloc_for_console();
+        boot_logo_show();
+        klogprintf("video: vmwgfx fbcon enabled early (wide console)\n");
+    } else if (cirrus_kernel_init() == 0) {
+        devfs_tty_realloc_for_console();
+        boot_logo_show();
+        klogprintf("video: cirrus fbcon enabled early\n");
+    }
+
     /* /etc/passwd and /etc/group so whoami/id show root. Use static buffers to avoid heap overflow. */
     (void)ramfs_mkdir("/etc");
     static const char root_passwd_line[] = "root:x:0:0:root:/root:/bin/sh\n";
@@ -595,6 +694,36 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     (void)ramfs_mkdir("/var");
     (void)ramfs_mkdir("/var/run");
     (void)ramfs_mkdir("/var/log");  /* ensure exists for wtmp (klog also creates it) */
+    (void)ramfs_mkdir("/run");
+    (void)ramfs_mkdir("/run/lock");
+    (void)ramfs_mkdir("/run/openrc");
+    (void)ramfs_mkdir("/run/openrc/daemons");
+    (void)ramfs_mkdir("/run/openrc/started");
+    (void)ramfs_mkdir("/run/openrc/stopped");
+    (void)ramfs_mkdir("/run/openrc/starting");
+    (void)ramfs_mkdir("/run/openrc/stopping");
+    (void)ramfs_mkdir("/run/openrc/inactive");
+    (void)ramfs_mkdir("/run/openrc/wasinactive");
+    (void)ramfs_mkdir("/run/openrc/failed");
+    (void)ramfs_mkdir("/run/openrc/crashed");
+    (void)ramfs_mkdir("/run/openrc/hotplugged");
+    (void)ramfs_mkdir("/run/openrc/scheduled");
+    (void)ramfs_mkdir("/run/openrc/exclusive");
+    (void)ramfs_mkdir("/run/openrc/options");
+    if (ramfs_symlink("/var/run/openrc", "/run/openrc") != 0)
+        (void)ramfs_mkdir("/var/run/openrc");
+    if (ramfs_symlink("/var/lock", "/run/lock") != 0)
+        (void)ramfs_mkdir("/var/lock");
+    {
+        struct fs_file *sf = fs_open("/run/openrc/softlevel");
+        if (!sf) sf = fs_create_file("/run/openrc/softlevel");
+        if (sf) {
+            static const char softlevel[] = "sysinit\n";
+            if (sf->size == 0)
+                fs_write(sf, softlevel, sizeof(softlevel) - 1, 0);
+            fs_file_free(sf);
+        }
+    }
     (void)ramfs_mkdir("/tmp");  /* passwd uses mkstemp in /tmp for shadow update */
     (void)ramfs_mkdir("/var/tmp");
     /* tmux and many POSIX tools expect sticky tmp dirs (01777). */
@@ -606,14 +735,21 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         if (!wf) wf = fs_open("/var/log/wtmp");
         if (wf) fs_file_free(wf);
     }
+    /* BusyBox init / login expect /var/run/utmp (ENOENT after openrc death). */
+    {
+        struct fs_file *uf = fs_create_file("/var/run/utmp");
+        if (!uf) uf = fs_open("/var/run/utmp");
+        if (uf) fs_file_free(uf);
+    }
     /* glibc getaddrinfo: без nsswitch часто тянет mdns/systemd и connect() на 127.0.0.1 -> ECONNREFUSED. */
     {
+        /* No "dns" here: libnss_dns.so NEEDs libc.so.6 and kills static busybox. */
         static const char nsswitch[] =
             "passwd: files\n"
             "group: files\n"
             "shadow: files\n"
             "gshadow: files\n"
-            "hosts: files dns\n"
+            "hosts: files\n"
             "networks: files\n"
             "protocols: files\n"
             "services: files\n"
@@ -736,8 +872,20 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         }
     }
 
+    /* OpenRC init scripts use #!/sbin/openrc-run; some initfs builds only ship
+     * /usr/sbin/openrc-run. */
+    {
+        struct stat st;
+        if (vfs_stat("/sbin/openrc-run", &st) != 0 && vfs_stat("/usr/sbin/openrc-run", &st) == 0) {
+            (void)ramfs_mkdir("/sbin");
+            if (ramfs_symlink("/sbin/openrc-run", "/usr/sbin/openrc-run") != 0) {
+                klogprintf("boot: warning: failed to link /sbin/openrc-run\n");
+            }
+        }
+    }
+
     /* Compatibility: many distros' adduser scripts call /sbin/addgroup explicitly,
-       while initfs may only provide /usr/sbin/addgroup. Create a tiny wrapper if needed. */
+     * while initfs may only provide /usr/sbin/addgroup. Create a tiny wrapper if needed. */
     {
         struct stat st;
         if (vfs_stat("/sbin/addgroup", &st) != 0 && vfs_stat("/usr/sbin/addgroup", &st) == 0) {
@@ -756,9 +904,28 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     ps2_keyboard_init();
     ps2_mouse_init();
     boot_logo_dismiss();
+
+    /* OpenRC rc_sys() reads /proc before init.sh mounts it; provide proc early.
+     * Same for sysfs: openrc's sysfs service greps /proc/filesystems and mounts
+     * /sys — pre-mount so mountinfo sees it and remount is a no-op. */
+    {
+        (void)procfs_register();
+        (void)ramfs_mkdir("/proc");
+        if (procfs_mount("/proc") != 0)
+            klogprintf("boot: warning: failed to mount /proc\n");
+    }
+    {
+        (void)sysfs_register();
+        (void)ramfs_mkdir("/sys");
+        if (sysfs_mount("/sys") == 0)
+            kernel_sysfs_populate_default();
+        else
+            klogprintf("boot: warning: failed to mount /sys\n");
+    }
+
     // Prefer linuxrc/init if present; fallback to kernel shell.
     if (boot_try_run_init() != 0) {
-        klogprintf("fatal: There's nothing to run. Download the correct initfs from https://apm.axont.ru/Packages/initfs.cpio and place it in the root of the boot device.");
+        klogprintf("fatal: There is nothing to run. Download the correct initfs from https://apm.axont.ru/Packages/initfs.cpio and place it in the root of the boot device.");
     }
     
     for(;;) {

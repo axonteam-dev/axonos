@@ -915,9 +915,13 @@ int ramfs_rename(const char *oldpath, const char *newpath) {
 int ramfs_remove(const char *path) {
     if (!path) return -1;
     if (strcmp(path, "/") == 0) return -2;
-    /* only root can remove files from ramfs by default */
+    /*
+     * Root-only for userspace. Boot/kernel context has no current thread —
+     * treat that as privileged (otherwise fs_unlink of initfs NSS stubs
+     * silently fails and static glibc still dlopens the hollow Debian .so).
+     */
     thread_t* ct = thread_current();
-    if (!ct || ct->euid != 0) return -1;
+    if (ct && ct->euid != 0) return -1;
     struct ramfs_node *n = ramfs_lookup(path);
     if (!n) return -3;
     struct ramfs_node *p = n->parent;
@@ -962,7 +966,9 @@ int ramfs_register(void) {
     ramfs_ops.unlink = ramfs_remove;
     ramfs_ops.release = ramfs_release;
 
-    return fs_register_driver(&ramfs_driver);
+    return fs_register_driver(&ramfs_driver) == 0
+        ? fs_mount("/", &ramfs_driver)
+        : -1;
 }
 
 int ramfs_unregister(void) {

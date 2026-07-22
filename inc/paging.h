@@ -19,6 +19,7 @@
 #define PG_PS_2M                 (1ULL << 7)   // set in PD entry for 2MiB page
 #define PG_GLOBAL                (1ULL << 8)
 #define PG_SOFT_RESERVED         (1ULL << 9)   // software-only marker for non-present reserved PTEs
+#define PG_SOFT_COW              (1ULL << 10)  // present user PTE write-protected for fork COW
 #define PG_NX                    (1ULL << 63)  // if EFER.NXE is enabled
 
 // Initialize paging helpers (assumes bootstrap tables are already active)
@@ -37,5 +38,7 @@ void invlpg(void* va);
 /* Raw CR3 access helpers for scheduler/mm switching. */
 uint64_t paging_read_cr3(void);
 void paging_write_cr3(uint64_t v);
+/* Force a local TLB flush (reload current CR3). */
+void paging_flush_tlb(void);
 
 

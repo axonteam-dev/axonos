@@ -10,6 +10,7 @@ typedef struct thread thread_t;
 #endif
 
 void qemu_debug_printf(const char *format, ...);
+void debug_serial_marker(const char *message);
 /* User-visible trace: writes to cur->fds[1] (stdout) and qemu_debug_printf. */
 void axon_user_dbg(thread_t *cur, const char *tag, int step, const char *msg,
     unsigned long long a, unsigned long long b, unsigned long long c);

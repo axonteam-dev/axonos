@@ -13,8 +13,12 @@
 #include <devfs.h>
 #include <fat32.h>
 
-#define MAX_FS_DRIVERS 8
-#define MAX_FS_MOUNTS 8
+#ifndef EIO
+#define EIO 5
+#endif
+
+#define MAX_FS_DRIVERS 16
+#define MAX_FS_MOUNTS 16
 
 static struct fs_driver *g_drivers[MAX_FS_DRIVERS];
 static int g_drivers_count = 0;
@@ -222,6 +226,10 @@ int fs_get_matching_mount_prefix(const char *path, char *out, size_t outlen) {
 
 int fs_register_driver(struct fs_driver *drv) {
     if (!drv || !drv->ops) return -1;
+    for (int i = 0; i < g_drivers_count; i++) {
+        if (g_drivers[i] == drv)
+            return 0; /* already registered */
+    }
     if (g_drivers_count >= MAX_FS_DRIVERS) return -1;
     g_drivers[g_drivers_count++] = drv;
     return 0;
@@ -240,9 +248,18 @@ int fs_unregister_driver(struct fs_driver *drv) {
 
 int fs_mount(const char *path, struct fs_driver *drv) {
     if (!path || !drv) return -1;
-    if (g_mount_count >= MAX_FS_MOUNTS) return -1;
     size_t len = strlen(path);
     if (len == 0 || len >= sizeof(g_mounts[0].path)) return -1;
+    /* Linux: remounting the same fstype on the same path is a no-op success for
+     * our virtual mounts; a different driver on a busy mountpoint is EBUSY. */
+    for (int i = 0; i < g_mount_count; i++) {
+        if (g_mounts[i].path_len == len && strcmp(g_mounts[i].path, path) == 0) {
+            if (g_mounts[i].driver == drv)
+                return 0;
+            return -1; /* busy: something else already mounted here */
+        }
+    }
+    if (g_mount_count >= MAX_FS_MOUNTS) return -1;
     /* Make mountpoint visible in ramfs directory listings. */
     fs_ensure_ramfs_mountpoint_dir(path);
     strcpy(g_mounts[g_mount_count].path, path);
@@ -551,22 +568,18 @@ struct fs_file *fs_open(const char *path) {
     /* Fast path: most paths have no symlinks. Try direct open first. */
     struct fs_file *f = fs_open_no_resolve(path);
     if (f) {
-        struct stat st;
-        int sr = vfs_fstat(f, &st);
-        /* Be conservative: if stat fails (driver didn't fill), do NOT attempt full symlink
-           resolution — it can hang if namespace structures are temporarily inconsistent.
-           Returning the handle is still useful for callers that just need "exists". */
-        if (sr != 0) {
-            return f;
-        }
         /* Git's .git/ paths should never need symlink resolution; avoid heavy resolve path. */
         if (strstr(path, "/.git/") != NULL) {
             return f;
         }
-        if ((st.st_mode & S_IFLNK) != S_IFLNK) {
+        struct stat st;
+        int sr = vfs_fstat(f, &st);
+        if (sr == 0 && (st.st_mode & S_IFLNK) != S_IFLNK) {
             return f;  /* regular file or dir, no resolution needed */
         }
-        fs_file_free(f);  /* symlink or error, need full resolve */
+        /* Symlink, or stat failed (driver didn't fill st_mode): resolve before returning.
+           ld.so open()+read() on an unresolved symlink reads the link text, not the ELF. */
+        fs_file_free(f);
     }
 
     /* Git's .git/ paths should never need symlink resolution; if not found directly,
@@ -613,7 +626,7 @@ struct fs_file *fs_open(const char *path) {
 }
 
 ssize_t fs_read(struct fs_file *file, void *buf, size_t size, size_t offset) {
-    if (!file || !file->path) return -1;
+    if (!file || !file->path) return -EIO;
     /* debug logging removed */
     for (int i = 0; i < g_drivers_count; i++) {
         struct fs_driver *drv = g_drivers[i];
@@ -621,10 +634,12 @@ ssize_t fs_read(struct fs_file *file, void *buf, size_t size, size_t offset) {
         /* debug logging removed */
         if (!fs_file_matches_driver(drv, file)) continue;
         /* debug logging removed */
-        if (!drv->ops->read) return -1;
-        return drv->ops->read(file, buf, size, offset);
+        if (!drv->ops->read) return -EIO;
+        ssize_t rr = drv->ops->read(file, buf, size, offset);
+        if (rr < 0 && rr == -1) return -EIO;
+        return rr;
     }
-    return -1;
+    return -EIO;
 }
 
 ssize_t fs_write(struct fs_file *file, const void *buf, size_t size, size_t offset) {
@@ -642,7 +657,16 @@ void fs_file_free(struct fs_file *file) {
     if (!file) return;
     /* reference-counted: decrement and only free when zero */
     if (file->refcount > 1) { file->refcount--; return; }
-    /* file->refcount <= 1 -> release resources */
+    if (file->refcount < 1) {
+        /* Already released or never counted — refuse UAF double free. */
+        static int warn_left = 8;
+        if (warn_left-- > 0)
+            kprintf("fs_file_free: refcount=%d path=%s (skip)\n",
+                file->refcount, file->path ? file->path : "(null)");
+        return;
+    }
+    file->refcount = 0;
+    /* file->refcount was 1 -> release resources */
     if (file->type == FS_TYPE_PIPE) {
         pipe_release_end(file);
     }
@@ -661,6 +685,24 @@ void fs_file_free(struct fs_file *file) {
     /* If no driver handled it, free memory */
     kfree((void*)file->path);
     kfree(file);
+}
+
+/*
+ * openat may retain the user-facing path spelling separately from the
+ * canonical path fs_open() stored on the handle.
+ */
+int fs_file_set_user_path(struct fs_file *file, const char *user_path) {
+    if (!file || !user_path || !user_path[0])
+        return -1;
+    size_t plen = strlen(user_path) + 1;
+    char *pp = (char *)kmalloc(plen);
+    if (!pp)
+        return -1;
+    memcpy(pp, user_path, plen);
+    if (file->path)
+        kfree((void *)file->path);
+    file->path = pp;
+    return 0;
 }
 
 int fs_chmod(const char *path, mode_t mode) {
@@ -796,10 +838,14 @@ fix_mode:
             st->st_mode = (st->st_mode & 07777u) | want_type;
         }
     }
+    if (st->st_dev == 0)
+        st->st_dev = (dev_t)1;
     return 0;
 done:
     st->st_size = (off_t)file->size;
     st->st_nlink = 1;
+    if (st->st_dev == 0)
+        st->st_dev = (dev_t)1;
     return 0;
 }
 

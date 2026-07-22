@@ -1,4 +1,5 @@
 #include <user_brk.h>
+#include <mm.h>
 #include <user_as.h>
 #include <user_map.h>
 #include <user_mm.h>
@@ -11,6 +12,7 @@
 #include <thread.h>
 #include <axonos.h>
 #include <klog.h>
+#include <syscall.h>
 
 extern void kprintf(const char *fmt, ...);
 
@@ -18,6 +20,22 @@ static int user_brk_watch(thread_t *t) {
     if (!t || !t->name[0]) return 0;
     return (strstr(t->name, "wget") || strstr(t->name, "busybox") || strstr(t->name, "uget") ||
             strstr(t->name, "adduser") || strstr(t->name, "addgroup")) ? 1 : 0;
+}
+
+/* Linux do_brk_flags: grow brk with anon zero pages (copy_old=0). Never
+ * map_page_2m(va,va) on a private mm — that shares identity with the parent. */
+static int user_brk_ensure_range(thread_t *tcur, uintptr_t lo, uintptr_t hi) {
+    if (hi <= lo)
+        return 0;
+    mm_t *k = mm_kernel();
+    if (tcur && tcur->mm && k && tcur->mm->pml4 && k->pml4 &&
+        tcur->mm->pml4 != k->pml4) {
+        mm_t *share = tcur->mm_ptemplate ? tcur->mm_ptemplate : k;
+        if (mm_privatize_identity_range_blank(tcur->mm, (uint64_t)lo, (uint64_t)hi) != 0)
+            return -1;
+        return mm_make_private_range(tcur->mm, (uint64_t)lo, (uint64_t)hi, 0, share);
+    }
+    return user_map_ensure_present_us_2m((uint64_t)lo, (uint64_t)hi);
 }
 
 void syscall_set_user_brk(uintptr_t base) {
@@ -32,8 +50,10 @@ int fault_try_grow_user_heap(uint64_t cr2) {
         tcur = thread_get_current_user();
         if (!tcur) return 0;
     }
-    uintptr_t brk_base = tcur->user_brk_base;
-    uintptr_t brk_cur = tcur->user_brk_cur;
+    uintptr_t brk_base = tcur->mm && tcur->mm->brk_base ?
+        tcur->mm->brk_base : tcur->user_brk_base;
+    uintptr_t brk_cur = tcur->mm && tcur->mm->brk_current ?
+        tcur->mm->brk_current : tcur->user_brk_cur;
     if (brk_base == 0) brk_base = brk_cur = 8u * 1024u * 1024u;
     uintptr_t top_limit = user_as_mmap_brk_top_limit(tcur);
     {
@@ -55,14 +75,23 @@ int fault_try_grow_user_heap(uint64_t cr2) {
     if (page_va + PAGE_SIZE_2M < page_va) return 0;
     if (page_va < brk_base || page_va + PAGE_SIZE_2M > top_limit) return 0;
     if (page_va + PAGE_SIZE_2M <= brk_cur) return 0;
-    if (map_page_2m(page_va, page_va, PG_PRESENT | PG_RW | PG_US) != 0) return 0;
+    if (user_brk_ensure_range(tcur, page_va, page_va + PAGE_SIZE_2M) != 0) return 0;
     uintptr_t old_brk = brk_cur;
     uintptr_t new_brk = page_va + PAGE_SIZE_2M;
     if (old_brk < page_va) old_brk = page_va;
     if (new_brk > brk_cur)
         tcur->user_brk_cur = new_brk;
+    if (tcur->mm) {
+        tcur->mm->brk_base = brk_base;
+        tcur->mm->brk_current = tcur->user_brk_cur;
+    }
     user_as_shared_publish_brk(tcur, tcur->user_brk_base, tcur->user_brk_cur);
-    if (new_brk > old_brk && !user_as_mmap_overlaps_kernel_heap(old_brk, (uintptr_t)(new_brk - old_brk)))
+    /* Private path already zero-fills; only memset identity-mapped growth. */
+    mm_t *k = mm_kernel();
+    int priv = tcur->mm && k && tcur->mm->pml4 && k->pml4 &&
+        tcur->mm->pml4 != k->pml4;
+    if (!priv && new_brk > old_brk &&
+        !user_as_mmap_overlaps_kernel_heap(old_brk, (uintptr_t)(new_brk - old_brk)))
         user_as_mmap_memset_zero_chunked(old_brk, (size_t)(new_brk - old_brk));
     if (user_brk_watch(tcur)) {
         kprintf("heap-grow: pid=%s cr2=0x%llx page=0x%llx old_brk=0x%llx new_brk=0x%llx\n",
@@ -75,8 +104,10 @@ int fault_try_grow_user_heap(uint64_t cr2) {
 uint64_t user_syscall_brk(uint64_t req) {
     thread_t *tcur = thread_get_current_user();
     if (!tcur) tcur = thread_current();
-    uintptr_t *p_base = tcur ? &tcur->user_brk_base : &user_as_brk_base;
-    uintptr_t *p_cur = tcur ? &tcur->user_brk_cur : &user_as_brk_cur;
+    uintptr_t *p_base = (tcur && tcur->mm) ? &tcur->mm->brk_base :
+        (tcur ? &tcur->user_brk_base : &user_as_brk_base);
+    uintptr_t *p_cur = (tcur && tcur->mm) ? &tcur->mm->brk_current :
+        (tcur ? &tcur->user_brk_cur : &user_as_brk_cur);
     if (tcur) {
         uintptr_t shared_base = user_as_shared_pick_brk_base(tcur, *p_base);
         uintptr_t shared_cur = user_as_shared_max_brk_cur(tcur, *p_cur);
@@ -113,7 +144,9 @@ uint64_t user_syscall_brk(uint64_t req) {
             top_limit = mmap_lo;
     }
     {
-        uintptr_t rsp = (uintptr_t)syscall_user_rsp_saved;
+        uintptr_t rsp = tcur && tcur->active_syscall_frame ?
+            (uintptr_t)tcur->active_syscall_frame->rsp :
+            (uintptr_t)syscall_user_rsp_saved;
         if (rsp >= 0x200000u && rsp < top_limit) {
             uintptr_t rsp_cap = (rsp > 0x40000u) ? (rsp - 0x40000u) : 0x200000u;
             if (rsp_cap < top_limit)
@@ -126,7 +159,7 @@ uint64_t user_syscall_brk(uint64_t req) {
                 (uintptr_t)(req - *p_cur), NULL)) {
             return (uint64_t)(*p_cur);
         }
-        if (user_map_ensure_present_us_2m((uint64_t)(*p_cur), (uint64_t)req) != 0)
+        if (user_brk_ensure_range(tcur, (uintptr_t)(*p_cur), (uintptr_t)req) != 0)
             return (uint64_t)(*p_cur);
         if (tcur && user_as_mmap_overlaps_user_stack(tcur, (uintptr_t)(*p_cur),
                 (uintptr_t)(req - *p_cur), NULL))
@@ -139,9 +172,20 @@ uint64_t user_syscall_brk(uint64_t req) {
                 (unsigned long long)(*p_cur), (unsigned long long)req);
             return (uint64_t)(*p_cur);
         }
-        user_as_mmap_memset_zero_chunked((uintptr_t)(*p_cur), (size_t)(req - *p_cur));
+        {
+            mm_t *k = mm_kernel();
+            int priv = tcur && tcur->mm && k && tcur->mm->pml4 && k->pml4 &&
+                tcur->mm->pml4 != k->pml4;
+            if (!priv)
+                user_as_mmap_memset_zero_chunked((uintptr_t)(*p_cur),
+                    (size_t)(req - *p_cur));
+        }
     }
     *p_cur = (uintptr_t)req;
+    if (tcur) {
+        tcur->user_brk_base = *p_base;
+        tcur->user_brk_cur = *p_cur;
+    }
     user_as_shared_publish_brk(tcur, *p_base, *p_cur);
     return (uint64_t)(*p_cur);
 }

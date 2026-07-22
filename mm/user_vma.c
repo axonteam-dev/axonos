@@ -9,9 +9,86 @@
 #include <spinlock.h>
 #include <string.h>
 #include <thread.h>
+#include <heap.h>
 
 static user_vma_t g_user_vmas[USER_VMA_MAX];
 static spinlock_t g_user_vma_lock;
+
+static user_vma_t *user_vma_mm_storage(mm_t *mm, int create) {
+    if (!mm)
+        return NULL;
+    if (!mm->vma_storage && create) {
+        /* Allocate under live CR3 — g_kernel_mm L3 may be a stale boot snapshot. */
+        user_vma_t *storage =
+            (user_vma_t *)kmalloc(sizeof(user_vma_t) * USER_VMA_MAX);
+        if (storage)
+            memset(storage, 0, sizeof(user_vma_t) * USER_VMA_MAX);
+        mm->vma_storage = storage;
+    }
+    return (user_vma_t *)mm->vma_storage;
+}
+
+int user_vma_add_mm(mm_t *mm, uintptr_t addr, size_t len, int prot, int kind) {
+    user_vma_t *vmas = user_vma_mm_storage(mm, 1);
+    if (!vmas)
+        return -1;
+    unsigned long fl;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    for (int i = 0; i < USER_VMA_MAX; ++i) {
+        if (vmas[i].used && vmas[i].addr == addr && vmas[i].len == len &&
+            vmas[i].kind == kind) {
+            vmas[i].prot = prot;
+            release_irqrestore(&g_user_vma_lock, fl);
+            return 0;
+        }
+    }
+    for (int i = 0; i < USER_VMA_MAX; ++i) {
+        if (!vmas[i].used) {
+            vmas[i].used = 1;
+            vmas[i].addr = addr;
+            vmas[i].len = len;
+            vmas[i].prot = prot;
+            vmas[i].kind = kind;
+            release_irqrestore(&g_user_vma_lock, fl);
+            return 0;
+        }
+    }
+    release_irqrestore(&g_user_vma_lock, fl);
+    return -1;
+}
+
+int user_vma_is_shared_page_mm(mm_t *mm, uintptr_t va) {
+    user_vma_t *vmas = user_vma_mm_storage(mm, 0);
+    if (!vmas)
+        return 0;
+    unsigned long fl;
+    int shared = 0;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    for (int i = 0; i < USER_VMA_MAX; ++i) {
+        if (!vmas[i].used || vmas[i].kind != USER_VMA_KIND_SHM)
+            continue;
+        if (va >= vmas[i].addr && va < vmas[i].addr + vmas[i].len) {
+            shared = 1;
+            break;
+        }
+    }
+    release_irqrestore(&g_user_vma_lock, fl);
+    return shared;
+}
+
+int user_vma_clone_mm(mm_t *dst, mm_t *src) {
+    user_vma_t *source = user_vma_mm_storage(src, 0);
+    if (!source)
+        return 0;
+    user_vma_t *target = user_vma_mm_storage(dst, 1);
+    if (!target)
+        return -1;
+    unsigned long fl;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    memcpy(target, source, sizeof(user_vma_t) * USER_VMA_MAX);
+    release_irqrestore(&g_user_vma_lock, fl);
+    return 0;
+}
 
 static int user_vma_kind_is_mmap_like(int kind) {
     return kind == USER_VMA_KIND_MMAP ||
@@ -87,6 +164,9 @@ int user_vma_add(uint64_t tid, uintptr_t addr, size_t len, int prot, int kind) {
     acquire_irqsave(&g_user_vma_lock, &fl);
     rc = user_vma_add_nolock(tid, addr, len, prot, kind);
     release_irqrestore(&g_user_vma_lock, fl);
+    thread_t *owner = thread_get((int)tid);
+    if (owner && owner->mm)
+        (void)user_vma_add_mm(owner->mm, addr, len, prot, kind);
     return rc;
 }
 
@@ -299,33 +379,66 @@ void user_vma_teardown_unmap_for_exec(thread_t *runner) {
         uintptr_t a = g_user_vmas[i].addr;
         uintptr_t e = a + g_user_vmas[i].len;
         if (e > a && a >= 0x200000u && e <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
-            (void)user_map_ensure_present_us_2m((uint64_t)a, (uint64_t)e);
-            user_as_mmap_memset_zero_chunked(a, (size_t)(e - a));
+            mm_t *k = mm_kernel();
+            int priv = runner && runner->mm && k && runner->mm->pml4 && k->pml4 &&
+                       runner->mm->pml4 != k->pml4;
+            if (priv) {
+                /* Do not map_page_2m: that collapses private ELF pages to identity. */
+                (void)mm_make_private_range(runner->mm, (uint64_t)a, (uint64_t)e, 0, k);
+            } else {
+                (void)user_map_ensure_present_us_2m((uint64_t)a, (uint64_t)e);
+                user_as_mmap_memset_zero_chunked(a, (size_t)(e - a));
+            }
         }
         g_user_vmas[i].used = 0;
     }
     release_irqrestore(&g_user_vma_lock, fl);
 }
 
-int user_vma_fork_privatize_mapped(mm_t *child_mm, uint64_t from_tid) {
-    if (!child_mm) return -1;
-    /* Linux COW: only materialize modest anon mmap regions at fork. Copying multi-MiB
-       test mappings (axon-harness mmap-large) exhausts kernel heap and breaks fork. */
-    enum { FORK_VMA_PRIV_PER_MAX = 256u * 1024u };
+int user_vma_is_shared_page(uint64_t tid, uintptr_t va) {
+    unsigned long fl = 0;
+    int shared = 0;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (!g_user_vmas[i].used || g_user_vmas[i].tid != tid) continue;
+        if (g_user_vmas[i].kind != USER_VMA_KIND_SHM) continue;
+        uintptr_t a = g_user_vmas[i].addr;
+        uintptr_t e = a + g_user_vmas[i].len;
+        if (va >= a && va < e) {
+            shared = 1;
+            break;
+        }
+    }
+    release_irqrestore(&g_user_vma_lock, fl);
+    return shared;
+}
+
+int user_vma_fork_privatize_mapped(mm_t *child_mm, mm_t *parent_mm,
+                                   uint64_t *parent_l4, uint64_t from_tid) {
+    if (!child_mm || !parent_mm || !parent_l4) return -1;
     unsigned long fl = 0;
     int rc = 0;
     acquire_irqsave(&g_user_vma_lock, &fl);
     for (int i = 0; i < USER_VMA_MAX; i++) {
         if (!g_user_vmas[i].used || g_user_vmas[i].tid != from_tid) continue;
-        if (g_user_vmas[i].kind == USER_VMA_KIND_MMAP_LAZY) continue;
-        if (g_user_vmas[i].len > FORK_VMA_PRIV_PER_MAX) continue;
+        if (g_user_vmas[i].kind == USER_VMA_KIND_SHM ||
+            g_user_vmas[i].kind == USER_VMA_KIND_MMAP_LAZY)
+            continue;
+        if ((g_user_vmas[i].prot & 2) == 0)
+            continue;
         uintptr_t a = g_user_vmas[i].addr;
         uintptr_t e = a + g_user_vmas[i].len;
         if (e <= a || e > (uintptr_t)MMIO_IDENTITY_LIMIT) {
             rc = -1;
             break;
         }
-        if (mm_cow_private_writable(child_mm, (uint64_t)a, (uint64_t)e) != 0) {
+        /*
+         * Linux fork applies COW to every writable private mapping regardless
+         * of size. This includes ELF .data/.bss and 2 MiB-backed mappings;
+         * skipping either leaves libc globals writable in both processes.
+         */
+        if (mm_cow_mark_user_readonly_pair_l4(child_mm, parent_mm, parent_l4,
+                                              (uint64_t)a, (uint64_t)e) != 0) {
             rc = -1;
             break;
         }
@@ -405,6 +518,23 @@ int user_vma_fault_lazy_anon(uint64_t cr2) {
         }
     }
     release_irqrestore(&g_user_vma_lock, fl);
+    /*
+     * Linux do_anonymous_page: private mm gets anon zero pages — never
+     * map_page_2m(va,va)+VA memset (that zeros the vfork parent's brk phys).
+     */
+    {
+        mm_t *k = mm_kernel();
+        if (t->mm && k && t->mm->pml4 && k->pml4 && t->mm->pml4 != k->pml4) {
+            mm_t *share = t->mm_ptemplate ? t->mm_ptemplate : k;
+            uint64_t lo = (uint64_t)va2m;
+            uint64_t hi = lo + (uint64_t)zlen;
+            if (mm_privatize_identity_range_blank(t->mm, lo, hi) != 0)
+                return 0;
+            if (mm_make_private_range_noyield(t->mm, lo, hi, 0, share) != 0)
+                return 0;
+            return 1;
+        }
+    }
     if (map_page_2m((uint64_t)va2m, (uint64_t)va2m, PG_PRESENT | PG_RW | PG_US) != 0)
         return 0;
     memset((void *)(uintptr_t)va2m, 0, zlen);
@@ -446,6 +576,29 @@ int user_vma_fault_nonpresent(uint64_t cr2, uint64_t err) {
     if (is_write && !(hit_copy.prot & 2)) return 0;
     if (is_exec && !(hit_copy.prot & 4) && hit_copy.kind != USER_VMA_KIND_ELF_LOAD) return 0;
 
+    {
+        mm_t *k = mm_kernel();
+        if (t->mm && k && t->mm->pml4 && k->pml4 && t->mm->pml4 != k->pml4) {
+            mm_t *share = t->mm_ptemplate ? t->mm_ptemplate : k;
+            uint64_t lo = (uint64_t)(cr2 & ~0xFFFULL);
+            uint64_t hi = lo + 0x1000ULL;
+            if (hit_copy.kind == USER_VMA_KIND_MMAP_LAZY) {
+                lo = (uint64_t)va2m;
+                uint64_t hit_end = (uint64_t)hit_copy.addr + (uint64_t)hit_copy.len;
+                uint64_t chunk_end = lo + (uint64_t)PAGE_SIZE_2M;
+                if (chunk_end > hit_end)
+                    chunk_end = hit_end;
+                if (chunk_end <= lo)
+                    return 1;
+                hi = chunk_end;
+            }
+            if (mm_privatize_identity_range_blank(t->mm, lo, hi) != 0)
+                return 0;
+            if (mm_make_private_range_noyield(t->mm, lo, hi, 0, share) != 0)
+                return 0;
+            return 1;
+        }
+    }
     if (err & 1u) {
         if (user_map_mark_identity_2m((uint64_t)va2m, (uint64_t)(va2m + PAGE_SIZE_2M)) != 0)
             return 0;

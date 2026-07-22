@@ -319,6 +319,18 @@ static uint8_t devfs_tty_acs_translate(uint8_t ch, int acs_on) {
     return ch;
 }
 
+static void devfs_tty_emit_byte(struct devfs_tty *tty, int tty_on_vga, uint8_t ch);
+
+void devfs_tty_console_write(const char *s, size_t n) {
+    if (!s || n == 0)
+        return;
+    struct devfs_tty *tty = devfs_get_tty_by_index(devfs_get_active());
+    if (!tty)
+        return;
+    for (size_t i = 0; i < n; i++)
+        devfs_tty_emit_byte(tty, 1, (uint8_t)s[i]);
+}
+
 static void devfs_tty_emit_byte(struct devfs_tty *tty, int tty_on_vga, uint8_t ch) {
     ch = devfs_tty_acs_translate(ch, tty->acs_mode);
     if (ch == '\n') {
@@ -390,7 +402,8 @@ static const char * const devfs_special_names[] = {
     "null", "zero", "random",
     "stdin", "stdout", "stderr",
     "tty",          /* controlling tty (alias to thread-attached tty) */
-    "urandom"
+    "urandom",
+    "full"
 };
 static const int devfs_special_count = sizeof(devfs_special_names) / sizeof(devfs_special_names[0]);
 
@@ -455,6 +468,7 @@ static struct fs_file *devfs_alloc_file(const char *path, int tty) {
     f->type = FS_TYPE_REG;
     f->size = 0;
     f->pos = 0;
+    f->refcount = 1;
     return f;
 }
 
@@ -466,6 +480,9 @@ static int devfs_create(const char *path, struct fs_file **out_file) {
 
 static int devfs_open(const char *path, struct fs_file **out_file) {
     if (!path) return -1;
+    static int devfs_full_trace_left = 4;
+    if (strcmp(path, "/dev/full") == 0 && devfs_full_trace_left-- > 0)
+        kprintf("devfs: open /dev/full\n");
     /* directory /dev */
     if (strcmp(path, "/dev") == 0 || strcmp(path, "/dev/") == 0) {
         struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
@@ -488,6 +505,7 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
         f->pos = 0;
         /* opened directory */
         f->fs_private = &devfs_driver_data;
+        f->refcount = 1;
         *out_file = f;
         return 0;
     }
@@ -511,6 +529,7 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
         f->size = 0;
         f->pos = 0;
         f->fs_private = &devfs_driver_data;
+        f->refcount = 1;
         *out_file = f;
         return 0;
     }
@@ -530,6 +549,7 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
         f->type = FS_TYPE_REG;
         f->size = (off_t)dev_blocks[bi].sectors * 512;
         f->pos = 0;
+        f->refcount = 1;
         *out_file = f;
         return 0;
     }
@@ -549,6 +569,7 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
             f->type = FS_TYPE_REG;
             f->size = (strcmp(path, "/dev/fb0") == 0) ? (size_t)fbdev_byte_len() : 0;
             f->pos = 0;
+            f->refcount = 1;
             *out_file = f;
             return 0;
         }
@@ -573,7 +594,10 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
             f->driver_private = (void*)ptype;
             f->type = FS_TYPE_REG;
             f->size = 0;
+            f->refcount = 1;
             *out_file = f;
+            if (strcmp(path, "/dev/full") == 0)
+                kprintf("devfs: /dev/full ready\n");
             return 0;
         }
     }
@@ -699,6 +723,9 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                     }
                     return (ssize_t)size;
                 }
+                case 8: /* /dev/full reads identically to /dev/zero */
+                    memset(buf, 0, size);
+                    return (ssize_t)size;
                 default: break;
             }
         }
@@ -730,6 +757,8 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                     release_irqrestore(&rb->lock, flags);
                     thread_block((int)cur->tid);
                     thread_yield();
+                    if (cur->pending_signals & ~cur->saved_sig_mask)
+                        return got > 0 ? (ssize_t)got : (ssize_t)-4;
                     continue;
                 } else {
                     release_irqrestore(&rb->lock, flags);
@@ -962,6 +991,8 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 t->waiters[t->waiters_count++] = tid;
             }
             release_irqrestore(&t->in_lock, flags);
+            if (tid == thread_get_init_user_tid())
+                kprintf("pid1: waiting for tty input\n");
             if (!is_canonical && vtime > 0 && got == 0)
                 thread_block_with_timeout((int)cur->tid, (uint32_t)vtime * 100u);
             else
@@ -972,7 +1003,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             acquire_irqsave(&t->in_lock, &flags);
             if (t->in_count == 0) {
                 thread_t *me = thread_current();
-                if (me && (me->pending_signals & (1ULL << 1))) { /* SIGINT=2, bit 1 */
+                if (me && (me->pending_signals & ~me->saved_sig_mask)) {
                     release_irqrestore(&t->in_lock, flags);
                     return got > 0 ? (ssize_t)got : (ssize_t)-4; /* -EINTR */
                 }
@@ -1036,6 +1067,8 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                         }
                         return (ssize_t)size;
                     }
+                    case 8: /* /dev/full: Linux returns ENOSPC for every write */
+                        return -28;
                     default: break;
                 }
             }
@@ -2009,8 +2042,43 @@ void devfs_tty_push_input_noblock(int tty, char c) {
         if (tid >= 0) thread_unblock(tid);
     }
     t->waiters_count = 0;
-    /* Do not echo from IRQ path: echo uses console output/locks and can deadlock
-       when IRQ interrupts code already holding VGA/console locks. */
+    /*
+     * Local echo (N_TTY). Same IRQ-time path as ^C above; ash with ICANON|ECHO
+     * expects the kernel to paint typed characters. Skip when ECHO is clear
+     * (userspace line editors).
+     *
+     * Keyboard arrows/Home/F-keys arrive as ESC CSI sequences. Echo must not
+     * paint them: ESC is dropped as a control byte, then "[" and "H" from Home
+     * used to print literal "[H" before init even starts (boot: trying init).
+     */
+    if (tty == devfs_get_active() && (t->term_lflag & 0x00000008u)) {
+        unsigned char uc = (unsigned char)c;
+        int skip_echo = 0;
+        if (t->echo_escape_state == 0) {
+            if (uc == 0x1Bu) {
+                t->echo_escape_state = 1;
+                skip_echo = 1;
+            }
+        } else if (t->echo_escape_state == 1) {
+            if (uc == '[' || uc == 'O') {
+                t->echo_escape_state = 2;
+                skip_echo = 1;
+            } else {
+                t->echo_escape_state = 0;
+                /* lone ESC + char: do not echo ESC; fall through for char */
+            }
+        } else { /* CSI / SS3 body */
+            skip_echo = 1;
+            if (uc >= 0x40u && uc <= 0x7Eu)
+                t->echo_escape_state = 0;
+        }
+        if (!skip_echo) {
+            if (uc == '\r')
+                uc = '\n';
+            if (uc == '\n' || uc == '\t' || uc >= 32u)
+                devfs_tty_emit_byte(t, 1, (uint8_t)uc);
+        }
+    }
     release(&t->in_lock);
 }
 

@@ -904,37 +904,32 @@ void isr_dispatch(cpu_registers_t* regs) {
                         isr_handlers[vec](regs);
                 }
                 pic_send_eoi(1);
-                return;
-        }
-
-        // IRQ 32..47: EOI required
-        if (vec >= 32 && vec <= 47) {
+        } else if (vec >= 32 && vec <= 47) {
+                // IRQ 32..47: EOI required
                 if (isr_handlers[vec]) {
                         isr_handlers[vec](regs);
                 } else {
                         qemu_debug_printf("Unhandled IRQ %d\n", vec - 32);
                 }
                 pic_send_eoi(vec - 32);
-                return;
-                }
-                
-        // Any other vector: call registered handler if present (e.g., int 0x80)
-        if (isr_handlers[vec]) {
+        } else if (isr_handlers[vec]) {
+                // Any other vector: call registered handler if present (e.g., int 0x80, APIC)
                 isr_handlers[vec](regs);
-                return;
-        }
-        
-        // Exceptions 0..31 without specific handler: print and halt
-        if (vec < 32) {
+        } else if (vec < 32) {
+                // Exceptions 0..31 without specific handler: print and halt
+                for (;;);
+        } else {
+                // Unknown vector
+                qemu_debug_printf("Unknown interrupt %d (0x%x)\n", vec, vec);
+                qemu_debug_printf("RIP: 0x%x, RSP: 0x%x\n", regs->rip, regs->rsp);
                 for (;;);
         }
-        
-        // Unknown vector
-        qemu_debug_printf("Unknown interrupt %d (0x%x)\n", vec, vec);
-        qemu_debug_printf("RIP: 0x%x, RSP: 0x%x\n", regs->rip, regs->rsp);
-        for (;;);
-        // no swap in VGA text mode
-        for (;;);
+
+        /* Deliver pending signals on return to ring3 from IRQ/IPI/int0x80.
+         * Skip CPU exceptions (0..31): #PF fatal paths can still fall through
+         * with a dead user frame (rip=0) and must not try to build a sigframe. */
+        if (regs && (regs->cs & 3) == 3 && vec >= 32)
+                (void)maybe_deliver_pending_signal_iretq(regs);
 }
 
 void idt_set_gate(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flags) {

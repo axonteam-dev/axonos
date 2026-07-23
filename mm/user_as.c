@@ -315,6 +315,20 @@ void user_as_set_brk_after_load(thread_t *tcur, uintptr_t elf_brk, uintptr_t ima
         if (zero_lo != 0 && brk > zero_lo && brk <= (uintptr_t)MMIO_IDENTITY_LIMIT)
             (void)user_as_ensure_range_for_exec(tcur, zero_lo, brk);
     } else {
+        /*
+         * Raise brk to 8MiB for glibc TLS, but also materialize [elf_end, brk).
+         * Musl-static bash uses the classic &_end heap in that gap (fopen
+         * /etc/passwd → malloc); if those pages are missing, getpwuid fails
+         * and the prompt becomes "I have no name!".
+         */
+        uintptr_t gap_lo = orig;
+        if (image_hi > gap_lo)
+            gap_lo = image_hi;
+        gap_lo = user_mm_align_up(gap_lo, 4096);
+        if (gap_lo < brk && gap_lo > 0x200000u &&
+            user_as_ensure_range_for_exec(tcur, gap_lo, brk) != 0)
+            kprintf("exec-brk: anon gap failed lo=0x%llx brk=0x%llx\n",
+                (unsigned long long)gap_lo, (unsigned long long)brk);
         uintptr_t hi = brk + tls_window;
         if (hi > (uintptr_t)MMIO_IDENTITY_LIMIT)
             hi = (uintptr_t)MMIO_IDENTITY_LIMIT;

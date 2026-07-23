@@ -151,6 +151,10 @@ extern uint64_t syscall_exit_to_shell_flag;
 __attribute__((noreturn)) void syscall_return_to_shell(void);
 /* Terminate current user thread after fatal trap (GPF etc.); schedule parent/shell. */
 void syscall_user_fatal_exit(int signo);
+/* Deliver pending user signal before SYSCALL iretq (patches syscall frame). */
+int maybe_deliver_pending_signal(uint64_t syscall_ret);
+/* Deliver pending user signal before interrupt/exception iretq (patches regs). */
+int maybe_deliver_pending_signal_iretq(cpu_registers_t *regs);
 /* vfork child exec (or fatal exit): restore parent snapshot and unblock blocked parent. */
 
 

@@ -110,8 +110,9 @@ $(NSS_DNS_BLOB_OBJ): $(NSS_DNS_SHIM)
 $(NSS_FILES_SHIM): core/nss_files_shim/nss_files.c
 	@mkdir -p $(dir $@)
 	@echo "HOST CC [nss_files]	$<"
-	@gcc -shared -fPIC -O2 -nostdlib -nodefaultlibs -Wall -Wextra \
-		-Wl,-soname,libnss_files.so.2 -o $@ $<
+	@gcc -shared -fPIC -O2 -nostdlib -nodefaultlibs -fno-builtin -ffreestanding \
+		-fno-tree-loop-distribute-patterns \
+		-Wall -Wextra -Wl,-soname,libnss_files.so.2 -Wl,--no-undefined -o $@ $<
 
 $(NSS_FILES_BLOB_OBJ): $(NSS_FILES_SHIM)
 	@echo "LD(BIN) [nss_files]	$<"

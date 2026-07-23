@@ -659,19 +659,23 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     /* /etc/passwd and /etc/group so whoami/id show root. Use static buffers to avoid heap overflow. */
     (void)ramfs_mkdir("/etc");
+    (void)ramfs_mkdir("/root");
     static const char root_passwd_line[] = "root:x:0:0:root:/root:/bin/sh\n";
     const size_t root_passwd_len = sizeof(root_passwd_line) - 1;
     struct fs_file *pf = fs_create_file("/etc/passwd");
     if (!pf) pf = fs_open("/etc/passwd");
     if (pf) {
+        (void)vfs_ftruncate(pf, 0);
         fs_write(pf, root_passwd_line, root_passwd_len, 0);
         fs_file_free(pf);
     }
-    static const char root_group_line[] = "root:x:0:\nusers:x:100:\n";
+    /* Member list required: BusyBox id(1) getgrouplist fails on "root:x:0:". */
+    static const char root_group_line[] = "root:x:0:root\nusers:x:100:\n";
     const size_t root_group_len = sizeof(root_group_line) - 1;
     struct fs_file *gf = fs_create_file("/etc/group");
     if (!gf) gf = fs_open("/etc/group");
     if (gf) {
+        (void)vfs_ftruncate(gf, 0);
         fs_write(gf, root_group_line, root_group_len, 0);
         fs_file_free(gf);
     }
@@ -815,6 +819,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     {
         static const char profile[] =
             "export TERM=builtin_ansi\n"
+            "export USER=root\n"
+            "export LOGNAME=root\n"
+            "export HOME=/root\n"
             "export PS1='\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[1;37m\\w\\033[0m \\$ '\n"
             "export OPENSSL_CONF=/etc/ssl/openssl.cnf\n"
             "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n"
@@ -822,9 +829,39 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         struct fs_file *pf = fs_create_file("/etc/profile");
         if (!pf) pf = fs_open("/etc/profile");
         if (pf) {
+            (void)vfs_ftruncate(pf, 0);
             fs_write(pf, profile, sizeof(profile) - 1, 0);
             fs_file_free(pf);
-        }   
+        }
+    }
+    /*
+     * Interactive non-login bash (typing `bash`) reads this. Musl-static bash
+     * caches getpwuid at startup; if that fails the prompt stays
+     * "I have no name!" unless PS1 is overridden without \\u.
+     */
+    {
+        static const char bashrc[] =
+            "export USER=${USER:-root}\n"
+            "export LOGNAME=${LOGNAME:-root}\n"
+            "export HOME=${HOME:-/root}\n"
+            "if [ \"${UID:-0}\" = 0 ] || [ \"$(id -u 2>/dev/null)\" = 0 ]; then\n"
+            "  PS1='\\[\\033[1;31m\\]root\\[\\033[0m\\]@\\h \\[\\033[0;37m\\]\\w\\[\\033[0m\\]\\$ '\n"
+            "fi\n";
+        struct fs_file *bf = fs_create_file("/etc/bash.bashrc");
+        if (!bf) bf = fs_open("/etc/bash.bashrc");
+        if (bf) {
+            (void)vfs_ftruncate(bf, 0);
+            fs_write(bf, bashrc, sizeof(bashrc) - 1, 0);
+            fs_file_free(bf);
+        }
+        struct fs_file *rbf = fs_create_file("/root/.bashrc");
+        if (!rbf) rbf = fs_open("/root/.bashrc");
+        if (rbf) {
+            static const char rbashrc[] = "[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n";
+            (void)vfs_ftruncate(rbf, 0);
+            fs_write(rbf, rbashrc, sizeof(rbashrc) - 1, 0);
+            fs_file_free(rbf);
+        }
     }
     /* /etc/issue: getty prints this before login prompt. \l = tty name (tty1, tty2, ...) */
     {

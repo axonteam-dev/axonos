@@ -1107,21 +1107,6 @@ static void syscall_restore_live_frame_from_snapshot(thread_t *t, const char *ta
     uint64_t *live = t->saved_syscall_frame;
     uint64_t *snap = t->syscall_frame_kbuf;
     int repaired = 0;
-    if (t->name[0] && (strstr(t->name, "openrc") || strstr(t->name, "busybox") || strstr(t->name, "/sh"))) {
-        kprintf("syscall-frame-check: tid=%llu tag=%s live_rdi=0x%llx snap_rdi=0x%llx live_rsi=0x%llx snap_rsi=0x%llx live_rdx=0x%llx snap_rdx=0x%llx live_rcx=0x%llx snap_rcx=0x%llx live_rsp=0x%llx snap_rsp=0x%llx\n",
-            (unsigned long long)(t->tid ? t->tid : 1),
-            tag ? tag : "?",
-            (unsigned long long)live[8],
-            (unsigned long long)snap[8],
-            (unsigned long long)live[9],
-            (unsigned long long)snap[9],
-            (unsigned long long)live[12],
-            (unsigned long long)snap[12],
-            (unsigned long long)live[13],
-            (unsigned long long)snap[13],
-            (unsigned long long)live[15],
-            (unsigned long long)snap[15]);
-    }
     for (int i = 0; i <= 13; i++) {
         if (live[i] != snap[i]) {
             live[i] = snap[i];
@@ -5172,36 +5157,6 @@ static void dl_fd_paths_dump(void) {
     kprintf("dl-fd-paths === end ===\n");
 }
 
-static void dl_boot_dump(const char *tag) {
-    int n = g_dl_boot_pos < DL_BOOT_CAP ? g_dl_boot_pos : DL_BOOT_CAP;
-    kprintf("dl-boot === %s (first %d of %d syscalls) ===\n",
-        tag ? tag : "?", n, g_dl_boot_pos);
-    int start = g_dl_boot_pos - n;
-    int eperm_hits = 0;
-    for (int i = 0; i < n; i++) {
-        dl_tail_ent_t *e = &g_dl_boot[(start + i) % DL_BOOT_CAP];
-        if (e->ret == -1 || e->ret == -(int64_t)EPERM) {
-            eperm_hits++;
-            kprintf("dl-boot EPERM? %03d %s(%llu) ret=0x%llx\n",
-                i, dl_tail_scname(e->num), (unsigned long long)e->num,
-                (unsigned long long)e->ret);
-        }
-        if (e->ret < 0) {
-            kprintf("dl-boot %03d %s(%llu) a1=0x%llx a2=0x%llx ret=-%lld\n",
-                i, dl_tail_scname(e->num), (unsigned long long)e->num,
-                (unsigned long long)e->a1, (unsigned long long)e->a2,
-                (long long)(-e->ret));
-        } else {
-            kprintf("dl-boot %03d %s(%llu) a1=0x%llx a2=0x%llx ret=0x%llx\n",
-                i, dl_tail_scname(e->num), (unsigned long long)e->num,
-                (unsigned long long)e->a1, (unsigned long long)e->a2,
-                (unsigned long long)e->ret);
-        }
-    }
-    kprintf("dl-boot === end (EPERM-like ret count=%d read_syscalls=%d) ===\n",
-        eperm_hits, g_dl_read_seen);
-}
-
 /* Ring buffer of recent PID1/ld.so syscalls; dumped on exit_group so a short
    boot log tail still shows what failed after a successful libeinfo openat. */
 #define DL_TAIL_CAP 80
@@ -5242,32 +5197,6 @@ static void dl_tail_push(uint64_t num, uint64_t a1, uint64_t a2, int64_t ret) {
     e->a2 = a2;
     e->ret = ret;
     g_dl_tail_pos++;
-}
-
-static void dl_tail_dump(const char *tag) {
-    int n = g_dl_tail_pos < DL_TAIL_CAP ? g_dl_tail_pos : DL_TAIL_CAP;
-    kprintf("dl-tail === %s (last %d syscalls) ===\n", tag ? tag : "?", n);
-    if (g_dl_first_eperm_sc)
-        kprintf("dl-tail: first EPERM from syscall=%llu count=%d libeinfo_fd=%d\n",
-            (unsigned long long)g_dl_first_eperm_sc, g_dl_eperm_count, g_dl_libeinfo_fd);
-    int start = g_dl_tail_pos - n;
-    for (int i = 0; i < n; i++) {
-        dl_tail_ent_t *e = &g_dl_tail[(start + i) % DL_TAIL_CAP];
-        if (e->ret < 0) {
-            kprintf("dl-tail %02d %s(%llu) a1=0x%llx a2=0x%llx ret=-%lld\n",
-                i, dl_tail_scname(e->num), (unsigned long long)e->num,
-                (unsigned long long)e->a1, (unsigned long long)e->a2,
-                (long long)(-e->ret));
-        } else {
-            kprintf("dl-tail %02d %s(%llu) a1=0x%llx a2=0x%llx ret=0x%llx\n",
-                i, dl_tail_scname(e->num), (unsigned long long)e->num,
-                (unsigned long long)e->a1, (unsigned long long)e->a2,
-                (unsigned long long)e->ret);
-        }
-    }
-    kprintf("dl-tail === end ===\n");
-    dl_boot_dump(tag);
-    dl_fd_paths_dump();
 }
 
 static void dl_watch_start(void) {
@@ -6080,7 +6009,9 @@ static ssize_t net_sock_read_userspace(thread_t *cur, ksock_net_t *s, void *bufp
     return -EINVAL;
 }
 
-/* Linux x86_64 rt_sigframe layout for signal delivery. */
+/* Linux x86_64 rt_sigframe / ucontext layout for signal delivery.
+ * Must match kernel/glibc x86_64: pretcode, ucontext (mcontext before sigmask),
+ * then siginfo. x86_64 SysV ABI also reserves a 128-byte red zone below RSP. */
 #pragma pack(push, 1)
 typedef struct {
     uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
@@ -6097,18 +6028,31 @@ typedef struct {
     uint64_t uc_link;
     uint64_t uc_stack_ss_sp, uc_stack_ss_size;
     uint32_t uc_stack_ss_flags, uc_pad;
-    uint64_t uc_sigmask[2];
     k_sigcontext_t uc_mcontext;
+    uint64_t uc_sigmask[2];
 } k_ucontext_t;
+typedef struct {
+    int32_t si_signo;
+    int32_t si_errno;
+    int32_t si_code;
+    int32_t si_pad;
+    uint64_t si_addr;
+    uint8_t  si_tail[128 - 24];
+} k_siginfo_t;
 #pragma pack(pop)
-#define RT_SIGFRAME_UC_OFF  8
-#define RT_SIGFRAME_SIZE   (8 + sizeof(k_ucontext_t))
+#define RT_SIGFRAME_UC_OFF    8
+#define RT_SIGFRAME_INFO_OFF  (8 + sizeof(k_ucontext_t))
+#define RT_SIGFRAME_SIZE      (RT_SIGFRAME_INFO_OFF + sizeof(k_siginfo_t))
+#define X86_REDZONE           128ULL
 
 
-/* Build signal frame and patch syscall return for delivery. Called from syscall_entry64. */
-int maybe_deliver_pending_signal(uint64_t syscall_ret) {
-    thread_t *cur = syscall_resolve_thread();
-    if (!cur || cur->ring != 3) return 0;
+/* Pick next deliverable signal. Returns:
+ *   0  — nothing to do
+ *   1  — *sa_out ready for user handler delivery (*sig_out set)
+ *  -1  — signal consumed (IGN / bad handler / non-fatal DFL); caller should retry
+ * Never returns on fatal SIG_DFL (yields / hlt). */
+static int signal_prepare_next(thread_t *cur, int *sig_out, user_sigaction_t *sa_out) {
+    if (!cur || cur->ring != 3 || cur->state == THREAD_TERMINATED) return 0;
     uint64_t blocked = cur->saved_sig_mask;
     uint64_t pending = cur->pending_signals & ~blocked;
     if (!pending) return 0;
@@ -6117,19 +6061,22 @@ int maybe_deliver_pending_signal(uint64_t syscall_ret) {
         if (pending & (1ULL << (s - 1))) sig = s;
     }
     if (sig <= 0) return 0;
-    user_sigaction_t process_action;
+
     user_sigaction_t *sa = &user_sig_actions[sig];
     if (cur->process) {
-        memset(&process_action, 0, sizeof(process_action));
-        process_action.handler = (user_sighandler_t)(uintptr_t)
+        memset(sa_out, 0, sizeof(*sa_out));
+        sa_out->handler = (user_sighandler_t)(uintptr_t)
             cur->process->signal_handlers[sig];
-        process_action.flags = cur->process->signal_flags[sig];
-        process_action.restorer = cur->process->signal_restorer[sig];
-        process_action.mask = cur->process->signal_masks[sig];
-        sa = &process_action;
+        sa_out->flags = cur->process->signal_flags[sig];
+        sa_out->restorer = cur->process->signal_restorer[sig];
+        sa_out->mask = cur->process->signal_masks[sig];
+        sa = sa_out;
+    } else {
+        *sa_out = *sa;
+        sa = sa_out;
     }
+
     user_sighandler_t h = sa->handler;
-    uint64_t restorer = sa->restorer;
     if (!sighandler_user_plausible((uint64_t)(uintptr_t)h)) {
         kprintf("sig-deliver: drop bad handler=0x%llx sig=%d tid=%d\n",
                 (unsigned long long)(uintptr_t)h, sig,
@@ -6138,16 +6085,15 @@ int maybe_deliver_pending_signal(uint64_t syscall_ret) {
         if (cur->process)
             cur->process->signal_handlers[sig] = 0;
         user_sig_actions[sig].handler = SIG_DFL;
-        return maybe_deliver_pending_signal(syscall_ret);
+        return -1;
     }
     if (h == SIG_IGN) {
         cur->pending_signals &= ~(1ULL << (sig - 1));
-        return maybe_deliver_pending_signal(syscall_ret);
+        return -1;
     }
     if (h == SIG_DFL) {
         cur->pending_signals &= ~(1ULL << (sig - 1));
-        /* Default action Term: terminate process (SIGINT, SIGQUIT, SIGTERM, SIGPIPE, etc.).
-           Process must actually exit so parent's wait() returns and shell gets control back. */
+        /* Default action Term: terminate process so parent's wait() returns. */
         if (sig == SIGHUP || sig == SIGINT || sig == 3 /*SIGQUIT*/ ||
             sig == 15 /*SIGTERM*/ || sig == 13 /*SIGPIPE*/) {
             cur->exit_status = sig; /* WIFSIGNALED, WTERMSIG = sig */
@@ -6191,69 +6137,204 @@ int maybe_deliver_pending_signal(uint64_t syscall_ret) {
             thread_yield();
             for (;;) asm volatile("sti; hlt" ::: "memory");
         }
-        return maybe_deliver_pending_signal(syscall_ret);
+        return -1;
     }
-    if (!restorer) return 0;
-    uint64_t old_rsp = cur->saved_user_rsp;
-    uint64_t old_rip = cur->saved_user_rip;
-    if (!old_rsp || !old_rip) return 0;
-    uint64_t *frame = cur->saved_syscall_frame;
-    if (!frame) return 0;
-    int restart_syscall = 0;
-    if ((sa->flags & 0x10000000ULL) && /* SA_RESTART */
-        (int64_t)syscall_ret == -(int64_t)EINTR &&
-        old_rip >= 2) {
-        uint8_t insn[2];
-        if (copy_from_user_raw(insn, (const void *)(uintptr_t)(old_rip - 2),
-                               sizeof(insn)) == 0 &&
-            insn[0] == 0x0f && insn[1] == 0x05) {
-            old_rip -= 2;
-            restart_syscall = 1;
-        }
-    }
-    uintptr_t frame_start = ((uintptr_t)old_rsp - RT_SIGFRAME_SIZE) & ~15ULL;
+    if (!sa->restorer) return 0;
+    *sig_out = sig;
+    return 1;
+}
+
+/* Write rt_sigframe below old_rsp (skipping red zone). Does not clear pending —
+ * caller commits pending/mask after user regs are patched. */
+static uintptr_t signal_write_rt_frame(thread_t *cur, int sig, const user_sigaction_t *sa,
+                                       uint64_t old_rsp, const k_sigcontext_t *sc) {
+    if (!cur || !sa || !sc || !old_rsp) return 0;
+    uintptr_t sp = (uintptr_t)old_rsp;
+    if (sp > X86_REDZONE)
+        sp -= X86_REDZONE;
+    uintptr_t frame_start = (sp - RT_SIGFRAME_SIZE) & ~15ULL;
     if (frame_start < 0x200000ULL) return 0;
-    if (mark_user_identity_range_2m_sys((uint64_t)frame_start, (uint64_t)(frame_start + RT_SIGFRAME_SIZE)) != 0)
+    if (mark_user_identity_range_2m_sys((uint64_t)frame_start,
+            (uint64_t)(frame_start + RT_SIGFRAME_SIZE)) != 0)
         return 0;
+
     k_ucontext_t uc;
     memset(&uc, 0, sizeof(uc));
-    uc.uc_mcontext.r8  = cur->saved_user_r8;
-    uc.uc_mcontext.r9  = cur->saved_user_r9;
-    uc.uc_mcontext.r10 = cur->saved_user_r10;
-    uc.uc_mcontext.r11 = cur->saved_user_r11;
-    uc.uc_mcontext.r12 = cur->saved_user_r12;
-    uc.uc_mcontext.r13 = cur->saved_user_r13;
-    uc.uc_mcontext.r14 = cur->saved_user_r14;
-    uc.uc_mcontext.r15 = cur->saved_user_r15;
-    uc.uc_mcontext.rdi = cur->saved_user_rdi;
-    uc.uc_mcontext.rsi = cur->saved_user_rsi;
-    uc.uc_mcontext.rbp = cur->saved_user_rbp;
-    uc.uc_mcontext.rbx = cur->saved_user_rbx;
-    uc.uc_mcontext.rdx = cur->saved_user_rdx;
-    uc.uc_mcontext.rax = restart_syscall ? frame[14] : syscall_ret;
-    uc.uc_mcontext.rcx = cur->saved_user_rcx;
-    uc.uc_mcontext.rsp = old_rsp;
-    uc.uc_mcontext.rip = old_rip;
-    uc.uc_mcontext.eflags = cur->saved_user_r11;
+    uc.uc_mcontext = *sc;
     uc.uc_mcontext.cs = 0x1B;
     uc.uc_mcontext.gs = 0;
     uc.uc_mcontext.fs = 0;
     uc.uc_mcontext.ss = 0x23;
-    uc.uc_sigmask[0] = blocked;
-    if (copy_to_user_safe((void *)(uintptr_t)(frame_start + RT_SIGFRAME_UC_OFF), &uc, sizeof(uc)) != 0)
+    uc.uc_sigmask[0] = cur->saved_sig_mask;
+    if (copy_to_user_safe((void *)(uintptr_t)(frame_start + RT_SIGFRAME_UC_OFF),
+                          &uc, sizeof(uc)) != 0)
         return 0;
-    if (copy_to_user_safe((void *)(uintptr_t)frame_start, &restorer, sizeof(restorer)) != 0)
+
+    k_siginfo_t info;
+    memset(&info, 0, sizeof(info));
+    info.si_signo = sig;
+    info.si_code = -6; /* SI_KERNEL */
+    if (copy_to_user_safe((void *)(uintptr_t)(frame_start + RT_SIGFRAME_INFO_OFF),
+                          &info, sizeof(info)) != 0)
         return 0;
+
+    if (copy_to_user_safe((void *)(uintptr_t)frame_start,
+                          &sa->restorer, sizeof(sa->restorer)) != 0)
+        return 0;
+
+    return frame_start;
+}
+
+static void signal_commit_delivery(thread_t *cur, int sig, const user_sigaction_t *sa) {
+    if (!cur || !sa || sig <= 0) return;
     cur->pending_signals &= ~(1ULL << (sig - 1));
-    cur->saved_sig_mask = blocked | sa->mask;
+    cur->saved_sig_mask = cur->saved_sig_mask | sa->mask;
     if (!(sa->flags & SA_NODEFER))
         cur->saved_sig_mask |= (1ULL << (sig - 1));
-    frame[8]  = (uint64_t)sig;
-    frame[13] = (uint64_t)(uintptr_t)h;
-    frame[15] = (uint64_t)frame_start;
-    syscall_user_rsp_saved = (uint64_t)frame_start;
-    asm volatile("mfence" ::: "memory");
-    return 1;
+}
+
+/* Build signal frame and patch syscall return for delivery. Called from syscall_entry64. */
+int maybe_deliver_pending_signal(uint64_t syscall_ret) {
+    thread_t *cur = syscall_resolve_thread();
+    if (!cur || cur->ring != 3) return 0;
+
+    for (;;) {
+        int sig = 0;
+        user_sigaction_t sa;
+        int prep = signal_prepare_next(cur, &sig, &sa);
+        if (prep == 0) return 0;
+        if (prep < 0) continue;
+
+        uint64_t old_rsp = cur->saved_user_rsp;
+        uint64_t old_rip = cur->saved_user_rip;
+        if (!old_rsp || !old_rip) return 0;
+        uint64_t *frame = cur->saved_syscall_frame;
+        if (!frame) return 0;
+
+        int restart_syscall = 0;
+        if ((sa.flags & 0x10000000ULL) && /* SA_RESTART */
+            (int64_t)syscall_ret == -(int64_t)EINTR &&
+            old_rip >= 2) {
+            uint8_t insn[2];
+            if (copy_from_user_raw(insn, (const void *)(uintptr_t)(old_rip - 2),
+                                   sizeof(insn)) == 0 &&
+                insn[0] == 0x0f && insn[1] == 0x05) {
+                old_rip -= 2;
+                restart_syscall = 1;
+            }
+        }
+
+        k_sigcontext_t sc;
+        memset(&sc, 0, sizeof(sc));
+        sc.r8  = cur->saved_user_r8;
+        sc.r9  = cur->saved_user_r9;
+        sc.r10 = cur->saved_user_r10;
+        sc.r11 = cur->saved_user_r11;
+        sc.r12 = cur->saved_user_r12;
+        sc.r13 = cur->saved_user_r13;
+        sc.r14 = cur->saved_user_r14;
+        sc.r15 = cur->saved_user_r15;
+        sc.rdi = cur->saved_user_rdi;
+        sc.rsi = cur->saved_user_rsi;
+        sc.rbp = cur->saved_user_rbp;
+        sc.rbx = cur->saved_user_rbx;
+        sc.rdx = cur->saved_user_rdx;
+        sc.rax = restart_syscall ? frame[14] : syscall_ret;
+        sc.rcx = cur->saved_user_rcx;
+        sc.rsp = old_rsp;
+        sc.rip = old_rip;
+        sc.eflags = cur->saved_user_r11;
+
+        uint64_t handler = (uint64_t)(uintptr_t)sa.handler;
+        if (handler < 0x10000ULL) return 0;
+
+        uintptr_t frame_start = signal_write_rt_frame(cur, sig, &sa, old_rsp, &sc);
+        if (!frame_start) return 0;
+
+        frame[8]  = (uint64_t)sig;
+        if (sa.flags & SA_SIGINFO) {
+            frame[9]  = (uint64_t)(frame_start + RT_SIGFRAME_INFO_OFF); /* rsi = info */
+            frame[12] = (uint64_t)(frame_start + RT_SIGFRAME_UC_OFF);   /* rdx = uc */
+        }
+        frame[13] = handler;
+        frame[15] = (uint64_t)frame_start;
+        syscall_user_rsp_saved = (uint64_t)frame_start;
+        signal_commit_delivery(cur, sig, &sa);
+        asm volatile("mfence" ::: "memory");
+        return 1;
+    }
+}
+
+/* Deliver pending signal by rewriting the interrupt return frame (ring3). */
+int maybe_deliver_pending_signal_iretq(cpu_registers_t *regs) {
+    if (!regs || (regs->cs & 3) != 3) return 0;
+
+    thread_t *cur = thread_current();
+    if (!cur || cur->ring != 3)
+        cur = thread_get_current_user();
+    if (!cur || cur->ring != 3 || cur->state == THREAD_TERMINATED) return 0;
+
+    for (;;) {
+        int sig = 0;
+        user_sigaction_t sa;
+        int prep = signal_prepare_next(cur, &sig, &sa);
+        if (prep == 0) return 0;
+        if (prep < 0) continue;
+
+        uint64_t handler = (uint64_t)(uintptr_t)sa.handler;
+        if (handler < 0x10000ULL) return 0;
+
+        uint64_t old_rsp = regs->rsp;
+        uint64_t old_rip = regs->rip;
+        if (!old_rsp || !old_rip) return 0;
+        /* Refuse nonsense return sites (prevents building a frame then iretq to 0). */
+        if (old_rip < 0x10000ULL) return 0;
+
+        k_sigcontext_t sc;
+        memset(&sc, 0, sizeof(sc));
+        sc.r8  = regs->r8;
+        sc.r9  = regs->r9;
+        sc.r10 = regs->r10;
+        sc.r11 = regs->r11;
+        sc.r12 = regs->r12;
+        sc.r13 = regs->r13;
+        sc.r14 = regs->r14;
+        sc.r15 = regs->r15;
+        sc.rdi = regs->rdi;
+        sc.rsi = regs->rsi;
+        sc.rbp = regs->rbp;
+        sc.rbx = regs->rbx;
+        sc.rdx = regs->rdx;
+        sc.rax = regs->rax;
+        sc.rcx = regs->rcx;
+        sc.rsp = old_rsp;
+        sc.rip = old_rip;
+        sc.eflags = regs->rflags;
+
+        uintptr_t frame_start = signal_write_rt_frame(cur, sig, &sa, old_rsp, &sc);
+        if (!frame_start) return 0;
+
+        regs->rdi = (uint64_t)sig;
+        if (sa.flags & SA_SIGINFO) {
+            regs->rsi = (uint64_t)(frame_start + RT_SIGFRAME_INFO_OFF);
+            regs->rdx = (uint64_t)(frame_start + RT_SIGFRAME_UC_OFF);
+        }
+        regs->rip = handler;
+        regs->rsp = (uint64_t)frame_start;
+        /* IF on, DF off — string ops in the handler must run forward. */
+        regs->rflags |= 0x200ULL;
+        regs->rflags &= ~0x400ULL;
+
+        cur->saved_user_rdi = regs->rdi;
+        cur->saved_user_rsi = regs->rsi;
+        cur->saved_user_rdx = regs->rdx;
+        cur->saved_user_rip = regs->rip;
+        cur->saved_user_rsp = regs->rsp;
+        cur->saved_user_r11 = regs->rflags;
+        signal_commit_delivery(cur, sig, &sa);
+        asm volatile("mfence" ::: "memory");
+        return 1;
+    }
 }
 
 /* Simple getrandom() state (non-crypto). */
@@ -13632,8 +13713,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 cs.st_gid = (uint32_t)st.st_gid;
                 cs.st_rdev = 0;
                 cs.st_size = (int64_t)st.st_size;
-                cs.st_blksize = 0;
-                cs.st_blocks = 0;
+                cs.st_blksize = 4096;
+                cs.st_blocks = (st.st_size + 511) / 512;
                 cs.st_atime_sec = (int64_t)st.st_atime;
                 cs.st_mtime_sec = (int64_t)st.st_mtime;
                 cs.st_ctime_sec = (int64_t)st.st_ctime;
@@ -13693,8 +13774,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 cs.st_gid = (uint32_t)st.st_gid;
                 cs.st_rdev = 0;
                 cs.st_size = (int64_t)st.st_size;
-                cs.st_blksize = 0;
-                cs.st_blocks = 0;
+                cs.st_blksize = 4096;
+                cs.st_blocks = (st.st_size + 511) / 512;
                 cs.st_atime_sec = (int64_t)st.st_atime;
                 cs.st_mtime_sec = (int64_t)st.st_mtime;
                 cs.st_ctime_sec = (int64_t)st.st_ctime;
@@ -13828,8 +13909,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 cs.st_gid = (uint32_t)st.st_gid;
                 cs.st_rdev = 0;
                 cs.st_size = (int64_t)st.st_size;
-                cs.st_blksize = 0;
-                cs.st_blocks = 0;
+                cs.st_blksize = 4096;
+                cs.st_blocks = (st.st_size + 511) / 512;
                 cs.st_atime_sec = (int64_t)st.st_atime;
                 cs.st_mtime_sec = (int64_t)st.st_mtime;
                 cs.st_ctime_sec = (int64_t)st.st_ctime;
@@ -14683,7 +14764,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     (unsigned long long)(cur->tid ? cur->tid : 1),
                     (unsigned long long)a1, cur->parent_tid, cur->waiter_tid);
             if (cur && pid1_dl_trace_thread(cur))
-                dl_tail_dump("exit_group");
             qemu_debug_printf("sys_exit_group: pid=%llu name=%s called exit_group(code=%llu)\n",
                               (unsigned long long)(cur->tid ? cur->tid : 1),
                               cur && cur->name ? cur->name : "(null)",

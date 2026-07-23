@@ -146,7 +146,7 @@ void klogprintf(const char *fmt, ...) {
 		else if (len > 0)
 			msg[len - 1] = '\n';
 	}
-
+#ifdef KERNEL_LOG_TIME
 	char ts[KLOG_TS_MAX];
 	uint64_t usec = klog_get_time_us();
 	uint64_t secs = usec / 1000000;
@@ -160,8 +160,8 @@ void klogprintf(const char *fmt, ...) {
 		else
 			tslen = sizeof ts - 1u;
 	}
-
 	size_t outlen = tslen + len;
+
 	if (outlen + 1 > sizeof klog_out) {
 		size_t room = sizeof klog_out - tslen - 1u;
 		if (room > len)
@@ -174,11 +174,17 @@ void klogprintf(const char *fmt, ...) {
 		memcpy(klog_out + tslen, msg, len);
 	}
 	klog_out[outlen] = '\0';
-
+	
 	klog_console_write_sync_tty(klog_out, outlen);
+#endif
 
 	if (!klog_inited) {
+#ifdef KERNEL_LOG_TIME
 		klog_early_append(klog_out, outlen);
+#endif
+#ifndef KERNEL_LOG_TIME
+		klog_early_append(klog_out, len);
+#endif
 #ifdef QEMU_LOG_ENABLE
 		qemu_debug_printf("%s", klog_out);
 #endif

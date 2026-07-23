@@ -3816,6 +3816,7 @@ static void net_announce_ipv4(const char *how) {
 }
 
 static void net_write_resolv_from_dns(uint32_t dns_be) {
+#ifdef AUTO_CONFIGURE_DNS
     if (!dns_be) return;
     char line[96];
     int n = snprintf(line, sizeof(line), "nameserver %u.%u.%u.%u\n",
@@ -3828,6 +3829,8 @@ static void net_write_resolv_from_dns(uint32_t dns_be) {
     if (!f) return;
     fs_write(f, line, (size_t)n, 0);
     fs_file_free(f);
+#endif
+    return;
 }
 
 static int net_apply_ipv4(uint32_t ip_be, uint32_t mask_be, uint32_t gw_be, uint32_t dns_be, int from_dhcp) {

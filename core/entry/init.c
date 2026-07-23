@@ -800,7 +800,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         if (!uf) uf = fs_open("/var/run/utmp");
         if (uf) fs_file_free(uf);
     }
-    /* glibc getaddrinfo: без nsswitch часто тянет mdns/systemd и connect() на 127.0.0.1 -> ECONNREFUSED. */
+#ifdef CONFIGURE_NET_START
     {
         /* No "dns" here: libnss_dns.so NEEDs libc.so.6 and kills static busybox. */
         static const char nsswitch[] =
@@ -823,6 +823,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             fs_file_free(nf);
         }
     }
+#endif
     {
         static const char hosts_min[] = "127.0.0.1\tlocalhost\n";
         (void)fs_unlink("/etc/hosts");
@@ -842,20 +843,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         if (cf) {
             fs_write(cf, host_conf, sizeof(host_conf) - 1, 0);
             fs_file_free(cf);
-        }
-    }
-    /* Prefer IPv4 / IPv4-mapped addresses so tools are not stuck on bare IPv6 path. */
-    {
-        static const char gai_conf[] =
-            "precedence  ::1/128       50\n"
-            "precedence  ::/0          40\n"
-            "precedence  ::ffff:0:0/96 100\n";
-        (void)fs_unlink("/etc/gai.conf");
-        struct fs_file *gf = fs_create_file("/etc/gai.conf");
-        if (!gf) gf = fs_open("/etc/gai.conf");
-        if (gf) {
-            fs_write(gf, gai_conf, sizeof(gai_conf) - 1, 0);
-            fs_file_free(gf);
         }
     }
     syscall_net_ensure_resolv();
@@ -915,7 +902,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
     /* /etc/issue: getty prints this before login prompt. \l = tty name (tty1, tty2, ...) */
     {
-        static const char issue[] = "AxonOS " OS_VERSION " (\\l)\n\n";
+        static const char issue[] = OS_NAME" "OS_VERSION"-"OS_PREFIX" (\\l)\n\n";
         struct fs_file *ifile = fs_create_file("/etc/issue");
         if (!ifile) ifile = fs_open("/etc/issue");
         if (ifile) {
@@ -937,8 +924,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     {
         static const char motd[] = "\nWelcome to " OS_NAME " " OS_VERSION "\n"
                                    "  * Website: https://axont.ru\n"
-                                   "  * GitHub: https://github.com/fcexx/AxonOS.git\n"
-                                   "  * AxonHub: https://axont.ru/axonhub\n"
+                                   "  * GitHub: https://github.com/axonteam-dev/axonos.git\n"
+                                   "  * AxonHub: https://xhub.axont.ru/ \n"
                                    "Feedback on axont@axont.ru\n\n";
         struct fs_file *mf = fs_create_file("/etc/motd");
         if (!mf) mf = fs_open("/etc/motd");

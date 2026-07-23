@@ -79,6 +79,52 @@ static inline int pt_page_pa_ok(uint64_t ent) {
     return (ent & PG_ADDR_MASK) < (uint64_t)MMIO_IDENTITY_LIMIT;
 }
 
+/*
+ * Linux services page-table walks through the direct map (__va / page_address),
+ * which userspace munmap / PROT_NONE cannot punch. AxonOS uses identity VA==PA
+ * for the same role: software casts of PTE PAs must run under swapper CR3 so
+ * a process hole at e.g. 0x8119000 (Go arena reserve) cannot Oops the kernel
+ * while reading share_l3 in mm_fork_private_pt_path / mm_map_4k_sharedaware.
+ *
+ * Critical: hold IF=0 for the whole window. thread_schedule → mm_switch would
+ * otherwise reload the process CR3 mid-walk and either Oops or corrupt user
+ * memory (seen as Go poison regs after docker pthread + PROT_NONE).
+ */
+typedef struct {
+    uint64_t cr3;
+    unsigned long irqf;
+} mm_dm_ctx_t;
+
+static uint64_t mm_direct_map_cr3(void) {
+    if (g_mm_ready && g_kernel_mm.cr3)
+        return g_kernel_mm.cr3;
+    if (g_mm_ready && g_kernel_mm.pml4)
+        return (uint64_t)(uintptr_t)g_kernel_mm.pml4;
+    return paging_read_cr3();
+}
+
+static mm_dm_ctx_t mm_enter_direct_map(void) {
+    mm_dm_ctx_t ctx;
+    asm volatile(
+        "pushfq\n\t"
+        "pop %0\n\t"
+        "cli"
+        : "=r"(ctx.irqf)
+        :
+        : "memory");
+    ctx.cr3 = paging_read_cr3();
+    uint64_t want = mm_direct_map_cr3();
+    if ((ctx.cr3 & ~0xFFFULL) != (want & ~0xFFFULL))
+        paging_write_cr3(want);
+    return ctx;
+}
+
+static void mm_leave_direct_map(mm_dm_ctx_t ctx) {
+    if ((paging_read_cr3() & ~0xFFFULL) != (ctx.cr3 & ~0xFFFULL))
+        paging_write_cr3(ctx.cr3);
+    asm volatile("push %0; popfq" :: "r"(ctx.irqf) : "memory", "cc");
+}
+
 static uint64_t *dup_pt_page(mm_t *mm, uint64_t *src) {
     if (!src || (uintptr_t)src >= (uintptr_t)MMIO_IDENTITY_LIMIT) return NULL;
     uint64_t *dst = alloc_pt_page(mm);
@@ -165,8 +211,9 @@ static int mm_pte_same_pt_page(uint64_t ent, uint64_t other) {
  * page tables one level at a time. `share_l4` is oldmm (exec) or parent (fork).
  * Always dup away from mm_kernel()/swapper before any split or leaf write —
  * mm_alloc() shallow-clones swapper L4, so comparing only to oldmm would miss
- * shared L3/L2/L1 and corrupt the kernel heap (seen as magic=0xe5c5403e). */
-static int mm_map_4k_sharedaware(mm_t *mm, uint64_t *share_l4, uint64_t va, uint64_t pa, uint64_t flags) {
+ * shared L3/L2/L1 and corrupt the kernel heap (seen as magic=0xe5c5403e).
+ * Caller must hold the direct-map CR3 (see mm_map_4k_sharedaware). */
+static int mm_map_4k_sharedaware_body(mm_t *mm, uint64_t *share_l4, uint64_t va, uint64_t pa, uint64_t flags) {
     if (!mm || !mm->pml4 || !share_l4) return -1;
     if (va >= (uint64_t)MMIO_IDENTITY_LIMIT) return -1;
     if ((uintptr_t)mm->pml4 == (uintptr_t)share_l4) return -1;
@@ -371,7 +418,15 @@ static int mm_map_4k_sharedaware(mm_t *mm, uint64_t *share_l4, uint64_t va, uint
     return 0;
 }
 
-/* Ensure child mm has a private page-table path to `va` (dup shared levels vs share_l4). */
+static int mm_map_4k_sharedaware(mm_t *mm, uint64_t *share_l4, uint64_t va, uint64_t pa, uint64_t flags) {
+    mm_dm_ctx_t dm = mm_enter_direct_map();
+    int rc = mm_map_4k_sharedaware_body(mm, share_l4, va, pa, flags);
+    mm_leave_direct_map(dm);
+    return rc;
+}
+
+/* Ensure child mm has a private page-table path to `va` (dup shared levels vs share_l4).
+ * Caller must hold the direct-map CR3. */
 static int mm_fork_private_pt_path(mm_t *mm, uint64_t *share_l4, uint64_t va,
                                    uint64_t **out_l2, int *out_l2i, uint64_t **out_l1) {
     if (!mm || !mm->pml4 || !share_l4 || !out_l2 || !out_l2i || !out_l1) return -1;
@@ -464,6 +519,7 @@ int mm_clear_range_private(mm_t *mm, uint64_t *share_l4, uint64_t va_begin, uint
 
     uint64_t begin = va_begin & ~0xFFFULL;
     uint64_t end = (va_end + 0xFFFULL) & ~0xFFFULL;
+    mm_dm_ctx_t dm = mm_enter_direct_map();
     for (uint64_t va = begin; va < end; ) {
         uint64_t *l2 = NULL;
         int l2i = 0;
@@ -486,6 +542,7 @@ int mm_clear_range_private(mm_t *mm, uint64_t *share_l4, uint64_t va_begin, uint
         }
         va += 0x1000ULL;
     }
+    mm_leave_direct_map(dm);
     return 0;
 }
 
@@ -513,8 +570,11 @@ int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
 
     uint64_t begin = va_begin & ~0xFFFULL;
     uint64_t end = (va_end + 0xFFFULL) & ~0xFFFULL;
-    uint64_t active_cr3 = paging_read_cr3() & ~0xFFFULL;
+    /* Caller's CR3: invlpg must hit the process TLB, not swapper's. */
+    uint64_t caller_cr3 = paging_read_cr3();
     uint64_t mm_cr3 = mm->cr3 & ~0xFFFULL;
+    mm_dm_ctx_t dm = mm_enter_direct_map();
+    int rc = -1;
 
     /*
      * Preparation pass: make every page-table path exclusive and perform all
@@ -533,20 +593,20 @@ int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
         uint64_t *l1 = NULL;
         if (mm_fork_private_pt_path(mm, share_l4, va,
                                     &l2, &l2i, &l1) != 0)
-            return -1;
+            goto out;
 
         uint64_t ent2 = l2[l2i];
         uint64_t page2m_lo = va & ~((uint64_t)PAGE_SIZE_2M - 1ULL);
         uint64_t page2m_hi = page2m_lo + PAGE_SIZE_2M;
         if (ent2 & PG_PS_2M) {
             if (ent2 & PG_SOFT_OWNED)
-                return -1; /* Owned huge frames have no allocator contract. */
+                goto out; /* Owned huge frames have no allocator contract. */
             if (begin <= page2m_lo && end >= page2m_hi) {
                 va = page2m_hi;
                 continue;
             }
             if (split_2m_to_4k(mm, l2, l2i, va) != 0)
-                return -1;
+                goto out;
         }
         va += PAGE_SIZE_4K;
     }
@@ -563,16 +623,19 @@ int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
         uint64_t *l1 = NULL;
         if (mm_fork_private_pt_path(mm, share_l4, va,
                                     &l2, &l2i, &l1) != 0)
-            return -1;
+            goto out;
         uint64_t ent2 = l2[l2i];
         uint64_t page2m_lo = va & ~((uint64_t)PAGE_SIZE_2M - 1ULL);
         uint64_t page2m_hi = page2m_lo + PAGE_SIZE_2M;
         if (ent2 & PG_PS_2M) {
             if (!(ent2 & PG_US) || (ent2 & PG_SOFT_OWNED))
-                return -1;
+                goto out;
             l2[l2i] = 0;
-            if (active_cr3 == mm_cr3)
+            if ((caller_cr3 & ~0xFFFULL) == mm_cr3) {
+                paging_write_cr3(caller_cr3);
                 invlpg((void *)(uintptr_t)page2m_lo);
+                paging_write_cr3(mm_direct_map_cr3());
+            }
             va = page2m_hi;
             continue;
         }
@@ -582,15 +645,21 @@ int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
             if ((old & (PG_PRESENT | PG_US)) == (PG_PRESENT | PG_US)) {
                 uint64_t old_pa = old & PG_ADDR_MASK;
                 l1[l1i] = 0;
-                if (active_cr3 == mm_cr3)
+                if ((caller_cr3 & ~0xFFFULL) == mm_cr3) {
+                    paging_write_cr3(caller_cr3);
                     invlpg((void *)(uintptr_t)va);
+                    paging_write_cr3(mm_direct_map_cr3());
+                }
                 if (old & PG_SOFT_OWNED)
                     frame_release(old_pa);
             }
         }
         va += PAGE_SIZE_4K;
     }
-    return 0;
+    rc = 0;
+out:
+    mm_leave_direct_map(dm);
+    return rc;
 }
 
 static int mm_privatize_identity_range_ex(mm_t *mm, uint64_t va_begin, uint64_t va_end,
@@ -619,7 +688,8 @@ static int mm_privatize_identity_range_ex(mm_t *mm, uint64_t va_begin, uint64_t 
     if (begin >= end)
         return 0;
 
-    uint64_t saved = paging_read_cr3();
+    mm_dm_ctx_t dm = mm_enter_direct_map();
+    int rc = -1;
     for (uint64_t va = begin; va < end; va += 0x1000ULL) {
         uint64_t pa = 0;
         if (mm_va_leaf_pa(mm, va, &pa) != 0)
@@ -658,19 +728,17 @@ static int mm_privatize_identity_range_ex(mm_t *mm, uint64_t va_begin, uint64_t 
 
         void *newp = mm_user_frame_alloc(!seed_from_live);
         if (!newp)
-            return -1;
+            goto out;
         if (((uint64_t)(uintptr_t)newp & ~0xFFFULL) == (va & ~0xFFFULL)) {
             mm_user_frame_put(newp);
-            paging_write_cr3(saved);
-            return -1;
+            goto out;
         }
         if (seed_from_live)
             memcpy(newp, (void *)(uintptr_t)pa, (size_t)PAGE_SIZE_4K);
         if (mm_map_4k_sharedaware(mm, share->pml4, va, (uint64_t)(uintptr_t)newp,
                                   PG_RW | PG_US | PG_SOFT_OWNED) != 0) {
             mm_user_frame_put(newp);
-            paging_write_cr3(saved);
-            return -1;
+            goto out;
         }
         {
             uint64_t got = 0;
@@ -681,15 +749,16 @@ static int mm_privatize_identity_range_ex(mm_t *mm, uint64_t va_begin, uint64_t 
                         (unsigned long long)va,
                         (unsigned long long)(uintptr_t)newp,
                         (unsigned long long)got);
-                paging_write_cr3(saved);
-                return -1;
+                goto out;
             }
         }
         invlpg((void *)(uintptr_t)va);
     }
-    /* Always reload CR3 so identity→private leaf updates flush stale TLBs. */
-    paging_write_cr3(saved);
-    return 0;
+    rc = 0;
+out:
+    /* Always reload caller CR3 so identity→private leaf updates flush TLBs. */
+    mm_leave_direct_map(dm);
+    return rc;
 }
 
 int mm_privatize_identity_range(mm_t *mm, uint64_t va_begin, uint64_t va_end) {
@@ -2137,12 +2206,11 @@ static int mm_make_private_range_impl(mm_t *mm, uint64_t va_begin, uint64_t va_e
     if (!mm || !mm->pml4) return -1;
     mm_dbg_ash_touch(copy_old ? "make-private-copy" : "make-private-zero",
                      mm, va_begin, va_end);
-    /* Always restore the caller's CR3. Switching to a share/parent tree for
-     * memcpy and then returning on that CR3 leaves fork children executing
-     * against the parent's still-RO COW PTEs — mm_cow_fault_page updates the
-     * child mm while the CPU keeps walking the parent, causing an infinite
-     * cow-fault loop with rc=0 (seen after linuxrc getpid stack-prep). */
-    uint64_t saved_cr3 = paging_read_cr3();
+    /* Always restore the caller's CR3. PT software walks use the direct-map
+     * (swapper) CR3 — Linux __va — so process PROT_NONE holes cannot Oops
+     * while we cast share/parent PTE PAs to pointers. */
+    uint64_t caller_cr3 = paging_read_cr3();
+    mm_dm_ctx_t dm = mm_enter_direct_map();
     int rc = -1;
     /* Baseline for dup/split decisions:
      * - fork setup usually runs with parent CR3 active, so live CR3 is valid;
@@ -2153,14 +2221,15 @@ static int mm_make_private_range_impl(mm_t *mm, uint64_t va_begin, uint64_t va_e
     if (copy_old) {
         /* Prefer an explicit parent/template mm when provided (boot PID1 loads
          * into a disposable mm that is not the caller's thread->mm). Otherwise
-         * use the live CR3 so fork still matches the parent even if pml4 is stale. */
+         * use the caller's CR3 so fork still matches the parent even if pml4
+         * is stale (must not use swapper after mm_enter_direct_map). */
         if (share_cmp_mm && share_cmp_mm->pml4) {
             share_l4 = share_cmp_mm->pml4;
             source_cr3 = share_cmp_mm->cr3 ? share_cmp_mm->cr3
                                            : (uint64_t)(uintptr_t)share_cmp_mm->pml4;
         } else {
-            share_l4 = (uint64_t*)(uintptr_t)(paging_read_cr3() & ~0xFFFULL);
-            source_cr3 = paging_read_cr3();
+            share_l4 = (uint64_t *)(uintptr_t)(caller_cr3 & ~0xFFFULL);
+            source_cr3 = caller_cr3;
         }
     } else {
         mm_t *share = share_cmp_mm ? share_cmp_mm : mm_kernel();
@@ -2217,9 +2286,13 @@ static int mm_make_private_range_impl(mm_t *mm, uint64_t va_begin, uint64_t va_e
                 }
             }
         }
-        /* fork() can duplicate many 4K pages — yield periodically. */
-        if (copy_old && !no_yield && (++page_idx & 31u) == 0u)
+        /* fork() can duplicate many 4K pages — yield periodically.
+         * Drop direct-map CR3 + IF across yield; re-enter after. */
+        if (copy_old && !no_yield && (++page_idx & 31u) == 0u) {
+            mm_leave_direct_map(dm);
             thread_yield();
+            dm = mm_enter_direct_map();
+        }
         uint64_t replaced_pa = 0;
         uint64_t replaced_pte = 0;
         int had_replaced = (mm_va_leaf_pa(mm, va, &replaced_pa) == 0);
@@ -2282,8 +2355,7 @@ static int mm_make_private_range_impl(mm_t *mm, uint64_t va_begin, uint64_t va_e
     }
     rc = 0;
 out:
-    if ((paging_read_cr3() & ~0xFFFULL) != (saved_cr3 & ~0xFFFULL))
-        paging_write_cr3(saved_cr3);
+    mm_leave_direct_map(dm);
     return rc;
 }
 
@@ -2312,6 +2384,8 @@ static int mm_make_private_range_bulk_zero_ex(mm_t *mm, uint64_t va_begin, uint6
     if (!share || !share->pml4)
         return -1;
     uint64_t *share_l4 = share->pml4;
+    mm_dm_ctx_t dm = mm_enter_direct_map();
+    int rc = -1;
 
     /*
      * Keep the historical API name, but allocate ordinary refcounted pages.
@@ -2329,16 +2403,16 @@ static int mm_make_private_range_bulk_zero_ex(mm_t *mm, uint64_t va_begin, uint6
             (void)mm_va_leaf_entry(mm, pg, &replaced_pte);
         void *page = mm_user_frame_alloc(1);
         if (!page)
-            return -1;
+            goto out;
         uint64_t want = (uint64_t)(uintptr_t)page;
         if ((want & ~0xFFFULL) == (pg & ~0xFFFULL)) {
             mm_user_frame_put(page);
-            return -1;
+            goto out;
         }
         if (mm_map_4k_sharedaware(mm, share_l4, pg, want,
                                   PG_RW | PG_US | PG_SOFT_OWNED) != 0) {
             mm_user_frame_put(page);
-            return -1;
+            goto out;
         }
         if (had_replaced &&
             (replaced_pa & ~0xFFFULL) != (want & ~0xFFFULL) &&
@@ -2353,10 +2427,13 @@ static int mm_make_private_range_bulk_zero_ex(mm_t *mm, uint64_t va_begin, uint6
                     (unsigned long long)pg,
                     (unsigned long long)want,
                     (unsigned long long)got);
-            return -1;
+            goto out;
         }
     }
-    return 0;
+    rc = 0;
+out:
+    mm_leave_direct_map(dm);
+    return rc;
 }
 
 int mm_make_private_range_bulk_zero(mm_t *mm, uint64_t va_begin, uint64_t va_end,

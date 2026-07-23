@@ -40,9 +40,8 @@ void pit_handler(cpu_registers_t* regs) {
         /* Userspace is BSP-only even when APs exist; preempt ring-3 on cpu0. */
         if (regs && ((regs->cs & 3) == 3)) {
                 if (smp_sched_cpu_id() == 0) {
-                        /* Match LAPIC: timer accounting may run at 250 Hz, but
-                           forced scheduling must not happen on every IRQ. */
-                        uint32_t quantum = pit_frequency / 64u;
+                        /* Match LAPIC: ~100 Hz forced preemption (~10 ms). */
+                        uint32_t quantum = pit_frequency / 100u;
                         if (quantum < 1u)
                                 quantum = 1u;
                         if ((pit_ticks % quantum) == 0)

@@ -286,12 +286,11 @@ void apic_timer_handler(cpu_registers_t* regs) {
          * pending at iretq and two runnable tasks livelock in IRQ frames
          * without retiring a single user instruction.
          *
-         * Keep timer accounting at 250 Hz, but cap forced scheduling at about
-         * 64 Hz. At 250 Hz, frequency / 250 is one and therefore schedules on
-         * every IRQ, recreating the exact interrupt-only livelock this cadence
-         * is meant to prevent on slow VMware hosts.
+         * Keep timer accounting at 250 Hz, but force scheduling around 100 Hz
+         * (~10 ms). /64 (~4 Hz) felt multi-second under load with console I/O.
+         * Still far below 1 kHz to avoid the VMware IRQ livelock.
          */
-        uint32_t quantum = apic_timer_state.frequency / 64u;
+        uint32_t quantum = apic_timer_state.frequency / 100u;
         if (quantum < 1u)
             quantum = 1u;
         if ((apic_timer_ticks % quantum) == 0)

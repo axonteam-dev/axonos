@@ -2542,8 +2542,9 @@ static int net_tcp_match_frame(const uint8_t *frame, size_t n, uint32_t local_ip
 static void net_tcp_sniff_frame(const uint8_t *frame, size_t n, const net_tcp_conn_t *c) {
     if (!g_net_tcp_connect_active || !frame || n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t))
         return;
+    /* Budgeted debug only — never re-arm forever (that painted VGA on every RX). */
     if (g_net_tcp_sniff_left <= 0)
-        g_net_tcp_sniff_left = 1; /* always log at least one RX during connect */
+        return;
     const eth_hdr_t *eth = (const eth_hdr_t *)frame;
     if (be16(eth->ethertype) != ETH_TYPE_IPV4) return;
     const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
@@ -13567,7 +13568,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 kfree(kbuf);
                 return 0;
             }
-            int step = 10; /* ms */
+            int step = 2; /* ms — keep net+tty poll snappy (was 10ms) */
             int cur_tid = poll_thr ? (int)poll_thr->tid : -1;
             int tty_waiting[16];
             int n_tty_waiting;

@@ -4,6 +4,17 @@
 
 extern void klogprintf(const char *fmt, ...);
 
+/* Hot-path RX/TX must not paint the VGA console — that alone made SSH and
+ * interactive tools feel multi-second laggy on VMware. Opt in with -DNET_TCP_TRACE=1. */
+#ifndef NET_TCP_TRACE
+#define NET_TCP_TRACE 0
+#endif
+#if NET_TCP_TRACE
+#define tcp_trace(...) klogprintf(__VA_ARGS__)
+#else
+#define tcp_trace(...) ((void)0)
+#endif
+
 #define ETH_TYPE_IPV4 0x0800
 #define IPPROTO_TCP_LOCAL 6
 
@@ -302,7 +313,7 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
                 got = 1;
                 continue;
             }
-            klogprintf("tcp: peer rst sport=%u dport=%u\n", (unsigned)sport, (unsigned)dport);
+            tcp_trace("tcp: peer rst sport=%u dport=%u\n", (unsigned)sport, (unsigned)dport);
             c->established = 0;
             c->connect_pending = 0;
             c->peer_rst = 1;
@@ -313,12 +324,12 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
         /* Handshake before tcp_apply_ack — stray large ack must not move snd_una early. */
         if ((th->flags & 0x02u) && (th->flags & 0x10u) && !c->established) {
             if (!c->connect_pending || ack != c->syn_isn + 1u) {
-                klogprintf("tcp: ignored syn-ack seq=%u ack=%u syn=%u\n",
+                tcp_trace("tcp: ignored syn-ack seq=%u ack=%u syn=%u\n",
                     (unsigned)seq, (unsigned)ack, (unsigned)c->syn_isn);
                 got = 1;
                 continue;
             }
-            klogprintf("tcp: syn-ack seq=%u ack=%u sport=%u dport=%u\n",
+            tcp_trace("tcp: syn-ack seq=%u ack=%u sport=%u dport=%u\n",
                 (unsigned)seq, (unsigned)ack, (unsigned)sport, (unsigned)dport);
             c->rcv_nxt = seq + 1;
             c->snd_una = ack;
@@ -347,7 +358,7 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
                 tcp_store_ooo(c, seq, payload, payload_len);
             }
             if (c->rx_len > before && c->rx_len - before >= 512)
-                klogprintf("tcp: rx +%u total=%u seq=%u\n",
+                tcp_trace("tcp: rx +%u total=%u seq=%u\n",
                     (unsigned)(c->rx_len - before), (unsigned)c->rx_len, (unsigned)seq);
             (void)tcp_send_seg(c, ops, 0x10u, NULL, 0);
             got = 1;
@@ -359,7 +370,7 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
                 continue;
             }
             uint32_t fin_seq = seq + (uint32_t)payload_len;
-            klogprintf("tcp: peer fin seq=%u rcv_nxt=%u\n", (unsigned)fin_seq, (unsigned)c->rcv_nxt);
+            tcp_trace("tcp: peer fin seq=%u rcv_nxt=%u\n", (unsigned)fin_seq, (unsigned)c->rcv_nxt);
             int fin_ok = 0;
             if (fin_seq == c->rcv_nxt) {
                 c->peer_fin = 1;
@@ -407,7 +418,7 @@ int net_tcp_connect(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t dst_ip
         return -1;
     }
     c->snd_nxt = isn + 1;
-    klogprintf("tcp: syn sent isn=%u sport=%u dport=%u\n",
+    tcp_trace("tcp: syn sent isn=%u sport=%u dport=%u\n",
         (unsigned)isn, (unsigned)c->src_port, (unsigned)c->dst_port);
     if (timeout_ms == 0) {
         c->connect_pending = 1;
@@ -520,7 +531,7 @@ int net_tcp_connect_poll(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t t
             }
             c->snd_nxt = save;
             last_syn = now;
-            klogprintf("tcp: syn rexmit sport=%u\n", (unsigned)c->src_port);
+            tcp_trace("tcp: syn rexmit sport=%u\n", (unsigned)c->src_port);
             for (int r = 0; r < 32; r++)
                 (void)net_tcp_service(c, ops, 256);
             if (c->established) {
@@ -532,7 +543,7 @@ int net_tcp_connect_poll(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t t
             continue;
     }
     c->connect_pending = 0;
-    klogprintf("tcp: connect give up peer_pkts=%d syn=%u\n",
+    tcp_trace("tcp: connect give up peer_pkts=%d syn=%u\n",
         c->connect_peer_pkts, (unsigned)c->syn_isn);
     return -2;
 }

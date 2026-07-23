@@ -2045,6 +2045,7 @@ void devfs_tty_push_input_noblock(int tty, char c) {
             if (tid >= 0) thread_unblock(tid);
         }
         t->waiters_count = 0;
+        thread_schedule();
         return;
     }
     /* Backspace (DEL 0x7F / BS 0x08): never handle in kernel; always pass to application.
@@ -2065,8 +2066,7 @@ void devfs_tty_push_input_noblock(int tty, char c) {
             devfs_tty_emit_byte(t, tty_on_vga, (uint8_t)'\n');
         }
         release(&t->in_lock);
-        if (smp_cpu_count() <= 1)
-            thread_schedule();
+        thread_schedule();
         return;
     }
     if (t->in_count < (int)sizeof(t->inbuf)) {
@@ -2119,6 +2119,9 @@ void devfs_tty_push_input_noblock(int tty, char c) {
         }
     }
     release(&t->in_lock);
+    /* Linux-like: input must wake a blocked reader immediately, not wait for
+     * the next timer quantum (was multi-second lag under VMware). */
+    thread_schedule();
 }
 
 int devfs_tty_pop_nb(int tty) {

@@ -782,14 +782,33 @@ void syscall_deferred_unblocks(void) {
              * would stomp fork_gpr_snap[14] and other state.
              * Linux vfork/CLONE_VM: never re-arm fork_child_user_rip — that marker
              * enables Soft_COW identity patches which mutate the shared mm and
-             * hang/corrupt the child at execve(/bin/mount). */
+             * hang/corrupt the child at execve(/bin/mount).
+             *
+             * CLONE_THREAD with its own child_stack already has correct rsp/tls in
+             * fork_gpr_snap. Re-copying from the parent replaces rsp with the
+             * parent's stack; __clone then pops garbage and SIGILL at ~0xf3. */
             if (rip && (child->state == THREAD_BLOCKED || child->state == THREAD_SLEEPING)) {
-                int vfork_share =
-                    (cur->vfork_waiting || cur->fork_request_vfork ||
-                     (child->mm && cur->mm && child->mm == cur->mm));
-                fork_copy_child_regs_from_snapshot(child, cur, rip);
-                if (vfork_share)
+                int shared_mm =
+                    (child->mm && cur->mm && child->mm == cur->mm);
+                int vfork_like =
+                    (cur->vfork_waiting || cur->fork_request_vfork);
+                int own_stack =
+                    child->saved_user_rsp != 0 &&
+                    child->saved_user_rsp != cur->saved_user_rsp;
+                if (!own_stack) {
+                    fork_copy_child_regs_from_snapshot(child, cur, rip);
+                    if (vfork_like || shared_mm)
+                        child->fork_child_user_rip = 0;
+                } else if (shared_mm) {
+                    /* pthread/CLONE_THREAD: keep prepared rsp/tls; no Soft_COW. */
                     child->fork_child_user_rip = 0;
+                    child->fork_gpr_snap[14] = 0;
+                    child->fork_gpr_snap[15] = child->saved_user_rsp;
+                    if (rip)
+                        child->fork_gpr_snap[13] = rip;
+                    child->user_rip = child->fork_gpr_snap[13];
+                    child->saved_user_rip = child->fork_gpr_snap[13];
+                }
             }
             if (cur->name[0] && strstr(cur->name, "openrc")) {
                 devel_printf("fork-defer-rip: child=%d rip=0x%llx tramp=0x%llx rsp=0x%llx rbp=0x%llx kbuf_rbp=0x%llx\n",
@@ -6733,11 +6752,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 child->saved_user_rbx = cur->saved_user_rbx;
                 child->saved_user_rdx = 0;
                 child->saved_user_rcx = saved_rcx;
-                child->fork_child_user_rip = saved_rcx;
                 child->saved_user_rip = saved_rcx;
                 child->saved_user_rsp = (uint64_t)child_rsp;
                 child->user_rip = saved_rcx;
+                /* snap[13] holds iretq RIP; leave fork_child_user_rip clear so
+                 * shared-mm Soft_COW does not treat this pthread like a vfork child. */
+                child->fork_child_user_rip = 0;
                 fork_build_gpr_snap_from_thread(child);
+                child->fork_gpr_snap[13] = saved_rcx;
                 child->fork_gpr_snap[14] = 0;
                 child->fork_gpr_snap[15] = (uint64_t)child_rsp;
 
@@ -7030,11 +7052,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 child->saved_user_rbx = cur->saved_user_rbx;
                 child->saved_user_rdx = cur->saved_user_rdx;
                 child->saved_user_rcx = saved_rcx;
-                child->fork_child_user_rip = saved_rcx;
                 child->saved_user_rip = saved_rcx;
                 child->saved_user_rsp = (uint64_t)child_rsp;
                 child->user_rip = saved_rcx;
+                child->fork_child_user_rip = 0;
                 fork_build_gpr_snap_from_thread(child);
+                child->fork_gpr_snap[13] = saved_rcx;
+                child->fork_gpr_snap[14] = 0;
+                child->fork_gpr_snap[15] = (uint64_t)child_rsp;
                 clone3_dbg(cur, 3, "return-frame",
                     (unsigned long long)saved_rcx,
                     (unsigned long long)child_rsp,

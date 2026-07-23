@@ -98,7 +98,8 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     int prot = (int)a3;
     int flags = (int)a4;
     int shared_mapping = (flags & MAP_SHARED) != 0;
-    (void)prot;
+    /* Linux: PROT_NONE (prot==0) is a pure VA reservation — no phys commit. */
+    int prot_none = ((prot & 7) == 0);
 
     if (len_u64 == 0) return user_mm_ret_err(USER_MM_EINVAL);
     if (user_mm_len_exceeds_cap(len_u64)) {
@@ -121,6 +122,15 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
 
     int fixed_mapping = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) ? 1 : 0;
     if (!(flags & (MAP_PRIVATE | MAP_SHARED))) return user_mm_ret_err(USER_MM_ENOSYS);
+
+    /* Go runtime sysReserve uses high arena hints (e.g. 0xc0<<32). Fail fast —
+     * do not walk install/zero paths for addresses we can never map. */
+    if (fixed_mapping &&
+        (req_addr >= (uintptr_t)USER_STACK_TOP ||
+         req_addr >= (uintptr_t)MMIO_IDENTITY_LIMIT ||
+         (uint64_t)req_addr + len_u64 < (uint64_t)req_addr ||
+         (uint64_t)req_addr + len_u64 > (uint64_t)USER_STACK_TOP))
+        return user_mm_ret_err(USER_MM_ENOMEM);
 
     thread_t *tcur = thread_get_current_user();
     if (!tcur) tcur = thread_current();
@@ -274,24 +284,40 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         user_as_mmap_overlaps_kernel_heap(addr, len)) {
         return user_mm_ret_err(USER_MM_ENOMEM);
     }
-    if (user_mmap_install_pages(addr, len, top_limit) != 0)
-        return user_mm_ret_err(USER_MM_EFAULT);
 
+    /*
+     * PROT_NONE / large anon: Linux reserves VA without allocating frames.
+     * Go docker mallocinit does mmap(PROT_NONE) for arena space; previously we
+     * mm_make_private_range'd the whole span then unmapped it — tens of seconds
+     * and often ENOMEM. Punch a hole + VMA only; fault path commits on demand
+     * (and refuses PROT_NONE so access still SIGSEGVs until mprotect/mmap FIXED).
+     */
     int mmap_vma_kind = (flags & MAP_SHARED) ?
         USER_VMA_KIND_SHM : USER_VMA_KIND_MMAP;
+    int reserve_only = 0;
+    if ((flags & MAP_ANONYMOUS) && !shared_mapping) {
+        const int large_aligned = (len_u64 > (96ull << 20)) &&
+            ((addr & ((uintptr_t)PAGE_SIZE_2M - 1)) == 0) &&
+            ((len_u64 & ((uint64_t)PAGE_SIZE_2M - 1)) == 0);
+        if (prot_none || large_aligned)
+            reserve_only = 1;
+    }
+
+    if (reserve_only) {
+        if (user_mmap_unmap_pages(tcur, addr, len) != 0)
+            return user_mm_ret_err(USER_MM_EFAULT);
+        /* Also clear identity leaves on the live CR3 (shared-mm / early path). */
+        user_as_mmap_lazy_drop_present_pages(addr, len);
+        mmap_vma_kind = USER_VMA_KIND_MMAP_LAZY;
+    } else if (user_mmap_install_pages(addr, len, top_limit) != 0) {
+        return user_mm_ret_err(USER_MM_EFAULT);
+    }
+
     if (flags & MAP_ANONYMOUS) {
         flags &= ~(MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED | MAP_FIXED | MAP_FIXED_NOREPLACE);
         if (flags != 0) return user_mm_ret_err(USER_MM_ENOSYS);
-        const int lazy_anon = !shared_mapping &&
-            (len_u64 > (96ull << 20)) &&
-            ((addr & ((uintptr_t)PAGE_SIZE_2M - 1)) == 0) &&
-            ((len_u64 & ((uint64_t)PAGE_SIZE_2M - 1)) == 0);
-        if (lazy_anon) {
-            mmap_vma_kind = USER_VMA_KIND_MMAP_LAZY;
-            user_as_mmap_lazy_drop_present_pages(addr, len);
-        } else {
+        if (!reserve_only)
             user_as_mmap_memset_zero_chunked(addr, len);
-        }
     } else {
         int fd = (int)(int64_t)a5;
         off_t file_off = (off_t)(int64_t)a6;

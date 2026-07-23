@@ -642,6 +642,11 @@ int user_vma_fault_lazy_anon(uint64_t cr2) {
         release_irqrestore(&g_user_vma_lock, fl);
         return 0;
     }
+    /* PROT_NONE reservation: access must fault, not demand-fill. */
+    if (hit->prot == 0) {
+        release_irqrestore(&g_user_vma_lock, fl);
+        return 0;
+    }
     uint64_t hit_end = (uint64_t)hit->addr + (uint64_t)hit->len;
     if (hit_end < (uint64_t)hit->addr || (uint64_t)cr2 >= hit_end) {
         release_irqrestore(&g_user_vma_lock, fl);

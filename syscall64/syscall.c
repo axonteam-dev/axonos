@@ -6640,19 +6640,180 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         case SYS_clone: {
             /* Old Linux clone(flags, child_stack, parent_tid, child_tid, tls).
                glibc fork() uses this as a fork-like clone with child_stack == 0
-               and no CLONE_VM, but still passes CHILD_SETTID/CLEARTID flags. */
+               and no CLONE_VM, but still passes CHILD_SETTID/CLEARTID flags.
+               glibc pthread_create uses CLONE_VM|CLONE_THREAD + child_stack. */
             enum {
                 CLONE_VM_OLD = 0x00000100u,
+                CLONE_FS_OLD = 0x00000200u,
+                CLONE_FILES_OLD = 0x00000400u,
+                CLONE_SIGHAND_OLD = 0x00000800u,
+                CLONE_THREAD_OLD = 0x00010000u,
+                CLONE_SYSVSEM_OLD = 0x00040000u,
+                CLONE_SETTLS_OLD = 0x00080000u,
                 CLONE_PARENT_SETTID_OLD = 0x00100000u,
                 CLONE_CHILD_CLEARTID_OLD = 0x00200000u,
-                CLONE_CHILD_SETTID_OLD = 0x01000000u,
-                CLONE_SETTLS_OLD = 0x00080000u
+                CLONE_CHILD_SETTID_OLD = 0x01000000u
             };
             uint64_t flags = a1;
             uint64_t child_stack = a2;
             uint64_t parent_tid_ptr = a3;
             uint64_t child_tid_ptr = a4;
             uint64_t tls = a5;
+
+            /* pthread / CLONE_VM thread: share mm, resume on child_stack (glibc
+             * __clone already pushed fn+arg there). */
+            if ((flags & CLONE_VM_OLD) && child_stack != 0) {
+                uint64_t saved_rcx = fork_caller_user_rip(cur);
+                if (!saved_rcx && cur->saved_syscall_frame)
+                    saved_rcx = cur->saved_syscall_frame[13];
+                if (!saved_rcx)
+                    return ret_err(EINVAL);
+
+                uintptr_t child_rsp = (uintptr_t)child_stack;
+                if (child_rsp < 0x1000 || child_rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT)
+                    return ret_err(EINVAL);
+                /* Classic clone has no stack_size; assume an 8MiB pthread stack. */
+                uintptr_t stack_span = 8u * 1024u * 1024u;
+                uintptr_t stack_lo = (child_rsp > stack_span) ? (child_rsp - stack_span) : 0x1000u;
+                {
+                    uintptr_t begin = (uintptr_t)saved_rcx & ~((uintptr_t)PAGE_SIZE_2M - 1);
+                    uintptr_t end = begin + (uintptr_t)PAGE_SIZE_2M;
+                    if (mark_user_identity_range_2m_sys((uint64_t)begin, (uint64_t)end) != 0)
+                        return ret_err(EINVAL);
+                    (void)user_map_ensure_present_us_2m(0x10000, 0x200000);
+                    (void)mark_user_identity_range_2m_sys(0x200000, (uint64_t)USER_STACK_TOP);
+                }
+                {
+                    uintptr_t aligned = child_rsp & ~(uintptr_t)0xFULL;
+                    if (aligned >= stack_lo + 32u)
+                        child_rsp = aligned;
+                }
+                {
+                    uintptr_t map_lo = stack_lo & ~((uintptr_t)PAGE_SIZE_2M - 1);
+                    uintptr_t map_hi = (child_rsp + 4096u) & ~((uintptr_t)PAGE_SIZE_2M - 1);
+                    if (map_hi <= map_lo) map_hi = map_lo + PAGE_SIZE_2M;
+                    if (mark_user_identity_range_2m_sys((uint64_t)map_lo, (uint64_t)map_hi) != 0)
+                        return ret_err(EFAULT);
+                }
+
+                char child_name[32];
+                strncpy(child_name, cur->name, sizeof(child_name) - 1);
+                child_name[sizeof(child_name) - 1] = '\0';
+                thread_t *child = thread_create_blocked(fork_child_return_entry, child_name);
+                if (!child) return ret_err(ENOMEM);
+                fpu_thread_fork(cur, child);
+                if (child->mm) mm_release(child->mm);
+                child->mm = mm_retain(cur->mm ? cur->mm : mm_kernel());
+
+                child->saved_user_r15 = cur->saved_user_r15;
+                child->saved_user_r14 = cur->saved_user_r14;
+                child->saved_user_r13 = cur->saved_user_r13;
+                child->saved_user_r12 = cur->saved_user_r12;
+                child->saved_user_r11 = cur->saved_user_r11;
+                child->saved_user_r10 = cur->saved_user_r10;
+                child->saved_user_r9 = cur->saved_user_r9;
+                child->saved_user_r8 = cur->saved_user_r8;
+                child->saved_user_rdi = cur->saved_user_rdi;
+                child->saved_user_rsi = cur->saved_user_rsi;
+                child->saved_user_rbp = cur->saved_user_rbp;
+                child->saved_user_rbx = cur->saved_user_rbx;
+                child->saved_user_rdx = 0;
+                child->saved_user_rcx = saved_rcx;
+                child->fork_child_user_rip = saved_rcx;
+                child->saved_user_rip = saved_rcx;
+                child->saved_user_rsp = (uint64_t)child_rsp;
+                child->user_rip = saved_rcx;
+                fork_build_gpr_snap_from_thread(child);
+                child->fork_gpr_snap[14] = 0;
+                child->fork_gpr_snap[15] = (uint64_t)child_rsp;
+
+                child->user_stack = (uint64_t)child_rsp;
+                child->user_stack_base = (uint64_t)stack_lo;
+                child->user_stack_limit = (uint64_t)child_rsp;
+                child->ring = 3;
+
+                if ((flags & CLONE_SETTLS_OLD) && tls >= 0x1000 &&
+                    tls < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                    child->user_fs_base = tls;
+                    uintptr_t tls_lo = ((uintptr_t)tls - 0x1000u) & ~((uintptr_t)PAGE_SIZE_2M - 1);
+                    uintptr_t tls_hi = ((uintptr_t)tls + 0x3000u + PAGE_SIZE_2M - 1) &
+                        ~((uintptr_t)PAGE_SIZE_2M - 1);
+                    (void)mark_user_identity_range_2m_sys((uint64_t)tls_lo, (uint64_t)tls_hi);
+                } else {
+                    child->user_fs_base = cur->user_fs_base;
+                }
+
+                child->uid = cur->uid;
+                child->euid = cur->euid;
+                child->suid = cur->suid;
+                child->gid = cur->gid;
+                child->egid = cur->egid;
+                child->sgid = cur->sgid;
+                child->umask = cur->umask;
+                child->attached_tty = cur->attached_tty;
+                child->parent_tid = (int)(cur->tid ? cur->tid : 1);
+                child->saved_sig_mask = cur->saved_sig_mask;
+                child->sas_ss_sp = 0;
+                child->sas_ss_size = 0;
+                child->sas_ss_flags = SS_DISABLE;
+                /* CLONE_THREAD: same process / signal handlers (Linux tgid). */
+                if (flags & CLONE_THREAD_OLD) {
+                    child->process = cur->process;
+                    child->sid = cur->sid;
+                    child->pgid = cur->pgid;
+                } else {
+                    if (!cur->process) {
+                        process_t *pp = process_create_init();
+                        if (pp) process_attach_thread(pp, cur);
+                    }
+                    process_t *child_process = process_create(cur->process);
+                    if (!child_process) {
+                        thread_stop((int)(child->tid ? child->tid : 1));
+                        return ret_err(ENOMEM);
+                    }
+                    process_attach_thread(child_process, child);
+                    child->sid = cur->sid;
+                    child->pgid = cur->pgid;
+                }
+                strncpy(child->cwd, cur->cwd, sizeof(child->cwd) - 1);
+                child->cwd[sizeof(child->cwd) - 1] = '\0';
+                fork_inherit_fd_table(child, cur);
+                child->user_brk_base = cur->user_brk_base;
+                child->user_brk_cur = cur->user_brk_cur;
+                child->user_mmap_next = cur->user_mmap_next;
+                child->user_mmap_hi = cur->user_mmap_hi;
+                {
+                    uintptr_t stack_end = child->user_stack_limit;
+                    uintptr_t min_next = user_mm_align_up(stack_end, (uintptr_t)PAGE_SIZE_2M);
+                    if (cur->user_mmap_next < min_next)
+                        cur->user_mmap_next = min_next;
+                }
+
+                uint32_t child_user_tid = (uint32_t)linux_task_tid(child);
+                if ((flags & CLONE_PARENT_SETTID_OLD) &&
+                    user_range_ok((const void *)(uintptr_t)parent_tid_ptr, 4)) {
+                    (void)copy_to_user_safe((void *)(uintptr_t)parent_tid_ptr,
+                                            &child_user_tid, 4);
+                }
+                if ((flags & CLONE_CHILD_SETTID_OLD) &&
+                    user_range_ok((const void *)(uintptr_t)child_tid_ptr, 4)) {
+                    (void)copy_to_user_safe((void *)(uintptr_t)child_tid_ptr,
+                                            &child_user_tid, 4);
+                }
+                if ((flags & CLONE_CHILD_CLEARTID_OLD) &&
+                    user_range_ok((const void *)(uintptr_t)child_tid_ptr, 4)) {
+                    child->clear_child_tid = child_tid_ptr;
+                }
+
+                rebuild_syscall_frame(cur);
+                if (flags & CLONE_THREAD_OLD) {
+                    cur->fork_child_to_publish = child;
+                } else {
+                    thread_unblock((int)(child->tid ? child->tid : 1));
+                }
+                return (uint64_t)child_user_tid;
+            }
+
             if ((flags & CLONE_VM_OLD) || child_stack != 0)
                 return ret_err(ENOSYS);
             /*

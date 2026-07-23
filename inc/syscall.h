@@ -105,6 +105,8 @@ typedef struct syscall_frame {
 #define SYS_nanosleep 35
 /* Linux x86_64: gettimeofday = 96, reboot = 169. */
 #define SYS_gettimeofday 96
+#define SYS_time 201
+#define SYS_getcpu 309
 #define SYS_reboot 169
 #define SYS_access 21
 #define SYS_link   86

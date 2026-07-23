@@ -20,6 +20,7 @@
 #include <frame.h>
 #include <user_map.h>
 #include <exec.h>
+#include <vsyscall.h>
 #include <keyboard.h>
 #include <serial.h>
 #include <string.h>
@@ -412,6 +413,8 @@ static void page_fault_handler(cpu_registers_t* regs) {
                                 (unsigned long long)regs->error_code,
                                 (unsigned long long)paging_read_cr3());
         }
+        if (user && (regs->error_code & 0x10u) && vsyscall_try_emulate(regs))
+                return;
         if (user && (regs->error_code & 1u) && fault_try_fix_ldso_kernel_phdr(regs, cr2))
                 return;
         if (user && fault_try_user_stack_page(cr2, regs->error_code))

@@ -7937,6 +7937,35 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (copy_to_user_safe(tv_u, &tv, sizeof(tv)) != 0) return ret_err(EFAULT);
             return 0;
         }
+        case SYS_time: { /* Linux x86_64 nr 201 — also vsyscall+0x400 */
+            int64_t *tloc = (int64_t *)(uintptr_t)a1;
+            rtc_datetime_t dt;
+            rtc_read_datetime(&dt);
+            int64_t secs = (int64_t)rtc_datetime_to_epoch(&dt);
+            if (tloc) {
+                if (!user_range_ok(tloc, sizeof(*tloc)) ||
+                    copy_to_user_safe(tloc, &secs, sizeof(secs)) != 0)
+                    return ret_err(EFAULT);
+            }
+            return (uint64_t)secs;
+        }
+        case SYS_getcpu: { /* Linux x86_64 nr 309 — also vsyscall+0x800 */
+            uint32_t *cpu_u = (uint32_t *)(uintptr_t)a1;
+            uint32_t *node_u = (uint32_t *)(uintptr_t)a2;
+            uint32_t zero = 0;
+            if (cpu_u) {
+                if (!user_range_ok(cpu_u, 4) ||
+                    copy_to_user_safe(cpu_u, &zero, 4) != 0)
+                    return ret_err(EFAULT);
+            }
+            if (node_u) {
+                if (!user_range_ok(node_u, 4) ||
+                    copy_to_user_safe(node_u, &zero, 4) != 0)
+                    return ret_err(EFAULT);
+            }
+            (void)a3;
+            return 0;
+        }
         case SYS_reboot: {
             /* Linux reboot(magic1, magic2, cmd, arg) — BusyBox reboot/halt/poweroff. */
             enum {
@@ -8013,19 +8042,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(path))
                 kprintf("dl-trace access ENOENT path=%s\n", path);
             return ret_err(ENOENT);
-        }
-        case 201: { /* time(time_t *tloc) */
-            void *tloc = (void*)(uintptr_t)a1;
-            /* If pointer is provided, store seconds since epoch there (time_t is 64-bit) */
-            rtc_datetime_t dt;
-            rtc_read_datetime(&dt);
-            uint64_t secs = rtc_datetime_to_epoch(&dt);
-            if (tloc) {
-                if ((uintptr_t)tloc + sizeof(int64_t) > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-                int64_t sval = (int64_t)secs;
-                if (copy_to_user_safe(tloc, &sval, sizeof(sval)) != 0) return ret_err(EFAULT);
-            }
-            return (uint64_t)secs;
         }
         case SYS_uname: {
             void *up = (void*)(uintptr_t)a1;

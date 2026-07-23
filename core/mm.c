@@ -803,6 +803,20 @@ mm_t *mm_retain(mm_t *mm) {
 static void mm_release_user_frames(mm_t *mm) {
     if (!mm || !mm->pml4 || mm == &g_kernel_mm)
         return;
+    /*
+     * PT pages are reached by casting PTE PAs to VAs.  After Soft_COW punches
+     * identity holes in a process CR3 (e.g. Go PROT_NONE / ELF scrub), those
+     * PAs may be unmapped under the current CR3 — seen as Oops in this walker
+     * at CR2≈0x841000 while reaping wget/apm after clone.  Walk under swapper
+     * with IF=0, same as mm_fork_private_pt_path.
+     *
+     * Pulse IF every so often: a failed fork can leave hundreds of Soft_OWNED
+     * leaves; holding cli across the whole walk freezes the machine (no Ctrl+C)
+     * after thread_stop.  Also never frame_release a PA that backs this mm's
+     * page tables (identity alias of a PT page).
+     */
+    mm_dm_ctx_t dm = mm_enter_direct_map();
+    unsigned progress = 0;
     uint64_t *l4 = mm->pml4;
     for (int l4i = 0; l4i < 512; ++l4i) {
         uint64_t e4 = l4[l4i];
@@ -831,13 +845,23 @@ static void mm_release_user_frames(mm_t *mm) {
                 uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
                 for (int l1i = 0; l1i < 512; ++l1i) {
                     uint64_t e1 = l1[l1i];
-                    if ((e1 & (PG_PRESENT | PG_US | PG_SOFT_OWNED)) ==
+                    if ((e1 & (PG_PRESENT | PG_US | PG_SOFT_OWNED)) !=
                         (PG_PRESENT | PG_US | PG_SOFT_OWNED))
-                        frame_release(e1 & PG_ADDR_MASK);
+                        continue;
+                    uint64_t pa = e1 & PG_ADDR_MASK;
+                    if (mm_owns_pt_page(mm, (const uint64_t *)(uintptr_t)pa))
+                        continue;
+                    frame_release(pa);
+                    if (++progress >= 64u) {
+                        progress = 0;
+                        mm_leave_direct_map(dm);
+                        dm = mm_enter_direct_map();
+                    }
                 }
             }
         }
     }
+    mm_leave_direct_map(dm);
 }
 
 void mm_release(mm_t *mm) {
@@ -1504,11 +1528,20 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
         return -1;
     if (protect_parent && (!parent_for_vma || !parent_for_vma->pml4))
         return -1;
-    uintptr_t hlo = heap_base_addr();
-    uintptr_t hhi = heap_region_end_exclusive();
     uint64_t limit = (uint64_t)USER_STACK_TOP;
     if (limit > (uint64_t)MMIO_IDENTITY_LIMIT)
         limit = (uint64_t)MMIO_IDENTITY_LIMIT;
+
+    /*
+     * Walk parent PTs under swapper (Linux direct map): process CR3 may have
+     * Soft_COW / exec-scrub holes at PT-frame PAs.  Skip raw identity leaves
+     * (pa==va, !SOFT_OWNED) — Linux fork only copies VMA-backed pages; AxonOS
+     * exec already privatizes ELF/stack/brk into Soft_OWNED frames.  Eagerly
+     * copying leftover PG_US identity 2MiB windows OOMs fork and then hangs
+     * mmput under cli (apm update → clone → thread_stop).
+     */
+    mm_dm_ctx_t dm = mm_enter_direct_map();
+    int rc = -1;
 
     for (int l4i = 0; l4i < 512; ++l4i) {
         uint64_t e4 = parent_l4[l4i];
@@ -1517,8 +1550,10 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
         uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
         for (int l3i = 0; l3i < 512; ++l3i) {
             uint64_t va_l3 = ((uint64_t)l4i << 39) | ((uint64_t)l3i << 30);
-            if (va_l3 >= limit)
-                return 0;
+            if (va_l3 >= limit) {
+                rc = 0;
+                goto out;
+            }
             uint64_t e3 = l3[l3i];
             if (!(e3 & PG_PRESENT) || (e3 & PG_PS_2M) || !pt_page_pa_ok(e3))
                 continue;
@@ -1533,21 +1568,21 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                 if (e2 & PG_PS_2M) {
                     if (!(e2 & PG_US))
                         continue;
+                    uint64_t leaf2 = e2 & PG_ADDR_MASK_2M;
+                    /* Entire 2MiB identity window — not a privatized user leaf. */
+                    if (leaf2 == va_l2 && !(e2 & PG_SOFT_OWNED))
+                        continue;
                     uint64_t chunk_end = va_l2 + PAGE_SIZE_2M;
                     if (chunk_end > limit)
                         chunk_end = limit;
-                    uint64_t leaf2 = e2 & PG_ADDR_MASK_2M;
                     for (uint64_t va = va_l2; va < chunk_end; va += PAGE_SIZE_4K) {
-                        /* Skip only identity kernel-heap slices (pa==va), not
-                         * every VA in [hlo,hhi) — match the 4K path below. */
-                        if (hlo && va >= (uint64_t)hlo && va < (uint64_t)hhi &&
-                            leaf2 == (va & ~(PAGE_SIZE_2M - 1ULL)))
-                            continue;
                         uint64_t pa = leaf2 + (va - va_l2);
+                        if (pa == (va & ~0xFFFULL) && !(e2 & PG_SOFT_OWNED))
+                            continue;
                         if (mm_fork_copy_user_leaf(child, parent_for_vma,
                                 parent_l4, owner_tid, va, pa, e2,
                                 protect_parent) != 0)
-                            return -1;
+                            goto out;
                     }
                     continue;
                 }
@@ -1558,25 +1593,25 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                     uint64_t va = va_l2 | ((uint64_t)l1i << 12);
                     if (va < 0x200000ULL || va >= limit)
                         continue;
-                    if (hlo && va >= (uint64_t)hlo && va < (uint64_t)hhi) {
-                        uint64_t e1 = l1[l1i];
-                        if ((e1 & PG_PRESENT) &&
-                            (e1 & PG_ADDR_MASK) == (va & ~0xFFFULL))
-                            continue;
-                    }
                     uint64_t e1 = l1[l1i];
                     if ((e1 & (PG_PRESENT | PG_US)) !=
                         (PG_PRESENT | PG_US))
                         continue;
+                    uint64_t pa = e1 & PG_ADDR_MASK;
+                    if (pa == (va & ~0xFFFULL) && !(e1 & PG_SOFT_OWNED))
+                        continue;
                     if (mm_fork_copy_user_leaf(child, parent_for_vma,
-                            parent_l4, owner_tid, va, e1 & PG_ADDR_MASK, e1,
+                            parent_l4, owner_tid, va, pa, e1,
                             protect_parent) != 0)
-                        return -1;
+                        goto out;
                 }
             }
         }
     }
-    return 0;
+    rc = 0;
+out:
+    mm_leave_direct_map(dm);
+    return rc;
 }
 
 int mm_cow_mark_all_user_writable_pair_l4(mm_t *child, mm_t *parent,

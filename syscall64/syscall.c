@@ -4263,6 +4263,17 @@ static struct fs_file *socket_file_get(thread_t *cur, int fd, ksock_net_t **out_
     return f;
 }
 
+/* Authoritative open-file lookup for the task issuing a syscall.
+ * Prefer process->fds (shared table) but fall back to the thread slot so a
+ * briefly desynced dup()/F_DUPFD path cannot spuriously POLLNVAL. */
+static struct fs_file *syscall_fd_get(thread_t *t, int fd) {
+    if (!t || fd < 0 || fd >= THREAD_MAX_FD)
+        return NULL;
+    if (t->process && t->process->fds[fd])
+        return t->process->fds[fd];
+    return t->fds[fd];
+}
+
 static void net_debug_log_tls443_tx(ksock_net_t *s, const uint8_t *buf, size_t len, const char *path) {
     if (!s || !buf || len == 0) return;
     if (s->type_base != SOCK_STREAM_LOCAL || s->protocol != IPPROTO_TCP_LOCAL || s->dns_tcp_udp_bridge)
@@ -8910,8 +8921,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 timeout_ms = (int)ms;
             }
 
-            thread_t *curth = thread_get_current_user();
-            if (!curth) curth = thread_current();
+            thread_t *curth = cur;
 
             auto_select_check:
             {
@@ -8926,7 +8936,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (win)  want_w = (int)((win[fd / 64]  >> (fd % 64)) & 1ULL);
                     if (!want_r && !want_w) continue;
 
-                    struct fs_file *f = curth ? curth->fds[fd] : NULL;
+                    struct fs_file *f = syscall_fd_get(curth, fd);
                     int can_r = 0, can_w = 0;
                     if (!f) {
                         /* invalid fd: POSIX would error via EBADF; keep it simple for now */
@@ -10749,11 +10759,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         case 32: { /* dup(oldfd) */
             int oldfd = (int)a1;
             if (oldfd < 0 || oldfd >= THREAD_MAX_FD) return ret_err(EBADF);
-            struct fs_file *f = cur->fds[oldfd];
+            struct fs_file *f = syscall_fd_get(cur, oldfd);
             if (!f) return ret_err(EBADF);
             for (int i = 0; i < THREAD_MAX_FD; i++) {
-                if (cur->fds[i] == NULL) {
+                if (syscall_fd_get(cur, i) == NULL) {
                     cur->fds[i] = f;
+                    if (cur->process)
+                        cur->process->fds[i] = f;
                     if (f->refcount <= 0) f->refcount = 1;
                     else f->refcount++;
                     return (uint64_t)i;
@@ -10840,7 +10852,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             };
             int duplicate_cloexec = (cmd == F_DUPFD_CLOEXEC);
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
-            struct fs_file *f = cur->fds[fd];
+            struct fs_file *f = syscall_fd_get(cur, fd);
             if (!f) return ret_err(EBADF);
             if (cmd == F_DUPFD_CLOEXEC) {
                 cmd = F_DUPFD;
@@ -10881,9 +10893,12 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 return 0;
             } else if (cmd == F_DUPFD) {
-                /* simple duplicate to next available fd */
-                for (int i = 0; i < THREAD_MAX_FD; i++) {
-                    if (cur->fds[i] == NULL) {
+                /* Linux: allocate lowest available fd >= arg */
+                int minfd = arg;
+                if (minfd < 0) minfd = 0;
+                if (minfd >= THREAD_MAX_FD) return ret_err(EINVAL);
+                for (int i = minfd; i < THREAD_MAX_FD; i++) {
+                    if (syscall_fd_get(cur, i) == NULL) {
                         cur->fds[i] = f;
                         if (cur->process) {
                             cur->process->fds[i] = f;
@@ -13337,11 +13352,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             const void *ufds = (const void*)(uintptr_t)a1;
             int nfds = (int)a2;
             int timeout;
-            thread_t *tcur_poll_cfg = thread_get_current_user();
-            if (!tcur_poll_cfg) tcur_poll_cfg = thread_current();
-            int is_wget_proc = (tcur_poll_cfg && tcur_poll_cfg->name[0] && strstr(tcur_poll_cfg->name, "wget")) ? 1 : 0;
-            int is_apm_proc = (tcur_poll_cfg && tcur_poll_cfg->name[0] && strstr(tcur_poll_cfg->name, "apm")) ? 1 : 0;
-            int is_git_proc = (tcur_poll_cfg && tcur_poll_cfg->name[0] && strstr(tcur_poll_cfg->name, "git")) ? 1 : 0;
+            /* Pin the syscall task across sleep/yield. Re-resolving via
+             * thread_get_current_user() can point at another process's fd
+             * table and spuriously return POLLNVAL (OpenSSH: invalid rfd). */
+            thread_t *poll_thr = cur;
+            int is_wget_proc = (poll_thr && poll_thr->name[0] && strstr(poll_thr->name, "wget")) ? 1 : 0;
+            int is_apm_proc = (poll_thr && poll_thr->name[0] && strstr(poll_thr->name, "apm")) ? 1 : 0;
+            int is_git_proc = (poll_thr && poll_thr->name[0] && strstr(poll_thr->name, "git")) ? 1 : 0;
             if (num == 271) {
                 /* Minimal ppoll: ignore sigmask/sigsetsize, translate timespec->ms for poll(). */
                 const void *tmo_u = (const void*)(uintptr_t)a3;
@@ -13358,11 +13375,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     /* Cap NULL-timeout ppoll so userland can't block forever on network. */
                     if (is_wget_proc || is_apm_proc || is_git_proc) timeout = 1000;
                 }
-                } else {
-                    timeout = (int)a3; /* milliseconds, -1 means infinite */
-                    /* Some tools can block forever on network poll(-1); cap so process can progress. */
-                    if (timeout < 0 && (is_wget_proc || is_apm_proc || is_git_proc)) timeout = 1000;
-                }
+            } else {
+                timeout = (int)a3; /* milliseconds, -1 means infinite */
+                /* Some tools can block forever on network poll(-1); cap so process can progress. */
+                if (timeout < 0 && (is_wget_proc || is_apm_proc || is_git_proc)) timeout = 1000;
+            }
             if (nfds < 0 || nfds > 1024) return ret_err(EINVAL);
             volatile int elapsed = 0;
             uint64_t poll_t_start = 0;
@@ -13390,16 +13407,17 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             auto_check:
             {
                 int ready = 0;
-                thread_t *curth = thread_get_current_user();
-                if (!curth) curth = thread_current();
                 for (int i = 0; i < nfds; i++) {
                     int fd = *(int*)((uint8_t*)kbuf + i * entry_size + 0);
                     short events = *(short*)((uint8_t*)kbuf + i * entry_size + 4);
                     short revents = 0;
-                    if (fd < 0 || fd >= THREAD_MAX_FD) {
+                    /* Linux/POSIX: negative fd is ignored (revents=0), not POLLNVAL. */
+                    if (fd < 0) {
+                        revents = 0;
+                    } else if (fd >= THREAD_MAX_FD) {
                         revents = POLLNVAL;
                     } else {
-                        struct fs_file *f = curth ? curth->fds[fd] : NULL;
+                        struct fs_file *f = syscall_fd_get(poll_thr, fd);
                         if (!f) {
                             revents = POLLNVAL;
                         } else {
@@ -13408,6 +13426,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                 int tidx = devfs_get_tty_index_from_file(f);
                                 if (tidx < 0) tidx = devfs_get_active();
                                 if ((events & POLLIN) && devfs_tty_available(tidx) > 0) revents |= POLLIN;
+                                if (events & POLLOUT) revents |= POLLOUT;
                             } else if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
                                 ksock_net_t *s = (ksock_net_t *)f->driver_private;
                                 if (events & POLLOUT) {
@@ -13495,10 +13514,20 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                     if (p->refcount < 2) revents |= POLLHUP;
                                 }
                             } else {
-                                /* regular file: readable if pos < size */
-                                if ((events & POLLIN)) {
+                                /* regular file / char device */
+                                if (events & POLLOUT)
+                                    revents |= POLLOUT;
+                                if (events & POLLIN) {
                                     if (f->type != FS_TYPE_DIR) {
-                                        if ((size_t)f->pos < (size_t)f->size) revents |= POLLIN;
+                                        if ((size_t)f->pos < (size_t)f->size)
+                                            revents |= POLLIN;
+                                        else if (f->path &&
+                                                 (strcmp(f->path, "/dev/null") == 0 ||
+                                                  strcmp(f->path, "/dev/zero") == 0 ||
+                                                  strcmp(f->path, "/dev/random") == 0 ||
+                                                  strcmp(f->path, "/dev/urandom") == 0 ||
+                                                  strcmp(f->path, "/dev/full") == 0))
+                                            revents |= POLLIN;
                                     } else {
                                         /* directories: indicate readable */
                                         revents |= POLLIN;
@@ -13517,14 +13546,12 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
             }
 
-            thread_t *curth_poll = thread_get_current_user();
-            if (!curth_poll) curth_poll = thread_current();
             /* Detect if poll set includes network sockets (TCP/UDP) - need e1000_poll */
             int has_net_socket = 0;
             for (int i = 0; i < nfds && !has_net_socket; i++) {
                 int fd = *(int*)((uint8_t*)kbuf + i * entry_size + 0);
                 if (fd < 0 || fd >= THREAD_MAX_FD) continue;
-                struct fs_file *f = curth_poll ? curth_poll->fds[fd] : NULL;
+                struct fs_file *f = syscall_fd_get(poll_thr, fd);
                 if (!f || f->type != SYSCALL_FTYPE_SOCKET || !f->driver_private) continue;
                 ksock_net_t *s = (ksock_net_t *)f->driver_private;
                 if ((s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) ||
@@ -13534,14 +13561,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (timeout == 0) {
                 /* Non-blocking poll: service network once so packets get processed. */
                 if (has_net_socket)
-                    net_pump_all_tcp(curth_poll);
+                    net_pump_all_tcp(poll_thr);
                 else
                     thread_sleep(10); /* avoid busy-loop when no network fds */
                 kfree(kbuf);
                 return 0;
             }
             int step = 10; /* ms */
-            int cur_tid = curth_poll ? (int)curth_poll->tid : -1;
+            int cur_tid = poll_thr ? (int)poll_thr->tid : -1;
             int tty_waiting[16];
             int n_tty_waiting;
             if (timeout < 0) {
@@ -13549,7 +13576,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                    When has_net_socket: must use bounded sleep so we periodically poll e1000 and re-check. */
                 for (;;) {
                     if (has_net_socket)
-                        net_pump_all_tcp(curth_poll);
+                        net_pump_all_tcp(poll_thr);
                     else
                         e1000_poll();
                     n_tty_waiting = 0;
@@ -13558,7 +13585,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             int fd = *(int*)((uint8_t*)kbuf + i * entry_size + 0);
                             short events = *(short*)((uint8_t*)kbuf + i * entry_size + 4);
                             if (fd < 0 || fd >= THREAD_MAX_FD || !(events & POLLIN)) continue;
-                            struct fs_file *f = curth_poll ? curth_poll->fds[fd] : NULL;
+                            struct fs_file *f = syscall_fd_get(poll_thr, fd);
                             if (!f || !devfs_is_tty_file(f)) continue;
                             int tidx = devfs_get_tty_index_from_file(f);
                             if (tidx < 0) tidx = devfs_get_active();
@@ -13597,7 +13624,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         int fd = *(int*)((uint8_t*)kbuf + i * entry_size + 0);
                         short events = *(short*)((uint8_t*)kbuf + i * entry_size + 4);
                         if (fd < 0 || fd >= THREAD_MAX_FD || !(events & POLLIN)) continue;
-                        struct fs_file *f = curth_poll ? curth_poll->fds[fd] : NULL;
+                        struct fs_file *f = syscall_fd_get(poll_thr, fd);
                         if (!f || !devfs_is_tty_file(f)) continue;
                         int tidx = devfs_get_tty_index_from_file(f);
                         if (tidx < 0) tidx = devfs_get_active();
@@ -13625,7 +13652,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (poll_first_entry) { poll_t_start = pit_get_time_ms(); poll_first_entry = 0; }
                 while (elapsed < timeout) {
                     if (has_net_socket)
-                        net_pump_all_tcp(curth_poll);
+                        net_pump_all_tcp(poll_thr);
                     else
                         e1000_poll();
                     uint32_t sleep_ms = (uint32_t)(timeout - elapsed);

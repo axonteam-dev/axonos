@@ -44,6 +44,7 @@ typedef struct syscall_frame {
 #define SYS_rt_sigaction 13
 #define SYS_rt_sigprocmask 14
 #define SYS_rt_sigreturn 15
+#define SYS_sigaltstack 131
 #define SYS_ioctl   16
 #define SYS_getdents64 217
 #define SYS_getdents 78

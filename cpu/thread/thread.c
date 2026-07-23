@@ -551,6 +551,9 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->uaccess_active = 0;
         t->pending_signals = 0;
         t->saved_sig_mask = 0;
+        t->sas_ss_sp = 0;
+        t->sas_ss_size = 0;
+        t->sas_ss_flags = 2; /* SS_DISABLE */
         t->waiter_tid = -1;
         t->exit_status = 0;
         t->exec_trampoline_flag = 0;
@@ -697,6 +700,9 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->uaccess_active = 0;
         t->pending_signals = 0;
         t->saved_sig_mask = 0;
+        t->sas_ss_sp = 0;
+        t->sas_ss_size = 0;
+        t->sas_ss_flags = 2; /* SS_DISABLE */
         t->waiter_tid = -1;
         t->exit_status = 0;
         t->exec_trampoline_flag = 0;

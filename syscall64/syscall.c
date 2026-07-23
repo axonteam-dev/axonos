@@ -5703,12 +5703,22 @@ static uint64_t user_pgrp = 1;
 /* Signal delivery: handlers, restorers, and per-thread mask. */
 typedef void (*user_sighandler_t)(int);
 #define SA_SIGINFO 0x4
+#ifndef SA_ONSTACK
+#define SA_ONSTACK 0x08000000u
+#endif
 #ifndef SA_NOCLDWAIT
 #define SA_NOCLDWAIT 0x01000000u
 #endif
 #ifndef SA_NODEFER
 #define SA_NODEFER 0x40000000u
 #endif
+#ifndef SS_ONSTACK
+#define SS_ONSTACK 1
+#endif
+#ifndef SS_DISABLE
+#define SS_DISABLE 2
+#endif
+#define MINSIGSTKSZ_AXON 2048u
 #define SIG_DFL ((user_sighandler_t)0)
 #define SIG_IGN ((user_sighandler_t)1)
 
@@ -6045,6 +6055,17 @@ typedef struct {
 #define RT_SIGFRAME_SIZE      (RT_SIGFRAME_INFO_OFF + sizeof(k_siginfo_t))
 #define X86_REDZONE           128ULL
 
+/* Prefer sigaltstack when SA_ONSTACK is set and an alt stack is armed. */
+static uint64_t signal_pick_handler_rsp(thread_t *cur, const user_sigaction_t *sa,
+                                        uint64_t normal_rsp) {
+    if (!cur || !sa) return normal_rsp;
+    if (!(sa->flags & SA_ONSTACK)) return normal_rsp;
+    if (cur->sas_ss_flags & SS_DISABLE) return normal_rsp;
+    if (!cur->sas_ss_sp || cur->sas_ss_size < MINSIGSTKSZ_AXON) return normal_rsp;
+    uint64_t top = cur->sas_ss_sp + cur->sas_ss_size;
+    if (top <= cur->sas_ss_sp || top > (uint64_t)MMIO_IDENTITY_LIMIT) return normal_rsp;
+    return top;
+}
 
 /* Pick next deliverable signal. Returns:
  *   0  — nothing to do
@@ -6165,6 +6186,10 @@ static uintptr_t signal_write_rt_frame(thread_t *cur, int sig, const user_sigact
     uc.uc_mcontext.gs = 0;
     uc.uc_mcontext.fs = 0;
     uc.uc_mcontext.ss = 0x23;
+    /* Best-effort stack_t fields (layout historically mismatched size/flags). */
+    uc.uc_stack_ss_sp = cur->sas_ss_sp;
+    uc.uc_stack_ss_size = cur->sas_ss_size;
+    uc.uc_stack_ss_flags = (uint32_t)cur->sas_ss_flags;
     uc.uc_sigmask[0] = cur->saved_sig_mask;
     if (copy_to_user_safe((void *)(uintptr_t)(frame_start + RT_SIGFRAME_UC_OFF),
                           &uc, sizeof(uc)) != 0)
@@ -6248,7 +6273,8 @@ int maybe_deliver_pending_signal(uint64_t syscall_ret) {
         uint64_t handler = (uint64_t)(uintptr_t)sa.handler;
         if (handler < 0x10000ULL) return 0;
 
-        uintptr_t frame_start = signal_write_rt_frame(cur, sig, &sa, old_rsp, &sc);
+        uint64_t frame_rsp = signal_pick_handler_rsp(cur, &sa, old_rsp);
+        uintptr_t frame_start = signal_write_rt_frame(cur, sig, &sa, frame_rsp, &sc);
         if (!frame_start) return 0;
 
         frame[8]  = (uint64_t)sig;
@@ -6311,7 +6337,8 @@ int maybe_deliver_pending_signal_iretq(cpu_registers_t *regs) {
         sc.rip = old_rip;
         sc.eflags = regs->rflags;
 
-        uintptr_t frame_start = signal_write_rt_frame(cur, sig, &sa, old_rsp, &sc);
+        uint64_t frame_rsp = signal_pick_handler_rsp(cur, &sa, old_rsp);
+        uintptr_t frame_start = signal_write_rt_frame(cur, sig, &sa, frame_rsp, &sc);
         if (!frame_start) return 0;
 
         regs->rdi = (uint64_t)sig;
@@ -11176,6 +11203,60 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             return 0;
         }
+        case SYS_sigaltstack: {
+            /* sigaltstack(const stack_t *ss, stack_t *old_ss) — Linux x86_64 nr 131.
+             * Go runtime.minit queries then arms an alternate signal stack. */
+            const void *ss_u = (const void *)(uintptr_t)a1;
+            void *old_u = (void *)(uintptr_t)a2;
+            if (!cur || cur->ring != 3) return ret_err(EINVAL);
+
+            typedef struct {
+                uint64_t ss_sp;
+                int32_t ss_flags;
+                int32_t __pad;
+                uint64_t ss_size;
+            } k_stack_t;
+
+            k_stack_t old;
+            old.ss_sp = cur->sas_ss_sp;
+            old.ss_flags = cur->sas_ss_flags;
+            old.__pad = 0;
+            old.ss_size = cur->sas_ss_size;
+
+            if (ss_u) {
+                k_stack_t ss;
+                if (!user_range_ok(ss_u, sizeof(ss)) ||
+                    copy_from_user_raw(&ss, ss_u, sizeof(ss)) != 0)
+                    return ret_err(EFAULT);
+                int flags = ss.ss_flags;
+                /* Input may only be 0 or SS_DISABLE (SS_ONSTACK is output-only). */
+                if (flags & ~SS_DISABLE)
+                    return ret_err(EINVAL);
+                if (flags & SS_DISABLE) {
+                    cur->sas_ss_sp = 0;
+                    cur->sas_ss_size = 0;
+                    cur->sas_ss_flags = SS_DISABLE;
+                } else {
+                    if (ss.ss_size < MINSIGSTKSZ_AXON)
+                        return ret_err(ENOMEM);
+                    if (!ss.ss_sp ||
+                        ss.ss_sp < 0x200000ULL ||
+                        ss.ss_sp + ss.ss_size < ss.ss_sp ||
+                        ss.ss_sp + ss.ss_size > (uint64_t)MMIO_IDENTITY_LIMIT)
+                        return ret_err(EFAULT);
+                    cur->sas_ss_sp = ss.ss_sp;
+                    cur->sas_ss_size = ss.ss_size;
+                    cur->sas_ss_flags = 0;
+                }
+            }
+
+            if (old_u) {
+                if (!user_range_ok(old_u, sizeof(old)) ||
+                    copy_to_user_safe(old_u, &old, sizeof(old)) != 0)
+                    return ret_err(EFAULT);
+            }
+            return 0;
+        }
         case SYS_fork: {
             uint64_t saved_rcx = fork_caller_user_rip(cur);
             if (!saved_rcx && cur->saved_syscall_frame)
@@ -11380,6 +11461,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             child->egid = cur->egid;
             child->sgid = cur->sgid;
             child->saved_sig_mask = cur->saved_sig_mask;
+            child->sas_ss_sp = cur->sas_ss_sp;
+            child->sas_ss_size = cur->sas_ss_size;
+            child->sas_ss_flags = cur->sas_ss_flags;
             child->pending_signals = 0;
             child->attached_tty = cur->attached_tty;
             child->parent_tid = (int)(cur->tid ? cur->tid : 1);

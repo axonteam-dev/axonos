@@ -124,6 +124,10 @@ typedef struct thread {
         uint64_t pending_signals;
         /* per-thread signal mask (blocked signals); used by rt_sigprocmask and signal delivery */
         uint64_t saved_sig_mask;
+        /* Linux sigaltstack(2) — Go runtime.minit queries this at startup. */
+        uint64_t sas_ss_sp;
+        uint64_t sas_ss_size;
+        int sas_ss_flags; /* SS_DISABLE=2 when unset */
         /* if non-negative, tid of thread waiting for this child (wait/waitpid) */
         int waiter_tid;
         /* fork/clone3: unblock child after parent syscall returns (avoid clobbering per-CPU syscall stack). */

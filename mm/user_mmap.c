@@ -147,6 +147,10 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
 
     if (tcur) {
         uintptr_t vma_hi = user_vma_max_mmap_like_end_for_mm(tcur);
+        /* ELF_LOAD ends near &_end / TLS (e.g. 0x14xxxxx). Do not start the
+         * next anon mmap there — PROT_NONE reserve would unmap Go's fs TLS. */
+        if (vma_hi < (uintptr_t)USER_MMAP_BASE)
+            vma_hi = 0;
         if (vma_hi > *p_mmap_next) {
             if (vma_hi < top_limit) *p_mmap_next = vma_hi;
             else *p_mmap_next = 0;
@@ -156,6 +160,19 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     uintptr_t brk_cur_for_mmap = tcur ? user_as_shared_max_brk_cur(tcur, tcur->user_brk_cur) : user_as_brk_cur;
     if (brk_cur_for_mmap == 0) brk_cur_for_mmap = 8u * 1024u * 1024u;
     uintptr_t brk_guard_floor = user_mm_align_up(brk_cur_for_mmap + 0x10000u, 4096);
+    /* Never place/punch anon mmap through the ELF image, brk gap, or TLS. */
+    uintptr_t anon_floor = (uintptr_t)USER_MMAP_BASE;
+    if (brk_guard_floor > anon_floor)
+        anon_floor = brk_guard_floor;
+    if (tcur && tcur->user_fs_base >= 0x200000u &&
+        tcur->user_fs_base < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+        uintptr_t tls_hi = user_mm_align_up(
+            (uintptr_t)tcur->user_fs_base + 0x10000u, (uintptr_t)PAGE_SIZE_2M);
+        if (tls_hi > anon_floor)
+            anon_floor = tls_hi;
+    }
+    if (anon_floor >= top_limit)
+        anon_floor = brk_guard_floor;
 
     if (len_u64 > (uint64_t)top_limit) {
         kprintf("mmap: ENOMEM len 0x%llx > top_limit 0x%llx\n",
@@ -166,14 +183,16 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     if (*p_mmap_next == 0) {
         /* Prefer the reserved user mmap window (see user_layout.h), not 32MiB
          * which collides with early brk growth and used to sit under the heap. */
-        uintptr_t def = (uintptr_t)USER_MMAP_BASE;
+        uintptr_t def = anon_floor;
         if (def >= top_limit && top_limit > (8u * 1024u * 1024u)) {
             def = user_mm_align_up(top_limit / 2u, 4096);
             if (def < (8u * 1024u * 1024u)) def = 8u * 1024u * 1024u;
+            if (def < anon_floor && anon_floor < top_limit)
+                def = anon_floor;
         }
-        if (def < brk_guard_floor) def = brk_guard_floor;
         *p_mmap_next = def;
     }
+    if (*p_mmap_next < anon_floor) *p_mmap_next = anon_floor;
     if (*p_mmap_next < brk_guard_floor) *p_mmap_next = brk_guard_floor;
 
     if (tcur && tcur->user_stack_base != 0 && tcur->user_stack_limit > tcur->user_stack_base) {
@@ -186,7 +205,7 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         if (min_alloc < top_limit && *p_mmap_next < min_alloc)
             *p_mmap_next = min_alloc;
         else if (*p_mmap_next >= top_limit)
-            *p_mmap_next = brk_guard_floor;
+            *p_mmap_next = anon_floor < top_limit ? anon_floor : brk_guard_floor;
     }
 
     uintptr_t addr = fixed_mapping ? req_addr : user_mm_align_up(*p_mmap_next, 4096);
@@ -210,12 +229,19 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         }
     }
     if (!fixed_mapping) {
+        if (addr < anon_floor) {
+            addr = anon_floor;
+            *p_mmap_next = anon_floor;
+        }
         if (addr < brk_guard_floor) {
             addr = brk_guard_floor;
             *p_mmap_next = brk_guard_floor;
         }
     }
     if (addr < brk_guard_floor) return user_mm_ret_err(USER_MM_EINVAL);
+    /* MAP_FIXED must not punch through TLS/brk/image below the anon floor. */
+    if (fixed_mapping && addr < anon_floor)
+        return user_mm_ret_err(USER_MM_ENOMEM);
     if ((uint64_t)addr + len_u64 < (uint64_t)addr)
         return user_mm_ret_err(USER_MM_ENOMEM);
     if (addr >= (uintptr_t)USER_TLS_BASE ||
@@ -304,9 +330,11 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     }
 
     if (reserve_only) {
+        if (addr < anon_floor)
+            return user_mm_ret_err(USER_MM_ENOMEM);
         if (user_mmap_unmap_pages(tcur, addr, len) != 0)
             return user_mm_ret_err(USER_MM_EFAULT);
-        /* Also clear identity leaves on the live CR3 (shared-mm / early path). */
+        /* Clear present leaves only inside the reserved span (private/live CR3). */
         user_as_mmap_lazy_drop_present_pages(addr, len);
         mmap_vma_kind = USER_VMA_KIND_MMAP_LAZY;
     } else if (user_mmap_install_pages(addr, len, top_limit) != 0) {

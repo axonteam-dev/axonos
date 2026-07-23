@@ -7,6 +7,7 @@
 #include <console.h>
 #include <keyboard.h>
 #include <thread.h>
+#include <process.h>
 #include <smp.h>
 #include <string.h>
 #include <stddef.h>
@@ -394,7 +395,7 @@ struct devfs_char {
     char path[32];
     void *driver_private;
 };
-static struct devfs_char dev_chars[16];
+static struct devfs_char dev_chars[32];
 static int dev_char_count = 0;
 static uint32_t devfs_rand_state = 0x12345678;
 /* special device names exposed under /dev */
@@ -403,9 +404,31 @@ static const char * const devfs_special_names[] = {
     "stdin", "stdout", "stderr",
     "tty",          /* controlling tty (alias to thread-attached tty) */
     "urandom",
-    "full"
+    "full",
+    "ptmx",         /* Unix98 PTY master multiplexor (node present; pty pair TBD) */
 };
 static const int devfs_special_count = sizeof(devfs_special_names) / sizeof(devfs_special_names[0]);
+
+/* Linux-like virtual directories under /dev. Always listed; some start empty. */
+static const char * const devfs_subdir_names[] = {
+    "input", "pts", "shm", "fd", "net",
+};
+static const int devfs_subdir_count =
+    (int)(sizeof(devfs_subdir_names) / sizeof(devfs_subdir_names[0]));
+
+/* Directory handle kinds — readdir must key off this, not path strings
+ * (BusyBox opens "/dev/pts/" with a trailing slash and used to fall through
+ * into the /dev root listing → ls: /dev/pts/console: No such file...). */
+enum {
+    DEVFS_DIR_ROOT = 1,
+    DEVFS_DIR_INPUT = 2,
+    DEVFS_DIR_EMPTY = 3, /* pts / shm / fd / net stubs: only . and .. */
+};
+typedef struct {
+    int is_dir;
+    int kind;
+    int dir_count;
+} devfs_dir_t;
 
 /* entropy and RNG state */
 static uint32_t devfs_entropy = 0;
@@ -480,9 +503,6 @@ static int devfs_create(const char *path, struct fs_file **out_file) {
 
 static int devfs_open(const char *path, struct fs_file **out_file) {
     if (!path) return -1;
-    static int devfs_full_trace_left = 4;
-    if (strcmp(path, "/dev/full") == 0 && devfs_full_trace_left-- > 0)
-        kprintf("devfs: open /dev/full\n");
     /* directory /dev */
     if (strcmp(path, "/dev") == 0 || strcmp(path, "/dev/") == 0) {
         struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
@@ -493,44 +513,66 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
         if (!pp) { kfree(f); return -1; }
         memcpy(pp, path, plen);
         f->path = (const char*)pp;
-        f->fs_private = NULL;
-        /* allocate a simple handle to mark directory */
-        struct { int is_dir; int dir_count; } *h = kmalloc(sizeof(*h));
+        devfs_dir_t *h = kmalloc(sizeof(*h));
         if (!h) { kfree((void*)f->path); kfree(f); return -1; }
         h->is_dir = 1;
-        h->dir_count = DEVFS_TTY_COUNT + 1; /* console + ttyN */
+        h->kind = DEVFS_DIR_ROOT;
+        h->dir_count = 0;
         f->driver_private = (void*)h;
         f->type = FS_TYPE_DIR;
         f->size = 0;
         f->pos = 0;
-        /* opened directory */
         f->fs_private = &devfs_driver_data;
         f->refcount = 1;
         *out_file = f;
         return 0;
     }
-    /* directory /dev/input */
-    if (strcmp(path, "/dev/input") == 0 || strcmp(path, "/dev/input/") == 0) {
-        struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
-        if (!f) return -1;
-        memset(f, 0, sizeof(*f));
-        size_t plen = strlen(path) + 1;
-        char *pp = (char*)kmalloc(plen);
-        if (!pp) { kfree(f); return -1; }
-        memcpy(pp, path, plen);
-        f->path = (const char*)pp;
-        f->fs_private = NULL;
-        struct { int is_dir; int dir_count; } *h = kmalloc(sizeof(*h));
-        if (!h) { kfree((void*)f->path); kfree(f); return -1; }
-        h->is_dir = 1;
-        h->dir_count = 1; /* mice */
-        f->driver_private = (void*)h;
-        f->type = FS_TYPE_DIR;
-        f->size = 0;
-        f->pos = 0;
-        f->fs_private = &devfs_driver_data;
-        f->refcount = 1;
-        *out_file = f;
+    /* Linux-like virtual subdirs: /dev/{input,pts,shm,fd,net} */
+    for (int di = 0; di < devfs_subdir_count; di++) {
+        char dpath[40];
+        snprintf(dpath, sizeof(dpath), "/dev/%s", devfs_subdir_names[di]);
+        size_t dlen = strlen(dpath);
+        if (strcmp(path, dpath) == 0 ||
+            (strncmp(path, dpath, dlen) == 0 && path[dlen] == '/' && path[dlen + 1] == '\0')) {
+            struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
+            if (!f) return -1;
+            memset(f, 0, sizeof(*f));
+            size_t plen = strlen(dpath) + 1;
+            char *pp = (char*)kmalloc(plen);
+            if (!pp) { kfree(f); return -1; }
+            memcpy(pp, dpath, plen);
+            f->path = (const char*)pp;
+            devfs_dir_t *h = kmalloc(sizeof(*h));
+            if (!h) { kfree((void*)f->path); kfree(f); return -1; }
+            h->is_dir = 1;
+            h->kind = (strcmp(devfs_subdir_names[di], "input") == 0)
+                ? DEVFS_DIR_INPUT : DEVFS_DIR_EMPTY;
+            h->dir_count = (h->kind == DEVFS_DIR_INPUT) ? 1 : 0;
+            f->driver_private = (void*)h;
+            f->type = FS_TYPE_DIR;
+            f->size = 0;
+            f->pos = 0;
+            f->fs_private = &devfs_driver_data;
+            f->refcount = 1;
+            *out_file = f;
+            return 0;
+        }
+    }
+    /* /dev/fd/N — Linux: open equals dup(N) of the calling process. */
+    if (strncmp(path, "/dev/fd/", 8) == 0 && path[8] >= '0' && path[8] <= '9') {
+        int n = 0;
+        for (const char *p = path + 8; *p >= '0' && *p <= '9'; p++)
+            n = n * 10 + (*p - '0');
+        if (n < 0 || n >= THREAD_MAX_FD) return -1;
+        thread_t *cur = thread_current();
+        if (!cur) cur = thread_get_current_user();
+        if (!cur) return -1;
+        struct fs_file *src = (cur->process && n < PROCESS_MAX_FD)
+            ? cur->process->fds[n] : cur->fds[n];
+        if (!src) return -1;
+        if (src->refcount <= 0) src->refcount = 1;
+        else src->refcount++;
+        *out_file = src;
         return 0;
     }
     /* block device? */
@@ -596,8 +638,6 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
             f->size = 0;
             f->refcount = 1;
             *out_file = f;
-            if (strcmp(path, "/dev/full") == 0)
-                kprintf("devfs: /dev/full ready\n");
             return 0;
         }
     }
@@ -726,6 +766,8 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 case 8: /* /dev/full reads identically to /dev/zero */
                     memset(buf, 0, size);
                     return (ssize_t)size;
+                case 9: /* /dev/ptmx — node present; real Unix98 pty not wired yet */
+                    return -1;
                 default: break;
             }
         }
@@ -770,7 +812,11 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
     }
     /* directory read */
     if (file->type == FS_TYPE_DIR && file->driver_private) {
-        if (file->path && (strcmp(file->path, "/dev/input") == 0 || strcmp(file->path, "/dev/input/") == 0)) {
+        devfs_dir_t *dh = (devfs_dir_t *)file->driver_private;
+        if (!dh->is_dir)
+            return -1;
+
+        if (dh->kind == DEVFS_DIR_INPUT) {
             uint8_t *out = (uint8_t*)buf;
             size_t pos = 0;
             size_t written = 0;
@@ -803,133 +849,124 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             }
             return (ssize_t)written;
         }
-        uint8_t *out = (uint8_t*)buf;
-        size_t pos = 0;
-        size_t written = 0;
-        /* Emit "." and ".." first for POSIX/readdir compatibility */
-        static const char *const dot_entries[] = { ".", ".." };
-        for (int di = 0; di < 2; di++) {
-            const char *nm = dot_entries[di];
-            size_t namelen = strlen(nm);
-            size_t rec_len = 8 + namelen;
-            rec_len = (rec_len + 3) & ~3u;
-            if (rec_len < sizeof(struct ext2_dir_entry)) rec_len = sizeof(struct ext2_dir_entry);
-            if (pos + rec_len <= (size_t)offset) { pos += rec_len; continue; }
-            if (written >= size) break;
-            uint8_t tmp[64];
-            for (size_t zi = 0; zi < sizeof(tmp); zi++) tmp[zi] = 0;
-            struct ext2_dir_entry de;
-            memset(&de, 0, sizeof(de));
-            de.inode = 1;
-            de.rec_len = (uint16_t)rec_len;
-            de.name_len = (uint8_t)namelen;
-            de.file_type = EXT2_FT_DIR;
-            memcpy(tmp, &de, 8);
-            memcpy(tmp + 8, nm, namelen);
-            size_t entry_off = ((size_t)offset > pos) ? (size_t)offset - pos : 0;
-            size_t avail = size - written;
-            size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
-            if (tocopy > avail) tocopy = avail;
-            memcpy(out + written, tmp + entry_off, tocopy);
-            written += tocopy;
-            pos += rec_len;
-        }
-        /* include ttys + console + any registered block devices */
-        int has_input_dir = 0;
-        for (int ci = 0; ci < dev_char_count; ci++) {
-            if (strncmp(dev_chars[ci].path, "/dev/input/", 11) == 0) { has_input_dir = 1; break; }
-        }
-        int total_with_special = (DEVFS_TTY_COUNT + 1) + devfs_special_count + dev_block_count + dev_char_count + (has_input_dir ? 1 : 0);
-        for (int i = 0; i < total_with_special; i++) {
-            const char *nm;
-            char tmpn[64];
-            if (i == 0) {
-                nm = "console";
-            } else if (i <= DEVFS_TTY_COUNT) {
-                tmpn[0] = 't'; tmpn[1] = 't'; tmpn[2] = 'y';
-                tmpn[3] = '0' + (char)i;
-                tmpn[4] = '\0';
-                nm = tmpn;
-            } else if (i <= DEVFS_TTY_COUNT + devfs_special_count) {
-                int si = i - (DEVFS_TTY_COUNT + 1);
-                if (si >=0 && si < devfs_special_count) nm = devfs_special_names[si];
-                else nm = "";
-            } else if (has_input_dir && i == (DEVFS_TTY_COUNT + 1 + devfs_special_count + dev_block_count + dev_char_count)) {
-                nm = "input";
-            } else {
-                /* block device entries stored in dev_blocks[] and character devices in dev_chars[] */
-                int bi = i - (DEVFS_TTY_COUNT + 1 + devfs_special_count);
-                const char *path = NULL;
-                if (bi < dev_block_count)
-                    path = dev_blocks[bi].path;
-                else if (bi - dev_block_count < dev_char_count)
-                    path = dev_chars[bi - dev_block_count].path;
-                if (path) {
-                    /* /dev directory listing must include only direct children.
-                       Skip nested paths like /dev/bus/usb/001/001 (they belong to subdirs). */
-                    if (strncmp(path, "/dev/", 5) == 0) {
-                        const char *rest = path + 5;
-                        if (strchr(rest, '/')) {
-                            pos += 8;
-                            continue;
-                        }
-                    }
-                    /* Bounded copy so we never read past path[31] or emit garbage from uninitialized bytes */
-                    char safe_path[32];
-                    size_t plen = 0;
-                    while (plen < sizeof(safe_path) - 1 && path[plen] != '\0') plen++;
-                    safe_path[plen] = '\0';
-                    if (plen > 0) memcpy(safe_path, path, plen);
-                    const char *last = strrchr(safe_path, '/');
-                    const char *base = last ? (last + 1) : safe_path;
-                    size_t blen = strlen(base);
-                    if (blen >= sizeof(tmpn)) blen = sizeof(tmpn) - 1;
-                    memcpy(tmpn, base, blen);
-                    tmpn[blen] = '\0';
-                    /* Sanitize: only printable ASCII to avoid ls "?X?..." garbage */
-                    for (size_t k = 0; k < blen; k++) {
-                        unsigned char c = (unsigned char)tmpn[k];
-                        if (c < 32 || c > 126) tmpn[k] = '?';
-                    }
-                    nm = tmpn;
-                } else {
-                    nm = "";
-                }
-            }
-            size_t namelen = strlen(nm);
-            if (namelen == 0) { pos += 8; continue; } /* skip empty names */
-            size_t rec_len = 8 + namelen;
-            /* pad to 4-byte boundary like ext2 dirent */
-            rec_len = (rec_len + 3) & ~3u;
-            if (rec_len < sizeof(struct ext2_dir_entry)) rec_len = sizeof(struct ext2_dir_entry);
-            if (pos + rec_len <= (size_t)offset) { pos += rec_len; continue; }
-            if (written >= size) break;
-            uint8_t tmp[512];
-            if (rec_len > sizeof(tmp)) {
-                /* name too long for our entry buffer -> skip safely */
+
+        if (dh->kind == DEVFS_DIR_EMPTY) {
+            uint8_t *out = (uint8_t*)buf;
+            size_t pos = 0;
+            size_t written = 0;
+            static const char *const names[] = { ".", ".." };
+            for (int i = 0; i < 2; i++) {
+                const char *nm = names[i];
+                size_t namelen = strlen(nm);
+                size_t rec_len = 8 + namelen;
+                rec_len = (rec_len + 3) & ~3u;
+                if (rec_len < sizeof(struct ext2_dir_entry)) rec_len = sizeof(struct ext2_dir_entry);
+                if (pos + rec_len <= (size_t)offset) { pos += rec_len; continue; }
+                if (written >= size) break;
+                uint8_t tmp[64];
+                memset(tmp, 0, sizeof(tmp));
+                struct ext2_dir_entry de;
+                memset(&de, 0, sizeof(de));
+                de.inode = (uint32_t)(200 + i);
+                de.rec_len = (uint16_t)rec_len;
+                de.name_len = (uint8_t)namelen;
+                de.file_type = EXT2_FT_DIR;
+                memcpy(tmp, &de, 8);
+                memcpy(tmp + 8, nm, namelen);
+                size_t entry_off = ((size_t)offset > pos) ? (size_t)offset - pos : 0;
+                size_t avail = size - written;
+                size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
+                if (tocopy > avail) tocopy = avail;
+                memcpy(out + written, tmp + entry_off, tocopy);
+                written += tocopy;
                 pos += rec_len;
-                continue;
             }
-            /* initialize buffer and ext2_dir_entry */
-            for (size_t zi = 0; zi < rec_len; zi++) tmp[zi] = 0;
-            struct ext2_dir_entry de;
-            memset(&de, 0, sizeof(de));
-            de.inode = (uint32_t)(i + 1);
-            de.rec_len = (uint16_t)rec_len;
-            de.name_len = (uint8_t)namelen;
-            de.file_type = (strcmp(nm, "input") == 0) ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
-            memcpy(tmp, &de, 8);
-            memcpy(tmp + 8, nm, namelen);
-            size_t entry_off = 0;
-            if ((size_t)offset > pos) entry_off = (size_t)offset - pos;
-            size_t avail = size - written;
-            size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
-            if (tocopy > avail) tocopy = avail;
-            memcpy(out + written, tmp + entry_off, tocopy);
-            written += tocopy;
-            pos += rec_len;
+            return (ssize_t)written;
         }
-        return (ssize_t)written;
+
+        if (dh->kind != DEVFS_DIR_ROOT)
+            return -1;
+
+        /* /dev root: unique top-level names (no nested paths, no duplicate dirs). */
+        {
+            char names[96][32];
+            uint8_t is_dir[96];
+            int nnames = 0;
+#define DEVFS_ADD_NAME(nm, dirflag) do { \
+                if (nnames >= 96) break; \
+                int _dup = 0; \
+                for (int _j = 0; _j < nnames; _j++) \
+                    if (strcmp(names[_j], (nm)) == 0) { _dup = 1; break; } \
+                if (_dup) break; \
+                size_t _l = strlen(nm); \
+                if (_l >= sizeof(names[0])) _l = sizeof(names[0]) - 1; \
+                memcpy(names[nnames], (nm), _l); \
+                names[nnames][_l] = '\0'; \
+                is_dir[nnames] = (uint8_t)(dirflag); \
+                nnames++; \
+            } while (0)
+
+            DEVFS_ADD_NAME(".", 1);
+            DEVFS_ADD_NAME("..", 1);
+            DEVFS_ADD_NAME("console", 0);
+            for (int t = 1; t <= DEVFS_TTY_COUNT; t++) {
+                char tn[8];
+                tn[0] = 't'; tn[1] = 't'; tn[2] = 'y';
+                tn[3] = (char)('0' + t); tn[4] = '\0';
+                DEVFS_ADD_NAME(tn, 0);
+            }
+            for (int si = 0; si < devfs_special_count; si++)
+                DEVFS_ADD_NAME(devfs_special_names[si], 0);
+            for (int di = 0; di < devfs_subdir_count; di++)
+                DEVFS_ADD_NAME(devfs_subdir_names[di], 1);
+            for (int bi = 0; bi < dev_block_count; bi++) {
+                const char *path = dev_blocks[bi].path;
+                if (strncmp(path, "/dev/", 5) != 0) continue;
+                const char *rest = path + 5;
+                if (strchr(rest, '/')) continue;
+                DEVFS_ADD_NAME(rest, 0);
+            }
+            for (int ci = 0; ci < dev_char_count; ci++) {
+                const char *path = dev_chars[ci].path;
+                if (strncmp(path, "/dev/", 5) != 0) continue;
+                const char *rest = path + 5;
+                if (strchr(rest, '/')) continue;
+                DEVFS_ADD_NAME(rest, 0);
+            }
+#undef DEVFS_ADD_NAME
+
+            uint8_t *out = (uint8_t*)buf;
+            size_t pos = 0;
+            size_t written = 0;
+            for (int i = 0; i < nnames; i++) {
+                const char *nm = names[i];
+                size_t namelen = strlen(nm);
+                size_t rec_len = 8 + namelen;
+                rec_len = (rec_len + 3) & ~3u;
+                if (rec_len < sizeof(struct ext2_dir_entry)) rec_len = sizeof(struct ext2_dir_entry);
+                if (pos + rec_len <= (size_t)offset) { pos += rec_len; continue; }
+                if (written >= size) break;
+                uint8_t tmp[64];
+                if (rec_len > sizeof(tmp)) { pos += rec_len; continue; }
+                memset(tmp, 0, rec_len);
+                struct ext2_dir_entry de;
+                memset(&de, 0, sizeof(de));
+                de.inode = (uint32_t)(i + 1);
+                de.rec_len = (uint16_t)rec_len;
+                de.name_len = (uint8_t)namelen;
+                de.file_type = is_dir[i] ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
+                memcpy(tmp, &de, 8);
+                memcpy(tmp + 8, nm, namelen);
+                size_t entry_off = ((size_t)offset > pos) ? (size_t)offset - pos : 0;
+                size_t avail = size - written;
+                size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
+                if (tocopy > avail) tocopy = avail;
+                memcpy(out + written, tmp + entry_off, tocopy);
+                written += tocopy;
+                pos += rec_len;
+            }
+            return (ssize_t)written;
+        }
     }
     /* regular device read (tty) */
     struct devfs_tty *t = (struct devfs_tty*)file->driver_private;
@@ -1069,6 +1106,8 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                     }
                     case 8: /* /dev/full: Linux returns ENOSPC for every write */
                         return -28;
+                    case 9: /* /dev/ptmx stub */
+                        return -1;
                     default: break;
                 }
             }

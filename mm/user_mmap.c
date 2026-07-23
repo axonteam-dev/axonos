@@ -4,6 +4,7 @@
 #include <user_as.h>
 #include <user_map.h>
 #include <user_mm.h>
+#include <user_layout.h>
 #include <exec.h>
 #include <fs.h>
 #include <thread.h>
@@ -101,15 +102,19 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
 
     if (len_u64 == 0) return user_mm_ret_err(USER_MM_EINVAL);
     if (user_mm_len_exceeds_cap(len_u64)) {
-        kprintf("mmap: ENOMEM raw len 0x%llx >= cap 0x10000000\n", (unsigned long long)len_u64);
-        klogprintf("mmap: ENOMEM raw len 0x%llx >= cap 0x10000000\n", (unsigned long long)len_u64);
+        kprintf("mmap: ENOMEM raw len 0x%llx >= cap 0x%llx\n",
+            (unsigned long long)len_u64, (unsigned long long)USER_MM_SINGLE_MAP_CAP);
+        klogprintf("mmap: ENOMEM raw len 0x%llx >= cap 0x%llx\n",
+            (unsigned long long)len_u64, (unsigned long long)USER_MM_SINGLE_MAP_CAP);
         return user_mm_ret_err(USER_MM_ENOMEM);
     }
     len_u64 = (len_u64 + 4095ull) & ~4095ull;
     if (len_u64 > (uint64_t)((size_t)-1)) return user_mm_ret_err(USER_MM_EINVAL);
     if (user_mm_len_exceeds_cap(len_u64)) {
-        kprintf("mmap: ENOMEM len 0x%llx >= cap 0x10000000\n", (unsigned long long)len_u64);
-        klogprintf("mmap: ENOMEM len 0x%llx >= cap 0x10000000\n", (unsigned long long)len_u64);
+        kprintf("mmap: ENOMEM len 0x%llx >= cap 0x%llx\n",
+            (unsigned long long)len_u64, (unsigned long long)USER_MM_SINGLE_MAP_CAP);
+        klogprintf("mmap: ENOMEM len 0x%llx >= cap 0x%llx\n",
+            (unsigned long long)len_u64, (unsigned long long)USER_MM_SINGLE_MAP_CAP);
         return user_mm_ret_err(USER_MM_ENOMEM);
     }
     size_t len = (size_t)len_u64;
@@ -149,7 +154,9 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     }
 
     if (*p_mmap_next == 0) {
-        uintptr_t def = 32u * 1024u * 1024u;
+        /* Prefer the reserved user mmap window (see user_layout.h), not 32MiB
+         * which collides with early brk growth and used to sit under the heap. */
+        uintptr_t def = (uintptr_t)USER_MMAP_BASE;
         if (def >= top_limit && top_limit > (8u * 1024u * 1024u)) {
             def = user_mm_align_up(top_limit / 2u, 4096);
             if (def < (8u * 1024u * 1024u)) def = 8u * 1024u * 1024u;

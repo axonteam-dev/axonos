@@ -405,17 +405,67 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             kprintf("warning: heap %llu MiB may be too small for initfs %llu MiB — increase VM RAM\n",
                     (unsigned long long)(heap_size / (1024ULL * 1024ULL)),
                     (unsigned long long)(initrd_sz / (1024ULL * 1024ULL)));
-        /* Identity-mapped heap must not cover user TLS/stack (USER_TLS_BASE..USER_STACK_TOP).
-           Otherwise kmalloc's arena overlaps userspace and mmap cannot use the gap without
-           clobbering heap metadata — wget/glibc then hit mmap ENOMEM and corrupt malloc. */
+        /*
+         * Keep the identity-mapped kernel heap OUT of the low user layout
+         * [USER_MMAP_BASE .. USER_STACK_TOP). Go (docker) reserves large anon
+         * arenas there; if kmalloc lives in the same VA window, mmap hits
+         * "overlap kernel heap (heap above user VA cap)" and the runtime dies
+         * before mallocinit completes.
+         *
+         * Prefer heap_start >= USER_STACK_TOP + 16MiB when RAM allows; still
+         * honor mods_end/initrd so we never cover the ramdisk. On tiny VMs
+         * keep the old low placement (docker needs ≥~1.5GiB RAM).
+         */
         {
-            uint64_t tls = (uint64_t)USER_TLS_BASE;
-            const uint64_t tls_guard = 1ULL << 20; /* 1 MiB below TLS */
-            uint64_t max_heap_end = tls > tls_guard ? tls - tls_guard : tls;
+            const uintptr_t HEAP_ABOVE_USER =
+                (uintptr_t)USER_STACK_TOP + (16u * 1024u * 1024u);
+            int raise_ok = 1;
+            if (ram_mb > 0) {
+                uint64_t ram_bytes = (uint64_t)ram_mb * 1024ULL * 1024ULL;
+                if (ram_bytes < (uint64_t)HEAP_ABOVE_USER + (64ULL * 1024ULL * 1024ULL))
+                    raise_ok = 0;
+            }
+            if (raise_ok) {
+                if (heap_start < HEAP_ABOVE_USER)
+                    heap_start = HEAP_ABOVE_USER;
+                if (mods_end_aligned != 0 && heap_start < mods_end_aligned)
+                    heap_start = mods_end_aligned;
+            }
+        }
+        /* Recompute heap_size against the (possibly raised) heap_start. */
+        if (ram_mb > 0) {
+            uint64_t ram_bytes = (uint64_t)ram_mb * 1024ULL * 1024ULL;
+            uint64_t start = (uint64_t)heap_start;
+            const uint64_t guard = 4ULL * 1024ULL * 1024ULL;
+            if (ram_bytes > start + guard + (16ULL * 1024ULL * 1024ULL))
+                heap_size = (size_t)(ram_bytes - start - guard);
+            else if (ram_bytes > start + guard)
+                heap_size = (size_t)(ram_bytes - start - guard);
+            else
+                heap_size = 0;
+        }
+        if (heap_size == 0)
+            heap_size = 64ULL * 1024ULL * 1024ULL;
+        /* Cap: never cross MMIO_IDENTITY_LIMIT; if still below STACK_TOP (tiny
+         * RAM / huge initrd), also stay below TLS as before. */
+        {
             uint64_t hs = (uint64_t)heap_start;
+            uint64_t max_heap_end = (uint64_t)MMIO_IDENTITY_LIMIT;
+            if (max_heap_end > 4ULL * 1024ULL * 1024ULL)
+                max_heap_end -= 4ULL * 1024ULL * 1024ULL;
+            if (hs < (uint64_t)USER_STACK_TOP) {
+                uint64_t tls = (uint64_t)USER_TLS_BASE;
+                const uint64_t tls_guard = 1ULL << 20;
+                uint64_t tls_cap = tls > tls_guard ? tls - tls_guard : tls;
+                if (tls_cap < max_heap_end)
+                    max_heap_end = tls_cap;
+            }
             if (max_heap_end > hs && hs + (uint64_t)heap_size > max_heap_end)
                 heap_size = (size_t)(max_heap_end - hs);
         }
+        if (heap_size < (16ULL * 1024ULL * 1024ULL))
+            kprintf("warning: kernel heap only %llu MiB after user-VA split — increase VM RAM\n",
+                    (unsigned long long)(heap_size / (1024ULL * 1024ULL)));
         heap_init(heap_start, heap_size);
         kprintf("Kernel starting... heap_start: %p heap_size=%llu heap_total=%llu heap_base=%p ram_mb=%d kernel_end: %p mods_end: %p\n",
                 (void*)heap_start,

@@ -101,6 +101,9 @@ typedef struct syscall_frame {
 #define SYS_getrlimit 97
 #define SYS_sysinfo  99
 #define SYS_sched_getaffinity 204
+#define SYS_sched_setaffinity 203
+#define SYS_sched_setscheduler 144
+#define SYS_sched_getscheduler 145
 #define SYS_getpriority       140
 #define SYS_setpriority       141
 #define SYS_nanosleep 35

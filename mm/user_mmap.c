@@ -31,7 +31,24 @@ enum {
     MAP_ANONYMOUS = 0x20,
     MAP_PRIVATE = 0x02,
     MAP_SHARED = 0x01,
+    MAP_GROWSDOWN = 0x0100,
+    MAP_DENYWRITE = 0x0800,
+    MAP_EXECUTABLE = 0x1000,
+    MAP_LOCKED = 0x2000,
+    MAP_NORESERVE = 0x4000,
+    MAP_POPULATE = 0x8000,
+    MAP_NONBLOCK = 0x10000,
+    MAP_STACK = 0x20000,
+    MAP_HUGETLB = 0x40000,
+    MAP_SYNC = 0x80000,
     MAP_FIXED_NOREPLACE = 0x100000,
+};
+
+/* Linux treats these as hints / bookkeeping; ignore after anon install. */
+enum {
+    MAP_IGNORABLE = MAP_GROWSDOWN | MAP_DENYWRITE | MAP_EXECUTABLE |
+                    MAP_LOCKED | MAP_NORESERVE | MAP_POPULATE | MAP_NONBLOCK |
+                    MAP_STACK | MAP_HUGETLB | MAP_SYNC
 };
 
 static int user_mmap_unmap_pages(thread_t *t, uintptr_t addr, size_t len) {
@@ -341,7 +358,11 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     }
 
     if (flags & MAP_ANONYMOUS) {
-        flags &= ~(MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED | MAP_FIXED | MAP_FIXED_NOREPLACE);
+        /* pthread stack uses MAP_STACK|MAP_ANONYMOUS|MAP_PRIVATE (0x20022).
+         * Stripping only the core bits left MAP_STACK set → spurious ENOSYS
+         * and docker's pthread_create never reached clone. */
+        flags &= ~(MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED | MAP_FIXED |
+                   MAP_FIXED_NOREPLACE | MAP_IGNORABLE);
         if (flags != 0) return user_mm_ret_err(USER_MM_ENOSYS);
         if (!reserve_only)
             user_as_mmap_memset_zero_chunked(addr, len);

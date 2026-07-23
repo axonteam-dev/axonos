@@ -6664,7 +6664,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             {
                 static int clone_log_left = 16;
                 if (clone_log_left-- > 0)
-                    kprintf("clone: flags=0x%llx stack=0x%llx ptid=0x%llx ctid=0x%llx tls=0x%llx tid=%d\n",
+                    klogprintf("clone: flags=0x%llx stack=0x%llx ptid=0x%llx ctid=0x%llx tls=0x%llx tid=%d\n",
                         (unsigned long long)flags,
                         (unsigned long long)child_stack,
                         (unsigned long long)parent_tid_ptr,
@@ -6828,7 +6828,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 {
                     static int clone_ok_left = 8;
                     if (clone_ok_left-- > 0)
-                        kprintf("clone-ok: child_tid=%u rip=0x%llx rsp=0x%llx fs=0x%llx\n",
+                        klogprintf("clone-ok: child_tid=%u rip=0x%llx rsp=0x%llx fs=0x%llx\n",
                             (unsigned)child_user_tid,
                             (unsigned long long)saved_rcx,
                             (unsigned long long)child_rsp,
@@ -6838,7 +6838,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
 
             if ((flags & CLONE_VM_OLD) || child_stack != 0) {
-                kprintf("clone-ENOSYS: flags=0x%llx stack=0x%llx (need VM|THREAD + stack)\n",
+                klogprintf("clone-ENOSYS: flags=0x%llx stack=0x%llx (need VM|THREAD + stack)\n",
                     (unsigned long long)flags, (unsigned long long)child_stack);
                 return ret_err(ENOSYS);
             }
@@ -10597,6 +10597,36 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (copy_to_user_safe((char*)mask_u + i, &zero, 1) != 0) return ret_err(EFAULT);
             }
             return 0;
+        }
+        case SYS_sched_setaffinity: {
+            /* sched_setaffinity(pid, len, user_mask) — accept and ignore mask. */
+            int pid = (int)a1;
+            size_t len = (size_t)a2;
+            const void *mask_u = (const void *)(uintptr_t)a3;
+            uint64_t self = (uint64_t)(cur->tid ? cur->tid : 1);
+            if (pid != 0 && (uint64_t)pid != self) return ret_err(ESRCH);
+            if (len == 0 || !mask_u || !user_range_ok(mask_u, len))
+                return ret_err(EFAULT);
+            return 0;
+        }
+        case SYS_sched_setscheduler: {
+            /* sched_setscheduler(pid, policy, param) — accept SCHED_OTHER only. */
+            int pid = (int)a1;
+            int policy = (int)a2;
+            const void *param_u = (const void *)(uintptr_t)a3;
+            uint64_t self = (uint64_t)(cur->tid ? cur->tid : 1);
+            if (pid != 0 && (uint64_t)pid != self) return ret_err(ESRCH);
+            if (policy != 0) /* SCHED_OTHER */
+                return ret_err(EINVAL);
+            if (param_u && !user_range_ok(param_u, 4))
+                return ret_err(EFAULT);
+            return 0;
+        }
+        case SYS_sched_getscheduler: {
+            int pid = (int)a1;
+            uint64_t self = (uint64_t)(cur->tid ? cur->tid : 1);
+            if (pid != 0 && (uint64_t)pid != self) return ret_err(ESRCH);
+            return 0; /* SCHED_OTHER */
         }
 #ifndef PRIO_PROCESS
 #define PRIO_PROCESS 0

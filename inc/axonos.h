@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 #define OS_NAME "AxonOS"
-#define OS_VERSION "4.0.1"
+#define OS_VERSION "4.0.2-pthread"
 #define OS_AUTHORS "Axon Team"
 
 /* Syscall globals (defined in syscall64/syscall.c). */

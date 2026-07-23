@@ -332,10 +332,9 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     if (reserve_only) {
         if (addr < anon_floor)
             return user_mm_ret_err(USER_MM_ENOMEM);
+        /* Unmap in the process mm only — never punch kernel identity. */
         if (user_mmap_unmap_pages(tcur, addr, len) != 0)
             return user_mm_ret_err(USER_MM_EFAULT);
-        /* Clear present leaves only inside the reserved span (private/live CR3). */
-        user_as_mmap_lazy_drop_present_pages(addr, len);
         mmap_vma_kind = USER_VMA_KIND_MMAP_LAZY;
     } else if (user_mmap_install_pages(addr, len, top_limit) != 0) {
         return user_mm_ret_err(USER_MM_EFAULT);

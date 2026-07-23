@@ -270,10 +270,29 @@ void user_as_mmap_memset_zero_chunked(uintptr_t addr, size_t len) {
 }
 
 void user_as_mmap_lazy_drop_present_pages(uintptr_t addr, size_t len) {
-    uintptr_t begin = addr & ~((uintptr_t)PAGE_SIZE_2M - 1);
-    uintptr_t end = (addr + len + (uintptr_t)PAGE_SIZE_2M - 1) & ~((uintptr_t)PAGE_SIZE_2M - 1);
-    for (uintptr_t va = begin; va < end; va += (uintptr_t)PAGE_SIZE_2M)
-        (void)unmap_page_2m((uint64_t)va);
+    /*
+     * Do NOT call unmap_page_2m() here: that clears the same VA in the kernel
+     * mm identity map. Page-table pages are accessed via VA==PA; punching a
+     * 128MiB+ hole under USER_MMAP_BASE then makes unmap_page_2m_on_l4 fault
+     * in the kernel (seen as Oops CR2=0x8117000 while dropping Go PROT_NONE).
+     *
+     * Private mm: unmap only in the process tables.
+     * Shared CR3: leave leaves present; PROT_NONE is enforced by VMA prot==0
+     * in the fault path (no demand-fill).
+     */
+    thread_t *t = thread_get_current_user();
+    if (!t)
+        t = thread_current();
+    mm_t *k = mm_kernel();
+    if (!t || !t->mm || !k || !t->mm->pml4 || t->mm->pml4 == k->pml4)
+        return;
+    mm_t *share = (t->mm_ptemplate && t->mm_ptemplate->pml4) ?
+        t->mm_ptemplate : k;
+    if (!share || !share->pml4)
+        return;
+    (void)mm_unmap_user_range(t->mm, share->pml4,
+                              (uint64_t)addr,
+                              (uint64_t)addr + (uint64_t)len);
 }
 
 void user_as_reset_on_exec(thread_t *tcur, uintptr_t brk_base) {

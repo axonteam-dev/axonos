@@ -6660,9 +6660,23 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             uint64_t child_tid_ptr = a4;
             uint64_t tls = a5;
 
-            /* pthread / CLONE_VM thread: share mm, resume on child_stack (glibc
-             * __clone already pushed fn+arg there). */
-            if ((flags & CLONE_VM_OLD) && child_stack != 0) {
+            /* Always log — docker pthread_create is clone(CLONE_VM|THREAD)+stack. */
+            {
+                static int clone_log_left = 16;
+                if (clone_log_left-- > 0)
+                    kprintf("clone: flags=0x%llx stack=0x%llx ptid=0x%llx ctid=0x%llx tls=0x%llx tid=%d\n",
+                        (unsigned long long)flags,
+                        (unsigned long long)child_stack,
+                        (unsigned long long)parent_tid_ptr,
+                        (unsigned long long)child_tid_ptr,
+                        (unsigned long long)tls,
+                        (int)(cur->tid ? cur->tid : 1));
+            }
+
+            /* pthread / any clone with a child stack: share mm. Prefer CLONE_VM
+             * or CLONE_THREAD; if only a stack is present still treat as thread
+             * (never ENOSYS — that was killing Go cgo). */
+            if (child_stack != 0) {
                 uint64_t saved_rcx = fork_caller_user_rip(cur);
                 if (!saved_rcx && cur->saved_syscall_frame)
                     saved_rcx = cur->saved_syscall_frame[13];
@@ -6811,11 +6825,23 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 } else {
                     thread_unblock((int)(child->tid ? child->tid : 1));
                 }
+                {
+                    static int clone_ok_left = 8;
+                    if (clone_ok_left-- > 0)
+                        kprintf("clone-ok: child_tid=%u rip=0x%llx rsp=0x%llx fs=0x%llx\n",
+                            (unsigned)child_user_tid,
+                            (unsigned long long)saved_rcx,
+                            (unsigned long long)child_rsp,
+                            (unsigned long long)child->user_fs_base);
+                }
                 return (uint64_t)child_user_tid;
             }
 
-            if ((flags & CLONE_VM_OLD) || child_stack != 0)
+            if ((flags & CLONE_VM_OLD) || child_stack != 0) {
+                kprintf("clone-ENOSYS: flags=0x%llx stack=0x%llx (need VM|THREAD + stack)\n",
+                    (unsigned long long)flags, (unsigned long long)child_stack);
                 return ret_err(ENOSYS);
+            }
             /*
              * Capture the architectural SYSCALL return RIP before the nested
              * SYS_fork mutates fork bookkeeping.  This must be the instruction

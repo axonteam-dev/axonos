@@ -290,14 +290,14 @@ static int exec_map_stack_tip(thread_t *tc, uintptr_t tip_lo, uintptr_t tip_hi) 
             return -1;
         cpa &= ~0xFFFULL;
         if (cpa == (va & ~0xFFFULL)) {
-            kprintf("exec-tip: still identity va=0x%llx\n",
+            devel_printf("exec-tip: still identity va=0x%llx\n",
                     (unsigned long long)va);
             return -1;
         }
         if (oldmm && oldmm->pml4 &&
             mm_va_leaf_pa(oldmm, va, &ppa) == 0 &&
             (ppa & ~0xFFFULL) == cpa) {
-            kprintf("exec-tip: shares oldmm va=0x%llx pa=0x%llx\n",
+            devel_printf("exec-tip: shares oldmm va=0x%llx pa=0x%llx\n",
                     (unsigned long long)va, (unsigned long long)cpa);
             return -1;
         }
@@ -979,7 +979,7 @@ static void exec_scrub_stale_image_tail(uint64_t keep_hi) {
     {
         static int scrub_log_left = 4;
         if (scrub_log_left-- > 0)
-            kprintf("exec-scrub: cleared stale image 0x%llx..0x%llx\n",
+            devel_printf("exec-scrub: cleared stale image 0x%llx..0x%llx\n",
                     (unsigned long long)begin, (unsigned long long)scrub_end);
     }
 }
@@ -1597,7 +1597,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[],
     int exec_dbg = cur->name[0] &&
                    (strstr(cur->name, "linuxrc") || (path && strstr(path, "mount")));
     if (exec_dbg)
-        kprintf("exec-mm: tid=%llu path=%s mm_alloc\n",
+        devel_printf("exec-mm: tid=%llu path=%s mm_alloc\n",
             (unsigned long long)(cur->tid ? cur->tid : 1),
             path ? path : "?");
 
@@ -1632,7 +1632,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[],
     /* activate_mm(new) — parent still vfork_waiting until into_mm finishes. */
     mm_switch(new_mm);
     if (exec_dbg)
-        kprintf("exec-mm: tid=%llu activated cr3=0x%llx (tip under new mm, parent frozen)\n",
+        devel_printf("exec-mm: tid=%llu activated cr3=0x%llx (tip under new mm, parent frozen)\n",
             (unsigned long long)(cur->tid ? cur->tid : 1),
             (unsigned long long)(new_mm->cr3 ? new_mm->cr3 : 0));
 
@@ -1708,7 +1708,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         thread_t *tr = thread_get_current_user();
         if (tr && tr->name[0] &&
             (strstr(tr->name, "linuxrc") || (path && strstr(path, "mount"))))
-            kprintf("exec-load: tid=%llu path=%s\n",
+            devel_printf("exec-load: tid=%llu path=%s\n",
                 (unsigned long long)(tr->tid ? tr->tid : 1),
                 curpath ? curpath : "?");
     }
@@ -1725,7 +1725,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         thread_t *tr = thread_get_current_user();
         if (tr && tr->name[0] &&
             (strstr(tr->name, "linuxrc") || (path && strstr(path, "mount"))))
-            kprintf("exec-load: tid=%llu ok entry=0x%llx hi=0x%llx\n",
+            devel_printf("exec-load: tid=%llu ok entry=0x%llx hi=0x%llx\n",
                 (unsigned long long)(tr->tid ? tr->tid : 1),
                 (unsigned long long)main_info.entry,
                 (unsigned long long)main_info.loaded_hi);
@@ -1783,7 +1783,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         main_info.load_base == 0x400000ULL && main_info.loaded_hi > 0x4030d0ULL) {
         const uint8_t *p = (const uint8_t *)(uintptr_t)0x4030d0ULL;
         uint64_t got = *(const uint64_t *)(uintptr_t)0x40c050ULL;
-        kprintf("exec-image: @0x4030d0 %02x %02x %02x %02x got@0x40c050=0x%llx (want ff25)\n",
+        devel_printf("exec-image: @0x4030d0 %02x %02x %02x %02x got@0x40c050=0x%llx (want ff25)\n",
                 (unsigned)p[0], (unsigned)p[1], (unsigned)p[2], (unsigned)p[3],
                 (unsigned long long)got);
         if (p[0] != 0xffu || p[1] != 0x25u) {

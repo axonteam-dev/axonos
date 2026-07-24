@@ -21,8 +21,8 @@ PAYLOAD_COBJS := $(filter-out $(STUB_OBJ),$(COBJS))
 # Legacy syscall64/ on disk confuses make's implicit rules; drop stale objects.
 $(shell rm -rf $(BUILD_DIR)/syscall64 2>/dev/null)
 
-$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(CA_TRUST_BLOB_OBJ) $(PAYLOAD_COBJS)
+$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(NSS_FILES_BLOB_OBJ) $(CA_TRUST_BLOB_OBJ) $(PAYLOAD_COBJS)
 	@mkdir -p $(BUILD_DIR)
 	@echo "LD		$@"
-	@ld -m elf_x86_64 -T linker.payload.ld -o $@ $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(CA_TRUST_BLOB_OBJ) $(PAYLOAD_COBJS)
+	@ld -m elf_x86_64 -T linker.payload.ld -o $@ $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(NSS_FILES_BLOB_OBJ) $(CA_TRUST_BLOB_OBJ) $(PAYLOAD_COBJS)
 

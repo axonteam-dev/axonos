@@ -264,6 +264,10 @@ void qemu_debug_printf(const char *format, ...) {
 }
 
 void debug_serial_marker(const char *message) {
+#if AXON_PRODUCTION
+    (void)message;
+    return;
+#else
     if (!message)
         return;
     while (*message) {
@@ -273,6 +277,7 @@ void debug_serial_marker(const char *message) {
     }
     write_serial('\n');
     outb(0xe9, '\n');
+#endif
 }
 
 void oom_serial_notify(unsigned long long syscall_num, const char *name) {

@@ -296,6 +296,34 @@ int process_reap(process_t *parent, process_t *child) {
     return 0;
 }
 
+int process_discard(process_t *parent, process_t *child) {
+    if (!parent || !child)
+        return -1;
+    unsigned long flags;
+    acquire_irqsave(&process_lock, &flags);
+    process_t **link = &parent->first_child;
+    while (*link && *link != child)
+        link = &(*link)->next_sibling;
+    if (*link != child || child->parent != parent) {
+        release_irqrestore(&process_lock, flags);
+        return -1;
+    }
+    *link = child->next_sibling;
+    child->parent = NULL;
+    child->next_sibling = NULL;
+    child->leader = NULL;
+    child->mm = NULL;
+    for (int i = 0; i < PROCESS_TABLE_MAX; ++i) {
+        if (process_table[i] == child) {
+            process_table[i] = NULL;
+            break;
+        }
+    }
+    release_irqrestore(&process_lock, flags);
+    kfree(child);
+    return 0;
+}
+
 void process_set_vfork_parent(process_t *child, process_t *parent) {
     if (!child || !parent)
         return;

@@ -63,6 +63,8 @@ process_t *process_find_child(process_t *parent, int pid, int pgid,
 void process_mark_zombie(process_t *process, int status);
 void process_reparent_children(process_t *process, process_t *new_parent);
 int process_reap(process_t *parent, process_t *child);
+/* Roll back a process that was never published to userspace. */
+int process_discard(process_t *parent, process_t *child);
 int process_adopt_child(process_t *parent, process_t *child);
 void process_set_vfork_parent(process_t *child, process_t *parent);
 void process_release_vfork_parent(process_t *child,

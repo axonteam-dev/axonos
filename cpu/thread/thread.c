@@ -420,14 +420,14 @@ static void thread_trampoline(void) {
         thread_t* _self = thread_current();
         int _tid = _self ? _self->tid : -1;
         if (_self && _self->parent_tid >= 0) {
-                kprintf("sched-fork[43] trampoline tid=%d entry=0x%llx rsp=0x%llx cr3=0x%llx\n",
+                devel_printf("sched-fork[43] trampoline tid=%d entry=0x%llx rsp=0x%llx cr3=0x%llx\n",
                         _tid,
                         (unsigned long long)(uintptr_t)entry,
                         (unsigned long long)_self->context.rsp,
                         (unsigned long long)paging_read_cr3());
         }
         if (_tid == thread_get_init_user_tid()) {
-                kprintf("thread_trampoline: PID1 entry=0x%llx rflags=0x%x\n",
+                devel_printf("thread_trampoline: PID1 entry=0x%llx rflags=0x%x\n",
                         (unsigned long long)(uintptr_t)entry,
                         (unsigned int)_rflags);
         }
@@ -737,7 +737,7 @@ int thread_get_init_user_tid(void) {
 // then enter user mode at saved rip/rsp. This function is used as the entry point passed to thread_create().
 void user_thread_entry(void) {
 	thread_t *self = thread_current();
-	kprintf("user_thread_entry: entered self=0x%llx tid=%d init=%d\n",
+	devel_printf("user_thread_entry: entered self=0x%llx tid=%d init=%d\n",
 		(unsigned long long)(uintptr_t)self,
 		self ? (int)self->tid : -1,
 		thread_get_init_user_tid());
@@ -800,7 +800,7 @@ void user_thread_entry(void) {
 			  (unsigned long long)self->user_stack,
 			  (int)self->tid);
 	if (self->tid == (uint64_t)thread_get_init_user_tid()) {
-		kprintf("user_thread_entry: PID1 rip=0x%llx rsp=0x%llx fs=0x%llx\n",
+		devel_printf("user_thread_entry: PID1 rip=0x%llx rsp=0x%llx fs=0x%llx\n",
 			(unsigned long long)self->user_rip,
 			(unsigned long long)self->user_stack,
 			(unsigned long long)self->user_fs_base);
@@ -1133,7 +1133,7 @@ void thread_schedule() {
                         if ((int)(t->tid ? t->tid : 1) == thread_get_init_user_tid()) {
                                 static int pid1_see_left = 24;
                                 if (pid1_see_left-- > 0)
-                                        kprintf("sched: see PID1 pass=%d tid=%d state=%d rsp=0x%llx bound=%d cpu=%d\n",
+                                        devel_printf("sched: see PID1 pass=%d tid=%d state=%d rsp=0x%llx bound=%d cpu=%d\n",
                                                 pass,
                                                 (int)t->tid,
                                                 (int)t->state,
@@ -1178,7 +1178,7 @@ void thread_schedule() {
                 if ((int)(pick->tid ? pick->tid : 1) == thread_get_init_user_tid()) {
                         static int pid1_sw_left = 24;
                         if (pid1_sw_left-- > 0)
-                                kprintf("sched: switching to PID1 from tid=%d prev_state=%d pick_rsp=0x%llx\n",
+                                devel_printf("sched: switching to PID1 from tid=%d prev_state=%d pick_rsp=0x%llx\n",
                                         prev ? (int)prev->tid : -1,
                                         prev ? (int)prev->state : -1,
                                         (unsigned long long)pick->context.rsp);
@@ -1206,7 +1206,7 @@ void thread_schedule() {
                 } else {
                         set_user_fs_base(0);
                 }
-                int dbg_fork_first = cur->ring == 3 && cur->parent_tid >= 0 &&
+                int dbg_fork_first = DEVEL_DEBUG && cur->ring == 3 && cur->parent_tid >= 0 &&
                         cur->fork_child_user_rip != 0;
                 if (dbg_fork_first) {
                         uint64_t live_rsp = 0, live_pa = 0, child_rsp_pa = 0;
@@ -1214,7 +1214,7 @@ void thread_schedule() {
                         int live_rc = mm_va_leaf_pa(cur->mm, live_rsp, &live_pa);
                         int child_rc = mm_va_leaf_pa(cur->mm, cur->context.rsp,
                                                     &child_rsp_pa);
-                        kprintf("sched-fork[40] tid=%d mm=0x%llx live-rsp=0x%llx/%d->0x%llx "
+                        devel_printf("sched-fork[40] tid=%d mm=0x%llx live-rsp=0x%llx/%d->0x%llx "
                                 "child-rsp=0x%llx/%d->0x%llx ret=0x%llx entry=0x%llx\n",
                                 (int)(cur->tid ? cur->tid : 1),
                                 (unsigned long long)(cur->mm ? cur->mm->cr3 : 0),
@@ -1228,7 +1228,7 @@ void thread_schedule() {
                 }
                 mm_switch(cur->mm);
                 if (dbg_fork_first)
-                        kprintf("sched-fork[41] child cr3 active=0x%llx\n",
+                        devel_printf("sched-fork[41] child cr3 active=0x%llx\n",
                                 (unsigned long long)paging_read_cr3());
                 syscall_bind_kstack_for_thread(cur);
                 if (!thread_context_valid(cur)) {
@@ -1242,7 +1242,7 @@ void thread_schedule() {
                 }
                 fpu_switch(prev, cur);
                 if (dbg_fork_first)
-                        kprintf("sched-fork[42] fpu ready; switching context\n");
+                        devel_printf("sched-fork[42] fpu ready; switching context\n");
                 context_switch_with_prev(&prev->context, &cur->context, prev);
                 restore_irqflags(irqf);
                 return;

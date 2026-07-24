@@ -2327,7 +2327,8 @@ int mm_va_leaf_pa(mm_t *mm, uint64_t va, uint64_t *pa_out) {
     return 0;
 }
 
-static int mm_va_leaf_entry(mm_t *mm, uint64_t va, uint64_t *entry_out) {
+static int mm_va_leaf_entry_direct(mm_t *mm, uint64_t va,
+                                   uint64_t *entry_out) {
     if (!mm || !mm->pml4 || !entry_out ||
         va >= (uint64_t)MMIO_IDENTITY_LIMIT)
         return -1;
@@ -2362,7 +2363,15 @@ static int mm_va_leaf_entry(mm_t *mm, uint64_t va, uint64_t *entry_out) {
     return 0;
 }
 
-int mm_user_leaf_pa(mm_t *mm, uint64_t va, int write, uint64_t *pa_out) {
+static int mm_va_leaf_entry(mm_t *mm, uint64_t va, uint64_t *entry_out) {
+    mm_dm_ctx_t dm = mm_enter_direct_map();
+    int rc = mm_va_leaf_entry_direct(mm, va, entry_out);
+    mm_leave_direct_map(dm);
+    return rc;
+}
+
+static int mm_user_leaf_pa_direct(mm_t *mm, uint64_t va, int write,
+                                  uint64_t *pa_out) {
     if (!mm || !mm->pml4 || !pa_out || va >= (uint64_t)MMIO_IDENTITY_LIMIT)
         return -1;
     uint64_t e4 = mm->pml4[(va >> 39) & 0x1FF];
@@ -2398,6 +2407,45 @@ int mm_user_leaf_pa(mm_t *mm, uint64_t va, int write, uint64_t *pa_out) {
         (write && !(e1 & PG_RW)))
         return -1;
     *pa_out = (e1 & PG_ADDR_MASK) + (va & 0xFFFULL);
+    return 0;
+}
+
+int mm_user_leaf_pa(mm_t *mm, uint64_t va, int write, uint64_t *pa_out) {
+    mm_dm_ctx_t dm = mm_enter_direct_map();
+    int rc = mm_user_leaf_pa_direct(mm, va, write, pa_out);
+    mm_leave_direct_map(dm);
+    return rc;
+}
+
+int mm_copy_to_user(mm_t *mm, mm_t *share_cmp_mm, uint64_t dst,
+                    const void *src, size_t len) {
+    if (!mm || !src || !len || dst >= (uint64_t)MMIO_IDENTITY_LIMIT ||
+        len > (size_t)((uint64_t)MMIO_IDENTITY_LIMIT - dst))
+        return -1;
+
+    const uint8_t *in = (const uint8_t *)src;
+    size_t done = 0;
+    while (done < len) {
+        uint64_t va = dst + done;
+        uint64_t page = va & ~0xFFFULL;
+        int cow = mm_cow_fault_page(mm, page, share_cmp_mm);
+        if (cow != 0 && cow != -2)
+            return -1;
+
+        size_t chunk = 0x1000u - (size_t)(va & 0xFFFULL);
+        if (chunk > len - done)
+            chunk = len - done;
+
+        mm_dm_ctx_t dm = mm_enter_direct_map();
+        uint64_t pa = 0;
+        int rc = mm_user_leaf_pa_direct(mm, va, 1, &pa);
+        if (rc == 0)
+            memcpy((void *)(uintptr_t)pa, in + done, chunk);
+        mm_leave_direct_map(dm);
+        if (rc != 0)
+            return -1;
+        done += chunk;
+    }
     return 0;
 }
 

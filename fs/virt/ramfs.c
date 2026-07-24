@@ -16,6 +16,7 @@ struct ramfs_node {
     char *data;
     int data_borrowed;
     size_t size;
+    size_t capacity;
     /* Serialize read/write/size for this file (SMP + kernel klog vs userspace write). */
     spinlock_t io_lock;
     unsigned long ino;
@@ -125,6 +126,7 @@ int ramfs_symlink(const char *path, const char *target) {
     }
     memcpy(n->data, target, tlen+1);
     n->size = tlen;
+    n->capacity = tlen + 1;
     /* owner */
     thread_t* ct = thread_current();
     if (ct) { n->uid = ct->euid; n->gid = ct->egid; }
@@ -200,6 +202,7 @@ static int ramfs_materialize_node_locked(struct ramfs_node *n) {
     if (n->size == 0) {
         n->data = NULL;
         n->data_borrowed = 0;
+        n->capacity = 0;
         return 0;
     }
     char *copy = (char *)kmalloc(n->size);
@@ -207,6 +210,7 @@ static int ramfs_materialize_node_locked(struct ramfs_node *n) {
     memcpy(copy, n->data, n->size);
     n->data = copy;
     n->data_borrowed = 0;
+    n->capacity = n->size;
     return 0;
 }
 
@@ -493,6 +497,7 @@ int ramfs_create_borrowed_file(const char *path, const void *data, size_t size) 
     n->data = (char *)data;
     n->data_borrowed = (data && size > 0) ? 1 : 0;
     n->size = size;
+    n->capacity = size;
     f->size = (off_t)size;
     release_irqrestore(&n->io_lock, irqf);
     ramfs_release(f);
@@ -681,6 +686,7 @@ int ramfs_ftruncate(struct fs_file *file, off_t length) {
         n->data = NULL;
         n->data_borrowed = 0;
         n->size = 0;
+        n->capacity = 0;
         file->size = 0;
         release_irqrestore(&n->io_lock, irqf);
         return 0;
@@ -697,6 +703,7 @@ int ramfs_ftruncate(struct fs_file *file, off_t length) {
         }
         n->data = d;
         n->size = newsize;
+        n->capacity = newsize;
         file->size = (off_t)n->size;
         release_irqrestore(&n->io_lock, irqf);
         return 0;
@@ -717,6 +724,7 @@ int ramfs_ftruncate(struct fs_file *file, off_t length) {
     }
     n->data = d;
     n->size = newsize;
+    n->capacity = newsize;
     file->size = (off_t)n->size;
     release_irqrestore(&n->io_lock, irqf);
     return 0;
@@ -756,14 +764,18 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
     if (ct) {
         if (ct->euid != 0 && (unsigned)ct->euid != n->uid) return -1;
     }
-    unsigned long irqf;
-    acquire_irqsave(&n->io_lock, &irqf);
+    /*
+     * ramfs is never touched from interrupt context. Keeping IF=0 while
+     * krealloc copies a multi-megabyte archive stalls timers, networking and
+     * every runnable userspace task. The scheduler does not preempt ring 0, so
+     * an ordinary spinlock still serializes this transaction safely.
+     */
+    acquire(&n->io_lock);
     if (n->data_borrowed && ramfs_materialize_node_locked(n) != 0) {
-        release_irqrestore(&n->io_lock, irqf);
+        release(&n->io_lock);
         return -1;
     }
-    /* Grow and copy in chunks to avoid one-shot large reallocs where possible.
-       This may allow progress when large contiguous allocations fail. */
+    /* Geometric capacity avoids O(file_size^2) copying during archive extract. */
     const size_t CHUNK = 64 * 1024; /* 64 KiB */
     size_t write_pos = offset;
     size_t src_pos = 0;
@@ -771,16 +783,29 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
     while (remaining > 0) {
         size_t chunk = remaining > CHUNK ? CHUNK : remaining;
         size_t needed_end = write_pos + chunk;
-        if (needed_end > n->size) {
+        if (needed_end < write_pos) {
+            release(&n->io_lock);
+            return -1;
+        }
+        if (needed_end > n->capacity) {
+            size_t capacity = n->capacity ? n->capacity : 4096u;
+            while (capacity < needed_end) {
+                size_t next = capacity + capacity / 2u;
+                if (next <= capacity) {
+                    capacity = needed_end;
+                    break;
+                }
+                capacity = next;
+            }
             char *d;
             if (!n->data) {
-                d = (char*)kmalloc(needed_end);
-                if (d) memset(d, 0, needed_end);
+                d = (char*)kmalloc(capacity);
+                if (d) memset(d, 0, capacity);
             } else {
                 size_t oldsz = n->size;
-                d = (char*)krealloc(n->data, needed_end);
-                if (d && needed_end > oldsz)
-                    memset(d + oldsz, 0, needed_end - oldsz);
+                d = (char*)krealloc(n->data, capacity);
+                if (d && capacity > oldsz)
+                    memset(d + oldsz, 0, capacity - oldsz);
             }
             if (!d) {
                 kprintf("ramfs OOM: write alloc failed path=%s needed=%llu heap_used=%llu heap_total=%llu\n",
@@ -789,10 +814,14 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
                 /* kprintf only: never klogprintf here — klog may hold klog_lock during fs_write (deadlock). */
                 kprintf("ramfs: write: alloc failed path=%s needed_end=%u\n",
                         file && file->path ? file->path : "(null)", (unsigned)needed_end);
-                release_irqrestore(&n->io_lock, irqf);
+                release(&n->io_lock);
                 return -1;
             }
             n->data = d;
+            n->capacity = capacity;
+        }
+        if (needed_end > n->size) {
+            memset(n->data + n->size, 0, needed_end - n->size);
             n->size = needed_end;
         }
         memcpy(n->data + write_pos, (const char*)buf + src_pos, chunk);
@@ -804,7 +833,7 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
      * (klog and others append using offset = f->size; a bug or race that reused a stale offset
      * previously chopped the file and left krealloc gaps full of garbage.) */
     file->size = (off_t)n->size; /* keep handle in sync for stat/read */
-    release_irqrestore(&n->io_lock, irqf);
+    release(&n->io_lock);
     return (ssize_t)size;
 }
 

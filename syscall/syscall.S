@@ -26,6 +26,7 @@
 .extern syscall_restore_user_fs_before_iretq
 .extern syscall_finalize_user_frame
 .extern syscall_maybe_vfork_wait
+.extern syscall_publish_deferred_fork_child
 .extern maybe_deliver_pending_signal
 
 // x86_64 SYSCALL entry point
@@ -192,9 +193,14 @@ syscall_entry64:
     movq    %rax, 112(%rsp)
 .L_skip_write_rax:
 
-    /* fork children remain blocked until a timer has observed this parent back
-     * in ring 3 (or until its next syscall entry). Never publish a child while
-     * this live parent frame is still being finalized. */
+    /*
+     * Linux wake_up_new_task(): the child becomes runnable before fork returns.
+     * Publication cannot schedule from here; timer preemption ignores ring 0,
+     * and every task owns its syscall stack. This removes the old timer/next-
+     * syscall gate that could leave a child blocked forever when its parent
+     * returned to userspace and slept without another tick-driven publication.
+     */
+    call    syscall_publish_deferred_fork_child
     /* Re-bind FS before iretq: after fork/vfork the child can lose MSR_FS_BASE
      * across a schedule while the parent runs; BusyBox then dies in tcsetpgrp
      * canary loads (%fs:0x28) with no further syscall logs. */

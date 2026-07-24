@@ -493,7 +493,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 uintptr_t top = (uintptr_t)df_stack + DF_STACK_SIZE + 16;
                 uintptr_t df_top = align_up_uintptr(top, 16);
                 tss_set_ist_for_cpu(i, 1, (uint64_t)df_top);
-                kprintf("Set kernel DF IST1 for cpu %d at %p.\n", i, (void*)(uintptr_t)df_top);
+                devel_printf("Set kernel DF IST1 for cpu %d at %p.\n", i,
+                             (void *)(uintptr_t)df_top);
             } else {
                 kprintf("Failed to allocate DF IST stack for cpu %d (warning)\n", i);
             }
@@ -583,9 +584,15 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             apic_timer_start(250);
             /* Confirm APIC is actually ticking at the new rate; otherwise revert to PIT. */
             uint64_t t0 = apic_timer_ticks;
-            for (int i = 0; i < 100000; i++) {
-                if (apic_timer_ticks != t0) break;
-                asm volatile("pause");
+            if (klog_tsc_per_us) {
+                uint64_t wait_start = time_monotonic_us();
+                while (apic_timer_ticks == t0 &&
+                       time_monotonic_us() - wait_start < 50000u)
+                    asm volatile("pause" ::: "memory");
+            } else {
+                for (volatile uint64_t i = 0;
+                     i < 10000000u && apic_timer_ticks == t0; i++)
+                    asm volatile("pause" ::: "memory");
             }
             if (apic_timer_ticks == t0) {
                 kprintf("APIC: no ticks after 250Hz start, falling back to PIT\n");

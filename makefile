@@ -25,7 +25,12 @@ STUB_OBJ := $(BUILD_DIR)/$(STUB_SRC:.c=.c.o)
 CC := gcc -m64
 # Optional: make CFLAGS_EXTRA='-DDEVEL_DEBUG=1' for COW/pipe/fork console traces.
 CFLAGS_EXTRA ?=
-CFLAGS := -g -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel -Iinc -MMD -MP $(CFLAGS_EXTRA)
+OPTFLAGS ?= -g
+CFLAGS := $(OPTFLAGS) -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel -Iinc -MMD -MP $(CFLAGS_EXTRA)
+PRODUCTION_CFLAGS := -DAXON_PRODUCTION=1 -DDEVEL_DEBUG=0 \
+	-DAXON_FORK_DEBUG=0 -DNET_TCP_TRACE=0 \
+	-DAXON_WGET_DNS_TRACE=0 -DKBD_DEBUG=0 \
+	-UQEMU_LOG_ENABLE -DKERNEL_LOG_TIME=1
 
 CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -path './userland' -prune -o -path './core/nss_dns_shim' -prune -o -path './core/nss_files_shim' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
 COBJS := $(patsubst %.c,$(BUILD_DIR)/%.c.o,$(CSRCS))
@@ -55,9 +60,13 @@ NSS_DNS_BLOB_OBJ := $(BUILD_DIR)/nss_dns/shim_blob.o
 NSS_FILES_SHIM := $(BUILD_DIR)/nss_files/shim
 NSS_FILES_BLOB_OBJ := $(BUILD_DIR)/nss_files/shim_blob.o
 
-.PHONY: all kernel iso clean run
+.PHONY: all kernel iso clean run for-production
 
 all: iso
+
+for-production:
+	@$(MAKE) clean
+	@$(MAKE) OPTFLAGS='-O0 -g0' CFLAGS_EXTRA='$(PRODUCTION_CFLAGS)' iso
 
 kernel: $(KERNEL_BIN)
 

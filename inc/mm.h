@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include <spinlock.h>
 
@@ -83,6 +84,10 @@ int mm_make_private_range_bulk_zero_force(mm_t *mm, uint64_t va_begin, uint64_t 
 int mm_va_leaf_pa(mm_t *mm, uint64_t va, uint64_t *pa_out);
 /* Resolve a present user leaf and enforce effective read/write permission. */
 int mm_user_leaf_pa(mm_t *mm, uint64_t va, int write, uint64_t *pa_out);
+/* Copy into an arbitrary task mm through the kernel direct map, breaking COW
+ * before each page. share_cmp_mm is the fork template/parent when applicable. */
+int mm_copy_to_user(mm_t *mm, mm_t *share_cmp_mm, uint64_t dst,
+                    const void *src, size_t len);
 
 /* COW up to max_pages present user-writable 4KiB pages (splits 2MiB when needed).
  * share_l4: parent page table root (NOT paging_read_cr3() — CR3 may differ mid-fork). */

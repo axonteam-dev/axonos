@@ -663,10 +663,12 @@ void fs_file_free(struct fs_file *file) {
     if (file->refcount > 1) { file->refcount--; return; }
     if (file->refcount < 1) {
         /* Already released or never counted — refuse UAF double free. */
+#if !AXON_PRODUCTION
         static int warn_left = 8;
         if (warn_left-- > 0)
             kprintf("fs_file_free: refcount=%d path=%s (skip)\n",
                 file->refcount, file->path ? file->path : "(null)");
+#endif
         return;
     }
     file->refcount = 0;

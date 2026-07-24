@@ -5,6 +5,10 @@
 struct thread;
 typedef struct thread thread_t;
 
+#ifndef AXON_PRODUCTION
+#define AXON_PRODUCTION 0
+#endif
+
 /*
  * Development console/serial traces (COW, pipe, fork child, ash-watch, …).
  * Off by default. Enable:  make CFLAGS_EXTRA='-DDEVEL_DEBUG=1'
@@ -16,6 +20,13 @@ typedef struct thread thread_t;
 
 #ifndef AXON_FORK_DEBUG
 #define AXON_FORK_DEBUG DEVEL_DEBUG
+#endif
+
+#if AXON_PRODUCTION
+#undef DEVEL_DEBUG
+#define DEVEL_DEBUG 0
+#undef AXON_FORK_DEBUG
+#define AXON_FORK_DEBUG 0
 #endif
 
 void kprintf(const char *fmt, ...);

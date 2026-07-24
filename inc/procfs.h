@@ -21,5 +21,7 @@ ssize_t procfs_net_snap_unix(char *buf, size_t size);
 ssize_t procfs_net_snap_arp(char *buf, size_t size);
 ssize_t procfs_net_snap_dev(char *buf, size_t size);
 ssize_t procfs_net_snap_route(char *buf, size_t size);
+ssize_t procfs_net_snap_dhcp(char *buf, size_t size);
+ssize_t procfs_net_store_dhcp(const char *buf, size_t size);
 
 

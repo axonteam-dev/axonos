@@ -569,12 +569,13 @@ static void test_clone3_thread(void) {
 		uwrite_hex64("  rc=0x", (unsigned long long)stk);
 		return;
 	}
-	uintptr_t sp = (uintptr_t)stk + (uintptr_t)CHILD_STK;
-	sp &= ~(uintptr_t)0xFULL;
+	/* Linux clone3: stack = lowest address; kernel sets RSP = stack+size. */
+	uintptr_t stack_lo = (uintptr_t)stk;
+	stack_lo = (stack_lo + 0xFULL) & ~(uintptr_t)0xFULL;
 	struct clone3_args cl = { 0 };
 	cl.flags = 0x00000100ULL;
-	cl.stack = sp;
-	cl.stack_size = CHILD_STK;
+	cl.stack = stack_lo;
+	cl.stack_size = CHILD_STK - (stack_lo - (uintptr_t)stk);
 	long tid = sys2(SYS_clone3, (long)(uintptr_t)&cl, (long)sizeof(cl));
 	if (tid < 0) {
 		skip("clone3 thread", "clone3 failed");

@@ -12,6 +12,7 @@
 #include <loadavg.h>
 #include <sysinfo.h>
 #include <paging.h>
+#include <syscall.h>
 #include <stdio.h>
 #include <string.h>
 /* common ticks */
@@ -224,6 +225,13 @@ void apic_timer_handler(cpu_registers_t* regs) {
     apic_timer_state.ticks = apic_timer_ticks;
     if (!pit_is_enabled())
         timer_ticks++;
+    /* A ring-3 interrupt proves the parent's fork-return IRETQ completed.
+     * It is now safe to make its fully initialized child runnable. Never also
+     * context-switch from this same IRQ: first return its complete interrupt
+     * frame to the parent, then let a later tick select the child. */
+    int published_fork_child = 0;
+    if (regs && ((regs->cs & 3) == 3))
+        published_fork_child = syscall_publish_deferred_fork_child();
     if (init && smp_sched_cpu_id() == 0 && apic_timer_state.frequency > 0 &&
         apic_timer_ticks > 0 &&
         (apic_timer_ticks % (uint64_t)apic_timer_state.frequency) == 0)
@@ -279,6 +287,8 @@ void apic_timer_handler(cpu_registers_t* regs) {
      */
     if (regs && ((regs->cs & 3) == 3) && smp_sched_cpu_id() == 0) {
         apic_eoi();
+        if (published_fork_child)
+            return;
         /*
          * Linux-style scheduling granularity: account every timer tick, but
          * do not context-switch on every IRQ. Under VMware a switch can take
@@ -302,7 +312,10 @@ void apic_timer_handler(cpu_registers_t* regs) {
     if (cirrusfb_is_ready()) {
         cirrusfb_update_cursor();
     } else {
-        if (apic_timer_ticks % 5) vbe_flush_full();
+        /* Full FB blit every few ms froze interactive work during kernel syscalls
+         * (connect/poll). Throttle to ~10 Hz; dirty regions flush on putchar. */
+        if ((apic_timer_ticks % 25u) == 0u)
+            vbe_flush_full();
         vbefb_update_cursor();
     }
     apic_eoi();

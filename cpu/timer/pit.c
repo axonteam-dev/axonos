@@ -12,6 +12,7 @@
 #include <smp.h>
 #include <loadavg.h>
 #include <power.h>
+#include <syscall.h>
 
 // Global variables
 volatile uint64_t pit_ticks = 0;
@@ -25,6 +26,11 @@ volatile uint32_t timer_frequency = 250;
 void pit_handler(cpu_registers_t* regs) {
         pit_ticks++;
         timer_ticks++;
+        /* Publish now, but force this IRQ to return to the parent before any
+         * later timer tick is allowed to select the new child. */
+        int published_fork_child = 0;
+        if (regs && ((regs->cs & 3) == 3))
+                published_fork_child = syscall_publish_deferred_fork_child();
 
         /* Ensure ACPI/power requests progress even when system is otherwise idle at a prompt. */
         if (power_is_pending() && (!regs || ((regs->cs & 3) == 0))) {
@@ -44,7 +50,8 @@ void pit_handler(cpu_registers_t* regs) {
                         uint32_t quantum = pit_frequency / 100u;
                         if (quantum < 1u)
                                 quantum = 1u;
-                        if ((pit_ticks % quantum) == 0)
+                        if (!published_fork_child &&
+                            (pit_ticks % quantum) == 0)
                                 thread_ring3_preempt_if_waiters();
                 }
                 return;
@@ -58,7 +65,9 @@ void pit_handler(cpu_registers_t* regs) {
         if (cirrusfb_is_ready()) {
                 cirrusfb_update_cursor();
         } else {
-                vbe_flush_full();
+                /* Match APIC: avoid full framebuffer blit on every timer IRQ. */
+                if ((pit_ticks % 25u) == 0u)
+                        vbe_flush_full();
                 vbefb_update_cursor();
         }
 }

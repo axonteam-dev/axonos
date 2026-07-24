@@ -630,10 +630,23 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
             memcpy(pp, path, plen);
             f->path = (const char*)pp;
             f->fs_private = &devfs_driver_data;
-            int *ptype = (int*)kmalloc(sizeof(int));
-            if (!ptype) { kfree((void*)f->path); kfree(f); return -1; }
-            *ptype = 0x80000000 | si;
-            f->driver_private = (void*)ptype;
+            /*
+             * Linux: /dev/tty and /dev/std{in,out,err} are the controlling tty.
+             * Bind at open so TIOCSPGRP/TIOCGPGRP update real tty->fg_pgrp —
+             * a deferred int marker left fg_pgrp stale (^C only hit the shell).
+             */
+            if (si == 3 || si == 4 || si == 5 || si == 6) {
+                thread_t *cur = thread_current();
+                if (!cur) cur = thread_get_current_user();
+                int tty_idx = (cur && cur->attached_tty >= 0) ? cur->attached_tty : devfs_get_active();
+                if (tty_idx < 0 || tty_idx >= DEVFS_TTY_COUNT) tty_idx = 0;
+                f->driver_private = (void*)&dev_ttys[tty_idx];
+            } else {
+                int *ptype = (int*)kmalloc(sizeof(int));
+                if (!ptype) { kfree((void*)f->path); kfree(f); return -1; }
+                *ptype = 0x80000000 | si;
+                f->driver_private = (void*)ptype;
+            }
             f->type = FS_TYPE_REG;
             f->size = 0;
             f->refcount = 1;
@@ -2030,7 +2043,7 @@ void devfs_tty_push_input_noblock(int tty, char c) {
     if (tty < 0 || tty >= DEVFS_TTY_COUNT) return;
     struct devfs_tty *t = &dev_ttys[tty];
     if (!try_acquire(&t->in_lock)) {
-        /* Ctrl+C: still send SIGINT so foreground process terminates even if lock busy */
+        /* Ctrl+C: Linux n_tty — SIGINT to the tty foreground process group only. */
         if ((unsigned char)c == 0x03) {
             int pgrp = devfs_get_tty_fg_pgrp(tty);
             if (pgrp >= 0) {
@@ -2050,7 +2063,7 @@ void devfs_tty_push_input_noblock(int tty, char c) {
     }
     /* Backspace (DEL 0x7F / BS 0x08): never handle in kernel; always pass to application.
        Prevents double handling (kernel try_erase + sh line editor) and keeps display in sync. */
-    /* Ctrl+C (0x03): send SIGINT to foreground process group only (Linux-like). */
+    /* Ctrl+C (0x03): SIGINT to tty->pgrp only (Linux n_tty_receive_char). */
     if ((unsigned char)c == 0x03) {
         if (t->fg_pgrp >= 0) thread_send_sigint_to_pgrp(t->fg_pgrp);
         /* Wake readers so they can observe updated process state. */
@@ -2217,23 +2230,15 @@ void devfs_tty_remove_waiter_from_all_ttys(int tid) {
 
 /* Helpers exposed to other kernel components */
 int devfs_tty_get_fg_pgrp(struct fs_file *file) {
-    if (!file || !file->driver_private) return -1;
-    uintptr_t p = (uintptr_t)file->driver_private;
-    uintptr_t base = (uintptr_t)&dev_ttys[0];
-    uintptr_t end = (uintptr_t)&dev_ttys[DEVFS_TTY_COUNT];
-    if (!(p >= base && p < end)) return -1;
-    struct devfs_tty *t = (struct devfs_tty*)p;
-    return t->fg_pgrp;
+    int idx = devfs_get_tty_index_from_file(file);
+    if (idx < 0 || idx >= DEVFS_TTY_COUNT) return -1;
+    return dev_ttys[idx].fg_pgrp;
 }
 
 int devfs_tty_set_fg_pgrp(struct fs_file *file, int pgrp) {
-    if (!file || !file->driver_private) return -1;
-    uintptr_t p = (uintptr_t)file->driver_private;
-    uintptr_t base = (uintptr_t)&dev_ttys[0];
-    uintptr_t end = (uintptr_t)&dev_ttys[DEVFS_TTY_COUNT];
-    if (!(p >= base && p < end)) return -1;
-    struct devfs_tty *t = (struct devfs_tty*)p;
-    t->fg_pgrp = pgrp;
+    int idx = devfs_get_tty_index_from_file(file);
+    if (idx < 0 || idx >= DEVFS_TTY_COUNT) return -1;
+    dev_ttys[idx].fg_pgrp = pgrp;
     return 0;
 }
 

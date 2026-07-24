@@ -44,6 +44,9 @@ mm_t *mm_clone_from(mm_t *src);
 /* Linux kernel/fork.c mm_alloc() + init_new_context(): nascent mm from swapper
  * (g_kernel_mm). map_page_2m keeps swapper coherent with kernel mappings. */
 mm_t *mm_alloc(void);
+/* Duplicate one userspace address space. Private VMAs get private frames;
+ * shared VMAs retain their backing frames. Parent page tables are unchanged. */
+mm_t *mm_dup_user(mm_t *parent, uint64_t owner_tid);
 /*
  * After cloning swapper: strip PG_US on user-window identity (keep PRESENT
  * for kernel phys / stack VA pokes under process CR3). Unmap identity only

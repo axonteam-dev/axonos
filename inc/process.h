@@ -71,5 +71,9 @@ void process_exec_reset(process_t *process, thread_t *thread);
 uint64_t process_pid(const thread_t *thread);
 uint64_t process_ppid(const thread_t *thread);
 int process_signal_targets(process_t *caller, int pid, int sig);
+/* Fill out[] with live PROCESS_ALIVE targets matching kill(2) pid rules.
+ * Returns number of entries written (capped at out_max). */
+int process_collect_signal_targets(process_t *caller, int pid,
+                                   process_t **out, int out_max);
 
 #endif

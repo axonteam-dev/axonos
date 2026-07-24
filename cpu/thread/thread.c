@@ -126,6 +126,9 @@ static void thread_note_ready_nolock(thread_t *t) {
                 return;
         if (t->state == THREAD_READY)
                 return;
+        /* Never resurrect a killed/exited thread (SIGKILL from another task). */
+        if (t->state == THREAD_TERMINATED)
+                return;
         /*
          * Linux wait_for_vfork_done: parent stays unscheduled until
          * complete_vfork_done(). If we READY a vfork parent early it can
@@ -205,9 +208,9 @@ static int thread_context_valid(thread_t *t) {
         return 1;
 }
 
-/* 8KiB was too small for syscall_do; 64KiB avoids kstack overflow corrupting thread state. */
-#define KERNEL_STACK_SIZE (64 * 1024)
-#define SYSCALL_KSTACK_SIZE (64 * 1024)
+/* 8KiB was too small for syscall_do; 128KiB covers fork/clone COW walks on large AS. */
+#define KERNEL_STACK_SIZE (128 * 1024)
+#define SYSCALL_KSTACK_SIZE (128 * 1024)
 
 static void thread_free_resources(thread_t *t) {
         if (!t) return;
@@ -416,6 +419,13 @@ static void thread_trampoline(void) {
         asm volatile("pushfq; pop %%rax" : "=a"(_rflags));
         thread_t* _self = thread_current();
         int _tid = _self ? _self->tid : -1;
+        if (_self && _self->parent_tid >= 0) {
+                kprintf("sched-fork[43] trampoline tid=%d entry=0x%llx rsp=0x%llx cr3=0x%llx\n",
+                        _tid,
+                        (unsigned long long)(uintptr_t)entry,
+                        (unsigned long long)_self->context.rsp,
+                        (unsigned long long)paging_read_cr3());
+        }
         if (_tid == thread_get_init_user_tid()) {
                 kprintf("thread_trampoline: PID1 entry=0x%llx rflags=0x%x\n",
                         (unsigned long long)(uintptr_t)entry,
@@ -1196,7 +1206,30 @@ void thread_schedule() {
                 } else {
                         set_user_fs_base(0);
                 }
+                int dbg_fork_first = cur->ring == 3 && cur->parent_tid >= 0 &&
+                        cur->fork_child_user_rip != 0;
+                if (dbg_fork_first) {
+                        uint64_t live_rsp = 0, live_pa = 0, child_rsp_pa = 0;
+                        asm volatile("mov %%rsp, %0" : "=r"(live_rsp));
+                        int live_rc = mm_va_leaf_pa(cur->mm, live_rsp, &live_pa);
+                        int child_rc = mm_va_leaf_pa(cur->mm, cur->context.rsp,
+                                                    &child_rsp_pa);
+                        kprintf("sched-fork[40] tid=%d mm=0x%llx live-rsp=0x%llx/%d->0x%llx "
+                                "child-rsp=0x%llx/%d->0x%llx ret=0x%llx entry=0x%llx\n",
+                                (int)(cur->tid ? cur->tid : 1),
+                                (unsigned long long)(cur->mm ? cur->mm->cr3 : 0),
+                                (unsigned long long)live_rsp, live_rc,
+                                (unsigned long long)live_pa,
+                                (unsigned long long)cur->context.rsp, child_rc,
+                                (unsigned long long)child_rsp_pa,
+                                (unsigned long long)(cur->context.rsp
+                                    ? *(uint64_t *)(uintptr_t)cur->context.rsp : 0),
+                                (unsigned long long)cur->context.r12);
+                }
                 mm_switch(cur->mm);
+                if (dbg_fork_first)
+                        kprintf("sched-fork[41] child cr3 active=0x%llx\n",
+                                (unsigned long long)paging_read_cr3());
                 syscall_bind_kstack_for_thread(cur);
                 if (!thread_context_valid(cur)) {
                         cur->state = THREAD_TERMINATED;
@@ -1208,6 +1241,8 @@ void thread_schedule() {
                         return;
                 }
                 fpu_switch(prev, cur);
+                if (dbg_fork_first)
+                        kprintf("sched-fork[42] fpu ready; switching context\n");
                 context_switch_with_prev(&prev->context, &cur->context, prev);
                 restore_irqflags(irqf);
                 return;
@@ -1284,8 +1319,6 @@ void thread_send_sigint_to_pgrp(int pgrp) {
                 if (!t) continue;
                 if (t->pgid != pgrp) continue;
                 if (t->state != THREAD_TERMINATED) {
-                        /* Mark pending SIGINT; let thread terminate via regular syscall path.
-                           Directly forcing THREAD_TERMINATED breaks vfork/exec parent restore. */
                         t->pending_signals |= (1ULL << (2 - 1)); /* SIGINT */
                         if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING) {
                                 t->sleep_until = 0;

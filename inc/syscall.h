@@ -130,7 +130,7 @@ typedef struct syscall_frame {
 
 /* initialize syscall subsystem (register handler) */
 void syscall_init(void);
-/* Explicit DHCP (not at boot). Also: echo 1 > /proc/net/dhcp */
+/* Optional in-kernel DHCP helper (prefer userspace udhcpc). */
 int syscall_net_preinit(void);
 
 /* ISR-compatible handler (called by IDT dispatcher) */
@@ -143,7 +143,8 @@ void syscall_frame_refresh(thread_t *t);
 /* Run deferred fork child GPR refresh after parent syscall (before iretq unblock). */
 void syscall_deferred_unblocks(void);
 /* Linux ordering: unblock fork child immediately before parent SYSCALL iretq. */
-void syscall_fork_parent_pre_iretq(void);
+/* Returns 1 when a child became runnable during this call. */
+int syscall_publish_deferred_fork_child(void);
 void syscall_restore_user_fs_before_iretq(void);
 /* Linux wait_for_vfork_done — after syscall_do, before iretq. */
 uint64_t syscall_maybe_vfork_wait(uint64_t parent_ret);

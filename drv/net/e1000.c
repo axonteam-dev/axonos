@@ -6,6 +6,7 @@
 #include <string.h>
 #include <klog.h>
 #include <pit.h>
+#include <spinlock.h>
 #include <stdint.h>
 
 extern uint64_t virt_to_phys(uint64_t va);
@@ -120,6 +121,7 @@ typedef struct {
     uint8_t *tx_buf[E1000_TX_DESC_COUNT];
     uint8_t *rx_buf[E1000_RX_DESC_COUNT];
     uint32_t rx_next;
+    uint32_t tx_tail; /* next descriptor to fill (software TDT) */
 
     e1000_stats_t stats;
     int last_link_up;
@@ -127,6 +129,7 @@ typedef struct {
 } e1000_state_t;
 
 static e1000_state_t g_e1000;
+static spinlock_t g_e1000_lock = { 0 };
 
 static void *kmalloc_aligned_local(size_t size, size_t align) {
     uintptr_t raw = (uintptr_t)kmalloc(size + align);
@@ -236,6 +239,7 @@ static int e1000_setup_tx(void) {
     e1000_write32(E1000_REG_TDLEN, (uint32_t)(sizeof(e1000_tx_desc_t) * E1000_TX_DESC_COUNT));
     e1000_write32(E1000_REG_TDH, 0);
     e1000_write32(E1000_REG_TDT, 0);
+    g_e1000.tx_tail = 0;
 
     /* Typical values used by Intel examples and hobby OS drivers. */
     uint32_t tctl = E1000_TCTL_EN | E1000_TCTL_PSP | (0x10u << E1000_TCTL_CT_SHIFT) | (0x40u << E1000_TCTL_COLD_SHIFT);
@@ -373,13 +377,23 @@ int e1000_send_frame(const void *data, size_t len) {
     if (!g_e1000.initialized || !data) return -1;
     if (len == 0 || len > E1000_TX_BUF_SIZE) return -1;
 
-    for (int attempt = 0; attempt < 8; attempt++) {
-        uint32_t tail = e1000_read32(E1000_REG_TDT);
-        if (tail >= E1000_TX_DESC_COUNT) tail = 0;
-        e1000_tx_desc_t *d = &g_e1000.tx_desc[tail];
+    /*
+     * Fire-and-forget TX (Linux-like). Never thread_sleep() here: on VMware the
+     * timer may not advance during a syscall, so sleeping for DD freezes udhcpc
+     * at "broadcasting discover".
+     */
+    for (int attempt = 0; attempt < 64; attempt++) {
+        unsigned long irqf = 0;
+        acquire_irqsave(&g_e1000_lock, &irqf);
 
+        uint32_t tail = g_e1000.tx_tail % E1000_TX_DESC_COUNT;
+        uint32_t next = (tail + 1) % E1000_TX_DESC_COUNT;
+        volatile e1000_tx_desc_t *d = (volatile e1000_tx_desc_t *)&g_e1000.tx_desc[tail];
+
+        /* Ring full: descriptor still owned by hardware. */
         if ((d->status & E1000_TX_STATUS_DD) == 0) {
-            for (volatile int s = 0; s < 2000; s++)
+            release_irqrestore(&g_e1000_lock, irqf);
+            for (volatile int s = 0; s < 500; s++)
                 ;
             continue;
         }
@@ -395,43 +409,40 @@ int e1000_send_frame(const void *data, size_t len) {
         d->css = 0;
         d->special = 0;
 
-        e1000_write32(E1000_REG_TDT, (tail + 1) % E1000_TX_DESC_COUNT);
-
-        for (int i = 0; i < 100000; i++) {
-            e1000_poll();
-            if (d->status & E1000_TX_STATUS_DD) {
-                g_e1000.stats.tx_packets++;
-                e1000_poll();
-                return (int)len;
-            }
-        }
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        g_e1000.tx_tail = next;
+        e1000_write32(E1000_REG_TDT, next);
+        g_e1000.stats.tx_packets++;
+        release_irqrestore(&g_e1000_lock, irqf);
+        return (int)len;
     }
 
     g_e1000.stats.tx_errors++;
-    return -3; /* timeout */
+    return -3; /* ring full */
 }
 
 int e1000_recv_frame(void *buf, size_t cap) {
     if (!g_e1000.initialized || !buf || cap == 0) return -1;
 
-    e1000_poll();
+    unsigned long irqf = 0;
+    acquire_irqsave(&g_e1000_lock, &irqf);
 
-    uint32_t rdt = e1000_read32(E1000_REG_RDT);
-    uint32_t rdh = e1000_read32(E1000_REG_RDH);
-    uint32_t idx = (rdt + 1) % E1000_RX_DESC_COUNT;
-    if (idx == rdh)
-        return 0;
-
+    (void)e1000_read32(E1000_REG_ICR);
+    uint32_t idx = g_e1000.rx_next;
     volatile e1000_rx_desc_t *d = (volatile e1000_rx_desc_t *)&g_e1000.rx_desc[idx];
-    __asm__ volatile("" ::: "memory");
-    if ((d->status & E1000_RX_STATUS_DD) == 0)
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    if ((d->status & E1000_RX_STATUS_DD) == 0) {
+        release_irqrestore(&g_e1000_lock, irqf);
         return 0;
+    }
 
-    if ((d->status & E1000_RX_STATUS_EOP) == 0) {
+    if ((d->status & E1000_RX_STATUS_EOP) == 0 || d->errors != 0) {
         d->status = 0;
+        __atomic_thread_fence(__ATOMIC_RELEASE);
         e1000_write32(E1000_REG_RDT, idx);
         g_e1000.rx_next = (idx + 1) % E1000_RX_DESC_COUNT;
         g_e1000.stats.rx_errors++;
+        release_irqrestore(&g_e1000_lock, irqf);
         return -2;
     }
 
@@ -443,10 +454,11 @@ int e1000_recv_frame(void *buf, size_t cap) {
     memcpy(buf, g_e1000.rx_buf[idx], copy_len);
 
     d->status = 0;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     e1000_write32(E1000_REG_RDT, idx);
     g_e1000.rx_next = (idx + 1) % E1000_RX_DESC_COUNT;
-
     g_e1000.stats.rx_packets++;
+    release_irqrestore(&g_e1000_lock, irqf);
     return (int)copy_len;
 }
 

@@ -171,6 +171,10 @@ typedef struct thread {
         uint32_t robust_list_len;     /* set_robust_list len. */
         uint64_t fork_libc_mt_r14;    /* glibc MT __fork: r14=rsp at d4160, snap at clone. */
         uint64_t fork_gpr_snap[16];   /* syscall GPR frame at clone; restore for MT __fork ret. */
+        /* 1 = pthread/clone3 child: keep %rdx (start_routine) across iretq. */
+        uint8_t clone_preserve_rdx;
+        /* 1 = SYS_clone/clone3 is nesting do_fork; skip parent frame rebuild. */
+        uint8_t fork_from_clone;
         /* Successful execve: release pre-exec mm AFTER switching to new_mm but
          * BEFORE enter_user_mode (which never returns). */
         mm_t *exec_discard_mm;
@@ -217,6 +221,7 @@ void thread_unblock(int pid);
 void thread_unblock_fork_child(int pid);
 /* Send SIGINT to foreground process group (Ctrl+C → terminate blocking program) */
 void thread_send_sigint_to_pgrp(int pgrp);
+void thread_send_sighup_to_pgrp(int pgrp);
 int thread_get_state(int pid);
 int thread_get_count();
 /* Reparent living children of exiting parent to init. Returns count reparented. */

@@ -94,7 +94,17 @@ void process_attach_thread(process_t *process, thread_t *thread) {
         return;
     unsigned long flags;
     acquire_irqsave(&process_lock, &flags);
-    process->leader = thread;
+    /*
+     * Linux TGID = PID of the thread-group leader. First attach wins as leader;
+     * CLONE_THREAD peers must not overwrite leader (that broke kill/ps).
+     * Unify process->pid with leader->tid so /proc and kill share one namespace.
+     */
+    if (!process->leader) {
+        process->leader = thread;
+        process->pid = thread->tid ? thread->tid : 1;
+        if (next_pid <= process->pid)
+            next_pid = process->pid + 1;
+    }
     thread->process = process;
     process->mm = thread->mm;
     /* Fork sets sid/pgid on the thread after process_create inherited them.
@@ -141,14 +151,23 @@ void process_sync_from_thread(process_t *process, thread_t *thread) {
 
 process_t *process_find(uint64_t pid) {
     process_t *result = NULL;
+    process_t *zombie = NULL;
     unsigned long flags;
     acquire_irqsave(&process_lock, &flags);
     for (int i = 0; i < PROCESS_TABLE_MAX; ++i) {
-        if (process_table[i] && process_table[i]->pid == pid) {
-            result = process_table[i];
+        process_t *p = process_table[i];
+        if (!p || p->pid != pid)
+            continue;
+        /* Prefer a live task; a recycled TGID must not hit a stale zombie. */
+        if (p->state == PROCESS_ALIVE) {
+            result = p;
             break;
         }
+        if (!zombie)
+            zombie = p;
     }
+    if (!result)
+        result = zombie;
     release_irqrestore(&process_lock, flags);
     return result;
 }
@@ -397,9 +416,11 @@ int process_adopt_child(process_t *parent, process_t *child) {
     return 0;
 }
 
-int process_signal_targets(process_t *caller, int pid, int sig) {
-    thread_t *targets[PROCESS_TABLE_MAX];
-    int count = 0;
+int process_collect_signal_targets(process_t *caller, int pid,
+                                   process_t **out, int out_max) {
+    if (!out || out_max <= 0)
+        return 0;
+    int mcount = 0;
     unsigned long flags;
     acquire_irqsave(&process_lock, &flags);
     for (int i = 0; i < PROCESS_TABLE_MAX; ++i) {
@@ -415,17 +436,47 @@ int process_signal_targets(process_t *caller, int pid, int sig) {
             match = p->pid != 1;
         else
             match = p->pgid == -pid;
-        if (match)
-            targets[count++] = p->leader;
+        if (!match)
+            continue;
+        if (mcount < out_max)
+            out[mcount] = p;
+        mcount++;
     }
     release_irqrestore(&process_lock, flags);
-    for (int i = 0; i < count; ++i) {
-        if (sig == 0)
-            continue;
-        targets[i]->pending_signals |= (1ULL << (sig - 1));
-        if (targets[i]->state == THREAD_BLOCKED ||
-            targets[i]->state == THREAD_SLEEPING)
-            thread_unblock((int)(targets[i]->tid ? targets[i]->tid : 1));
+    return mcount > out_max ? out_max : mcount;
+}
+
+int process_signal_targets(process_t *caller, int pid, int sig) {
+    process_t *matched[PROCESS_TABLE_MAX];
+    int mcount = process_collect_signal_targets(caller, pid, matched,
+                                                 PROCESS_TABLE_MAX);
+
+    int count = 0;
+    /* Linux kill(2): deliver to every live thread in the thread group. */
+    for (int mi = 0; mi < mcount; ++mi) {
+        process_t *p = matched[mi];
+        int hit = 0;
+        for (int i = 0; i < thread_get_count(); ++i) {
+            thread_t *t = thread_get_by_index(i);
+            if (!t || t->state == THREAD_TERMINATED) continue;
+            if (t->process != p) continue;
+            hit = 1;
+            count++;
+            if (sig == 0)
+                continue;
+            t->pending_signals |= (1ULL << (sig - 1));
+            if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING)
+                thread_unblock((int)(t->tid ? t->tid : 1));
+        }
+        if (!hit && p->leader && p->leader->state != THREAD_TERMINATED) {
+            count++;
+            if (sig != 0) {
+                p->leader->pending_signals |= (1ULL << (sig - 1));
+                if (p->leader->state == THREAD_BLOCKED ||
+                    p->leader->state == THREAD_SLEEPING)
+                    thread_unblock((int)(p->leader->tid ? p->leader->tid : 1));
+            }
+        }
     }
     return count;
 }

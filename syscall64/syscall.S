@@ -23,7 +23,6 @@
 .extern syscall_return_to_shell
 .extern syscall_exec_trampoline_active
 .extern syscall_snapshot_user_regs
-.extern syscall_fork_parent_pre_iretq
 .extern syscall_restore_user_fs_before_iretq
 .extern syscall_finalize_user_frame
 .extern syscall_maybe_vfork_wait
@@ -193,11 +192,9 @@ syscall_entry64:
     movq    %rax, 112(%rsp)
 .L_skip_write_rax:
 
-    /* Wake deferred fork child while the saved user frame is still on the
-     * stack. Calling this AFTER popping user GPRs clobbers rax/r9/… and
-     * corrupts syscall return values (seen as mmap→0x180000000 then SIGSEGV
-     * in glibc __libc_setup_tls memcpy). */
-    call    syscall_fork_parent_pre_iretq
+    /* fork children remain blocked until a timer has observed this parent back
+     * in ring 3 (or until its next syscall entry). Never publish a child while
+     * this live parent frame is still being finalized. */
     /* Re-bind FS before iretq: after fork/vfork the child can lose MSR_FS_BASE
      * across a schedule while the parent runs; BusyBox then dies in tcsetpgrp
      * canary loads (%fs:0x28) with no further syscall logs. */

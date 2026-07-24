@@ -1562,7 +1562,7 @@ static int try_exec_shebang(const char *resolved_path,
                       has_arg ? " arg='" : "",
                       has_arg ? arg : "",
                       has_arg ? "'" : "");
-    kprintf("exec-shebang: '%s' -> '%s'\n", resolved_path, interp);
+    /* shebang: run interpreter with script path as argv0 */
 
     int rc = kernel_execve_into_mm(k_interp, nargv, envp);
     kfree((void*)nargv);

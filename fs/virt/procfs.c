@@ -9,6 +9,7 @@
 #include <stat.h>
 #include <spinlock.h>
 #include <thread.h>
+#include <process.h>
 #include <rtc.h>
 #include <sysinfo.h>
 #include <axonos.h>
@@ -35,10 +36,26 @@ static struct fs_driver procfs_driver;
 static struct fs_driver_ops procfs_ops;
 static spinlock_t procfs_lock = { 0 };
 
+/* Linux /proc/<pid>: pid is TGID. Resolve process leader, else fall back to tid. */
+static thread_t *procfs_thread_by_id(int id) {
+    if (id <= 0) return NULL;
+    process_t *p = process_find((uint64_t)(unsigned)id);
+    if (p && p->leader && p->leader->state != THREAD_TERMINATED)
+        return p->leader;
+    return thread_get(id);
+}
+
+static int procfs_tgid(const thread_t *t) {
+    if (!t) return 0;
+    if (t->process)
+        return (int)t->process->pid;
+    return (int)(t->tid ? t->tid : 0);
+}
+
 static ssize_t procfs_show_cmdline(char *buf, size_t size, void *priv) {
     int pid = (int)(uintptr_t)priv;
     if (!buf || size == 0) return 0;
-    thread_t *t = thread_get(pid);
+    thread_t *t = procfs_thread_by_id(pid);
     if (!t) return 0;
     char comm[sizeof(t->name)];
     memcpy(comm, t->name, sizeof(comm));
@@ -154,7 +171,7 @@ static uint64_t procfs_sum_unique_user_rss_kb(void) {
 static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
     int pid = (int)(uintptr_t)priv;
     if (!buf || size == 0) return 0;
-    thread_t *t = thread_get(pid);
+    thread_t *t = procfs_thread_by_id(pid);
     if (!t) return 0;
     char comm[sizeof(t->name)];
     memcpy(comm, t->name, sizeof(comm));
@@ -190,7 +207,7 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
         "%d %d %d %d %llu %llu %lu "
         "%llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
         "%d %d %llu %llu %lld %llu %llu %llu %llu %llu %llu %llu %d\n",
-        (int)t->tid, comm, procfs_state_char(t), ppid, pgrp, sid, tty_nr, tpgid,
+        procfs_tgid(t), comm, procfs_state_char(t), ppid, pgrp, sid, tty_nr, tpgid,
         0u,
         0ull, 0ull, 0ull, 0ull,
         (unsigned long long)utime,
@@ -217,7 +234,7 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
 static ssize_t procfs_show_status(char *buf, size_t size, void *priv) {
     int pid = (int)(uintptr_t)priv;
     if (!buf || size == 0) return 0;
-    thread_t *t = thread_get(pid);
+    thread_t *t = procfs_thread_by_id(pid);
     if (!t) return 0;
     char comm[sizeof(t->name)];
     memcpy(comm, t->name, sizeof(comm));
@@ -258,7 +275,7 @@ static ssize_t procfs_show_status(char *buf, size_t size, void *priv) {
         "Threads:\t1\n"
         "NSpgid:\t%d\n"
         "NSsid:\t%d\n",
-        comm, procfs_state_char(t), (int)t->tid, ppid,
+        comm, procfs_state_char(t), procfs_tgid(t), ppid,
         vm_size_kb, vm_size_kb, vm_rss_kb, vm_data_kb, vm_stk_kb,
         (unsigned)t->uid, (unsigned)t->euid, (unsigned)t->suid, (unsigned)t->euid,
         (unsigned)t->gid, (unsigned)t->egid, (unsigned)t->sgid, (unsigned)t->egid,
@@ -274,7 +291,7 @@ static ssize_t procfs_show_status(char *buf, size_t size, void *priv) {
 static ssize_t procfs_show_statm(char *buf, size_t size, void *priv) {
     int pid = (int)(uintptr_t)priv;
     if (!buf || size == 0) return 0;
-    thread_t *t = thread_get(pid);
+    thread_t *t = procfs_thread_by_id(pid);
     if (!t) return 0;
     struct procfs_proc_mem mem;
     procfs_calc_proc_mem(t, &mem);
@@ -565,7 +582,6 @@ static ssize_t procfs_write(struct fs_file *file, const void *buf, size_t size, 
 	if (!file || !file->driver_private || !buf) return -1;
 	struct procfs_handle *h = (struct procfs_handle*)file->driver_private;
 	if (!h) return -1;
-	/* only support writing to proc/sys/kernel/hostname (kind 9, file_id 20) */
 	if (h->kind == 9 && h->file_id == 20) {
 		/* permission: only root */
 		thread_t *ct = thread_current();
@@ -573,14 +589,10 @@ static ssize_t procfs_write(struct fs_file *file, const void *buf, size_t size, 
 		/* accept whole buffer (ignore offset semantics for simplicity) */
 		return procfs_store_hostname((const char*)buf, size, NULL);
 	}
-	/* echo 1 > /proc/net/dhcp — run DHCP when user asks (not at boot). */
 	if (h->kind == 7 && h->file_id == 60) {
 		thread_t *ct = thread_current();
-		if (!ct || ct->euid != 0) return -1;
-		(void)offset;
-		if (size == 0) return 0;
-		if (syscall_net_preinit() != 0) return -1;
-		return (ssize_t)size;
+		if (!ct || ct->euid != 0 || offset != 0) return -1;
+		return procfs_net_store_dhcp((const char *)buf, size);
 	}
 	return -1;
 }
@@ -989,7 +1001,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					char *tmpbuf = (char*)kmalloc(cap);
 					if (tmpbuf) {
 						/* build link target */
-						thread_t *t = thread_get(pid);
+						thread_t *t = procfs_thread_by_id(pid);
 						if (t && fdnum >= 0 && fdnum < THREAD_MAX_FD && t->fds[fdnum]) {
 							const char *target = t->fds[fdnum]->path ? t->fds[fdnum]->path : "(anon)";
 							size_t tlen = strlen(target);
@@ -1092,8 +1104,13 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         for (int i = 0; i < cnt; i++) {
             thread_t *t = thread_get_by_index(i);
             if (!t || t->tid == 0) continue;
+            /* Linux: one /proc/<tgid> per process (leader). Skip CLONE_THREAD peers. */
+            if (t->process && t->process->leader && t->process->leader != t)
+                continue;
+            int tgid = procfs_tgid(t);
+            if (tgid <= 0) continue;
             char namebuf[32];
-            int nlen = snprintf(namebuf, sizeof(namebuf), "%d", (int)t->tid);
+            int nlen = snprintf(namebuf, sizeof(namebuf), "%d", tgid);
             if (nlen <= 0) continue;
             size_t namelen = (size_t)nlen;
             size_t rec_len = 8 + namelen;
@@ -1106,7 +1123,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
             if (rec_len > sizeof(tmp)) { pos += rec_len; continue; }
             struct ext2_dir_entry de;
             /* Ensure non-zero pseudo-inode: some userspace parsers stop at inode==0 */
-            de.inode = (uint32_t)((uint32_t)(t->tid + 1) & 0xFFFFFFFFu);
+            de.inode = (uint32_t)((uint32_t)(tgid + 1) & 0xFFFFFFFFu);
             de.rec_len = (uint16_t)rec_len;
             de.name_len = (uint8_t)namelen;
             de.file_type = EXT2_FT_DIR;
@@ -1131,7 +1148,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         size_t written = 0;
         uint8_t *out = (uint8_t*)buf;
         /* if pid has fd dir, include 'fd' as directory entry first */
-        thread_t *ttmp = thread_get(h->pid);
+        thread_t *ttmp = procfs_thread_by_id(h->pid);
         int include_fd = (ttmp != NULL);
         int start_idx = 0;
         if (include_fd) {
@@ -1446,7 +1463,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 
 	/* /proc/<pid>/task — list thread ids (minimal: main thread only) */
 	if (h->kind == 15) {
-		thread_t *t = thread_get(h->pid);
+		thread_t *t = procfs_thread_by_id(h->pid);
 		if (!t) return -1;
 		char namebuf[32];
 		int nlen = snprintf(namebuf, sizeof(namebuf), "%d", (int)t->tid);
@@ -1499,7 +1516,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 
 	/* pid fd directory listing */
 	if (h->kind == 5) {
-		thread_t *t = thread_get(h->pid);
+		thread_t *t = procfs_thread_by_id(h->pid);
 		if (!t) return -1;
 		size_t pos = 0;
 		size_t written = 0;
@@ -1537,7 +1554,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 
 	/* pid fd symlink target */
 	if (h->kind == 6) {
-		thread_t *t = thread_get(h->pid);
+		thread_t *t = procfs_thread_by_id(h->pid);
 		if (!t) return 0;
 		int fdnum = h->file_id;
 		const char *target = "(invalid)";
@@ -1584,11 +1601,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         else if (h->file_id == 57) full = procfs_net_snap_arp(tmpbuf, cap);
         else if (h->file_id == 58) full = procfs_net_snap_dev(tmpbuf, cap);
         else if (h->file_id == 59) full = procfs_net_snap_route(tmpbuf, cap);
-        else if (h->file_id == 60) {
-            full = (ssize_t)snprintf(tmpbuf, cap,
-                "write 1 to run DHCP (not at boot)\n"
-                "example: echo 1 > /proc/net/dhcp\n");
-        }
+        else if (h->file_id == 60) full = procfs_net_snap_dhcp(tmpbuf, cap);
 		if (full < 0) { kfree(tmpbuf); return -1; }
 		size_t len = (size_t)full;
 		if ((size_t)offset >= len) { kfree(tmpbuf); return 0; }
@@ -1641,7 +1654,7 @@ int procfs_fill_stat(struct fs_file *file, struct stat *st) {
         st->st_mode = S_IFDIR | 0555;
         st->st_nlink = 2;
         if (h->kind == 2) {
-            thread_t *pt = thread_get(h->pid);
+            thread_t *pt = procfs_thread_by_id(h->pid);
             if (pt) {
                 st->st_uid = (uid_t)pt->euid;
                 st->st_gid = (gid_t)pt->egid;

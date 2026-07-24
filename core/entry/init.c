@@ -622,7 +622,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     if (e1000_init() != 0) {
         klogprintf("net: e1000 not found\n");
     } else {
-        klogprintf("e1000: ready (L2 only; configure IP later)\n");
+        if (syscall_net_preinit() != 0)
+            klogprintf("net: failed to register eth0\n");
     }
 
     
@@ -933,6 +934,46 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             fs_write(mf, motd, sizeof(motd) - 1, 0);
             fs_file_free(mf);
         }
+    }
+    /* BusyBox udhcpc default script (Linux semantics: userspace DHCP). */
+    {
+        (void)ramfs_mkdir("/usr");
+        (void)ramfs_mkdir("/usr/share");
+        (void)ramfs_mkdir("/usr/share/udhcpc");
+        static const char udhcpc_script[] =
+            "#!/bin/sh\n"
+            "[ -z \"$1\" ] && exit 1\n"
+            "RESOLV_CONF=\"/etc/resolv.conf\"\n"
+            "[ -n \"$broadcast\" ] && BROADCAST=\"broadcast $broadcast\"\n"
+            "[ -n \"$subnet\" ] && NETMASK=\"netmask $subnet\"\n"
+            "case \"$1\" in\n"
+            "deconfig)\n"
+            "\tifconfig \"$interface\" 0.0.0.0\n"
+            "\t;;\n"
+            "renew|bound)\n"
+            "\tifconfig \"$interface\" \"$ip\" $BROADCAST $NETMASK\n"
+            "\tif [ -n \"$router\" ]; then\n"
+            "\t\twhile route del default gw 0.0.0.0 dev \"$interface\" 2>/dev/null; do :; done\n"
+            "\t\tfor i in $router; do\n"
+            "\t\t\troute add default gw \"$i\" dev \"$interface\"\n"
+            "\t\tdone\n"
+            "\tfi\n"
+            "\techo -n > \"$RESOLV_CONF\"\n"
+            "\t[ -n \"$domain\" ] && echo \"search $domain\" >> \"$RESOLV_CONF\"\n"
+            "\tfor i in $dns; do\n"
+            "\t\techo \"nameserver $i\" >> \"$RESOLV_CONF\"\n"
+            "\tdone\n"
+            "\t;;\n"
+            "esac\n"
+            "exit 0\n";
+        (void)fs_unlink("/usr/share/udhcpc/default.script");
+        struct fs_file *us = fs_create_file("/usr/share/udhcpc/default.script");
+        if (!us) us = fs_open("/usr/share/udhcpc/default.script");
+        if (us) {
+            fs_write(us, udhcpc_script, sizeof(udhcpc_script) - 1, 0);
+            fs_file_free(us);
+        }
+        (void)fs_chmod("/usr/share/udhcpc/default.script", S_IFREG | 0755);
     }
     /* /etc/termcap: vt102/linux with arrow keys (ku/kd/kr/kl) so vim moves cursor correctly */
     {

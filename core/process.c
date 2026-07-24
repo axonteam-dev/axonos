@@ -158,10 +158,16 @@ process_t *process_find(uint64_t pid) {
         process_t *p = process_table[i];
         if (!p || p->pid != pid)
             continue;
-        /* Prefer a live task; a recycled TGID must not hit a stale zombie. */
+        /* Prefer a live task with a live leader. Do not mutate state here —
+         * demoting to ZOMBIE during lookup left /sbin/init stuck as Z in htop. */
         if (p->state == PROCESS_ALIVE) {
-            result = p;
-            break;
+            if (p->leader && p->leader->state != THREAD_TERMINATED) {
+                result = p;
+                break;
+            }
+            if (!zombie)
+                zombie = p;
+            continue;
         }
         if (!zombie)
             zombie = p;
@@ -454,6 +460,8 @@ int process_collect_signal_targets(process_t *caller, int pid,
     for (int i = 0; i < PROCESS_TABLE_MAX; ++i) {
         process_t *p = process_table[i];
         if (!p || p->state != PROCESS_ALIVE || !p->leader)
+            continue;
+        if (p->leader->state == THREAD_TERMINATED)
             continue;
         int match;
         if (pid > 0)

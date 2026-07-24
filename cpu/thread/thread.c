@@ -36,10 +36,16 @@ static uint32_t sched_fifo_counter;
 static thread_t* current_user[SMP_MAX_CPUS] = { NULL };
 static thread_t* idle_thread_by_cpu[SMP_MAX_CPUS];
 static volatile uint8_t need_resched[SMP_MAX_CPUS];
+/* Raw timer-tick CPU accounting (converted to USER_HZ in /proc). */
+static uint64_t cpu_user_ticks;
+static uint64_t cpu_nice_ticks;
+static uint64_t cpu_system_ticks;
+static uint64_t cpu_idle_ticks;
 int init = 0;
 static int init_user_tid = -1;
 
 static void thread_note_ready_nolock(thread_t *t);
+static int thread_is_any_idle(const thread_t *t);
 
 static inline int thread_time_after_eq32(uint32_t now, uint32_t deadline) {
         return (int32_t)(now - deadline) >= 0;
@@ -83,6 +89,42 @@ static int thread_is_any_idle(const thread_t *t) {
                         return 1;
         }
         return 0;
+}
+
+void thread_account_timer_tick(int user_mode) {
+        thread_t *cur = thread_current();
+        if (!cur || thread_is_any_idle(cur) || cur->ring != 3) {
+                cpu_idle_ticks++;
+                return;
+        }
+        if (user_mode) {
+                cur->utime_ticks++;
+                if (cur->nice > 0)
+                        cpu_nice_ticks++;
+                else
+                        cpu_user_ticks++;
+        } else {
+                cur->stime_ticks++;
+                cpu_system_ticks++;
+        }
+}
+
+void thread_cpu_times_user_hz(uint64_t *user, uint64_t *nice, uint64_t *system,
+                              uint64_t *idle) {
+        uint32_t freq = (uint32_t)pit_get_frequency();
+        if (freq == 0)
+                freq = 1000u;
+        /* Convert timer ticks → USER_HZ (100). */
+        uint64_t scale_num = 100ull;
+        uint64_t scale_den = (uint64_t)freq;
+        if (user)
+                *user = (cpu_user_ticks * scale_num) / scale_den;
+        if (nice)
+                *nice = (cpu_nice_ticks * scale_num) / scale_den;
+        if (system)
+                *system = (cpu_system_ticks * scale_num) / scale_den;
+        if (idle)
+                *idle = (cpu_idle_ticks * scale_num) / scale_den;
 }
 
 /* declared below (needs main_thread, sched_lock, KERNEL_STACK_SIZE, thread_is_any_idle) */
@@ -280,6 +322,10 @@ static int thread_zombie_autoreap_ok(thread_t *t) {
         if (t == &main_thread || thread_is_any_idle(t)) return 0;
         if (t->waiter_tid >= 0) return 0;
         if (t->exit_status == (int)0x80000000) return 0;
+        /* Boot often leaves a dead /sbin/init while /linuxrc stays PID1-ish. */
+        if (t->name[0] && (strstr(t->name, "/sbin/init") ||
+                           strcmp(t->name, "init") == 0))
+                return 1;
         if (t->parent_tid < 0) return 1;
         thread_t *pt = thread_get(t->parent_tid);
         if (!pt) return 1;
@@ -944,15 +990,13 @@ void thread_cond_resched(void) {
         int cpu = smp_sched_cpu_id();
         if (cpu < 0 || cpu >= SMP_MAX_CPUS || !need_resched[cpu])
                 return;
-        need_resched[cpu] = 0;
+        /* Leave the flag set so thread_schedule() can expire the current slice
+         * when another READY task is waiting (tty reader after keypress). */
         thread_schedule();
 }
 
 /* If a ring-3 thread is spinning, run pthread helpers / syscall waiters (OpenSSL init). */
 void thread_ring3_preempt_if_waiters(void) {
-        int cpu = smp_sched_cpu_id();
-        if (cpu >= 0 && cpu < SMP_MAX_CPUS)
-                need_resched[cpu] = 0;
         thread_t *cur = thread_current();
         if (!cur || cur->ring != 3 || cur->state != THREAD_RUNNING)
                 return;
@@ -961,22 +1005,15 @@ void thread_ring3_preempt_if_waiters(void) {
                 if (!t || t == cur || thread_is_any_idle(t))
                         continue;
                 if (t->state == THREAD_READY) {
+                        thread_request_resched();
                         thread_schedule();
                         return;
                 }
         }
         if (thread_runnable_nonidle_count() > 1) {
+                thread_request_resched();
                 thread_schedule();
                 return;
-        }
-        for (int i = 0; i < thread_count; ++i) {
-                thread_t *t = threads[i];
-                if (!t || t == cur)
-                        continue;
-                if (t->state == THREAD_SLEEPING || t->state == THREAD_BLOCKED) {
-                        thread_schedule();
-                        return;
-                }
         }
 }
 
@@ -1136,6 +1173,32 @@ void thread_schedule() {
         if (my_cpu >= 0 && my_cpu < SMP_MAX_CPUS)
                 my_idle = idle_thread_by_cpu[my_cpu];
 
+        /*
+         * Slice expiry: a RUNNING htop/poll task otherwise keeps the BSP forever
+         * while a tty reader sits READY after keyboard unblock. Requeue current
+         * with a bumped vruntime so the waiter wins the next pick.
+         */
+        if (my_cpu >= 0 && my_cpu < SMP_MAX_CPUS && need_resched[my_cpu] &&
+            cur && cur->state == THREAD_RUNNING && !thread_is_any_idle(cur)) {
+                int peer_ready = 0;
+                for (int i = 0; i < thread_count; ++i) {
+                        thread_t *t = threads[i];
+                        if (!t || t == cur || thread_is_any_idle(t))
+                                continue;
+                        if (t->state == THREAD_READY && !t->vfork_waiting) {
+                                peer_ready = 1;
+                                break;
+                        }
+                }
+                need_resched[my_cpu] = 0;
+                if (peer_ready) {
+                        cur->sched_vruntime += thread_vruntime_delta(cur) * 8u;
+                        thread_note_ready_nolock(cur);
+                }
+        } else if (my_cpu >= 0 && my_cpu < SMP_MAX_CPUS) {
+                need_resched[my_cpu] = 0;
+        }
+
         for (int pass = 0; pass < 2 && !pick; pass++) {
                 for (int i = 0; i < thread_count; ++i) {
                         thread_t *t = threads[i];
@@ -1193,6 +1256,11 @@ void thread_schedule() {
         }
 
         if (pick == cur) {
+                /* Slice-expiry may have marked us READY for fair picking; if we
+                 * keep the CPU, restore RUNNING so blockers and preempt checks
+                 * still see an active task. */
+                if (cur && cur->state == THREAD_READY)
+                        cur->state = THREAD_RUNNING;
                 release_irqrestore(&sched_lock, irqf);
                 return;
         }
@@ -1300,23 +1368,29 @@ void thread_schedule() {
 
 void thread_unblock(int pid) {
         unsigned long irqf;
+        int woke = 0;
         acquire_irqsave(&sched_lock, &irqf);
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->tid == pid &&
                     (threads[i]->state == THREAD_BLOCKED || threads[i]->state == THREAD_SLEEPING)) {
                         threads[i]->sleep_until = 0;
                         thread_note_ready_nolock(threads[i]);
-                        release_irqrestore(&sched_lock, irqf);
-                        return;
+                        woke = 1;
+                        break;
                 }
         }
         release_irqrestore(&sched_lock, irqf);
+        /* Keyboard/pipe wakeups must be visible to the next schedule point —
+         * otherwise a busy htop syscall keeps the shell READY but unscheduled. */
+        if (woke)
+                thread_request_resched();
 }
 
 /* Wake a fork child only after the parent syscall frame is complete. */
 void thread_unblock_fork_child(int pid) {
         unsigned long irqf;
         int cpu = smp_sched_cpu_id();
+        int woke = 0;
         acquire_irqsave(&sched_lock, &irqf);
         for (int i = 0; i < thread_count; ++i) {
                 thread_t *t = threads[i];
@@ -1329,10 +1403,13 @@ void thread_unblock_fork_child(int pid) {
                 if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING) {
                         t->sleep_until = 0;
                         thread_note_ready_nolock(t);
+                        woke = 1;
                 }
                 break;
         }
         release_irqrestore(&sched_lock, irqf);
+        if (woke)
+                thread_request_resched();
 }
 
 /* SIGINT (Ctrl+C): terminate all threads in the foreground process group. */

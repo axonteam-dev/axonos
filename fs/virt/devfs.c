@@ -2038,7 +2038,9 @@ ssize_t devfs_tty_debug_dump(char *buf, size_t size) {
     return (ssize_t)w;
 }
 
-/* Non-blocking push from ISR: try lock; on failure drop char and wake waiters */
+/* Non-blocking push from ISR: try lock; on failure park the char in a
+ * lock-free overflow slot instead of dropping it (htop can hold in_lock via
+ * poll/read briefly under STI syscalls). */
 void devfs_tty_push_input_noblock(int tty, char c) {
     if (tty < 0 || tty >= DEVFS_TTY_COUNT) return;
     struct devfs_tty *t = &dev_ttys[tty];
@@ -2049,13 +2051,18 @@ void devfs_tty_push_input_noblock(int tty, char c) {
             if (pgrp >= 0) {
                 thread_send_sigint_to_pgrp(pgrp);
             }
+            thread_request_resched();
             return;
         }
+        /* Best-effort overflow: one pending byte survives a contested lock. */
+        if (t->unget_char < 0)
+            t->unget_char = (unsigned char)c;
         for (int i = 0; i < t->waiters_count; i++) {
             int tid = t->waiters[i];
             if (tid >= 0) thread_unblock(tid);
         }
         t->waiters_count = 0;
+        thread_request_resched();
         return;
     }
     /* Backspace (DEL 0x7F / BS 0x08): never handle in kernel; always pass to application.
@@ -2069,13 +2076,15 @@ void devfs_tty_push_input_noblock(int tty, char c) {
             if (tid >= 0) thread_unblock(tid);
         }
         t->waiters_count = 0;
-        if (tty == devfs_get_active() && (t->term_lflag & 0x00000008u)) {
+        int do_echo_cc = (tty == devfs_get_active() && (t->term_lflag & 0x00000008u));
+        release(&t->in_lock);
+        if (do_echo_cc) {
             int tty_on_vga = 1;
             devfs_tty_emit_byte(t, tty_on_vga, (uint8_t)'^');
             devfs_tty_emit_byte(t, tty_on_vga, (uint8_t)'C');
             devfs_tty_emit_byte(t, tty_on_vga, (uint8_t)'\n');
         }
-        release(&t->in_lock);
+        thread_request_resched();
         return;
     }
     if (t->in_count < (int)sizeof(t->inbuf)) {
@@ -2091,14 +2100,11 @@ void devfs_tty_push_input_noblock(int tty, char c) {
     }
     t->waiters_count = 0;
     /*
-     * Local echo (N_TTY). Same IRQ-time path as ^C above; ash with ICANON|ECHO
-     * expects the kernel to paint typed characters. Skip when ECHO is clear
-     * (userspace line editors).
-     *
-     * Keyboard arrows/Home/F-keys arrive as ESC CSI sequences. Echo must not
-     * paint them: ESC is dropped as a control byte, then "[" and "H" from Home
-     * used to print literal "[H" before init even starts (boot: trying init).
+     * Local echo (N_TTY). Release in_lock before painting so a concurrent
+     * reader/poll cannot starve the next scancode on try_acquire.
      */
+    unsigned char echo_uc = 0;
+    int do_echo = 0;
     if (tty == devfs_get_active() && (t->term_lflag & 0x00000008u)) {
         unsigned char uc = (unsigned char)c;
         int skip_echo = 0;
@@ -2113,7 +2119,6 @@ void devfs_tty_push_input_noblock(int tty, char c) {
                 skip_echo = 1;
             } else {
                 t->echo_escape_state = 0;
-                /* lone ESC + char: do not echo ESC; fall through for char */
             }
         } else { /* CSI / SS3 body */
             skip_echo = 1;
@@ -2123,14 +2128,19 @@ void devfs_tty_push_input_noblock(int tty, char c) {
         if (!skip_echo) {
             if (uc == '\r')
                 uc = '\n';
-            if (uc == '\n' || uc == '\t' || uc >= 32u)
-                devfs_tty_emit_byte(t, 1, (uint8_t)uc);
+            if (uc == '\n' || uc == '\t' || uc >= 32u) {
+                echo_uc = uc;
+                do_echo = 1;
+            }
         }
     }
     release(&t->in_lock);
+    if (do_echo)
+        devfs_tty_emit_byte(t, 1, echo_uc);
     /* IRQ context only marks waiters runnable. Scheduling from IRQ1 can
-     * corrupt the active syscall/IRQ frame; timer preemption performs the
-     * context switch after the handler returns. */
+     * corrupt the active syscall/IRQ frame; timer preemption / syscall-exit
+     * cond_resched performs the context switch after the handler returns. */
+    thread_request_resched();
 }
 
 int devfs_tty_pop_nb(int tty) {

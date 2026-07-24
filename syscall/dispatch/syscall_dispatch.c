@@ -851,8 +851,8 @@ void syscall_deferred_unblocks(void) {
         }
     }
     cur->fork_child_trap_rip = 0;
-    /* Child remains blocked until a later ring-3 timer interrupt or the
-     * parent's next syscall proves this return frame has been consumed. */
+    /* Child stays blocked until syscall_publish_deferred_fork_child() —
+     * called before cond_resched / iretq (Linux wake_up_new_task). */
 }
 
 /*
@@ -870,6 +870,9 @@ int syscall_publish_deferred_fork_child(void) {
     int tid = (int)(child->tid ? child->tid : 1);
     cur->fork_child_to_publish = NULL;
     thread_unblock_fork_child(tid);
+    /* Ensure the newly runnable child is considered before the parent
+     * returns to a wait4/busy peer (same tick as wake_up_new_task). */
+    thread_request_resched();
     devel_printf("fork[30] publish after user return parent=%llu child=%d cr3=0x%llx\n",
         (unsigned long long)(cur->tid ? cur->tid : 1), tid,
         (unsigned long long)paging_read_cr3());
@@ -6875,7 +6878,15 @@ static uintptr_t signal_write_rt_frame(thread_t *cur, int sig, const user_sigact
     uintptr_t sp = (uintptr_t)old_rsp;
     if (sp > X86_REDZONE)
         sp -= X86_REDZONE;
-    uintptr_t frame_start = (sp - RT_SIGFRAME_SIZE) & ~15ULL;
+    /*
+     * Linux get_sigframe(): sp = round_down(sp - frame_size, 16) - 8.
+     * x86-64 SysV requires RSP%16==8 on handler entry (as after CALL). Aligning
+     * only to 16 left RSP≡0; htop's SIGINT path then #GP on movaps locals
+     * (seen: rip movaps [rsp+0x30] with rsp=…888).
+     */
+    if (sp < RT_SIGFRAME_SIZE + 8ULL)
+        return 0;
+    uintptr_t frame_start = ((sp - RT_SIGFRAME_SIZE) & ~15ULL) - 8ULL;
     if (frame_start < 0x200000ULL) return 0;
     if (mark_user_identity_range_2m_sys((uint64_t)frame_start,
             (uint64_t)(frame_start + RT_SIGFRAME_SIZE)) != 0)
@@ -7793,7 +7804,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 child->sas_ss_flags = SS_DISABLE;
                 /* CLONE_THREAD: same process / signal handlers (Linux tgid). */
                 if (flags & CLONE_THREAD_OLD) {
+                    if (!cur->process) {
+                        process_t *pp = process_create_init();
+                        if (pp) process_attach_thread(pp, cur);
+                    }
                     child->process = cur->process;
+                    if (cur->process && !cur->process->leader)
+                        process_attach_thread(cur->process, cur);
                     child->sid = cur->sid;
                     child->pgid = cur->pgid;
                 } else {
@@ -8038,7 +8055,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 child->parent_tid = (int)(cur->tid ? cur->tid : 1);
                 /* Linux: CLONE_THREAD shares TGID; otherwise new process. */
                 if (flags & CLONE3_CLONE_THREAD) {
+                    if (!cur->process) {
+                        process_t *pp = process_create_init();
+                        if (pp) process_attach_thread(pp, cur);
+                    }
                     child->process = cur->process;
+                    if (cur->process && !cur->process->leader)
+                        process_attach_thread(cur->process, cur);
                     child->sid = cur->sid;
                     child->pgid = cur->pgid;
                 } else {
@@ -11780,11 +11803,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         killed++;
                 }
                 if (killed == 0 && pid > 0) {
+                    /* /proc may expose a tid; resolve to the live task / TGID. */
                     thread_t *t = thread_get(pid);
-                    if (t && t->process && t->process->leader)
-                        t = t->process->leader;
-                    if (t && force_sigkill_thread_group(t))
-                        killed = 1;
+                    if (t && t->state != THREAD_TERMINATED) {
+                        if (t->process && t->process->leader)
+                            t = t->process->leader;
+                        if (force_sigkill_thread_group(t))
+                            killed = 1;
+                    }
                 }
                 return killed > 0 ? 0 : ret_err(ESRCH);
             }
@@ -11793,6 +11819,30 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     devel_printf("ash-jobctl: kill pid=%d sig=SIGTTIN pgid=%d sid=%d\n",
                             pid, cur->process->pgid, cur->process->sid);
                 int count = process_signal_targets(cur->process, pid, sig);
+                if (count == 0 && pid > 0) {
+                    /*
+                     * Fallback: pid may be a tid advertised by /proc when the
+                     * task has no process_t yet, or TGID lookup missed a live
+                     * thread. Linux kill(2) is TGID-based; once we resolve a
+                     * live task, signal its thread group.
+                     */
+                    thread_t *t = thread_get(pid);
+                    if (t && t->ring == 3 && t->state != THREAD_TERMINATED) {
+                        if (t->process) {
+                            count = process_signal_targets(cur->process,
+                                                           (int)t->process->pid,
+                                                           sig);
+                        } else if (sig == 0) {
+                            count = 1;
+                        } else {
+                            t->pending_signals |= (1ULL << (sig - 1));
+                            if (t->state == THREAD_BLOCKED ||
+                                t->state == THREAD_SLEEPING)
+                                thread_unblock((int)(t->tid ? t->tid : 1));
+                            count = 1;
+                        }
+                    }
+                }
                 return count > 0 ? 0 : ret_err(ESRCH);
             }
             if (pid > 0) {
@@ -14206,6 +14256,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
             auto_check:
             {
+                /* htop refresh loops live inside one poll/getdents window on SMP
+                 * (timer only sets need_resched in kernel). Yield so a woken tty
+                 * reader on another VC can run. */
+                thread_cond_resched();
                 thread_t *pt_sig = poll_thr ? poll_thr : thread_current();
                 if (thread_has_interrupt_signal(pt_sig)) {
                     kfree(kbuf);
@@ -15211,6 +15265,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             uint8_t *outbuf = (uint8_t*)kmalloc(out_cap);
             if (!outbuf) return ret_err(ENOMEM);
 
+            int dent_iters = 0;
             while (in_off + 8 <= (size_t)rr) {
                 struct ext2_dir_entry *de = (struct ext2_dir_entry*)(kbuf + in_off);
                 if (de->rec_len < 8) break;
@@ -15240,10 +15295,12 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 /* Determine inode/type by stat'ing the full path if possible.
                    IMPORTANT: some virtual filesystems don't provide st_ino (0).
                    Userspace tools often treat d_ino==0 as "absent" and skip it,
-                   which makes mountpoints like /dev invisible. */
+                   which makes mountpoints like /dev invisible.
+                   Skip open+stat when the driver already filled inode — htop's
+                   /proc refresh otherwise opens every pid entry twice per tick. */
                 uint64_t out_ino = (uint64_t)de->inode;
                 uint8_t out_type = (uint8_t)de->file_type;
-                if (f->path && nlen > 0) {
+                if (out_ino == 0 && f->path && nlen > 0) {
                     char fullpath[512];
                     size_t plen = strlen(f->path);
                     if (plen + 1 + nlen + 1 < sizeof(fullpath)) {
@@ -15263,6 +15320,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             }
                             fs_file_free(ef);
                         }
+                    }
+                }
+                /* Yield / honor Ctrl+C during long /proc scans (htop). */
+                if ((++dent_iters & 3) == 0) {
+                    thread_cond_resched();
+                    if (thread_has_interrupt_signal(cur)) {
+                        kfree(outbuf);
+                        return ret_err(EINTR);
                     }
                 }
 
@@ -16497,6 +16562,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         }
     }
     syscall_deferred_unblocks();
+    /*
+     * Linux wake_up_new_task(): make the fork/clone child runnable before any
+     * schedule point. thread_cond_resched() used to run first, so a busy peer
+     * (htop) could keep the parent off-CPU forever with fork_child_to_publish
+     * still set — the child sat THREAD_BLOCKED until Ctrl+C's pgrp wake looked
+     * like a "kick", then a second SIGINT actually killed the app.
+     */
+    (void)syscall_publish_deferred_fork_child();
     /* Timer IRQs only request rescheduling while the CPU is in kernel mode.
      * Switch here, after syscall state is committed and before returning to
      * ring 3, matching Linux's exit-to-user reschedule point. */

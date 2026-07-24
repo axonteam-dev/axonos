@@ -26,6 +26,7 @@ volatile uint32_t timer_frequency = 250;
 void pit_handler(cpu_registers_t* regs) {
         pit_ticks++;
         timer_ticks++;
+        thread_account_timer_tick(regs && ((regs->cs & 3) == 3));
         /* Publish now, but force this IRQ to return to the parent before any
          * later timer tick is allowed to select the new child. */
         int published_fork_child = 0;

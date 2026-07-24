@@ -225,6 +225,8 @@ void apic_timer_handler(cpu_registers_t* regs) {
     apic_timer_state.ticks = apic_timer_ticks;
     if (!pit_is_enabled())
         timer_ticks++;
+    /* Charge CPU time before any schedule/publish side effects. */
+    thread_account_timer_tick(regs && ((regs->cs & 3) == 3));
     /* A ring-3 interrupt proves the parent's fork-return IRETQ completed.
      * It is now safe to make its fully initialized child runnable. Never also
      * context-switch from this same IRQ: first return its complete interrupt

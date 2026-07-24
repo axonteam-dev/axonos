@@ -40,9 +40,19 @@ static spinlock_t procfs_lock = { 0 };
 static thread_t *procfs_thread_by_id(int id) {
     if (id <= 0) return NULL;
     process_t *p = process_find((uint64_t)(unsigned)id);
-    if (p && p->leader && p->leader->state != THREAD_TERMINATED)
-        return p->leader;
-    return thread_get(id);
+    if (p && p->leader) {
+        if (p->leader->state != THREAD_TERMINATED)
+            return p->leader;
+        if (p->state == PROCESS_ZOMBIE)
+            return p->leader;
+    }
+    thread_t *t = thread_get(id);
+    if (!t || t->ring != 3) return NULL;
+    if (t->state == THREAD_TERMINATED) {
+        if (!t->process || t->process->state != PROCESS_ZOMBIE)
+            return NULL;
+    }
+    return t;
 }
 
 static int procfs_tgid(const thread_t *t) {
@@ -191,12 +201,22 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
     if (prio > 39) prio = 39;
     uint64_t hz = pit_get_frequency();
     if (hz == 0) hz = 1000;
-    uint64_t now_ms = pit_get_time_ms();
-    uint64_t start_ms = (t->start_ticks * 1000ull) / hz;
-    uint64_t elapsed_ms = (now_ms >= start_ms) ? (now_ms - start_ms) : 0;
     /* /proc/<pid>/stat expects USER_HZ units (typically 100). */
-    uint64_t utime = elapsed_ms / 10ull;
+    uint64_t utime = 0;
     uint64_t stime = 0;
+    if (t->process) {
+        /* Linux: /proc/<tgid>/stat utime/stime are thread-group totals. */
+        int cnt = thread_get_count();
+        for (int i = 0; i < cnt; i++) {
+            thread_t *th = thread_get_by_index(i);
+            if (!th || th->process != t->process) continue;
+            utime += (th->utime_ticks * 100ull) / hz;
+            stime += (th->stime_ticks * 100ull) / hz;
+        }
+    } else {
+        utime = (t->utime_ticks * 100ull) / hz;
+        stime = (t->stime_ticks * 100ull) / hz;
+    }
     uint64_t starttime = (t->start_ticks * 100ull) / hz;
     struct procfs_proc_mem mem;
     procfs_calc_proc_mem(t, &mem);
@@ -404,12 +424,23 @@ static ssize_t procfs_show_kernel_stat(char *buf, size_t size, void *priv) {
 	int n = smp_cpu_count();
 	if (n < 1)
 		n = 1;
+	uint64_t user = 0, nice = 0, system = 0, idle = 0;
+	thread_cpu_times_user_hz(&user, &nice, &system, &idle);
 	size_t w = 0;
 	w += (size_t)snprintf(buf + w, (w < size) ? (size - w) : 0,
-			      "cpu  0 0 0 0 0 0 0 0 0 0\n");
+			      "cpu  %llu %llu %llu %llu 0 0 0 0 0 0\n",
+			      (unsigned long long)user,
+			      (unsigned long long)nice,
+			      (unsigned long long)system,
+			      (unsigned long long)idle);
+	/* Per-CPU breakdown is approximate: all charge BSP until SMP accounting. */
 	for (int i = 0; i < n && w < size; i++) {
 		int wr = snprintf(buf + w, (w < size) ? (size - w) : 0,
-				  "cpu%d 0 0 0 0 0 0 0 0 0 0\n", i);
+				  "cpu%d %llu %llu %llu %llu 0 0 0 0 0 0\n", i,
+				  (unsigned long long)(i == 0 ? user : 0),
+				  (unsigned long long)(i == 0 ? nice : 0),
+				  (unsigned long long)(i == 0 ? system : 0),
+				  (unsigned long long)(i == 0 ? idle : 0));
 		if (wr < 0)
 			break;
 		w += (size_t)wr;
@@ -1103,10 +1134,23 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         int cnt = thread_get_count();
         for (int i = 0; i < cnt; i++) {
             thread_t *t = thread_get_by_index(i);
-            if (!t || t->tid == 0) continue;
-            /* Linux: one /proc/<tgid> per process (leader). Skip CLONE_THREAD peers. */
-            if (t->process && t->process->leader && t->process->leader != t)
+            if (!t || t->tid == 0 || t->ring != 3) continue;
+            /*
+             * Linux /proc: one directory per live TGID, plus unreaped zombies.
+             * Advertising THREAD_TERMINATED slots as PIDs made ps show "live"
+             * httpd workers (fake utime from wall clock) that kill(2) could not
+             * signal (ESRCH).
+             */
+            if (t->state == THREAD_TERMINATED) {
+                if (!t->process || t->process->state != PROCESS_ZOMBIE)
+                    continue;
+                if (t->process->leader && t->process->leader != t)
+                    continue;
+            } else if (t->process && t->process->leader &&
+                       t->process->leader != t) {
+                /* CLONE_THREAD peer — only the leader owns /proc/<tgid>. */
                 continue;
+            }
             int tgid = procfs_tgid(t);
             if (tgid <= 0) continue;
             char namebuf[32];

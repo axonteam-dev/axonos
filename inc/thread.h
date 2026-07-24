@@ -33,8 +33,11 @@ typedef struct thread {
         uint64_t tid;
         process_t *process;             /* Linux process identity/lifecycle owner */
         char name[32];                 // thread name (urmomissofaturmomissofaturmomiss)
-        /* Process start tick for /proc/<pid>/stat starttime and utime approximation. */
+        /* Process start tick for /proc/<pid>/stat starttime. */
         uint64_t start_ticks;
+        /* Accumulated USER_HZ (100Hz) runtime for /proc/<pid>/stat utime/stime. */
+        uint64_t utime_ticks;
+        uint64_t stime_ticks;
 
         /* POSIX-ish job control identifiers */
         int pgid;                      // process group id
@@ -204,6 +207,11 @@ void thread_yield();
 void thread_ring3_preempt_if_waiters(void);
 void thread_request_resched(void);
 void thread_cond_resched(void);
+/* Charge the current task one timer tick (user vs system) for /proc accounting. */
+void thread_account_timer_tick(int user_mode);
+/* Aggregate USER_HZ counters for /proc/stat (cpu line). */
+void thread_cpu_times_user_hz(uint64_t *user, uint64_t *nice, uint64_t *system,
+                              uint64_t *idle);
 void thread_schedule();
 thread_t* thread_current();
 void thread_stop(int pid);

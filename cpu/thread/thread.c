@@ -415,6 +415,8 @@ void thread_init() {
         /* default credentials: root */
         main_thread.uid = main_thread.euid = main_thread.suid = 0;
         main_thread.gid = main_thread.egid = main_thread.sgid = 0;
+        main_thread.ngroups = 1;
+        main_thread.groups[0] = 0;
         main_thread.attached_tty = devfs_get_active();
         strncpy(main_thread.cwd, "/", sizeof(main_thread.cwd));
         main_thread.cwd[sizeof(main_thread.cwd) - 1] = '\0';
@@ -573,6 +575,8 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         /* default credentials (root) */
         t->uid = t->euid = t->suid = 0;
         t->gid = t->egid = t->sgid = 0;
+        t->ngroups = 1;
+        t->groups[0] = 0;
         t->attached_tty = -1;
         t->user_brk_base = 0;
         t->user_brk_cur = 0;
@@ -705,6 +709,13 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                 t->gid = tc->gid;
                 t->egid = tc->egid;
                 t->sgid = tc->sgid;
+                t->ngroups = tc->ngroups;
+                if (t->ngroups < 0)
+                    t->ngroups = 0;
+                if (t->ngroups > AXON_NGROUPS_MAX)
+                    t->ngroups = AXON_NGROUPS_MAX;
+                if (t->ngroups > 0)
+                    memcpy(t->groups, tc->groups, (size_t)t->ngroups * sizeof(gid_t));
                 t->umask = tc->umask;
                 /* copy fd table and bump refcount so close in parent doesn't free shared files (e.g. pipe) */
                 for (int i = 0; i < THREAD_MAX_FD; i++) {
@@ -720,6 +731,8 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         } else {
                 t->uid = t->euid = t->suid = 0;
                 t->gid = t->egid = t->sgid = 0;
+                t->ngroups = 1;
+                t->groups[0] = 0;
                 t->attached_tty = devfs_get_active();
         }
         if (!t->cwd[0]) { strncpy(t->cwd, "/", sizeof(t->cwd)); t->cwd[sizeof(t->cwd)-1] = '\0'; }

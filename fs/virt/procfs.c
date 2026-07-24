@@ -62,11 +62,29 @@ static int procfs_tgid(const thread_t *t) {
     return (int)(t->tid ? t->tid : 0);
 }
 
+static void procfs_sanitize_comm(char *comm, size_t cap) {
+    if (!comm || cap == 0) return;
+    /* Linux get_task_comm / proc_task_name: '(' ')' never appear raw in (comm). */
+    for (size_t i = 0; i < cap && comm[i]; i++) {
+        if (comm[i] == '(' || comm[i] == ')' || comm[i] == ' ' ||
+            comm[i] == '\n' || comm[i] == '\t')
+            comm[i] = '_';
+    }
+    if (!comm[0]) {
+        comm[0] = '?';
+        if (cap > 1) comm[1] = '\0';
+    }
+}
+
 static ssize_t procfs_show_cmdline(char *buf, size_t size, void *priv) {
     int pid = (int)(uintptr_t)priv;
     if (!buf || size == 0) return 0;
     thread_t *t = procfs_thread_by_id(pid);
-    if (!t) return 0;
+    if (!t) {
+        /* Empty cmdline is OK; never leave parsers with garbage. */
+        if (size > 0) buf[0] = '\0';
+        return (size > 0) ? 1 : 0;
+    }
     char comm[sizeof(t->name)];
     memcpy(comm, t->name, sizeof(comm));
     comm[sizeof(comm) - 1] = '\0';
@@ -182,7 +200,23 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
     int pid = (int)(uintptr_t)priv;
     if (!buf || size == 0) return 0;
     thread_t *t = procfs_thread_by_id(pid);
-    if (!t) return 0;
+    /*
+     * BusyBox ps does strchr(buf, ')') then *p = 0 with no NULL check.
+     * An empty / missing-paren line → #PF at cr2=0. Always emit Linux form.
+     */
+    if (!t) {
+        int written = snprintf(buf, size,
+            "%d (unknown) Z 0 0 0 0 0 "
+            "0 0 0 0 0 0 0 0 0 "
+            "0 0 0 0 0 0 0 "
+            "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 "
+            "0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+            pid);
+        if (written < 0) return 0;
+        size_t w = (size_t)written;
+        if (w > size) w = size;
+        return (ssize_t)w;
+    }
     char comm[sizeof(t->name)];
     memcpy(comm, t->name, sizeof(comm));
     comm[sizeof(comm) - 1] = '\0';
@@ -190,6 +224,7 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
         char *slash = strrchr(comm, '/');
         if (slash && slash[1]) memmove(comm, slash + 1, strlen(slash + 1) + 1);
         if (strlen(comm) > 15) comm[15] = '\0';
+        procfs_sanitize_comm(comm, sizeof(comm));
     }
     int ppid = (t->parent_tid >= 0) ? t->parent_tid : 0;
     int pgrp = (t->pgid >= 0) ? t->pgid : (int)t->tid;
@@ -246,6 +281,14 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
         0ull, 0ull, 0ull, 0ull, 0
     );
     if (written < 0) return 0;
+    /* Truncation must not drop the closing ')' or BusyBox ps #PF's. */
+    if ((size_t)written >= size || !strchr(buf, ')')) {
+        int stub = snprintf(buf, size, "%d (%s) %c %d 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 "
+            "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+            procfs_tgid(t), comm[0] ? comm : "?", procfs_state_char(t), ppid);
+        if (stub < 0) return 0;
+        written = stub;
+    }
     size_t w = (size_t)written;
     if (w > size) w = size;
     return (ssize_t)w;
@@ -263,6 +306,7 @@ static ssize_t procfs_show_status(char *buf, size_t size, void *priv) {
         char *slash = strrchr(comm, '/');
         if (slash && slash[1]) memmove(comm, slash + 1, strlen(slash + 1) + 1);
         if (strlen(comm) > 15) comm[15] = '\0';
+        procfs_sanitize_comm(comm, sizeof(comm));
     }
     int ppid = (t->parent_tid >= 0) ? t->parent_tid : 0;
     int pgrp = (t->pgid >= 0) ? t->pgid : (int)t->tid;

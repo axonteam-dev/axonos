@@ -60,6 +60,8 @@ typedef struct syscall_frame {
 #define SYS_setgid  106
 #define SYS_setreuid 113
 #define SYS_setregid 114
+#define SYS_getgroups 115
+#define SYS_setgroups 116
 #define SYS_setsid  112
 #define SYS_kill    62
 #define SYS_syslog  103
@@ -78,6 +80,7 @@ typedef struct syscall_frame {
 #define SYS_dup3    292
 #define SYS_pipe2   293
 #define SYS_arch_prctl 158
+#define SYS_prctl 157
 #define SYS_exit    60
 #define SYS_execve  59
 #define SYS_vfork   58

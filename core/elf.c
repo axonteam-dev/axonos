@@ -665,7 +665,9 @@ static int elf_needs_private_user_pages(thread_t *tc) {
     return tc->mm->pml4 != k->pml4;
 }
 
-/* Linux applies R_X86_64_RELATIVE for ET_DYN (PIE + ld.so) before user entry. */
+/* Linux applies R_X86_64_RELATIVE for ET_DYN (PIE + ld.so) before user entry.
+ * IRELATIVE for ET_EXEC static binaries is applied by glibc CRT before main —
+ * do not invoke IFUNC resolvers from the kernel. */
 static int elf_apply_rela_relative(uint64_t load_base, const Elf64_Phdr *phdrs, int phnum) {
     if (!phdrs || phnum <= 0 || load_base == 0) return 0;
     const Elf64_Rela *rela = NULL;
@@ -693,12 +695,20 @@ static int elf_apply_rela_relative(uint64_t load_base, const Elf64_Phdr *phdrs, 
     size_t nrel = relasz / relaent;
     for (size_t i = 0; i < nrel; i++) {
         const Elf64_Rela *r = (const Elf64_Rela *)((const char *)rela + i * relaent);
-        if (ELF64_R_TYPE(r->r_info) != ELF_R_X86_64_RELATIVE)
-            continue;
+        uint32_t rtype = (uint32_t)ELF64_R_TYPE(r->r_info);
         uint64_t *where = (uint64_t *)(uintptr_t)(load_base + r->r_offset);
         if ((uintptr_t)where < load_base || (uintptr_t)where >= (uintptr_t)MMIO_IDENTITY_LIMIT)
             return -1;
-        *where = load_base + (uint64_t)r->r_addend;
+        if (rtype == ELF_R_X86_64_RELATIVE) {
+            *where = load_base + (uint64_t)r->r_addend;
+        } else if (rtype == ELF_R_X86_64_IRELATIVE) {
+            typedef uint64_t (*irel_fn_t)(void);
+            irel_fn_t resolver = (irel_fn_t)(uintptr_t)(load_base + (uint64_t)r->r_addend);
+            if ((uintptr_t)resolver < load_base ||
+                (uintptr_t)resolver >= (uintptr_t)MMIO_IDENTITY_LIMIT)
+                return -1;
+            *where = resolver();
+        }
     }
     return 0;
 }

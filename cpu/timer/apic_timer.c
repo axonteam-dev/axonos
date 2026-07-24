@@ -13,6 +13,7 @@
 #include <sysinfo.h>
 #include <paging.h>
 #include <syscall.h>
+#include <process.h>
 #include <stdio.h>
 #include <string.h>
 /* common ticks */
@@ -227,6 +228,7 @@ void apic_timer_handler(cpu_registers_t* regs) {
         timer_ticks++;
     /* Charge CPU time before any schedule/publish side effects. */
     thread_account_timer_tick(regs && ((regs->cs & 3) == 3));
+    process_itimer_tick(pit_get_time_ms());
     /* A ring-3 interrupt proves the parent's fork-return IRETQ completed.
      * It is now safe to make its fully initialized child runnable. Never also
      * context-switch from this same IRQ: first return its complete interrupt

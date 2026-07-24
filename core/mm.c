@@ -1697,15 +1697,20 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                     if (!(e2 & PG_US))
                         continue;
                     uint64_t leaf2 = e2 & PG_ADDR_MASK_2M;
-                    /* Entire 2MiB identity window — not a privatized user leaf. */
-                    if (leaf2 == va_l2 && !(e2 & PG_SOFT_OWNED))
+                    /* Entire 2MiB identity window — not a privatized user leaf.
+                     * Exception: MAP_SHARED anon also uses identity VA==PA and
+                     * must be installed into the child (nginx shm zones). */
+                    int shared_2m = parent_for_vma &&
+                        (user_vma_is_shared_page_mm(parent_for_vma, (uintptr_t)va_l2) ||
+                         user_vma_is_shared_page(owner_tid, (uintptr_t)va_l2));
+                    if (leaf2 == va_l2 && !(e2 & PG_SOFT_OWNED) && !shared_2m)
                         continue;
                     uint64_t chunk_end = va_l2 + PAGE_SIZE_2M;
                     if (chunk_end > limit)
                         chunk_end = limit;
                     for (uint64_t va = va_l2; va < chunk_end; va += PAGE_SIZE_4K) {
                         uint64_t pa = leaf2 + (va - va_l2);
-                        if (pa == (va & ~0xFFFULL) && !(e2 & PG_SOFT_OWNED))
+                        if (pa == (va & ~0xFFFULL) && !(e2 & PG_SOFT_OWNED) && !shared_2m)
                             continue;
                         if (mm_fork_copy_user_leaf(child, parent_for_vma,
                                 parent_l4, owner_tid, va, pa, e2,
@@ -1728,7 +1733,11 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                     uint64_t pa = e1 & PG_ADDR_MASK;
                     if (pa >= (uint64_t)MMIO_IDENTITY_LIMIT || !pt_page_pa_ok(e1))
                         continue;
-                    if (pa == (va & ~0xFFFULL) && !(e1 & PG_SOFT_OWNED))
+                    /* Skip bare identity leaves unless MAP_SHARED (nginx shm). */
+                    int shared_4k = parent_for_vma &&
+                        (user_vma_is_shared_page_mm(parent_for_vma, (uintptr_t)va) ||
+                         user_vma_is_shared_page(owner_tid, (uintptr_t)va));
+                    if (pa == (va & ~0xFFFULL) && !(e1 & PG_SOFT_OWNED) && !shared_4k)
                         continue;
                     if (mm_fork_copy_user_leaf(child, parent_for_vma,
                             parent_l4, owner_tid, va, pa, e1,

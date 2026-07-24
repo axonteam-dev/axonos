@@ -13,6 +13,7 @@
 #include <loadavg.h>
 #include <power.h>
 #include <syscall.h>
+#include <process.h>
 
 // Global variables
 volatile uint64_t pit_ticks = 0;
@@ -27,6 +28,7 @@ void pit_handler(cpu_registers_t* regs) {
         pit_ticks++;
         timer_ticks++;
         thread_account_timer_tick(regs && ((regs->cs & 3) == 3));
+        process_itimer_tick(pit_get_time_ms());
         /* Publish now, but force this IRQ to return to the parent before any
          * later timer tick is allowed to select the new child. */
         int published_fork_child = 0;

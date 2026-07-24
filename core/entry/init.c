@@ -754,10 +754,16 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         klogprintf("video: cirrus fbcon enabled early\n");
     }
 
-    /* /etc/passwd and /etc/group so whoami/id show root. Use static buffers to avoid heap overflow. */
+    /* /etc/passwd and /etc/group so whoami/id/groups/adduser work.
+       Use static buffers to avoid heap overflow. Seed a normal user so
+       `adduser miha root` (BusyBox: add existing user to group) is meaningful. */
     (void)ramfs_mkdir("/etc");
     (void)ramfs_mkdir("/root");
-    static const char root_passwd_line[] = "root:x:0:0:root:/root:/bin/sh\n";
+    (void)ramfs_mkdir("/home");
+    (void)ramfs_mkdir("/home/miha");
+    static const char root_passwd_line[] =
+        "root:x:0:0:root:/root:/bin/sh\n"
+        "miha:x:1000:1000:miha:/home/miha:/bin/sh\n";
     const size_t root_passwd_len = sizeof(root_passwd_line) - 1;
     struct fs_file *pf = fs_create_file("/etc/passwd");
     if (!pf) pf = fs_open("/etc/passwd");
@@ -766,8 +772,11 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         fs_write(pf, root_passwd_line, root_passwd_len, 0);
         fs_file_free(pf);
     }
-    /* Member list required: BusyBox id(1) getgrouplist fails on "root:x:0:". */
-    static const char root_group_line[] = "root:x:0:root\nusers:x:100:\n";
+    /* Member lists required: BusyBox id(1) getgrouplist fails on "root:x:0:". */
+    static const char root_group_line[] =
+        "root:x:0:root,miha\n"
+        "users:x:100:miha\n"
+        "miha:x:1000:miha\n";
     const size_t root_group_len = sizeof(root_group_line) - 1;
     struct fs_file *gf = fs_create_file("/etc/group");
     if (!gf) gf = fs_open("/etc/group");
@@ -778,21 +787,28 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
     /* adduser expects /etc/shadow to exist and appends entries with O_APPEND. */
     {
-        /* root:: = no password (empty field allows login with Enter) */
-        static const char root_shadow[] = "root::0:0:99999:7:::\n";
+        /* empty password field = login with Enter */
+        static const char root_shadow[] =
+            "root::0:0:99999:7:::\n"
+            "miha::0:0:99999:7:::\n";
         struct fs_file *sf = fs_create_file("/etc/shadow");
         if (!sf) sf = fs_open("/etc/shadow");
         if (sf) {
+            (void)vfs_ftruncate(sf, 0);
             fs_write(sf, root_shadow, sizeof(root_shadow) - 1, 0);
             fs_file_free(sf);
         }
     }
     /* adduser/addgroup may readlink /etc/gshadow; create minimal file. */
     {
-        static const char root_gshadow[] = "root::\nusers::\n";
+        static const char root_gshadow[] =
+            "root::root,miha\n"
+            "users::miha\n"
+            "miha::miha\n";
         struct fs_file *gsf = fs_create_file("/etc/gshadow");
         if (!gsf) gsf = fs_open("/etc/gshadow");
         if (gsf) {
+            (void)vfs_ftruncate(gsf, 0);
             fs_write(gsf, root_gshadow, sizeof(root_gshadow) - 1, 0);
             fs_file_free(gsf);
         }
@@ -800,6 +816,65 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     (void)ramfs_mkdir("/var");
     (void)ramfs_mkdir("/var/run");
     (void)ramfs_mkdir("/var/log");  /* ensure exists for wtmp (klog also creates it) */
+    (void)ramfs_mkdir("/var/log/nginx");
+    (void)ramfs_mkdir("/var/run");
+    (void)ramfs_mkdir("/srv");
+    (void)ramfs_mkdir("/srv/www");
+    {
+        static const char index_html[] = "ok\n";
+        struct fs_file *idx = fs_create_file("/srv/www/index.html");
+        if (!idx) idx = fs_open("/srv/www/index.html");
+        if (idx) {
+            (void)vfs_ftruncate(idx, 0);
+            fs_write(idx, index_html, sizeof(index_html) - 1, 0);
+            fs_file_free(idx);
+        }
+    }
+    /* Linux-default nginx.conf: epoll, sendfile, dual-stack, master/daemon on. */
+    {
+        struct stat st;
+        if (vfs_stat("/etc/nginx/nginx.conf", &st) == 0) {
+            static const char nginx_conf[] =
+                "user root;\n"
+                "worker_processes  1;\n"
+                "error_log  /var/log/nginx/error.log warn;\n"
+                "pid        /var/run/nginx.pid;\n"
+                "\n"
+                "events {\n"
+                "    use poll;\n"
+                "    worker_connections  256;\n"
+                "}\n"
+                "\n"
+                "http {\n"
+                "    include       mime.types;\n"
+                "    default_type  application/octet-stream;\n"
+                "    access_log    /var/log/nginx/access.log;\n"
+                "\n"
+                "    sendfile        on;\n"
+                "    keepalive_timeout  65;\n"
+                "\n"
+                "    server {\n"
+                "        listen       80 default_server;\n"
+                "        listen       [::]:80 default_server;\n"
+                "        server_name  localhost;\n"
+                "\n"
+                "        root   /srv/www;\n"
+                "        index  index.html index.htm;\n"
+                "\n"
+                "        location / {\n"
+                "            try_files $uri $uri/ =404;\n"
+                "        }\n"
+                "    }\n"
+                "}\n";
+            struct fs_file *nf = fs_open("/etc/nginx/nginx.conf");
+            if (!nf) nf = fs_create_file("/etc/nginx/nginx.conf");
+            if (nf) {
+                (void)vfs_ftruncate(nf, 0);
+                fs_write(nf, nginx_conf, sizeof(nginx_conf) - 1, 0);
+                fs_file_free(nf);
+            }
+        }
+    }
     (void)ramfs_mkdir("/run");
     (void)ramfs_mkdir("/run/lock");
     (void)ramfs_mkdir("/run/openrc");

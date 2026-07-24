@@ -65,7 +65,6 @@ NSS_FILES_BLOB_OBJ := $(BUILD_DIR)/nss_files/shim_blob.o
 all: iso
 
 for-production:
-	@$(MAKE) clean
 	@$(MAKE) OPTFLAGS='-O0 -g0' CFLAGS_EXTRA='$(PRODUCTION_CFLAGS)' iso
 
 kernel: $(KERNEL_BIN)

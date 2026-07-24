@@ -742,6 +742,21 @@ int user_vma_fault_nonpresent(uint64_t cr2, uint64_t err) {
             mm_t *share = t->mm_ptemplate ? t->mm_ptemplate : k;
             uint64_t lo = (uint64_t)(cr2 & ~0xFFFULL);
             uint64_t hi = lo + 0x1000ULL;
+            if (hit_copy.kind == USER_VMA_KIND_SHM) {
+                /*
+                 * MAP_SHARED anon uses identity VA==PA. Do not privatize/blank —
+                 * that breaks nginx master↔worker shared zones. Install the same
+                 * identity leaf into this mm so writers stay coherent.
+                 */
+                if (mm_clear_range_private(t->mm, share->pml4, lo, hi) != 0)
+                    return 0;
+                /* map_page_2m updates live CR3 (already this process after #PF). */
+                if (map_page_2m((uint64_t)(lo & ~((uint64_t)PAGE_SIZE_2M - 1)),
+                                (uint64_t)(lo & ~((uint64_t)PAGE_SIZE_2M - 1)),
+                                PG_PRESENT | PG_RW | PG_US) != 0)
+                    return 0;
+                return 1;
+            }
             if (hit_copy.kind == USER_VMA_KIND_MMAP_LAZY) {
                 lo = (uint64_t)va2m;
                 uint64_t hit_end = (uint64_t)hit_copy.addr + (uint64_t)hit_copy.len;

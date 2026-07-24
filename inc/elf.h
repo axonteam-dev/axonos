@@ -54,6 +54,7 @@ enum {
     ELF_DT_RELASZ  = 8,
     ELF_DT_RELAENT = 9,
     ELF_R_X86_64_RELATIVE = 8,
+    ELF_R_X86_64_IRELATIVE = 37,
 };
 
 typedef struct {

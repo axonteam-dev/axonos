@@ -56,6 +56,11 @@ typedef struct thread {
         gid_t gid;
         gid_t egid;
         gid_t sgid;
+#ifndef AXON_NGROUPS_MAX
+#define AXON_NGROUPS_MAX 32
+#endif
+        int ngroups;
+        gid_t groups[AXON_NGROUPS_MAX];
         /* file mode creation mask (umask) for mkdir/open */
         unsigned int umask;
 

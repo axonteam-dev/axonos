@@ -69,7 +69,8 @@ static int user_mmap_unmap_pages(thread_t *t, uintptr_t addr, size_t len) {
                                (uint64_t)addr + (uint64_t)len);
 }
 
-static int user_mmap_install_pages(uintptr_t addr, size_t len, uintptr_t top_limit) {
+static int user_mmap_install_pages(uintptr_t addr, size_t len, uintptr_t top_limit,
+                                   int shared_mapping) {
     if ((uint64_t)addr + (uint64_t)len > (uint64_t)top_limit)
         return -1;
     uint64_t req_lo = (uint64_t)addr & ~0xFFFULL;
@@ -79,10 +80,22 @@ static int user_mmap_install_pages(uintptr_t addr, size_t len, uintptr_t top_lim
     if (req_lo >= req_hi)
         return -1;
     /*
-     * Linux MAP_PRIVATE anon: do_mmap → new zero pages. Never map_page_2m(va,va)
-     * on a private mm — that re-identities into the parent/sibling phys and
-     * causes ash GPF at RIP=="ls" after fork.
+     * MAP_SHARED anon must stay coherent across fork (nginx accept mutex /
+     * slab zones). Use identity VA==PA leaves; fork + #PF keep them shared.
+     * MAP_PRIVATE: never identity-map into a private mm (ash GPF after fork).
      */
+    if (shared_mapping) {
+        uintptr_t map_begin = addr & ~((uintptr_t)PAGE_SIZE_2M - 1);
+        uintptr_t map_end = (uintptr_t)(((uint64_t)addr + (uint64_t)len + PAGE_SIZE_2M - 1) &
+                                        ~((uint64_t)PAGE_SIZE_2M - 1));
+        if (map_begin >= map_end || map_end > top_limit)
+            return -1;
+        for (uintptr_t va = map_begin; va < map_end; va += PAGE_SIZE_2M) {
+            if (map_page_2m(va, va, PG_PRESENT | PG_RW | PG_US) != 0)
+                return -1;
+        }
+        return 0;
+    }
     {
         thread_t *t = thread_get_current_user();
         if (!t)
@@ -353,7 +366,7 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         if (user_mmap_unmap_pages(tcur, addr, len) != 0)
             return user_mm_ret_err(USER_MM_EFAULT);
         mmap_vma_kind = USER_VMA_KIND_MMAP_LAZY;
-    } else if (user_mmap_install_pages(addr, len, top_limit) != 0) {
+    } else if (user_mmap_install_pages(addr, len, top_limit, shared_mapping) != 0) {
         return user_mm_ret_err(USER_MM_EFAULT);
     }
 

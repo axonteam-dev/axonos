@@ -8,6 +8,9 @@
 
 #define PROCESS_MAX_FD 256
 #define PROCESS_SIGNAL_MAX 64
+#ifndef AXON_NGROUPS_MAX
+#define AXON_NGROUPS_MAX 32
+#endif
 
 typedef struct mm_struct mm_t;
 typedef struct thread thread_t;
@@ -39,6 +42,9 @@ typedef struct process {
     char cwd[256];
     uid_t uid, euid, suid;
     gid_t gid, egid, sgid;
+    /* Supplementary groups (getgroups/setgroups). ngroups==0 means empty list. */
+    int ngroups;
+    gid_t groups[AXON_NGROUPS_MAX];
     unsigned int umask;
     int pgid;
     int sid;
@@ -50,6 +56,12 @@ typedef struct process {
 
     int vfork_parent_blocked;
     struct process *vfork_parent;
+
+    /* ITIMER_REAL (setitimer/alarm): expire at monotonic ms; 0 = disarmed. */
+    uint64_t itimer_expire_ms;
+    uint32_t itimer_interval_ms;
+    /* prctl(PR_SET_DUMPABLE): 0/1/2 — Linux default is 1 (SUID_DUMP_USER). */
+    int dumpable;
 } process_t;
 
 void process_init(void);
@@ -77,5 +89,10 @@ int process_signal_targets(process_t *caller, int pid, int sig);
  * Returns number of entries written (capped at out_max). */
 int process_collect_signal_targets(process_t *caller, int pid,
                                    process_t **out, int out_max);
+/* ITIMER_REAL: arm/disarm and fire expired timers (call from timer IRQ). */
+void process_arm_itimer_real(process_t *p, uint64_t expire_ms, uint32_t interval_ms);
+void process_get_itimer_real(process_t *p, uint32_t *value_ms, uint32_t *interval_ms,
+                             uint64_t now_ms);
+void process_itimer_tick(uint64_t now_ms);
 
 #endif

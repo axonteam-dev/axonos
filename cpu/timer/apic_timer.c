@@ -1,5 +1,6 @@
 #include <apic_timer.h>
 #include <vga.h>
+#include <debug.h>
 #include <vbe.h>
 #include <klog.h>
 #include <cirrusfb.h>
@@ -10,11 +11,14 @@
 #include <power.h>
 #include <loadavg.h>
 #include <sysinfo.h>
+#include <paging.h>
+#include <syscall.h>
 #include <stdio.h>
 #include <string.h>
 /* common ticks */
 extern volatile uint64_t timer_ticks;
 extern volatile uint32_t timer_frequency;
+extern int syscall_pipe_watch_active;
 
 volatile uint64_t apic_timer_ticks = 0;
 apic_timer_state_t apic_timer_state = {0};
@@ -221,6 +225,13 @@ void apic_timer_handler(cpu_registers_t* regs) {
     apic_timer_state.ticks = apic_timer_ticks;
     if (!pit_is_enabled())
         timer_ticks++;
+    /* A ring-3 interrupt proves the parent's fork-return IRETQ completed.
+     * It is now safe to make its fully initialized child runnable. Never also
+     * context-switch from this same IRQ: first return its complete interrupt
+     * frame to the parent, then let a later tick select the child. */
+    int published_fork_child = 0;
+    if (regs && ((regs->cs & 3) == 3))
+        published_fork_child = syscall_publish_deferred_fork_child();
     if (init && smp_sched_cpu_id() == 0 && apic_timer_state.frequency > 0 &&
         apic_timer_ticks > 0 &&
         (apic_timer_ticks % (uint64_t)apic_timer_state.frequency) == 0)
@@ -233,13 +244,78 @@ void apic_timer_handler(cpu_registers_t* regs) {
 
     thread_wake_expired_timeouts();
 
-    /* Never call the scheduler from an interrupt handler.
-       Switching context while running on an IRQ stack frame corrupts return context.
-       This became a hard hang once we introduced an always-READY idle thread. */
+    /*
+     * Bounded post-pipe sampler. Keep this deliberately tiny: it is diagnostic
+     * evidence, not part of scheduling, and must not recreate the old IRQ-log
+     * livelock. It can be removed once pipeline bring-up is complete.
+     */
+    if (regs && ((regs->cs & 3) == 3) && syscall_pipe_watch_active &&
+        apic_timer_state.frequency > 0) {
+        uint32_t sample_every = apic_timer_state.frequency / 16u;
+        if (sample_every < 1u)
+            sample_every = 1u;
+        if ((apic_timer_ticks % sample_every) == 0) {
+            static int samples_left = 16;
+            if (samples_left-- > 0) {
+                thread_t *cur = thread_current();
+                devel_printf("pipe-sample: tid=%d rip=0x%llx rsp=0x%llx "
+                        "rax=0x%llx rdx=0x%llx state=%d cr3=0x%llx\n",
+                        cur ? (int)(cur->tid ? cur->tid : 1) : -1,
+                        (unsigned long long)regs->rip,
+                        (unsigned long long)regs->rsp,
+                        (unsigned long long)regs->rax,
+                        (unsigned long long)regs->rdx,
+                        cur ? (int)cur->state : -1,
+                        (unsigned long long)paging_read_cr3());
+            }
+        }
+    }
+
+    /*
+     * UP needs timer preemption for a ring-3 CPU spinner.  PIT already uses
+     * this path; omitting it after PIT is disabled lets a post-fork child
+     * starve its parent forever (the shell cannot regain the tty or handle
+     * Ctrl-C).  Acknowledge the local APIC before a possible context switch,
+     * because this handler may resume only when this task is scheduled again.
+     * SMP remains cooperative until syscall entry/scheduler state is per-CPU.
+     */
+    /*
+     * All ring-3 tasks are intentionally pinned to the BSP until syscall
+     * entry is per-CPU.  A VM may still expose several vCPUs; using the total
+     * CPU count here disabled preemption on cpu0 and let one shell freeze all
+     * user terminals.  Preempt the BSP's ring-3 task regardless of AP count.
+     */
+    if (regs && ((regs->cs & 3) == 3) && smp_sched_cpu_id() == 0) {
+        apic_eoi();
+        if (published_fork_child)
+            return;
+        /*
+         * Linux-style scheduling granularity: account every timer tick, but
+         * do not context-switch on every IRQ. Under VMware a switch can take
+         * longer than a 1 kHz period; the next LAPIC interrupt is then already
+         * pending at iretq and two runnable tasks livelock in IRQ frames
+         * without retiring a single user instruction.
+         *
+         * Keep timer accounting at 250 Hz, but force scheduling around 100 Hz
+         * (~10 ms). /64 (~4 Hz) felt multi-second under load with console I/O.
+         * Still far below 1 kHz to avoid the VMware IRQ livelock.
+         */
+        uint32_t quantum = apic_timer_state.frequency / 100u;
+        if (quantum < 1u)
+            quantum = 1u;
+        if ((apic_timer_ticks % quantum) == 0)
+            thread_ring3_preempt_if_waiters();
+        return;
+    }
+
+    /* Kernel-mode/AP timer ticks do not schedule from IRQ context. */
     if (cirrusfb_is_ready()) {
         cirrusfb_update_cursor();
     } else {
-        if (apic_timer_ticks % 5) vbe_flush_full();
+        /* Full FB blit every few ms froze interactive work during kernel syscalls
+         * (connect/poll). Throttle to ~10 Hz; dirty regions flush on putchar. */
+        if ((apic_timer_ticks % 25u) == 0u)
+            vbe_flush_full();
         vbefb_update_cursor();
     }
     apic_eoi();

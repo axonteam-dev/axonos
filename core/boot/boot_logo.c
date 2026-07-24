@@ -34,10 +34,6 @@ void boot_logo_show(void) {
 			tty->cursor_y = margin;
 		}
 	}
-
-	klogprintf("boot: crox logo %ux%u (console below row %u)\n",
-	           (unsigned)CROX_LOGO_WIDTH, (unsigned)CROX_LOGO_HEIGHT,
-	           (unsigned)margin);
 }
 
 void boot_logo_dismiss(void) {

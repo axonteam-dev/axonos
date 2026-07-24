@@ -11,12 +11,17 @@
 #include <heap.h>
 #include <mmio.h>
 #include <thread.h>
+#include <process.h>
+
+static int kernel_execve_into_mm(const char *path, const char *const argv[],
+                                 const char *const envp[]);
 #include <devfs.h>
 #include <gdt.h>
 #include <paging.h>
 #include <mm.h>
 #include <user_vma.h>
 #include <user_as.h>
+#include <user_map.h>
 #include <elf.h>
 #include <vga.h>
 #include <debug.h>
@@ -24,11 +29,136 @@
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
 
+static int exec_stdio_is_dev_null(const struct fs_file *f) {
+    if (!f || !f->path)
+        return 0;
+    return strcmp(f->path, "/dev/null") == 0 ||
+           strcmp(f->path, "null") == 0;
+}
+
+/* Intentional redirects (pipes, sockets, regular files) must survive exec.
+ * Only closed fds or /dev/null need the boot console rebind. */
+static int exec_stdio_needs_console(const struct fs_file *f) {
+    if (!f)
+        return 1;
+    if (f->type == FS_TYPE_PIPE || f->type == FS_TYPE_SOCKET)
+        return 0;
+    if (devfs_is_tty_file((struct fs_file *)f))
+        return 0;
+    if (exec_stdio_is_dev_null(f))
+        return 1;
+    /* Keep open non-tty files (redirections to regular paths). */
+    return 0;
+}
+
+void exec_boot_ensure_stdio(thread_t *ut) {
+    if (!ut)
+        return;
+
+    /*
+     * Linux starts init with descriptors 0, 1 and 2 already open. Use one
+     * shared open-file description for the console, like dup2(0, 1/2).
+     *
+     * BusyBox bb_sanitize_stdio() opens /dev/null when stdio is closed. With
+     * an empty inittab console id, spawn never reopens a real tty — ash then
+     * sees EOF on stdin and exits, and ::respawn loops forever.
+     *
+     * Only rebind closed /dev/null stdio. Never replace pipes/sockets: that
+     * destroyed `echo test | cat` (stdin pipe freed on execve → no "test").
+     *
+     * fds 0/1/2 often alias the same fs_file; free each unique pointer once
+     * per aliased slot (refcount may be wrong after fork/exec).
+     */
+    int need_console = 0;
+    for (int fd = 0; fd <= 2; fd++) {
+        if (exec_stdio_needs_console(ut->fds[fd])) {
+            need_console = 1;
+            break;
+        }
+    }
+    if (need_console) {
+        struct fs_file *console = devfs_open_direct("/dev/console");
+        if (!console)
+            return;
+        struct fs_file *old[3] = { ut->fds[0], ut->fds[1], ut->fds[2] };
+        /* Replace only slots that need a console; keep pipes/redirections. */
+        for (int fd = 0; fd <= 2; fd++) {
+            if (exec_stdio_needs_console(old[fd]))
+                ut->fds[fd] = NULL;
+        }
+        for (int i = 0; i < 3; i++) {
+            struct fs_file *f = old[i];
+            if (!f || f == console)
+                continue;
+            if (!exec_stdio_needs_console(f))
+                continue;
+            int first = 1;
+            for (int j = 0; j < i; j++) {
+                if (old[j] == f) {
+                    first = 0;
+                    break;
+                }
+            }
+            if (!first)
+                continue;
+            int n = 0;
+            for (int j = 0; j < 3; j++) {
+                if (old[j] == f && exec_stdio_needs_console(f))
+                    n++;
+            }
+            for (int k = 0; k < n; k++)
+                fs_file_free(f);
+        }
+        int adopted = 0;
+        for (int fd = 0; fd <= 2; fd++) {
+            if (!ut->fds[fd]) {
+                ut->fds[fd] = console;
+                adopted++;
+            }
+        }
+        if (adopted == 0)
+            fs_file_free(console);
+        else
+            console->refcount = adopted;
+    } else {
+        for (int fd = 1; fd <= 2; fd++) {
+            if (!ut->fds[fd]) {
+                ut->fds[fd] = ut->fds[0];
+                if (ut->fds[fd])
+                    ut->fds[fd]->refcount++;
+            }
+        }
+    }
+
+    if (ut->fds[0] && devfs_is_tty_file(ut->fds[0])) {
+        int tty = devfs_get_tty_index_from_file(ut->fds[0]);
+        if (tty < 0)
+            tty = devfs_get_active();
+        ut->attached_tty = tty;
+        /* Do not invent sid/pgid here — getty must call setsid() itself. */
+        if (ut->sid > 0)
+            (void)devfs_set_tty_controlling_sid(ut->fds[0], ut->sid);
+        (void)devfs_tty_attach_thread(ut->fds[0], ut);
+        if (ut->pgid > 0)
+            devfs_set_tty_fg_pgrp(tty, ut->pgid);
+        devel_printf("stdio-console: tid=%llu path=%s tty=%d sid=%d pgid=%d\n",
+            (unsigned long long)(ut->tid ? ut->tid : 1),
+            ut->fds[0]->path ? ut->fds[0]->path : "?",
+            tty, ut->sid, ut->pgid);
+    }
+
+    process_sync_from_thread(ut->process, ut);
+}
+
 uint64_t elf_et_dyn_base(void) {
     uintptr_t ke = (uintptr_t)_end;
     uint64_t base = ((uint64_t)ke + (uint64_t)(PAGE_SIZE_2M - 1)) & ~((uint64_t)PAGE_SIZE_2M - 1);
-    if (base < 0x00800000ULL)
-        base = 0x00800000ULL;
+    /* Conventional Linux x86-64 ET_EXEC/PIE low load address. Must stay at
+     * USER_IMAGE_BASE (0x400000) so a new PIE replaces busybox in-place;
+     * flooring to 0x800000 left a ghost busybox image that openrc then
+     * jumped into (RIP=0x4030d0 AVX / 0x63e2c0 .bss zeros). */
+    if (base < (uint64_t)USER_IMAGE_BASE)
+        base = (uint64_t)USER_IMAGE_BASE;
     return base;
 }
 
@@ -40,80 +170,144 @@ uint64_t elf_interp_base(void) {
     return base;
 }
 
-/* ET_EXEC linked at 0x400000 overlaps a grown kernel (_end past 4MiB). Slide load base. */
+/*
+ * ET_EXEC has fixed virtual addresses and must never be slid: its machine code
+ * may contain absolute references. Only PIE/shared-object images (ET_DYN) are
+ * position independent. Overlapping ET_EXEC segments are rejected by the
+ * loader's kernel-range check below.
+ */
 static uint64_t elf_load_base_for_image(const Elf64_Ehdr *eh, const Elf64_Phdr *phdrs, int nph) {
-    const uintptr_t kernel_start = (uintptr_t)0x100000;
-    const uintptr_t kernel_end = (uintptr_t)_end;
-
+    (void)phdrs;
+    (void)nph;
     if (eh->e_type == 3)
         return elf_et_dyn_base();
-
-    uint64_t min_v = UINT64_MAX;
-    uint64_t max_v = 0;
-    int nload = 0;
-    for (int i = 0; i < nph; i++) {
-        if (phdrs[i].p_type != 1)
-            continue;
-        uint64_t v = phdrs[i].p_vaddr;
-        uint64_t ve = v + phdrs[i].p_memsz;
-        if (v < min_v)
-            min_v = v;
-        if (ve > max_v)
-            max_v = ve;
-        nload++;
-    }
-    if (nload == 0)
-        return 0;
-    if (min_v >= kernel_end || max_v <= kernel_start)
-        return 0;
-    {
-        uint64_t base = elf_et_dyn_base();
-        if (min_v >= base)
-            return 0;
-        return base - min_v;
-    }
+    return 0;
 }
 
-/* In AxonOS, user programs currently run as kernel threads in a shared identity-mapped
-   address space. That means user stacks and TLS must not overlap between threads,
-   otherwise vfork/exec will clobber the parent's stack/TLS and trigger user-mode #GP
-   after the child exits. We carve out per-tid stack/TLS regions below USER_STACK_TOP. */
+static int elf_needs_private_user_pages(thread_t *tc);
+static int mark_user_identity_range_2m(uint64_t va_begin, uint64_t va_end);
+
+/*
+ * Copy into the target mm by physical leaf address. Writing through a user VA
+ * while CR3 is the kernel tree (or a stale TLB) fills identity phys and leaves
+ * the private exec pages zero — user then runs `00 00` at entry (add [rax],al
+ * → #PF cr2=0). Linux load_elf_binary writes the destination VMA backing;
+ * with identity-mapped phys we store to the leaf PA directly.
+ */
+static int elf_copy_into_mm(mm_t *mm, uint64_t va, const void *src, size_t n) {
+    if (!mm || (!src && n) || n == 0)
+        return n == 0 ? 0 : -1;
+    const uint8_t *s = (const uint8_t *)src;
+    while (n) {
+        uint64_t leaf = 0;
+        if (mm_va_leaf_pa(mm, va, &leaf) != 0)
+            return -1;
+        uint64_t page = leaf & ~0xFFFULL;
+        /* Identity leaf (pa==va): store hits the frozen vfork parent's phys
+         * BusyBox image — BSS wipe / PT_LOAD rewrite → parent #PF at junk RIP. */
+        if (page == (va & ~0xFFFULL)) {
+            kprintf("elf_copy: refuse identity leaf va=0x%llx\n",
+                    (unsigned long long)va);
+            return -1;
+        }
+        uint64_t off = va & 0xFFFULL;
+        size_t chunk = (size_t)(0x1000ULL - off);
+        if (chunk > n)
+            chunk = n;
+        memcpy((void *)(uintptr_t)(page + off), s, chunk);
+        invlpg((void *)(uintptr_t)va);
+        va += chunk;
+        s += chunk;
+        n -= chunk;
+    }
+    return 0;
+}
+
+static int elf_zero_into_mm(mm_t *mm, uint64_t va, size_t n) {
+    if (!mm || n == 0)
+        return 0;
+    while (n) {
+        uint64_t leaf = 0;
+        if (mm_va_leaf_pa(mm, va, &leaf) != 0)
+            return -1;
+        uint64_t page = leaf & ~0xFFFULL;
+        if (page == (va & ~0xFFFULL)) {
+            kprintf("elf_zero: refuse identity leaf va=0x%llx\n",
+                    (unsigned long long)va);
+            return -1;
+        }
+        uint64_t off = va & 0xFFFULL;
+        size_t chunk = (size_t)(0x1000ULL - off);
+        if (chunk > n)
+            chunk = n;
+        memset((void *)(uintptr_t)(page + off), 0, chunk);
+        va += chunk;
+        n -= chunk;
+    }
+    return 0;
+}
+
+/*
+ * Linux process-local layout: every mm uses the same stack VA
+ * (USER_STACK_TOP). Separate page tables make that safe across tasks.
+ * Per-tid descending slots used to walk into the kernel heap arena
+ * (e.g. 0x8050e000), so execve's kmalloc backing collided with the stack VA
+ * (priv-map-bug want==got==va) and burned ~8MiB heap per getty.
+ */
 static uintptr_t user_stack_top_for_tid(uint64_t tid) {
-    const uintptr_t top = (uintptr_t)USER_STACK_TOP;
-    /* Each slot: stack + tls + small guard. */
-    const uintptr_t stride = (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + (uintptr_t)(64 * 1024);
-    /* Avoid colliding with tid0/ring0 assumptions; shift by 1. */
-    const uint64_t slot = tid + 1ULL;
-    /* Defensive programming:
-       - if tid is corrupted/huge, (slot * stride) can overflow and later cause unsigned underflow
-         in (top - off), producing a bogus "TLS base outside identity map".
-       - avoid overflow and avoid (off + 0x10000) wrap by using a non-overflowing comparison. */
-    if (stride == 0) return top;
-    if (slot > (uint64_t)((uintptr_t)-1) / (uint64_t)stride) {
-        return top;
+    (void)tid;
+    return (uintptr_t)USER_STACK_TOP;
+}
+
+/* Linux execve: map only the argv/env tip; the rest of RLIMIT_STACK is demand-zero. */
+static int exec_map_stack_tip(thread_t *tc, uintptr_t tip_lo, uintptr_t tip_hi) {
+    if (!tc || !tc->mm || tip_hi <= tip_lo)
+        return -1;
+    tip_lo &= ~0xFFFULL;
+    tip_hi = (tip_hi + 0xFFFULL) & ~0xFFFULL;
+    /* Cap tip — never prefault the whole 8MiB slot. */
+    if (tip_hi - tip_lo > 256u * 1024u)
+        tip_lo = tip_hi - 256u * 1024u;
+    /*
+     * Linux get_arg_page(bprm->mm): install the tip only in the nascent mm.
+     * The old mm is consulted solely to reject accidental frame sharing.
+     */
+    mm_t *oldmm = tc->mm_ptemplate ? tc->mm_ptemplate : NULL;
+    if (!oldmm && tc->exec_discard_mm &&
+        tc->exec_discard_mm->pml4 && tc->exec_discard_mm != tc->mm)
+        oldmm = tc->exec_discard_mm;
+    mm_t *map_share = mm_kernel();
+    if (!map_share || !map_share->pml4 || map_share == tc->mm)
+        return -1;
+
+    /* Map tip vs swapper only — never pass oldmm into sharedaware. */
+    if (mm_make_private_range_bulk_zero_force(tc->mm, (uint64_t)tip_lo,
+                                              (uint64_t)tip_hi, map_share) != 0)
+        return -1;
+    for (uint64_t va = (uint64_t)tip_lo; va < (uint64_t)tip_hi; va += 0x1000ULL) {
+        uint64_t cpa = 0, ppa = 0;
+        if (mm_va_leaf_pa(tc->mm, va, &cpa) != 0)
+            return -1;
+        cpa &= ~0xFFFULL;
+        if (cpa == (va & ~0xFFFULL)) {
+            kprintf("exec-tip: still identity va=0x%llx\n",
+                    (unsigned long long)va);
+            return -1;
+        }
+        if (oldmm && oldmm->pml4 &&
+            mm_va_leaf_pa(oldmm, va, &ppa) == 0 &&
+            (ppa & ~0xFFFULL) == cpa) {
+            kprintf("exec-tip: shares oldmm va=0x%llx pa=0x%llx\n",
+                    (unsigned long long)va, (unsigned long long)cpa);
+            return -1;
+        }
     }
-    const uintptr_t off = (uintptr_t)(slot * (uint64_t)stride);
-    /* We must guarantee that the computed stack_top leaves room for BOTH:
-       - the full reserved user stack (USER_STACK_SIZE)
-       - the reserved TLS region (USER_TLS_SIZE)
-       Otherwise TLS base = stack_top - stack - tls will underflow and become huge,
-       triggering "tls base outside identity map" after enough process launches. */
-    const uintptr_t min_room = (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + 0x10000u;
-    if (top <= min_room) return top;
-    if (off >= (top - min_room)) {
-        /* Out of reserved per-tid slots: reuse the top slot.
-           This is safe for the common "run one program at a time from osh" case. */
-        return top;
-    }
-    return top - off;
+    return 0;
 }
 
 static inline uintptr_t user_tls_base_for_stack_top(uintptr_t stack_top) {
     return (uintptr_t)stack_top - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
 }
-
-static int elf_needs_private_user_pages(thread_t *tc);
-static int mark_user_identity_range_2m(uint64_t va_begin, uint64_t va_end);
 
 static inline uintptr_t exec_align_up_ptr(uintptr_t v, uintptr_t a) {
     if (a == 0) return v;
@@ -142,42 +336,111 @@ static int exec_seed_static_tls(uintptr_t stack_top, uintptr_t random_addr,
 
     thread_t *tc = thread_current();
     if (elf_needs_private_user_pages(tc)) {
-        mm_t *share = tc->mm_ptemplate ? tc->mm_ptemplate : mm_kernel();
-        if (mm_make_private_range(tc->mm, (uint64_t)tls_region_base, (uint64_t)used_hi, 0, share) != 0)
+        mm_t *share = mm_kernel();
+        if (mm_make_private_range_bulk_zero(tc->mm, (uint64_t)tls_region_base,
+                (uint64_t)used_hi, share) != 0)
             return -1;
+        /* Private TLS already PG_US from bulk_zero — no identity mark. */
+    } else {
+        (void)mark_user_identity_range_2m((uint64_t)tls_region_base, (uint64_t)used_hi);
     }
-    if (mark_user_identity_range_2m((uint64_t)tls_region_base, (uint64_t)used_hi) != 0)
-        return -1;
 
-    memset((void *)tls_region_base, 0, (size_t)(used_hi - tls_region_base));
-    if (tls_block_size != 0) {
-        if (!tls || tls->vaddr + tls_filesz > (uint64_t)MMIO_IDENTITY_LIMIT)
+    /* Publish through leaf PAs — VA memset under kernel CR3 hits identity PFNs. */
+    if (tc && elf_needs_private_user_pages(tc) && tc->mm) {
+        if (elf_zero_into_mm(tc->mm, (uint64_t)tls_region_base,
+                             (size_t)(used_hi - tls_region_base)) != 0)
             return -1;
-        if (tls_filesz)
-            memcpy((void *)tls_block, (const void *)(uintptr_t)tls->vaddr, (size_t)tls_filesz);
+        if (tls_block_size != 0) {
+            if (!tls || tls->vaddr + tls_filesz > (uint64_t)MMIO_IDENTITY_LIMIT)
+                return -1;
+            if (tls_filesz &&
+                elf_copy_into_mm(tc->mm, (uint64_t)tls_block,
+                                 (const void *)(uintptr_t)tls->vaddr,
+                                 (size_t)tls_filesz) != 0)
+                return -1;
+        }
+    } else {
+        memset((void *)tls_region_base, 0, (size_t)(used_hi - tls_region_base));
+        if (tls_block_size != 0) {
+            if (!tls || tls->vaddr + tls_filesz > (uint64_t)MMIO_IDENTITY_LIMIT)
+                return -1;
+            if (tls_filesz)
+                memcpy((void *)tls_block, (const void *)(uintptr_t)tls->vaddr,
+                       (size_t)tls_filesz);
+        }
     }
 
     uint64_t guard = 0;
-    if (random_addr + 16 <= (uintptr_t)MMIO_IDENTITY_LIMIT) guard = *(uint64_t*)(uintptr_t)random_addr;
-    else guard = 0x8b13f00d2a11c0deULL;
+    if (tc && elf_needs_private_user_pages(tc) && tc->mm) {
+        uint64_t rpa = 0;
+        if (mm_va_leaf_pa(tc->mm, (uint64_t)random_addr, &rpa) == 0)
+            guard = *(uint64_t *)(uintptr_t)(rpa + (random_addr & 0xFFFULL));
+        else
+            guard = 0x8b13f00d2a11c0deULL;
+    } else if (random_addr + 16 <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
+        guard = *(uint64_t *)(uintptr_t)random_addr;
+    } else {
+        guard = 0x8b13f00d2a11c0deULL;
+    }
     guard &= ~0xFFULL;
 
     /* glibc x86_64 static TLS uses variant II: TLS lives below the TCB,
        and helpers like __errno_location compute from %fs:0. */
-    *(volatile uint64_t *)(uintptr_t)(fs_base + 0x00u) = (uint64_t)fs_base;
-    *(volatile uint64_t *)(uintptr_t)(fs_base + 0x08u) = (uint64_t)(fs_base + 0x800u);
-    *(volatile uint64_t *)(uintptr_t)(fs_base + 0x10u) = (uint64_t)fs_base;
-    *(volatile uint64_t *)(uintptr_t)(fs_base + 0x28u) = guard;
-    *(volatile uint64_t *)(uintptr_t)(fs_base + 0x30u) = guard ^ 0x5a5a5a5a5a5a5a5aULL;
+    {
+        uint64_t tcb[6];
+        tcb[0] = (uint64_t)fs_base;
+        tcb[1] = (uint64_t)(fs_base + 0x800u);
+        tcb[2] = (uint64_t)fs_base;
+        tcb[3] = 0;
+        tcb[4] = 0;
+        tcb[5] = guard; /* placed at fs_base+0x28 via separate writes below */
+        if (tc && elf_needs_private_user_pages(tc) && tc->mm) {
+            uint64_t words[2];
+            words[0] = (uint64_t)fs_base;
+            words[1] = (uint64_t)(fs_base + 0x800u);
+            if (elf_copy_into_mm(tc->mm, (uint64_t)fs_base, words, 16) != 0)
+                return -1;
+            words[0] = (uint64_t)fs_base;
+            if (elf_copy_into_mm(tc->mm, (uint64_t)fs_base + 0x10u, words, 8) != 0)
+                return -1;
+            words[0] = guard;
+            if (elf_copy_into_mm(tc->mm, (uint64_t)fs_base + 0x28u, words, 8) != 0)
+                return -1;
+            words[0] = guard ^ 0x5a5a5a5a5a5a5a5aULL;
+            if (elf_copy_into_mm(tc->mm, (uint64_t)fs_base + 0x30u, words, 8) != 0)
+                return -1;
+            (void)tcb;
+        } else {
+            *(volatile uint64_t *)(uintptr_t)(fs_base + 0x00u) = (uint64_t)fs_base;
+            *(volatile uint64_t *)(uintptr_t)(fs_base + 0x08u) = (uint64_t)(fs_base + 0x800u);
+            *(volatile uint64_t *)(uintptr_t)(fs_base + 0x10u) = (uint64_t)fs_base;
+            *(volatile uint64_t *)(uintptr_t)(fs_base + 0x28u) = guard;
+            *(volatile uint64_t *)(uintptr_t)(fs_base + 0x30u) =
+                guard ^ 0x5a5a5a5a5a5a5a5aULL;
+        }
+    }
 
     {
         const uintptr_t fake_locale = fs_base + 0x1800u;
         if (fake_locale + 0x100u < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-            *(volatile uint8_t *)(uintptr_t)(fake_locale + 0) = (uint8_t)'C';
-            *(volatile uint8_t *)(uintptr_t)(fake_locale + 1) = 0;
-            for (uintptr_t key = 0; key < 32; key++) {
-                const uintptr_t slot = fs_base + 0x80u + key * sizeof(uint64_t);
-                *(volatile uint64_t *)(uintptr_t)slot = (uint64_t)fake_locale;
+            if (tc && elf_needs_private_user_pages(tc) && tc->mm) {
+                uint8_t cbuf[2] = { (uint8_t)'C', 0 };
+                if (elf_copy_into_mm(tc->mm, (uint64_t)fake_locale, cbuf, 2) != 0)
+                    return -1;
+                for (uintptr_t key = 0; key < 32; key++) {
+                    uint64_t slot_val = (uint64_t)fake_locale;
+                    if (elf_copy_into_mm(tc->mm,
+                            (uint64_t)(fs_base + 0x80u + key * sizeof(uint64_t)),
+                            &slot_val, sizeof(slot_val)) != 0)
+                        return -1;
+                }
+            } else {
+                *(volatile uint8_t *)(uintptr_t)(fake_locale + 0) = (uint8_t)'C';
+                *(volatile uint8_t *)(uintptr_t)(fake_locale + 1) = 0;
+                for (uintptr_t key = 0; key < 32; key++) {
+                    const uintptr_t slot = fs_base + 0x80u + key * sizeof(uint64_t);
+                    *(volatile uint64_t *)(uintptr_t)slot = (uint64_t)fake_locale;
+                }
             }
         }
     }
@@ -440,11 +703,23 @@ static int elf_apply_rela_relative(uint64_t load_base, const Elf64_Phdr *phdrs, 
     return 0;
 }
 
-/* Mark range user-accessible, writable, executable (2MiB walk; no map_page_2m). */
+/*
+ * Legacy shared-CR3 only: stamp PG_US on the active page tables.
+ * Never call this for a private mm while CR3 is still oldmm (vfork-exec load):
+ * that mutates the frozen parent's tables (ash GPF at RIP=="ls" @ 0x801738).
+ * Private exec leaves already have PG_US from mm_make_private_range / bulk_zero.
+ */
 static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
     if (va_end < va_begin) return -1;
     if (va_end > MMIO_IDENTITY_LIMIT) va_end = MMIO_IDENTITY_LIMIT;
     if (va_begin >= va_end) return 0;
+    {
+        thread_t *tc = thread_current();
+        if (!tc || tc->ring != 3)
+            tc = thread_get_current_user();
+        if (tc && elf_needs_private_user_pages(tc))
+            return 0;
+    }
     uint64_t cr3 = paging_read_cr3();
     uint64_t *active_l4 = (uint64_t *)(uintptr_t)(cr3 & ~0xFFFULL);
     if (!active_l4) return -1;
@@ -455,7 +730,6 @@ static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
         uint64_t l4i = (va >> 39) & 0x1FF;
         uint64_t l3i = (va >> 30) & 0x1FF;
         uint64_t l2i = (va >> 21) & 0x1FF;
-        uint64_t l1i = (va >> 12) & 0x1FF;
         uint64_t *l4 = active_l4;
         if (!(l4[l4i] & PG_PRESENT)) return -1;
         l4[l4i] |= PG_US | PG_RW;
@@ -463,13 +737,12 @@ static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
 
         uint64_t *l3 = (uint64_t *)(uintptr_t)(l4[l4i] & ~0xFFFULL);
         if (!(l3[l3i] & PG_PRESENT)) return -1;
+        /* Do not OR flags onto a 1GiB leaf — that would publish the whole GB. */
+        if (l3[l3i] & PG_PS_2M)
+            return -1;
         l3[l3i] |= PG_US | PG_RW;
         l3[l3i] &= ~PG_NX;
         uint64_t l3e = l3[l3i];
-        if (l3e & PG_PS_2M) {
-            invlpg((void *)(uintptr_t)va);
-            continue;
-        }
 
         uint64_t *l2 = (uint64_t *)(uintptr_t)(l3e & ~0xFFFULL);
         if (!(l2[l2i] & PG_PRESENT)) return -1;
@@ -477,6 +750,9 @@ static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
         if (l2e & PG_PS_2M) {
             l2[l2i] |= PG_US | PG_RW;
             l2[l2i] &= ~PG_NX;
+            /* Never grant RW on Soft_COW — that bypasses mm_cow_fault_page. */
+            if (l2[l2i] & PG_SOFT_COW)
+                l2[l2i] &= ~PG_RW;
             invlpg((void *)(uintptr_t)va);
             continue;
         }
@@ -486,8 +762,14 @@ static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
         if (chunk_end > end) chunk_end = end;
         for (uint64_t p = va; p < chunk_end; p += PAGE_SIZE_4K) {
             uint64_t idx = (p >> 12) & 0x1FF;
-            l1[idx] |= PG_US | PG_RW;
+            if (!(l1[idx] & PG_PRESENT))
+                continue;
+            l1[idx] |= PG_US;
             l1[idx] &= ~PG_NX;
+            if (l1[idx] & PG_SOFT_COW)
+                l1[idx] &= ~PG_RW;
+            else
+                l1[idx] |= PG_RW;
             invlpg((void *)(uintptr_t)p);
         }
     }
@@ -621,16 +903,85 @@ static int mark_user_identity_range_2m(uint64_t va_begin, uint64_t va_end) {
     return 0;
 }
 
-/* Init thread: mark low user VA user-accessible (PG_US only on existing 2MiB maps). */
 static void mark_broad_user_ranges_for_exec(void) {
     uintptr_t begin = 0x200000;
-    uintptr_t end = (uintptr_t)USER_TLS_BASE;
+    uintptr_t end = 0x80000000ULL; /* low 2GiB identity — covers stack AVX overruns */
     if (end > (uintptr_t)MMIO_IDENTITY_LIMIT) end = (uintptr_t)MMIO_IDENTITY_LIMIT;
-    (void)mark_user_identity_range_2m((uint64_t)begin, (uint64_t)end);
+    /*
+     * Never stamp PG_US onto identity-mapped kernel-heap pages. Per-tid stacks
+     * live in the same VA window as the heap arena; after privatize their PTEs
+     * point at distinct PAs (safe to mark). Raw identity heap leaves must stay
+     * supervisor-only or ring3 scribbles zero kmalloc headers (magic=0 flood).
+     */
+    uintptr_t hlo = heap_base_addr();
+    uintptr_t hhi = heap_region_end_exclusive();
+    if (hlo == 0 || hhi <= hlo || hlo >= end) {
+        (void)mark_user_identity_range_2m((uint64_t)begin, (uint64_t)end);
+        return;
+    }
+    if (begin < hlo)
+        (void)mark_user_identity_range_2m((uint64_t)begin, (uint64_t)hlo);
+    /* Skip [hlo, hhi): privatized stack/TLS pages are marked by exec stack setup. */
+    if (hhi < end)
+        (void)mark_user_identity_range_2m((uint64_t)hhi, (uint64_t)end);
 }
 
 void exec_ensure_user_mappings(void) {
+    /*
+     * Linux has no identity-map PG_US stamp. On a private mm from
+     * mm_alloc() the L4 is a shallow clone of swapper — L3/L2/L1
+     * are still shared. Walking ~2GiB here and doing `l3[i] |= PG_US` mutates
+     * the kernel page tables (and the frozen vfork parent's) and hangs boot
+     * at openrc-exec-enter. Only the legacy shared-CR3 path needs this.
+     */
+    thread_t *tc = thread_current();
+    if (!tc || tc->ring != 3)
+        tc = thread_get_current_user();
+    if (tc && elf_needs_private_user_pages(tc))
+        return;
     mark_broad_user_ranges_for_exec();
+}
+
+/* After replacing an ET_EXEC (busybox @ 0x400000) with a small PIE (openrc),
+ * leftover .text/.data from the previous image stays identity-mapped and
+ * executable. Scrub the tail so RIP cannot land in stale busybox or zeroed
+ * .bss (double-kill: #PF then #UD at 0x63e2c0).
+ *
+ * Do NOT scrub on busybox→busybox re-exec (/bin/mount, /bin/sh): keep_hi is
+ * already ~0x63f000 and zeroing 0x63f000..0x800000 via still-shared fork page
+ * tables wipes the parent's brk/heap. Init then dies right after wait4-reap
+ * of the first sysinit child. */
+static void exec_scrub_stale_image_tail(uint64_t keep_hi) {
+    /* Always cover the classic busybox ET_EXEC window. */
+    uint64_t scrub_lo = 0x400000ULL;
+    uint64_t scrub_end = 8ULL * 1024ULL * 1024ULL;
+    uintptr_t hb = heap_base_addr();
+    if (hb != 0 && (uint64_t)hb < scrub_end)
+        scrub_end = (uint64_t)hb;
+    /* Large ET_EXEC still occupies the busybox window — nothing stale to clear. */
+    if (keep_hi >= 0x600000ULL)
+        return;
+    /* Keep the newly loaded image; scrub only above it within the window. */
+    uint64_t begin = scrub_lo;
+    if (keep_hi > scrub_lo)
+        begin = (keep_hi + 0xFFFULL) & ~0xFFFULL;
+    if (begin >= scrub_end)
+        return;
+    thread_t *tc = thread_current();
+    if (!tc || tc->ring != 3)
+        tc = thread_get_current_user();
+    if (!tc || !elf_needs_private_user_pages(tc))
+        return;
+    mm_t *share = mm_kernel();
+    if (mm_make_private_range(tc->mm, begin, scrub_end, 0, share) != 0)
+        return;
+    (void)user_map_mprotect_range(begin, scrub_end, 3 /* PROT_READ|PROT_WRITE */);
+    {
+        static int scrub_log_left = 4;
+        if (scrub_log_left-- > 0)
+            kprintf("exec-scrub: cleared stale image 0x%llx..0x%llx\n",
+                    (unsigned long long)begin, (unsigned long long)scrub_end);
+    }
 }
 
 static void exec_reset_shared_user_space(thread_t *owner, uintptr_t brk_base) {
@@ -803,40 +1154,87 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
         }
 
         void *dst = (void*)(uintptr_t)(ph->p_vaddr + load_base);
-        /* Ensure identity user pages exist before copying (bootstrap 1GiB may be split). */
+        /*
+         * Privatize only this segment's pages (4K-aligned), not a 2MiB
+         * superpage window. Widening to 2MiB made a later PT_LOAD re-zero
+         * already-copied .text when has_private missed (zeros at entry →
+         * #PF CR2=0). Linux maps each PT_LOAD to its own VMA span.
+         */
         {
-            uint64_t map_lo = vstart & ~((uint64_t)PAGE_SIZE_2M - 1);
-            uint64_t map_hi = (vend + PAGE_SIZE_2M - 1) & ~((uint64_t)PAGE_SIZE_2M - 1);
-            for (uint64_t va = map_lo; va < map_hi; va += PAGE_SIZE_2M) {
-                if (map_page_2m(va, va, PG_PRESENT | PG_RW | PG_US) != 0) {
-                    kfree(phdrs);
-                    fs_file_free(f);
-                    return -1;
-                }
-            }
-        }
-        /* If current task has a private mm, make destination pages private before writing ELF. */
-        {
+            uint64_t map_lo = vstart & ~0xFFFULL;
+            uint64_t map_hi = (vend + 0xFFFULL) & ~0xFFFULL;
             thread_t *tc = thread_current();
-            if (elf_needs_private_user_pages(tc)) {
-                mm_t *share = tc->mm_ptemplate ? tc->mm_ptemplate : mm_kernel();
-                if (mm_make_private_range(tc->mm, vstart, vend, 0, share) != 0) {
+            if (!tc || tc->ring != 3)
+                tc = thread_get_current_user();
+            if (tc && elf_needs_private_user_pages(tc)) {
+                /* Linux load_elf: map into current->mm only; never walk oldmm PTs. */
+                mm_t *share = mm_kernel();
+                /* copy_old=0 + has_private skip: never wipe a prior PT_LOAD. */
+                if (mm_make_private_range(tc->mm, map_lo, map_hi, 0, share) != 0) {
                     kfree(phdrs);
                     fs_file_free(f);
                     return -1;
                 }
+                /* Do NOT mark_user_identity here: holes become pa==va and the
+                 * following elf_copy_into_mm smashes the vfork parent's image. */
+            } else {
+                uint64_t lo2 = map_lo & ~((uint64_t)PAGE_SIZE_2M - 1);
+                uint64_t hi2 = (map_hi + PAGE_SIZE_2M - 1) & ~((uint64_t)PAGE_SIZE_2M - 1);
+                for (uint64_t va = lo2; va < hi2; va += PAGE_SIZE_2M) {
+                    if (map_page_2m(va, va, PG_PRESENT | PG_RW | PG_US) != 0) {
+                        kfree(phdrs);
+                        fs_file_free(f);
+                        return -1;
+                    }
+                }
+                (void)mark_user_identity_range_2m(map_lo, map_hi);
             }
         }
         if (ph->p_filesz > 0) {
-            ssize_t rr = fs_read(f, dst, (size_t)ph->p_filesz, (size_t)ph->p_offset);
-            if (rr != (ssize_t)ph->p_filesz) {
-                kfree(phdrs);
-                fs_file_free(f);
-                return -1;
+            thread_t *tc = thread_current();
+            if (!tc || tc->ring != 3)
+                tc = thread_get_current_user();
+            if (tc && elf_needs_private_user_pages(tc) && tc->mm) {
+                void *kbuf = kmalloc((size_t)ph->p_filesz);
+                if (!kbuf) {
+                    kfree(phdrs);
+                    fs_file_free(f);
+                    return -1;
+                }
+                ssize_t rr = fs_read(f, kbuf, (size_t)ph->p_filesz, (size_t)ph->p_offset);
+                if (rr != (ssize_t)ph->p_filesz ||
+                    elf_copy_into_mm(tc->mm, (uint64_t)(uintptr_t)dst, kbuf,
+                                    (size_t)ph->p_filesz) != 0) {
+                    kfree(kbuf);
+                    kfree(phdrs);
+                    fs_file_free(f);
+                    return -1;
+                }
+                kfree(kbuf);
+            } else {
+                ssize_t rr = fs_read(f, dst, (size_t)ph->p_filesz, (size_t)ph->p_offset);
+                if (rr != (ssize_t)ph->p_filesz) {
+                    kfree(phdrs);
+                    fs_file_free(f);
+                    return -1;
+                }
             }
         }
         if (ph->p_memsz > ph->p_filesz) {
-            memset((char*)dst + ph->p_filesz, 0, (size_t)(ph->p_memsz - ph->p_filesz));
+            thread_t *tc = thread_current();
+            if (!tc || tc->ring != 3)
+                tc = thread_get_current_user();
+            size_t zlen = (size_t)(ph->p_memsz - ph->p_filesz);
+            uint64_t zva = (uint64_t)(uintptr_t)dst + (uint64_t)ph->p_filesz;
+            if (tc && elf_needs_private_user_pages(tc) && tc->mm) {
+                if (elf_zero_into_mm(tc->mm, zva, zlen) != 0) {
+                    kfree(phdrs);
+                    fs_file_free(f);
+                    return -1;
+                }
+            } else {
+                memset((char *)dst + ph->p_filesz, 0, zlen);
+            }
         }
         if (vstart < loaded_lo) loaded_lo = vstart;
         if (vend > loaded_hi) loaded_hi = vend;
@@ -1017,53 +1415,82 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
     {
         thread_t *tc = thread_current();
         if (elf_needs_private_user_pages(tc)) {
-            mm_t *share = tc->mm_ptemplate ? tc->mm_ptemplate : mm_kernel();
+            uintptr_t tip_lo = final_stack > 0x8000u ? (final_stack - 0x8000u) : final_stack;
+            if (exec_map_stack_tip(tc, tip_lo, stack_top) != 0)
+                return -1;
+        }
+    }
+
+    /* Same as main exec path: build in kernel, publish via leaf PAs. */
+    {
+        thread_t *tc = thread_current();
+        if (!tc || tc->ring != 3)
+            tc = thread_get_current_user();
+        mm_t *tip_mm = (tc && elf_needs_private_user_pages(tc)) ? tc->mm : NULL;
+        size_t tip_bytes = (size_t)(stack_top - final_stack);
+        void *tip_kimg = kmalloc(tip_bytes ? tip_bytes : 8u);
+        if (!tip_kimg)
+            return -1;
+        memset(tip_kimg, 0, tip_bytes);
+        {
+            uint8_t *base = (uint8_t *)tip_kimg;
+            uint64_t *sp64 = (uint64_t *)(base + (ptrs_addr - final_stack));
+            char *str_base = (char *)(base + (strings_addr - final_stack));
+            char *str_dst = str_base;
+            for (int i = 0; i < argc; i++) {
+                size_t l = strlen(argv[i]) + 1;
+                memcpy(str_dst, argv[i], l);
+                sp64[i] = (uint64_t)strings_addr + (uint64_t)(str_dst - str_base);
+                str_dst += l;
+            }
+            sp64[argc] = 0;
+            for (int i = 0; i < envc; i++) {
+                size_t l = strlen(envp[i]) + 1;
+                memcpy(str_dst, envp[i], l);
+                sp64[argc + 1 + i] = (uint64_t)strings_addr + (uint64_t)(str_dst - str_base);
+                str_dst += l;
+            }
+            sp64[argc + 1 + envc] = 0;
+            {
+                uint8_t *rp = base + (random_addr - final_stack);
+                for (size_t i = 0; i < 16; i++)
+                    rp[i] = (uint8_t)(0xA5u ^ (uint8_t)(i * 17u));
+            }
+            size_t ax = (size_t)argc + 2 + (size_t)envc;
+            sp64[ax + 0] = (uint64_t)AT_PHDR;   sp64[ax + 1] = aux_phdr;
+            sp64[ax + 2] = (uint64_t)AT_PHENT;  sp64[ax + 3] = aux_phent ? aux_phent : (uint64_t)sizeof(Elf64_Phdr);
+            sp64[ax + 4] = (uint64_t)AT_PHNUM;  sp64[ax + 5] = aux_phnum;
+            sp64[ax + 6] = (uint64_t)AT_BASE;   sp64[ax + 7] = aux_base;
+            sp64[ax + 8] = (uint64_t)AT_ENTRY;  sp64[ax + 9] = aux_entry;
+            sp64[ax +10] = (uint64_t)AT_PAGESZ; sp64[ax +11] = 4096ULL;
+            sp64[ax +12] = (uint64_t)AT_RANDOM; sp64[ax +13] = (uint64_t)random_addr;
+            sp64[ax +14] = (uint64_t)AT_CLKTCK; sp64[ax +15] = 100ULL;
+            sp64[ax +16] = (uint64_t)AT_NULL;   sp64[ax +17] = 0;
+            *(uint64_t *)base = (uint64_t)argc;
+        }
+        if (tip_mm) {
+            if (elf_copy_into_mm(tip_mm, (uint64_t)final_stack, tip_kimg, tip_bytes) != 0) {
+                kfree(tip_kimg);
+                return -1;
+            }
+        } else if (tc && tc->ring == 3) {
+            kfree(tip_kimg);
+            return -1;
+        } else {
+            memcpy((void *)(uintptr_t)final_stack, tip_kimg, tip_bytes);
             uintptr_t stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
-            if (mm_make_private_range(tc->mm, (uint64_t)stack_base, (uint64_t)stack_top, 0, share) != 0) {
+            uintptr_t tls_base = user_tls_base_for_stack_top(stack_top);
+            if (tls_base < stack_base)
+                stack_base = tls_base & ~0xFFFULL;
+            uintptr_t mark_end = stack_top + (uintptr_t)PAGE_SIZE_2M;
+            if (mark_end > (uintptr_t)MMIO_IDENTITY_LIMIT)
+                mark_end = (uintptr_t)MMIO_IDENTITY_LIMIT;
+            if (mark_user_identity_range_2m((uint64_t)stack_base, (uint64_t)mark_end) != 0) {
+                kfree(tip_kimg);
                 return -1;
             }
         }
-    }
-
-    char *str_dst = (char*)(uintptr_t)strings_addr;
-    uint64_t *sp64 = (uint64_t*)(uintptr_t)ptrs_addr;
-    for (int i = 0; i < argc; i++) {
-        size_t l = strlen(argv[i]) + 1;
-        memcpy(str_dst, argv[i], l);
-        sp64[i] = (uint64_t)(uintptr_t)str_dst;
-        str_dst += l;
-    }
-    sp64[argc] = 0;
-    for (int i = 0; i < envc; i++) {
-        size_t l = strlen(envp[i]) + 1;
-        memcpy(str_dst, envp[i], l);
-        sp64[argc + 1 + i] = (uint64_t)(uintptr_t)str_dst;
-        str_dst += l;
-    }
-    sp64[argc + 1 + envc] = 0;
-
-    {
-        uint8_t *rp = (uint8_t*)(uintptr_t)random_addr;
-        for (size_t i = 0; i < 16; i++) rp[i] = (uint8_t)(0xA5u ^ (uint8_t)(i * 17u));
-    }
-
-    size_t ax = (size_t)argc + 2 + (size_t)envc;
-    sp64[ax + 0] = (uint64_t)AT_PHDR;   sp64[ax + 1] = aux_phdr;
-    sp64[ax + 2] = (uint64_t)AT_PHENT;  sp64[ax + 3] = aux_phent ? aux_phent : (uint64_t)sizeof(Elf64_Phdr);
-    sp64[ax + 4] = (uint64_t)AT_PHNUM;  sp64[ax + 5] = aux_phnum;
-    sp64[ax + 6] = (uint64_t)AT_BASE;   sp64[ax + 7] = aux_base;
-    sp64[ax + 8] = (uint64_t)AT_ENTRY;  sp64[ax + 9] = aux_entry;
-    sp64[ax +10] = (uint64_t)AT_PAGESZ; sp64[ax +11] = 4096ULL;
-    sp64[ax +12] = (uint64_t)AT_RANDOM; sp64[ax +13] = (uint64_t)random_addr;
-    sp64[ax +14] = (uint64_t)AT_CLKTCK; sp64[ax +15] = 100ULL;
-    sp64[ax +16] = (uint64_t)AT_NULL;   sp64[ax +17] = 0;
-    *((uint64_t*)(uintptr_t)final_stack) = (uint64_t)argc;
-
-    {
-        uintptr_t stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
-        if (mark_user_identity_range_2m((uint64_t)stack_base, (uint64_t)stack_top) != 0) {
-            return -1;
-        }
+        kfree(tip_kimg);
     }
 
     enum { MSR_FS_BASE_LOCAL = 0xC0000100u };
@@ -1133,15 +1560,137 @@ static int try_exec_shebang(const char *resolved_path,
                       has_arg ? " arg='" : "",
                       has_arg ? arg : "",
                       has_arg ? "'" : "");
+    /* shebang: run interpreter with script path as argv0 */
 
-    int rc = kernel_execve_from_path(k_interp, nargv, envp);
+    int rc = kernel_execve_into_mm(k_interp, nargv, envp);
     kfree((void*)nargv);
     kfree(k_interp);
     if (k_arg) kfree(k_arg);
     return rc;
 }
 
-int kernel_execve_from_path(const char *path, const char *const argv[], const char *const envp[]) {
+int kernel_execve_from_path(const char *path, const char *const argv[],
+                            const char *const envp[]) {
+    thread_t *cur = thread_current();
+    if (!cur || cur->ring != 3)
+        cur = thread_get_current_user();
+    if (!cur)
+        return kernel_execve_into_mm(path, argv, envp);
+
+    /* Drop Soft_COW fork marker before touching a new mm (vfork child). */
+    cur->fork_child_user_rip = 0;
+
+    mm_t *old_mm = cur->mm;
+    mm_t *old_template = cur->mm_ptemplate;
+
+    /*
+     * Linux (torvalds fs/exec.c) order of interest:
+     *   copy_strings into bprm->mm pages   // tip exists before wake
+     *   exec_mmap: complete_vfork_done + activate_mm
+     *   load_elf / setup_arg_pages on new mm
+     *
+     * AxonOS adaptation (identity map): activate BEFORE tip/ELF so stores
+     * never run under oldmm CR3, but keep the vfork parent frozen until tip
+     * publish finishes — waking early raced with tip L1 installs and left
+     * ash RA==0x801738 ("ls"). Wake + mmput(old) at end of into_mm.
+     */
+    int exec_dbg = cur->name[0] &&
+                   (strstr(cur->name, "linuxrc") || (path && strstr(path, "mount")));
+    if (exec_dbg)
+        kprintf("exec-mm: tid=%llu path=%s mm_alloc\n",
+            (unsigned long long)(cur->tid ? cur->tid : 1),
+            path ? path : "?");
+
+    mm_t *new_mm = mm_alloc();
+    if (!new_mm) {
+        if (exec_dbg)
+            kprintf("exec-mm: tid=%llu mm_alloc FAILED\n",
+                (unsigned long long)(cur->tid ? cur->tid : 1));
+        return -3;
+    }
+
+    if (old_template) {
+        mm_release(old_template);
+        old_template = NULL;
+    }
+    cur->exec_discard_template = NULL;
+    /* Keep oldmm until tip/ELF done (share baseline + freeze-check + late wake). */
+    cur->exec_discard_mm = (old_mm && old_mm != mm_kernel() && old_mm != new_mm)
+                               ? old_mm : NULL;
+    if (old_mm && old_mm != new_mm && old_mm->pml4)
+        cur->mm_ptemplate = mm_retain(old_mm);
+    else
+        cur->mm_ptemplate = NULL;
+
+    /*
+     * Keep process->mm pointing at old_mm until commit.  current->mm is the
+     * private bprm construction context used by the loader, but no other
+     * thread/process lookup may observe a half-built image.
+     */
+    cur->mm = new_mm;
+
+    /* activate_mm(new) — parent still vfork_waiting until into_mm finishes. */
+    mm_switch(new_mm);
+    if (exec_dbg)
+        kprintf("exec-mm: tid=%llu activated cr3=0x%llx (tip under new mm, parent frozen)\n",
+            (unsigned long long)(cur->tid ? cur->tid : 1),
+            (unsigned long long)(new_mm->cr3 ? new_mm->cr3 : 0));
+
+    int rc = kernel_execve_into_mm(path, argv, envp);
+    if (rc != 0) {
+        if (cur->mm_ptemplate) {
+            mm_release(cur->mm_ptemplate);
+            cur->mm_ptemplate = NULL;
+        }
+        if (cur->exec_discard_mm) {
+            mm_t *dead = new_mm;
+            cur->mm = cur->exec_discard_mm;
+            cur->exec_discard_mm = NULL;
+            mm_switch(cur->mm);
+            mm_release(dead);
+        } else {
+            mm_release(new_mm);
+        }
+        kprintf("execve: failed after activate rc=%d path=%s\n",
+                rc, path ? path : "?");
+        return rc;
+    }
+
+    /* Unreachable on success (enter_user_mode). */
+    process_sync_from_thread(cur->process, cur);
+    return 0;
+}
+
+int kernel_execve_init_from_path(const char *path, const char *const argv[],
+                                 const char *const envp[]) {
+    if (thread_get_current_user() != NULL)
+        return -1;
+    thread_t *caller = thread_current();
+    if (!caller)
+        return -1;
+
+    /*
+     * Prepare PID1 exactly like a bprm mm.  Loading into swapper and cloning
+     * afterwards leaves identity user leaves outside frame ownership; a later
+     * kmalloc can then reuse the live init stack physical page.
+     */
+    mm_t *old_mm = caller->mm;
+    mm_t *new_mm = mm_alloc();
+    if (!new_mm)
+        return -3;
+    caller->mm = new_mm;
+    mm_switch(new_mm);
+
+    int rc = kernel_execve_into_mm(path, argv, envp);
+
+    caller->mm = old_mm;
+    mm_switch(old_mm ? old_mm : mm_kernel());
+    mm_release(new_mm);
+    return rc;
+}
+
+static int kernel_execve_into_mm(const char *path, const char *const argv[],
+                                 const char *const envp[]) {
     if (!path) return -1;
     /* IMPORTANT:
        Symlinks are resolved by VFS (`fs_open()` does it via `fs_resolve_symlinks()`).
@@ -1155,6 +1704,14 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     memset(&interp_info, 0, sizeof(interp_info));
     memset(&main_tls, 0, sizeof(main_tls));
     exec_reset_shared_user_space(thread_get_current_user(), 8u * 1024u * 1024u);
+    {
+        thread_t *tr = thread_get_current_user();
+        if (tr && tr->name[0] &&
+            (strstr(tr->name, "linuxrc") || (path && strstr(path, "mount"))))
+            kprintf("exec-load: tid=%llu path=%s\n",
+                (unsigned long long)(tr->tid ? tr->tid : 1),
+                curpath ? curpath : "?");
+    }
     int r = elf_load_from_path_info(curpath, 0, &main_info, &main_tls);
     if (r == -2) {
         /* unsupported ELF format */
@@ -1164,6 +1721,17 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         /* Not an ELF. Try shebang scripts (e.g. /linuxrc). */
         return try_exec_shebang(curpath, path, argv, envp);
     }
+    {
+        thread_t *tr = thread_get_current_user();
+        if (tr && tr->name[0] &&
+            (strstr(tr->name, "linuxrc") || (path && strstr(path, "mount"))))
+            kprintf("exec-load: tid=%llu ok entry=0x%llx hi=0x%llx\n",
+                (unsigned long long)(tr->tid ? tr->tid : 1),
+                (unsigned long long)main_info.entry,
+                (unsigned long long)main_info.loaded_hi);
+    }
+    if (strstr(curpath, "openrc"))
+        debug_serial_marker("AXON_BOOT_OPENRC_EXEC");
     /* NOTE:
        We currently execute user programs in the *same* address space (same CR3),
        relying on identity mapping and marking PT_LOAD pages as user-accessible in elf_load_from_memory().
@@ -1202,6 +1770,35 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
                           (unsigned long long)entry,
                           (unsigned long long)aux_base,
                           (unsigned long long)aux_entry);
+    }
+
+    /* Drop leftover bytes from the previous ET_EXEC (busybox @ 0x400000)
+     * beyond the MAIN image only — do not use interp loaded_hi (ld.so lives
+     * near 0x2000000 and would skip the scrub). */
+    exec_scrub_stale_image_tail(main_info.loaded_hi);
+
+    /* Sanity: after replacing busybox with openrc PIE, PLT @+0x30d0 must be
+     * ff25 — not busybox AVX (c57e) or zeros (0000 → add [rax],al → #PF CR2=0). */
+    if (path && strstr(path, "openrc") &&
+        main_info.load_base == 0x400000ULL && main_info.loaded_hi > 0x4030d0ULL) {
+        const uint8_t *p = (const uint8_t *)(uintptr_t)0x4030d0ULL;
+        uint64_t got = *(const uint64_t *)(uintptr_t)0x40c050ULL;
+        kprintf("exec-image: @0x4030d0 %02x %02x %02x %02x got@0x40c050=0x%llx (want ff25)\n",
+                (unsigned)p[0], (unsigned)p[1], (unsigned)p[2], (unsigned)p[3],
+                (unsigned long long)got);
+        if (p[0] != 0xffu || p[1] != 0x25u) {
+            kprintf("exec-image: BAD image at PLT (not openrc) — abort exec\n");
+            return -1;
+        }
+    }
+    /* PG_US for the loaded image comes from make_private / mark_user_range_exec.
+     * Remapping 0x400000..0x800000 as identity would alias the vfork parent. */
+    {
+        thread_t *tc = thread_current();
+        if (!tc || tc->ring != 3)
+            tc = thread_get_current_user();
+        if (!tc || !elf_needs_private_user_pages(tc))
+            (void)mark_user_identity_range_2m(0x400000ULL, 0x800000ULL);
     }
 
     /* Determine which tid we are preparing the stack/TLS for.
@@ -1292,62 +1889,97 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     {
         thread_t *tc = thread_current();
         if (elf_needs_private_user_pages(tc)) {
-            mm_t *share = tc->mm_ptemplate ? tc->mm_ptemplate : mm_kernel();
-            uintptr_t stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
-            if (mm_make_private_range(tc->mm, (uint64_t)stack_base, (uint64_t)stack_top, 0, share) != 0) {
-                kprintf("execve: failed to private-map user stack\n");
+            uintptr_t tip_lo = final_stack > 0x8000u ? (final_stack - 0x8000u) : final_stack;
+            if (exec_map_stack_tip(tc, tip_lo, stack_top) != 0) {
+                kprintf("execve: failed to map stack tip (linux demand-stack)\n");
                 return -1;
             }
         }
     }
 
-    /* copy strings into their place */
-    char *str_dst = (char*)(uintptr_t)strings_addr;
-    uint64_t *sp64 = (uint64_t*)(uintptr_t)ptrs_addr;
-    for (int i = 0; i < argc; i++) {
-        size_t l = strlen(argv[i]) + 1;
-        memcpy(str_dst, argv[i], l);
-        sp64[i] = (uint64_t)(uintptr_t)str_dst; /* argv[i] pointer */
-        str_dst += l;
+    /* Build argv/env/auxv in a kernel buffer; publish once via leaf PAs. */
+    thread_t *tip_tc = thread_current();
+    if (!tip_tc || tip_tc->ring != 3)
+        tip_tc = thread_get_current_user();
+    mm_t *tip_mm = (tip_tc && elf_needs_private_user_pages(tip_tc)) ? tip_tc->mm : NULL;
+    size_t tip_bytes = (size_t)(stack_top - final_stack);
+    void *tip_kimg = kmalloc(tip_bytes ? tip_bytes : 8u);
+    if (!tip_kimg) {
+        kprintf("execve: OOM stack image\n");
+        return -1;
     }
-    sp64[argc] = 0;     /* argv NULL */
-    for (int i = 0; i < envc; i++) {
-        size_t l = strlen(envp[i]) + 1;
-        memcpy(str_dst, envp[i], l);
-        sp64[argc + 1 + i] = (uint64_t)(uintptr_t)str_dst;
-        str_dst += l;
-    }
-    sp64[argc + 1 + envc] = 0; /* envp NULL */
-
-    /* AT_RANDOM: 16 bytes. Not cryptographically secure; enough for libc bootstrap. */
+    memset(tip_kimg, 0, tip_bytes);
     {
-        uint8_t *rp = (uint8_t*)(uintptr_t)random_addr;
-        for (size_t i = 0; i < 16; i++) rp[i] = (uint8_t)(0xA5u ^ (uint8_t)(i * 17u));
+        uint8_t *base = (uint8_t *)tip_kimg;
+        uint64_t *sp64 = (uint64_t *)(base + (ptrs_addr - final_stack));
+        char *str_base = (char *)(base + (strings_addr - final_stack));
+        char *str_dst = str_base;
+        for (int i = 0; i < argc; i++) {
+            size_t l = strlen(argv[i]) + 1;
+            memcpy(str_dst, argv[i], l);
+            sp64[i] = (uint64_t)strings_addr + (uint64_t)(str_dst - str_base);
+            str_dst += l;
+        }
+        sp64[argc] = 0;
+        for (int i = 0; i < envc; i++) {
+            size_t l = strlen(envp[i]) + 1;
+            memcpy(str_dst, envp[i], l);
+            sp64[argc + 1 + i] = (uint64_t)strings_addr + (uint64_t)(str_dst - str_base);
+            str_dst += l;
+        }
+        sp64[argc + 1 + envc] = 0;
+        {
+            uint8_t *rp = base + (random_addr - final_stack);
+            for (size_t i = 0; i < 16; i++)
+                rp[i] = (uint8_t)(0xA5u ^ (uint8_t)(i * 17u));
+        }
+        size_t ax = (size_t)argc + 2 + (size_t)envc;
+        sp64[ax + 0] = (uint64_t)AT_PHDR;   sp64[ax + 1] = aux_phdr;
+        sp64[ax + 2] = (uint64_t)AT_PHENT;  sp64[ax + 3] = aux_phent ? aux_phent : (uint64_t)sizeof(Elf64_Phdr);
+        sp64[ax + 4] = (uint64_t)AT_PHNUM;  sp64[ax + 5] = aux_phnum;
+        sp64[ax + 6] = (uint64_t)AT_BASE;   sp64[ax + 7] = aux_base;
+        sp64[ax + 8] = (uint64_t)AT_ENTRY;  sp64[ax + 9] = aux_entry;
+        sp64[ax +10] = (uint64_t)AT_PAGESZ; sp64[ax +11] = 4096ULL;
+        sp64[ax +12] = (uint64_t)AT_RANDOM; sp64[ax +13] = (uint64_t)random_addr;
+        sp64[ax +14] = (uint64_t)AT_CLKTCK; sp64[ax +15] = 100ULL;
+        sp64[ax +16] = (uint64_t)AT_NULL;   sp64[ax +17] = 0;
+        *(uint64_t *)base = (uint64_t)argc;
     }
-
-    /* auxv pairs start right after envp NULL */
-    size_t ax = (size_t)argc + 2 + (size_t)envc;
-    sp64[ax + 0] = (uint64_t)AT_PHDR;   sp64[ax + 1] = aux_phdr;
-    sp64[ax + 2] = (uint64_t)AT_PHENT;  sp64[ax + 3] = aux_phent ? aux_phent : (uint64_t)sizeof(Elf64_Phdr);
-    sp64[ax + 4] = (uint64_t)AT_PHNUM;  sp64[ax + 5] = aux_phnum;
-    sp64[ax + 6] = (uint64_t)AT_BASE;   sp64[ax + 7] = aux_base;
-    sp64[ax + 8] = (uint64_t)AT_ENTRY;  sp64[ax + 9] = aux_entry;
-    sp64[ax +10] = (uint64_t)AT_PAGESZ; sp64[ax +11] = 4096ULL;
-    sp64[ax +12] = (uint64_t)AT_RANDOM; sp64[ax +13] = (uint64_t)random_addr;
-    sp64[ax +14] = (uint64_t)AT_CLKTCK; sp64[ax +15] = 100ULL;
-    sp64[ax +16] = (uint64_t)AT_NULL;   sp64[ax +17] = 0;
-
-    /* write argc at final_stack (RSP will point here) */
-    *((uint64_t*)(uintptr_t)final_stack) = (uint64_t)argc;
-
-    /* Ensure the entire user stack mapping is user-accessible (PG_US).
-       Without this, the first user push/read will trigger #PF err=0x5. */
-    {
-        uintptr_t stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
-        uintptr_t stack_end = stack_top;
-        if (mark_user_identity_range_2m((uint64_t)stack_base, (uint64_t)stack_end) != 0) {
-            kprintf("Failed to mark user stack range user-accessible\n");
+    if (tip_mm) {
+        if (elf_copy_into_mm(tip_mm, (uint64_t)final_stack, tip_kimg, tip_bytes) != 0) {
+            kfree(tip_kimg);
+            kprintf("execve: stack tip publish failed\n");
             return -1;
+        }
+    } else if (tip_tc && tip_tc->ring == 3) {
+        /* Never VA-store tip under a live user/oldmm CR3 (vfork parent smash). */
+        kfree(tip_kimg);
+        kprintf("execve: refuse identity tip publish (ring3 without private mm)\n");
+        return -1;
+    } else {
+        /* Kernel-launched path only (no user mm). */
+        memcpy((void *)(uintptr_t)final_stack, tip_kimg, tip_bytes);
+    }
+    kfree(tip_kimg);
+
+    /*
+     * Legacy shared-CR3 only. Private mm (including vfork-exec load under oldmm):
+     * tip/TLS already PG_US from bulk_zero — mark_user_identity would mutate
+     * the frozen parent's live CR3.
+     */
+    {
+        thread_t *tc = tip_tc;
+        if (tc && !elf_needs_private_user_pages(tc)) {
+            uintptr_t stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
+            uintptr_t tls_base = user_tls_base_for_stack_top(stack_top);
+            uintptr_t mark_end = stack_top + (uintptr_t)PAGE_SIZE_2M;
+            if (tls_base < stack_base)
+                stack_base = tls_base & ~0xFFFULL;
+            if (mark_end > (uintptr_t)MMIO_IDENTITY_LIMIT)
+                mark_end = (uintptr_t)MMIO_IDENTITY_LIMIT;
+            if (mark_user_identity_range_2m((uint64_t)stack_base, (uint64_t)mark_end) != 0)
+                kprintf("execve: warn mark stack/TLS 0x%llx..0x%llx (continuing)\n",
+                    (unsigned long long)stack_base, (unsigned long long)mark_end);
         }
     }
 
@@ -1384,11 +2016,30 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         cur_user->user_stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
         cur_user->user_stack_limit = stack_top;
         cur_user->user_fs_base = (uint64_t)fs_base;
+        thread_proc_env_set(cur_user, envp);
         /* update display name */
         strncpy(cur_user->name, path, sizeof(cur_user->name) - 1);
         cur_user->name[sizeof(cur_user->name) - 1] = '\0';
-        /* New program runs in its own process group so Ctrl+C (SIGINT) only kills it, not the shell */
-        cur_user->pgid = (int)(cur_user->tid ? cur_user->tid : 1);
+        /* Fresh program image: drop fork-child tracing so libc set_robust_list
+         * in the new binary is not treated as glibc _Fork epilogue. */
+        cur_user->fork_child_user_rip = 0;
+        cur_user->fork_child_trap_rip = 0;
+        cur_user->fork_locked_syscall_rip = 0;
+        /* Keep inherited sid/pgid across exec so getty is not already a
+         * process group leader before its setsid() (pgid == pid → EPERM). */
+        if (cur_user->process) {
+            if (cur_user->sid <= 0)
+                cur_user->sid = cur_user->process->sid;
+            if (cur_user->pgid <= 0)
+                cur_user->pgid = cur_user->process->pgid;
+            process_sync_from_thread(cur_user->process, cur_user);
+        }
+        /*
+         * After setsid(), BusyBox init with empty console id leaves /dev/null
+         * on stdio. Re-bind console before entering ash or the shell exits on
+         * EOF and ::respawn spins.
+         */
+        exec_boot_ensure_stdio(cur_user);
         /* Set foreground so Ctrl+C terminates this process when waiting */
         if (cur_user->attached_tty >= 0) {
             devfs_set_tty_fg_pgrp(cur_user->attached_tty, cur_user->pgid);
@@ -1408,6 +2059,26 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         extern void user_thread_entry(void);
         thread_t *ut = thread_create_blocked(user_thread_entry, path ? path : "user");
         if (!ut) return -1;
+        /*
+         * kernel_execve_init_from_path prepared the image in a nascent mm.
+         * Share that mm object with the new task; do not clone page tables
+         * after loading, because that loses leaf ownership accounting.
+         */
+        {
+            mm_t *kmm = mm_kernel();
+            mm_t *user_mm = (caller && caller->mm && caller->mm != kmm)
+                                ? mm_retain(caller->mm)
+                                : NULL;
+            if (!user_mm) {
+                int failed_tid = (int)(ut->tid ? ut->tid : 1);
+                ut->state = THREAD_TERMINATED;
+                (void)thread_reap(failed_tid);
+                return -3;
+            }
+            if (ut->mm)
+                mm_release(ut->mm);
+            ut->mm = user_mm;
+        }
         user_as_reset_on_exec(ut, loaded_brk_end ? loaded_brk_end : (8u * 1024u * 1024u));
         {
             uint64_t actual_tid = (uint64_t)(ut->tid ? ut->tid : 1);
@@ -1428,7 +2099,9 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
                                             aux_phdr, aux_phent, aux_phnum, aux_entry, aux_base,
                                             &main_tls,
                                             &final_stack, &stack_top, &fs_base) != 0) {
+                int failed_tid = (int)(ut->tid ? ut->tid : 1);
                 ut->state = THREAD_TERMINATED;
+                (void)thread_reap(failed_tid);
                 return -3; /* transient exec setup race; caller may retry */
             }
         }
@@ -1444,7 +2117,8 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         }
         /* Mark PID 1 only for kernel-launched init candidates */
         if (strcmp(path, "/linuxrc") == 0 || strcmp(path, "/init") == 0 ||
-            strcmp(path, "/sbin/init") == 0) {
+            strcmp(path, "/sbin/init") == 0 ||
+            strcmp(path, "/sbin/openrc-init") == 0) {
             thread_mark_init_user(ut);
         }
         /* inherit basic POSIX-ish attributes and stdio from caller (usually tid0 osh) */
@@ -1470,7 +2144,9 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
             ut->waiter_tid = (int)caller->tid;
             caller->state = THREAD_BLOCKED;
         }
-        /* New program in its own process group so Ctrl+C only kills it */
+        thread_proc_env_set(ut, envp);
+        /* A kernel-launched program is a session and process-group leader. */
+        ut->sid = (int)(ut->tid ? ut->tid : 1);
         ut->pgid = (int)(ut->tid ? ut->tid : 1);
         if (ut->attached_tty >= 0) {
             devfs_set_tty_fg_pgrp(ut->attached_tty, ut->pgid);
@@ -1517,41 +2193,11 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     /* wrap read in a benign check */
     first = entry_b[0];
 
-    /* If this thread was created via vfork, we normally wake parent on exec.
-       However, in a shared address space we keep the parent blocked when a full
-       memory snapshot is active, and only restore/unblock on child exit. */
     {
         thread_t *tc = thread_current();
-        if (tc && tc->vfork_parent_tid >= 0) {
-            qemu_debug_printf("execve: child %llu has vfork_parent_tid=%d mem_backup=%p\n",
-                (unsigned long long)(tc->tid ? tc->tid : 1),
-                tc->vfork_parent_tid, tc->vfork_parent_mem_backup);
-            if (!tc->vfork_parent_mem_backup) {
-                qemu_debug_printf("execve: waking vfork parent %d (no mem backup)\n", tc->vfork_parent_tid);
-                thread_unblock(tc->vfork_parent_tid);
-                tc->vfork_parent_tid = -1;
-            } else {
-                /* Parent stays blocked until we exit. Close only parent's pipe WRITE end -
-                   that releases EOF for us (read end). Must not close read end: we hold it
-                   (fd 0). Closing read end would free pipe while we use it. */
-                thread_t *parent = thread_get(tc->vfork_parent_tid);
-                if (parent) {
-                    for (int i = 0; i < THREAD_MAX_FD; i++) {
-                        struct fs_file *f = parent->fds[i];
-                        if (f && f->type == FS_TYPE_PIPE && f->fs_private == (void *)1) {
-                            parent->fds[i] = NULL;
-                            fs_file_free(f);
-                            break; /* one write end per pipe */
-                        }
-                    }
-                }
-                thread_yield(); /* let pipe reader (us) run and see EOF before we continue */
-                qemu_debug_printf("execve: NOT waking vfork parent %d (mem backup active, will wake on exit)\n",
-                    tc->vfork_parent_tid);
-            }
-        } else {
-            qemu_debug_printf("execve: child %llu has no vfork_parent_tid\n",
-                (unsigned long long)(tc ? (tc->tid ? tc->tid : 1) : 0));
+        if (tc) {
+            process_sync_from_thread(tc->process, tc);
+            process_exec_reset(tc->process, tc);
         }
     }
 
@@ -1574,9 +2220,33 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     /* Transfer to user mode (does not return on success). */
     {
         thread_t *tc = thread_current();
-        if (tc && tc->mm_ptemplate) {
-            mm_release(tc->mm_ptemplate);
-            tc->mm_ptemplate = NULL;
+        if (!tc)
+            tc = thread_get_current_user();
+        if (tc) {
+            if (tc->exec_discard_template) {
+                mm_release(tc->exec_discard_template);
+                tc->exec_discard_template = NULL;
+            }
+            if (tc->mm_ptemplate) {
+                mm_release(tc->mm_ptemplate);
+                tc->mm_ptemplate = NULL;
+            }
+            /*
+             * Finish exec_mmap: tip/ELF are installed on the active new mm.
+             * Now complete_vfork_done + mmput(old). Parent was kept frozen
+             * through tip publish (unlike waking at activate time).
+             */
+            if (tc->mm)
+                mm_switch(tc->mm);
+            if (tc->exec_discard_mm) {
+                mm_t *dead = tc->exec_discard_mm;
+                tc->exec_discard_mm = NULL;
+                mm_dbg_ash_watch("exec-mmap-before-mmput-old", dead);
+                mm_release(dead);
+            }
+            process_release_vfork_parent(tc->process, PROCESS_VFORK_EXEC_COMMIT);
+            if (tc->user_fs_base)
+                set_user_fs_base(tc->user_fs_base);
         }
     }
     enter_user_mode(entry, final_stack);

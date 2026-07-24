@@ -11,7 +11,8 @@ context_switch_with_prev:
         movq %rsp, 0x80(%rdi)
         pushfq
         popq %rax
-        orq $0x200, %rax
+        /* Scheduler entered with IRQs disabled.  Preserve IF=0 until the
+           resumed thread_schedule() finishes its restore_irqflags() tail. */
         movq %rax, 0x88(%rdi)
         pushq %rsi
         movq %rdx, %rdi

@@ -17,15 +17,19 @@
 #include <syscall.h>
 #include <paging.h>
 #include <mm.h>
+#include <frame.h>
 #include <user_map.h>
 #include <exec.h>
+#include <vsyscall.h>
 #include <keyboard.h>
 #include <serial.h>
+#include <string.h>
 // Avoid including <cstdint> because cross-toolchain headers may not provide it; use uint64_t instead
 
 // Forward declare C-linkage helpers from other compilation units
 uint64_t dbg_saved_rbx_in;
 uint64_t dbg_saved_rbx_out;
+extern int syscall_pipe_watch_active;
 
 // локальные таблицы обработчиков (неиспользуемые предупреждения устраним использованием ниже)
 static void (*irq_handlers[16])() = {NULL};
@@ -178,7 +182,9 @@ static void ud_fault_handler(cpu_registers_t* regs) {
                         klogprintf("user code dump skipped (out of identity range)\n");
                     }
                 }
-                for(;;){ asm volatile("sti; hlt" ::: "memory"); }
+                /* SIGILL — do not hang the CPU (was sti;hlt forever). */
+                syscall_user_fatal_exit(4);
+                return;
         }
         // Иначе — ядро: печатаем и стоп
         dump("invalid opcode", "kernel", regs, 0, 0, false);
@@ -217,11 +223,31 @@ static void ud_fault_handler(cpu_registers_t* regs) {
         for (;;) {
             kprint("Reboot? [Y/N]: ");
             choice = kgetc();
-            if (choice == 'Y' | choice == 'y') reboot_system();
+            if (choice == 'Y' | choice == 'y') reboot_system(); 
             if (choice == 'N' | choice == 'n') break;
-        }
+        }        
         kprint("Halt.");
         for(;;){ asm volatile("sti; hlt":::"memory"); }
+}
+
+static void debug_fault_handler(cpu_registers_t *regs) {
+        /* Temporary single-step probe for the glibc _Fork child return path. */
+        regs->rflags &= ~0x100ULL;
+        if ((regs->cs & 3) == 3 && syscall_pipe_watch_active) {
+                static int steps_left = 12;
+                if (steps_left > 0) {
+                        steps_left--;
+                        devel_printf("user-step: rip=0x%llx rsp=0x%llx rax=0x%llx "
+                                "rdx=0x%llx rflags=0x%llx\n",
+                                (unsigned long long)regs->rip,
+                                (unsigned long long)regs->rsp,
+                                (unsigned long long)regs->rax,
+                                (unsigned long long)regs->rdx,
+                                (unsigned long long)regs->rflags);
+                        if (steps_left > 0)
+                                regs->rflags |= 0x100ULL;
+                }
+        }
 }
 
 // Handle Divide-by-zero (INT 0). For user faults: kill process and return to idle;
@@ -250,16 +276,75 @@ static int fault_try_user_stack_page(uint64_t cr2, uint64_t err) {
                 return 0;
         if (t->user_stack_base == 0 || t->user_stack_limit <= t->user_stack_base)
                 return 0;
-        if (a < (uintptr_t)t->user_stack_base || a >= (uintptr_t)t->user_stack_limit)
+        /* Include TLS slot immediately below the stack. */
+        uintptr_t lo = (uintptr_t)t->user_stack_base;
+        if (lo > (uintptr_t)USER_TLS_SIZE)
+                lo -= (uintptr_t)USER_TLS_SIZE;
+        /* Allow a wide overrun past stack_limit for AVX/SIMD copies. */
+        uintptr_t hi = (uintptr_t)t->user_stack_limit + (64ULL * (uintptr_t)PAGE_SIZE_2M);
+        if (hi > (uintptr_t)MMIO_IDENTITY_LIMIT)
+                hi = (uintptr_t)MMIO_IDENTITY_LIMIT;
+        if (a < lo || a >= hi)
                 return 0;
-        uintptr_t page = a & ~((uintptr_t)PAGE_SIZE_2M - 1);
-        if (err & 1u) {
-                if (user_map_mark_identity_2m((uint64_t)page, (uint64_t)(page + PAGE_SIZE_2M)) != 0)
-                        return 0;
-        } else {
-                if (map_page_2m((uint64_t)page, (uint64_t)page, PG_PRESENT | PG_RW | PG_US) != 0)
-                        return 0;
+        /* Present write-protect: fork Soft_COW — not stack growth. */
+        if ((err & 1u) && (err & 2u))
+                return 0;
+        if (!t->mm)
+                return 0;
+        /*
+         * Linux MAP_GROWSDOWN / demand-zero: install a private zero page.
+         * Never identity-map into the kernel heap arena.
+         */
+        uint64_t page = (uint64_t)a & ~0xFFFULL;
+        mm_t *share = t->mm_ptemplate ? t->mm_ptemplate : mm_kernel();
+        if (mm_make_private_range_noyield(t->mm, page, page + 0x1000ULL, 0, share) != 0)
+                return 0;
+        return 1;
+}
+
+/* Identity-map pages often start supervisor-only. User touch of present U=0
+ * in the low identity window is fixed by setting PG_US.
+ * Ceiling is well past USER_STACK_TOP: AVX copies have hit TOP, TOP+2MiB
+ * (0x40200000), and will keep walking upward. */
+static int fault_try_user_identity_us(uint64_t cr2, uint64_t err) {
+        if ((err & 1u) == 0)
+                return 0; /* not present — different path */
+        if (err & 0x10u)
+                return 0; /* instruction fetch — do not widen NX/identity blindly */
+        uintptr_t a = (uintptr_t)cr2;
+        /* Soft-fix U=0 for any user data access in the low identity window.
+         * Previous fixed ceilings (TOP, TOP+2MiB, TOP+128MiB) were exactly hit
+         * by AVX overruns (CR2=0x40000000/0x40200000/0x48000000). */
+        if (a < 0x200000u || a >= 0x80000000ULL)
+                return 0;
+        if (a >= (uintptr_t)MMIO_IDENTITY_LIMIT)
+                return 0;
+        /* Present + user-mode access (err bit2). Ignore pure write-protect COW. */
+        if ((err & 4u) == 0)
+                return 0;
+        if (err & 2u)
+                return 0; /* write to present: may be COW */
+        /*
+         * Private mm: stamping PG_US on a live identity leaf keeps sharing phys
+         * with the vfork parent. Copy-privatize the fault page first (preserve
+         * content — never blank; that is do_brk_flags only).
+         */
+        {
+                thread_t *t = thread_current();
+                if (!t || t->ring != 3)
+                        t = thread_get_current_user();
+                mm_t *k = mm_kernel();
+                if (t && t->mm && k && t->mm->pml4 && k->pml4 &&
+                    t->mm->pml4 != k->pml4) {
+                        uint64_t lo = (uint64_t)a & ~0xFFFULL;
+                        if (mm_privatize_identity_range(t->mm, lo, lo + 0x1000ULL) != 0)
+                                return 0;
+                        return 1;
+                }
         }
+        uintptr_t page = a & ~((uintptr_t)PAGE_SIZE_2M - 1);
+        if (user_map_mark_identity_2m((uint64_t)page, (uint64_t)(page + PAGE_SIZE_2M)) != 0)
+                return 0;
         return 1;
 }
 
@@ -317,12 +402,86 @@ static void page_fault_handler(cpu_registers_t* regs) {
         uint64_t cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
         int user = (regs->cs & 3) == 3;
+        if (user && syscall_pipe_watch_active) {
+                static int pf_all_left = 24;
+                if (pf_all_left-- > 0)
+                        devel_printf("user-pf-any: tid=%d va=0x%llx rip=0x%llx err=0x%llx cr3=0x%llx\n",
+                                thread_current() ? (int)(thread_current()->tid
+                                    ? thread_current()->tid : 1) : -1,
+                                (unsigned long long)cr2,
+                                (unsigned long long)regs->rip,
+                                (unsigned long long)regs->error_code,
+                                (unsigned long long)paging_read_cr3());
+        }
+        if (user && (regs->error_code & 0x10u) && vsyscall_try_emulate(regs))
+                return;
         if (user && (regs->error_code & 1u) && fault_try_fix_ldso_kernel_phdr(regs, cr2))
                 return;
         if (user && fault_try_user_stack_page(cr2, regs->error_code))
                 return;
-        /* Large anonymous mmap: PTEs were installed then removed so we do not memset
-         * hundreds of MiB in syscall; fill each 2MiB chunk on first access. */
+        if (user && fault_try_user_identity_us(cr2, regs->error_code))
+                return;
+        /* fork COW / do_wp_page: present write-protect before any demand-fill. */
+        if (user && (regs->error_code & 0x7u) == 0x7u) {
+                extern thread_t *thread_current(void);
+                extern thread_t *thread_get_current_user(void);
+                thread_t *ut = thread_current();
+                if (!ut || ut->ring != 3) ut = thread_get_current_user();
+                if (ut && ut->mm && ut->mm != mm_kernel()) {
+                        mm_t *share = ut->mm_ptemplate ? ut->mm_ptemplate : mm_kernel();
+                        if (syscall_pipe_watch_active) {
+                                static int cow_enter_left = 16;
+                                if (cow_enter_left-- > 0)
+                                        devel_printf("cow-enter: tid=%llu va=0x%llx rip=0x%llx cr3=0x%llx tmpl=%d\n",
+                                                (unsigned long long)(ut->tid ? ut->tid : 1),
+                                                (unsigned long long)cr2,
+                                                (unsigned long long)regs->rip,
+                                                (unsigned long long)paging_read_cr3(),
+                                                ut->mm_ptemplate ? 1 : 0);
+                        }
+                        int cow_rc = mm_cow_fault_page(ut->mm, cr2, share);
+                        /* Detect silent infinite COW: same CR2 succeeding forever
+                         * (bad PTE/CR3) freezes openrc after set_robust_list with
+                         * no further syscall logs once the print budget is gone. */
+                        {
+                                static uint64_t storm_cr2;
+                                static int storm_count;
+                                static int storm_tid;
+                                int tid = (int)(ut->tid ? ut->tid : 1);
+                                if (cow_rc == 0 && (uint64_t)cr2 == storm_cr2 && tid == storm_tid)
+                                        storm_count++;
+                                else {
+                                        storm_cr2 = (uint64_t)cr2;
+                                        storm_tid = tid;
+                                        storm_count = (cow_rc == 0) ? 1 : 0;
+                                }
+                                if (storm_count >= 8) {
+                                        devel_printf("cow-storm: tid=%d name=%s va=0x%llx rip=0x%llx rc=%d n=%d — force private\n",
+                                                tid,
+                                                ut->name[0] ? ut->name : "?",
+                                                (unsigned long long)cr2,
+                                                (unsigned long long)regs->rip, cow_rc, storm_count);
+                                        (void)mm_make_private_range_noyield(ut->mm, cr2 & ~0xFFFULL,
+                                                (cr2 & ~0xFFFULL) + 0x1000ULL, 1, share);
+                                        storm_count = 0;
+                                        return;
+                                }
+                        }
+                        {
+                                static int boot_cow_left = 24;
+                                if (boot_cow_left-- > 0)
+                                        devel_printf("cow-fault: tid=%llu name=%s va=0x%llx rip=0x%llx rc=%d\n",
+                                                (unsigned long long)(ut->tid ? ut->tid : 1),
+                                                ut->name[0] ? ut->name : "?",
+                                                (unsigned long long)cr2,
+                                                (unsigned long long)regs->rip,
+                                                cow_rc);
+                        }
+                        if (cow_rc == 0)
+                                return;
+                }
+        }
+        /* Demand-fill only for !present (after do_wp_page above). */
         if (user && (regs->error_code & 1u) == 0u && fault_try_mmap_lazy_anon(cr2))
                 return;
         if (user && fault_try_user_vma_nonpresent(cr2, regs->error_code))
@@ -332,19 +491,54 @@ static void page_fault_handler(cpu_registers_t* regs) {
                 if (map_page_2m(0, 0, PG_PRESENT | PG_RW | PG_US) == 0)
                         return;
         }
-        /* fork COW: first write to a still-shared writable page (Linux-style). */
-        if (user && (regs->error_code & 0x7u) == 0x7u) {
+        /* Any other user fault: always visible (budget-limited). */
+        if (user) {
                 extern thread_t *thread_current(void);
                 extern thread_t *thread_get_current_user(void);
                 thread_t *ut = thread_current();
                 if (!ut || ut->ring != 3) ut = thread_get_current_user();
-                if (ut && ut->mm && ut->mm != mm_kernel()) {
-                        mm_t *share = ut->mm_ptemplate ? ut->mm_ptemplate : mm_kernel();
-                        if (mm_cow_fault_page(ut->mm, cr2, share) == 0)
-                                return;
+                if (ut) {
+                        static int boot_pf_left = 48;
+                        if (boot_pf_left-- > 0)
+                                devel_printf("user-pf: tid=%llu name=%s va=0x%llx rip=0x%llx err=0x%llx fs=0x%llx\n",
+                                        (unsigned long long)(ut->tid ? ut->tid : 1),
+                                        ut->name[0] ? ut->name : "?",
+                                        (unsigned long long)cr2,
+                                        (unsigned long long)regs->rip,
+                                        (unsigned long long)regs->error_code,
+                                        (unsigned long long)ut->user_fs_base);
                 }
         }
         if (!user) {
+            /*
+             * Kernel uaccess store onto a fork-COW user page (e.g. rt_sigaction
+             * writing oldact on the child's still-shared stack). Break COW and
+             * retry the faulting instruction; aborting uaccess alone left openrc
+             * wedged mid-sigaction after fork-eager-cow reported pages=0.
+             */
+            {
+                extern thread_t *thread_current(void);
+                extern thread_t *thread_get_current_user(void);
+                thread_t *ut = thread_current();
+                if (!ut || ut->ring != 3)
+                    ut = thread_get_current_user();
+                if (ut && ut->uaccess_active && ut->mm && ut->mm != mm_kernel() &&
+                    (uintptr_t)cr2 >= ut->uaccess_begin &&
+                    (uintptr_t)cr2 < ut->uaccess_end) {
+                    static int kcow_retries;
+                    mm_t *share = ut->mm_ptemplate ? ut->mm_ptemplate : mm_kernel();
+                    if (mm_cow_fault_page(ut->mm, cr2, share) == 0) {
+                        if (++kcow_retries < 16)
+                            return;
+                        kcow_retries = 0;
+                        devel_printf("kcow-storm: tid=%llu va=0x%llx — abort uaccess\n",
+                                (unsigned long long)(ut->tid ? ut->tid : 1),
+                                (unsigned long long)cr2);
+                    } else {
+                        kcow_retries = 0;
+                    }
+                }
+            }
             uint64_t resume_rip = 0;
             if (syscall_try_handle_uaccess_fault(cr2, &resume_rip)) {
                 regs->rip = resume_rip;
@@ -356,17 +550,18 @@ static void page_fault_handler(cpu_registers_t* regs) {
            We repeatedly see crashes at RIP=0x158c94 (payload memset byte-store). */
         if (!user) {
             uint64_t rip = regs->rip;
-            /* Also print when CR2 is clearly non-user (upper half), regardless of RIP range. */
+            /* Skip CR2-driven dumps when CR2 itself is non-identity — walking
+             * frames after a bad pointer often nests another #PF (e.g. 0x100000000). */
             int want_bt = 0;
             if (rip >= 0x158c40ULL && rip < 0x159000ULL) want_bt = 1; /* libc/string area */
-            if (cr2 >= (uint64_t)MMIO_IDENTITY_LIMIT) want_bt = 1;    /* bogus pointer like 0xffff... */
             if (want_bt) {
                 uint64_t rbp = regs->rbp;
                 klogprintf("pf: in libc/string area, rbp=0x%llx\n", (unsigned long long)rbp);
                 qemu_debug_printf("pf: in libc/string area, rbp=0x%llx\n", (unsigned long long)rbp);
+
                 for (int depth = 0; depth < 6; depth++) {
                     if (rbp == 0) break;
-                    if (rbp + 16 > (uint64_t)MMIO_IDENTITY_LIMIT) break;
+                    if (rbp < 0x1000ULL || rbp + 16 > (uint64_t)MMIO_IDENTITY_LIMIT) break;
                     uint64_t next_rbp = *(uint64_t*)(uintptr_t)(rbp + 0);
                     uint64_t ret_rip  = *(uint64_t*)(uintptr_t)(rbp + 8);
                     klogprintf("pf: bt[%d] rbp=0x%llx ret=0x%llx next_rbp=0x%llx\n",
@@ -388,8 +583,10 @@ static void page_fault_handler(cpu_registers_t* regs) {
         uint64_t fsbase_lo = 0, fsbase_hi = 0;
         asm volatile("rdmsr" : "=a"(fsbase_lo), "=d"(fsbase_hi) : "c"(0xC0000100u));
         uint64_t fsbase = ((uint64_t)fsbase_hi << 32) | fsbase_lo;
+        
         klogprintf("page fault MSR_FS_BASE=0x%016llx\n", (unsigned long long)fsbase);
         klogprintf("page fault details: CR2=0x%llx err=0x%llx user=%d\n", (unsigned long long)cr2, (unsigned long long)regs->error_code, user);
+
         qemu_debug_printf("page fault: MSR_FS_BASE=0x%016llx CR2=0x%llx err=0x%llx user=%d\n",
                           (unsigned long long)fsbase,
                           (unsigned long long)cr2,
@@ -514,6 +711,24 @@ pte_dump_done:
                     klogprintf("syscall_kernel_rsp0 not set or out of range\n");
                 }
             }
+            /* User faults must not freeze the whole CPU — that masked the
+             * post-getpid hang as a silent lockup with a blinking cursor. */
+            kprintf("user-pf-fatal: killing after unhandled #PF rip=0x%llx cr2=0x%llx err=0x%llx\n",
+                    (unsigned long long)regs->rip,
+                    (unsigned long long)cr2,
+                    (unsigned long long)regs->error_code);
+            if (regs->rip == 0 && regs->rsp >= 0x200000ULL &&
+                regs->rsp + 16ULL < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                uint64_t *sp = (uint64_t *)(uintptr_t)regs->rsp;
+                kprintf("user-pf-null-rip: rsp=0x%llx [0]=0x%llx [1]=0x%llx rbp=0x%llx rdi=0x%llx\n",
+                        (unsigned long long)regs->rsp,
+                        (unsigned long long)sp[0],
+                        (unsigned long long)sp[1],
+                        (unsigned long long)regs->rbp,
+                        (unsigned long long)regs->rdi);
+            }
+            syscall_user_fatal_exit(11);
+            return;
         }
         for (;;) { asm volatile("sti; hlt" ::: "memory"); }
 }
@@ -523,6 +738,11 @@ static void gp_fault_handler(cpu_registers_t* regs){
     // Строгая семантика для POSIX-подобного поведения: никаких эмуляций в ring3.
     // General Protection Fault в пользовательском процессе рассматривается как фатальная ошибка процесса.
     if ((regs->cs & 3) == 3) {
+        /* VGA too — klogprintf alone is invisible in VMware console. */
+        kprintf("GPF (user): rip=0x%llx rsp=0x%llx err=0x%llx\n",
+                (unsigned long long)regs->rip,
+                (unsigned long long)regs->rsp,
+                (unsigned long long)regs->error_code);
         klogprintf("\nGPF (user-mode) trap.\n");
         /* Identify which kernel thread/user-thread this happened in */
         {
@@ -530,6 +750,12 @@ static void gp_fault_handler(cpu_registers_t* regs){
             extern thread_t* thread_get_current_user(void);
             thread_t *kc = thread_current();
             thread_t *uc = thread_get_current_user();
+            kprintf("GPF: tid=%d name=%s fs=0x%llx cu_tid=%d cu_fs=0x%llx\n",
+                       kc ? (int)kc->tid : -1,
+                       kc && kc->name[0] ? kc->name : "(null)",
+                       (unsigned long long)(kc ? kc->user_fs_base : 0ULL),
+                       uc ? (int)uc->tid : -1,
+                       (unsigned long long)(uc ? uc->user_fs_base : 0ULL));
             klogprintf("GPF: thread_current tid=%d name=%s ring=%u fs_base=0x%llx state=%d\n",
                        kc ? (int)kc->tid : -1,
                        kc ? kc->name : "(null)",
@@ -559,25 +785,95 @@ static void gp_fault_handler(cpu_registers_t* regs){
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
         asm volatile("mov %%cr3, %0" : "=r"(cr3));
         klogprintf("CR2=0x%016llx CR3=0x%016llx\n", (unsigned long long)cr2, (unsigned long long)cr3);
+        kprintf("CR2=0x%016llx CR3=0x%016llx\n", (unsigned long long)cr2, (unsigned long long)cr3);
 
-        /* Attempt to dump a few instruction bytes at RIP (if in identity region) */
-        if ((uintptr_t)regs->rip < (uintptr_t)0x100000000ULL) {
-            const uint8_t *code = (const uint8_t*)(uintptr_t)regs->rip;
-            klogprintf("code @ RIP: ");
-            for (int i = 0; i < 16; i++) kprintf("%02x ", (unsigned)code[i]);
-            kprintf("\n");
-        } else {
-            klogprintf("code @ RIP: (outside identity map)\n");
+        /* ash GPF @ 0x801738 ("ls"): dump leaf state for the watch VA. */
+        if (regs->rip >= MM_ASH_WATCH_LO && regs->rip < MM_ASH_WATCH_HI) {
+            thread_t *gt = thread_current();
+            if (!gt || gt->ring != 3)
+                gt = thread_get_current_user();
+            mm_dbg_ash_watch_thread("GPF-ash-rip", gt);
         }
 
-        /* Dump few stack words */
-        if ((uintptr_t)regs->rsp < (uintptr_t)0x100000000ULL) {
-            const uint64_t *stk = (const uint64_t*)(uintptr_t)regs->rsp;
-            klogprintf("stack @ RSP: ");
-            for (int i = 0; i < 8; i++) kprintf("0x%016llx ", (unsigned long long)stk[i]);
-            kprintf("\n");
-        } else {
-            klogprintf("stack @ RSP: (outside identity map)\n");
+        /* Dump code/stack via task leaf PA — VA identity may be demoted/unmapped. */
+        {
+            thread_t *gt = thread_current();
+            if (!gt || gt->ring != 3)
+                gt = thread_get_current_user();
+            uint64_t leaf = 0;
+            if (gt && gt->mm &&
+                mm_va_leaf_pa(gt->mm, regs->rip, &leaf) == 0) {
+                uint64_t page = leaf & ~0xFFFULL;
+                uint64_t off = regs->rip & 0xFFFULL;
+                const uint8_t *code = (const uint8_t *)(uintptr_t)(page + off);
+                klogprintf("code @ RIP: ");
+                kprintf("code @ RIP: ");
+                for (int i = 0; i < 16 && off + (uint64_t)i < 0x1000ULL; i++)
+                    kprintf("%02x ", (unsigned)code[i]);
+                kprintf("\n");
+            } else if ((uintptr_t)regs->rip < (uintptr_t)0x100000000ULL) {
+                const uint8_t *code = (const uint8_t *)(uintptr_t)regs->rip;
+                klogprintf("code @ RIP: ");
+                kprintf("code @ RIP: ");
+                for (int i = 0; i < 16; i++) kprintf("%02x ", (unsigned)code[i]);
+                kprintf("\n");
+            } else {
+                klogprintf("code @ RIP: (unmapped)\n");
+            }
+            if (gt && gt->mm &&
+                mm_va_leaf_pa(gt->mm, regs->rsp, &leaf) == 0) {
+                uint64_t page = leaf & ~0xFFFULL;
+                uint64_t off = regs->rsp & 0xFFFULL;
+                uint64_t w0 = 0;
+                klogprintf("stack @ RSP: ");
+                kprintf("stack @ RSP: ");
+                for (int i = 0; i < 8 && off + (uint64_t)i * 8ull < 0x1000ULL; i++) {
+                    uint64_t w = *(const uint64_t *)(uintptr_t)(page + off + (uint64_t)i * 8ull);
+                    if (i == 0) w0 = w;
+                    kprintf("0x%016llx ", (unsigned long long)w);
+                }
+                kprintf("\n");
+                /* After ret, RSP already advanced; smashed RA was at rsp-8. */
+                if (regs->rip >= MM_ASH_WATCH_LO && regs->rip < MM_ASH_WATCH_HI &&
+                    regs->rsp >= 8) {
+                    uint64_t ra_va = regs->rsp - 8ull;
+                    uint64_t ra_leaf = 0;
+                    if (mm_va_leaf_pa(gt->mm, ra_va, &ra_leaf) == 0) {
+                        uint64_t ra_page = ra_leaf & ~0xFFFULL;
+                        uint64_t ra_off = ra_va & 0xFFFULL;
+                        uint64_t ra = *(const uint64_t *)(uintptr_t)(ra_page + ra_off);
+                        uint64_t heap_leaf = 0;
+                        (void)mm_va_leaf_pa(gt->mm, regs->rip, &heap_leaf);
+                        kprintf("GPF: leaves ra_va=0x%llx stack_pa=0x%llx stack_ref=%u "
+                                "heap_va=0x%llx heap_pa=0x%llx heap_ref=%u alias=%d\n",
+                                (unsigned long long)ra_va,
+                                (unsigned long long)ra_page,
+                                frame_refcount(ra_page),
+                                (unsigned long long)regs->rip,
+                                (unsigned long long)(heap_leaf & ~0xFFFULL),
+                                frame_refcount(heap_leaf),
+                                ((ra_page & ~0xFFFULL) ==
+                                 (heap_leaf & ~0xFFFULL)) ? 1 : 0);
+                        kprintf("GPF: post-ret; [rsp-8]=0x%llx (expect smash RA==rip if ret-to-heap)\n",
+                                (unsigned long long)ra);
+                        if (ra == regs->rip)
+                            kprintf("GPF: confirmed ret-to-heap via [rsp-8]\n");
+                    }
+                }
+                /* Legacy check (only if fault before ret popped the slot). */
+                if (w0 == regs->rip &&
+                    regs->rip >= MM_ASH_WATCH_LO && regs->rip < MM_ASH_WATCH_HI)
+                    kprintf("GPF: ret-to-heap rsp[0]==rip=0x%llx (vfork stack smash)\n",
+                            (unsigned long long)regs->rip);
+            } else if ((uintptr_t)regs->rsp < (uintptr_t)0x100000000ULL) {
+                const uint64_t *stk = (const uint64_t *)(uintptr_t)regs->rsp;
+                klogprintf("stack @ RSP: ");
+                for (int i = 0; i < 8; i++)
+                    kprintf("0x%016llx ", (unsigned long long)stk[i]);
+                kprintf("\n");
+            } else {
+                klogprintf("stack @ RSP: (unmapped)\n");
+            }
         }
 
         klogprintf("GPF: terminating user thread\n");
@@ -611,37 +907,32 @@ void isr_dispatch(cpu_registers_t* regs) {
                         isr_handlers[vec](regs);
                 }
                 pic_send_eoi(1);
-                return;
-        }
-
-        // IRQ 32..47: EOI required
-        if (vec >= 32 && vec <= 47) {
+        } else if (vec >= 32 && vec <= 47) {
+                // IRQ 32..47: EOI required
                 if (isr_handlers[vec]) {
                         isr_handlers[vec](regs);
                 } else {
                         qemu_debug_printf("Unhandled IRQ %d\n", vec - 32);
                 }
                 pic_send_eoi(vec - 32);
-                return;
-                }
-
-        // Any other vector: call registered handler if present (e.g., int 0x80)
-        if (isr_handlers[vec]) {
+        } else if (isr_handlers[vec]) {
+                // Any other vector: call registered handler if present (e.g., int 0x80, APIC)
                 isr_handlers[vec](regs);
-                return;
-        }
-
-        // Exceptions 0..31 without specific handler: print and halt
-        if (vec < 32) {
+        } else if (vec < 32) {
+                // Exceptions 0..31 without specific handler: print and halt
+                for (;;);
+        } else {
+                // Unknown vector
+                qemu_debug_printf("Unknown interrupt %d (0x%x)\n", vec, vec);
+                qemu_debug_printf("RIP: 0x%x, RSP: 0x%x\n", regs->rip, regs->rsp);
                 for (;;);
         }
 
-        // Unknown vector
-        qemu_debug_printf("Unknown interrupt %d (0x%x)\n", vec, vec);
-        qemu_debug_printf("RIP: 0x%x, RSP: 0x%x\n", regs->rip, regs->rsp);
-        for (;;);
-        // no swap in VGA text mode
-        for (;;);
+        /* Deliver pending signals on return to ring3 from IRQ/IPI/int0x80.
+         * Skip CPU exceptions (0..31): #PF fatal paths can still fall through
+         * with a dead user frame (rip=0) and must not try to build a sigframe. */
+        if (regs && (regs->cs & 3) == 3 && vec >= 32)
+                (void)maybe_deliver_pending_signal_iretq(regs);
 }
 
 void idt_set_gate(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flags) {
@@ -661,15 +952,16 @@ void idt_set_handler(uint8_t num, void (*handler)(cpu_registers_t*)) {
 void idt_init() {
         idt_ptr.limit = sizeof(idt) - 1;
         idt_ptr.base = (uint64_t)&idt;
-
+        
         for (int i = 0; i < 256; i++) {
                 idt_set_gate(i, isr_stub_table[i], 0x08, 0x8E);
         }
-
+        
         // Register detailed page fault handler
         idt_set_handler(14, page_fault_handler);
         // Register divide-by-zero handler (#0)
         idt_set_handler(0, div_zero_handler);
+        idt_set_handler(1, debug_fault_handler);
         // Register UD handler (#6)
         idt_set_handler(6, ud_fault_handler);
         // Register GP fault handler (#13)
@@ -678,7 +970,7 @@ void idt_init() {
         idt_set_handler(8, df_fault_handler);
         // Пометим IST=1 у вектора 8
         idt[8].ist = 1;
-
+        
         // Register RTC handler (IRQ 8 = vector 40)
         idt_set_handler(40, rtc_handler);
 

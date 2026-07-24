@@ -282,14 +282,6 @@ void vga_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t ch, u
 	}
 }
 
-uint32_t vga_write_colorized_xy(uint32_t x, uint32_t y, const char *s, uint8_t default_attr) {
-	if (y >= MAX_ROWS) return 0;
-	/* Color tags are no longer supported; print the string as-is. */
-	(void)default_attr;
-	vga_write_str_xy(x, y, s, GRAY_ON_BLACK);
-	return (uint32_t)strlen(s);
-}
-
 void kprint(uint8_t *str) {
 	if (!str) return;
 	unsigned long fl;
@@ -676,17 +668,19 @@ static int utoa_rev(unsigned long long v, unsigned base, int upper, char *out)
 	return n;
 }
 
-/* kprintf may bypass devfs tty writes; keep active tty cursor in sync.
-   Caller must hold vga_lock_spin. We set/get cursor once per kprintf to avoid
-   early-boot backend quirks around frequent cursor I/O. */
+/* kprintf may bypass /dev/console write(). Drive the active tty so its
+ * cursor_x/y (and screen backing) stay aligned with userspace I/O — otherwise
+ * the next write(1) / ECHO lands at a stale position (often 0,0). */
 static inline void kprintf_putc_locked(struct devfs_tty *tty, uint8_t ch, uint8_t color) {
-	(void)tty;
-	console_putc_nolock(ch, color);
+	if (tty)
+		devfs_tty_console_write((const char *)&ch, 1);
+	else
+		console_putc_nolock(ch, color);
 }
 
 static inline void kprintf_putn_locked(struct devfs_tty *tty, uint8_t ch, int count, uint8_t color) {
-	(void)tty;
-	for (int i = 0; i < count; i++) console_putc_nolock(ch, color);
+	for (int i = 0; i < count; i++)
+		kprintf_putc_locked(tty, ch, color);
 }
 
 void kprintf(const char* fmt, ...)
@@ -697,28 +691,29 @@ void kprintf(const char* fmt, ...)
 	uint8_t color = 0x07; // светло-серый на чёрном
 	unsigned long vga_fl;
 	acquire_irqsave(&vga_lock_spin, &vga_fl);
-	/* Keep devfs active tty cursor in sync, same motivation as klogprintf:
-	   kernel prints must not desync interactive tty cursor. */
+	/* Keep devfs active tty cursor in sync with framebuffer/VGA backend.
+	 * Must use console_get/set_cursor (fb-aware), not VGA CRTC ports. */
 	struct devfs_tty *tty = NULL;
 	if (devfs_is_ready()) {
 		tty = devfs_get_tty_by_index(devfs_get_active());
-		if (tty) console_set_cursor(tty->cursor_x, tty->cursor_y);
+		if (tty)
+			console_set_cursor(tty->cursor_x, tty->cursor_y);
 	}
 	for (const char *p = fmt; *p; ) {
 		// Color tags are no longer supported; treat them as normal characters.
 		// support tab character: move to next tab stop (8 columns) like Linux
 		if (*p == '\t') {
 			uint32_t cx = 0, cy = 0;
-			if (cirrusfb_is_ready()) cirrusfb_get_cursor(&cx, &cy);
-			else if (vbe_is_available()) vbefb_get_cursor(&cx, &cy);
-			else {
-				uint16_t pos = get_cursor_nolock();
-				cx = (uint32_t)((pos % (MAX_COLS * 2)) / 2);
-				cy = (uint32_t)(pos / (MAX_COLS * 2));
+			if (tty) {
+				cx = tty->cursor_x;
+				cy = tty->cursor_y;
+			} else {
+				console_get_cursor(&cx, &cy);
 			}
 			uint32_t spaces = 8u - (cx % 8u);
 			if (spaces == 0) spaces = 8;
 			kprintf_putn_locked(tty, ' ', (int)spaces, color);
+			(void)cy;
 			p++; continue;
 		}
 
@@ -826,18 +821,18 @@ void kprintf(const char* fmt, ...)
  			int pad = (width > field_len) ? width - field_len : 0;
  			char padch = (zero && !left) ? '0' : ' ';
 
- 			if (!left && padch == ' ') kputn_nolock(' ', pad, color);
- 			// вывод префикса/нулями заполнение
- 			if (!left && padch == '0') kputn_nolock('0', pad, color);
- 			if (plen) { for (int i = 0; i < plen; i++) console_putc_nolock(prefix[i], color); }
- 			kputn_nolock('0', prec_zeros, color);
- 			for (int i = num_digits - 1; i >= 0; i--) console_putc_nolock(tmp[i], color);
- 			if (left) kputn_nolock(' ', pad, color);
- 			break; }
+			if (!left && padch == ' ') kprintf_putn_locked(tty, ' ', pad, color);
+			// вывод префикса/нулями заполнение
+			if (!left && padch == '0') kprintf_putn_locked(tty, '0', pad, color);
+			if (plen) { for (int i = 0; i < plen; i++) kprintf_putc_locked(tty, (uint8_t)prefix[i], color); }
+			kprintf_putn_locked(tty, '0', prec_zeros, color);
+			for (int i = num_digits - 1; i >= 0; i--) kprintf_putc_locked(tty, (uint8_t)tmp[i], color);
+			if (left) kprintf_putn_locked(tty, ' ', pad, color);
+			break; }
 
- 		case '%':
- 			console_putc_nolock('%', color);
- 			break;
+		case '%':
+			kprintf_putc_locked(tty, '%', color);
+			break;
 
  		default:
 			kprintf_putc_locked(tty, (uint8_t)spec, color);
@@ -862,7 +857,6 @@ PRINT_NUMBER_BASE10:
  		}
  		}
  	}
-	if (tty) console_get_cursor(&tty->cursor_x, &tty->cursor_y);
 
 	release_irqrestore(&vga_lock_spin, vga_fl);
 	va_end(ap);

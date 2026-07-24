@@ -5,6 +5,7 @@
 #include <debug.h>
 #include <mmio.h>
 #include <smp.h>
+#include <fpu.h>
 
 #pragma pack(push,1)
 struct gdtr {
@@ -150,6 +151,9 @@ void gdt_init() {
                 cr4 &= ~(1ULL << 16); // CR4.FSGSBASE OFF (see comment above)
                 asm volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
         }
+
+        /* Enable SSE + AVX (XSAVE/XCR0) so userland VEX opcodes do not #UD. */
+        fpu_init_cpu();
 }
 
 void gdt_fill_smp_mailbox_lgdt(uint16_t *gdt_lim, uint32_t *gdt_base32) {

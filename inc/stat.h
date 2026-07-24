@@ -6,10 +6,12 @@
 typedef unsigned long ino_t;
 typedef unsigned int mode_t;
 typedef unsigned int nlink_t;
+typedef unsigned long dev_t; /* Linux-compatible device identity for stat/fstat. */
 typedef long off_t;
 typedef long time_t;
 
 struct stat {
+    dev_t st_dev;
     ino_t st_ino;
     mode_t st_mode;
     nlink_t st_nlink;

@@ -33,10 +33,7 @@ multiboot_magic_saved:
 global multiboot_info_saved
 multiboot_info_saved:
         resq 1
-; page tables in BSS (aligned to 4096)
-; IMPORTANT: use alignb in .bss, because NASM may ignore normal `align` here
-; (it would require emitting padding bytes, which is "initialization" for BSS).
-; If alignment is ignored, page tables may become non-4KiB-aligned -> random #GP/#PF.
+
 alignb 4096
 global page_table_l4
 page_table_l4:
@@ -186,7 +183,6 @@ setup_page_tables:
         mov dword [page_table_l3 + 3*8], eax
         mov dword [page_table_l3 + 3*8 + 4], 0
 
-        ; Fill PDs: each entry maps 2MiB (PS bit = 1 in PDE)
         ; PD0: pages 0..511 -> 0..1GiB
         xor ecx, ecx
         mov ebx, 0
@@ -247,6 +243,7 @@ setup_page_tables:
 
 enable_paging:
         mov eax, cr4
+        
         ; enable PAE (bit5) and PGE (bit7) to be more compatible with host expectations
         or eax, (1 << 5) | (1 << 7)
         mov cr4, eax
@@ -342,7 +339,6 @@ long_mode_start:
         mov fs, ax
         mov gs, ax
 
-        ; !!! включаем sse чтобы использовать fpu или sse инструкции для установки gdt
         mov rax, cr0
         and rax, ~(1 << 2)           ; CR0.EM = 0 (enable FPU/SSE instructions)
         or  rax,  (1 << 1)           ; CR0.MP = 1 (monitor coprocessor)
@@ -352,6 +348,28 @@ long_mode_start:
         or  rax, (1 << 9)            ; CR4.OSFXSR = 1 (FXSAVE/FXRSTOR + SSE)
         or  rax, (1 << 10)           ; CR4.OSXMMEXCPT = 1 (SSE exceptions)
         mov cr4, rax
+
+        ; Enable x87+SSE (+AVX if present) in XCR0 so VEX user code does not #UD.
+        push rbx
+        mov eax, 1
+        xor ecx, ecx
+        cpuid
+        bt  ecx, 26                  ; CPUID.1.ECX.XSAVE
+        jnc .skip_xsetbv
+        mov rax, cr4
+        or  rax, (1 << 18)           ; CR4.OSXSAVE (only if XSAVE exists)
+        mov cr4, rax
+        mov r8d, ecx                 ; save feature flags
+        mov eax, 0x3                 ; XCR0: x87 | SSE
+        bt  r8d, 28                  ; CPUID.1.ECX.AVX
+        jnc .do_xsetbv
+        or  eax, 0x4                 ; XCR0.AVX (YMM)
+.do_xsetbv:
+        xor edx, edx
+        xor ecx, ecx                 ; XCR0
+        xsetbv
+.skip_xsetbv:
+        pop rbx
 
 	lea rsp, [rel stack_top]
 	and rsp, -16

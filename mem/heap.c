@@ -164,10 +164,11 @@ static void* kmalloc_nolock(size_t size) {
     return 0; /* out of memory */
 }
 
-static void kfree_nolock(void* ptr) {
+static void kfree_nolock(void* ptr, void *caller) {
     if (!ptr) return;
     if (!heap_ptr_in_range(ptr)) {
-        kprintf("heap: invalid free ptr=%p (out of heap range)\n", ptr);
+        kprintf("heap: invalid free ptr=%p (out of heap range) caller=%p\n",
+                ptr, caller ? caller : __builtin_return_address(0));
         return;
     }
     heap_block_header_t* blk = (heap_block_header_t*)((uint8_t*)ptr - sizeof(heap_block_header_t));
@@ -178,10 +179,9 @@ static void kfree_nolock(void* ptr) {
     if (blk->magic != HEAP_MAGIC_ALLOC || blk->free) {
         kprintf("heap: double free / corrupt header ptr=%p magic=0x%x free=%u\n",
                 ptr, (unsigned)blk->magic, (unsigned)blk->free);
-        /* print caller address to help locate the double-free site */
-        void *caller = __builtin_return_address(0);
-        kprintf("    caller: %p\n", caller);
-        /* print header diagnostics */
+        kprintf("    caller: %p alloc_caller: %p\n",
+                caller ? caller : __builtin_return_address(0),
+                blk->alloc_caller);
         kprintf("    hdr: addr=%p size=%u req=%u prev=%p next=%p\n",
                 (void*)blk, (unsigned)blk->size, (unsigned)blk->req_size,
                 (void*)blk->prev, (void*)blk->next);
@@ -197,8 +197,7 @@ static void kfree_nolock(void* ptr) {
         if (got != (uint64_t)HEAP_CANARY_QWORD) {
             kprintf("heap: overflow detected ptr=%p req=%u can=%p\n",
                     ptr, (unsigned)blk->req_size, (void*)canp);
-            void *caller = __builtin_return_address(0);
-            kprintf("    caller: %p\n", caller);
+            kprintf("    caller: %p\n", caller ? caller : __builtin_return_address(0));
             kprintf("    alloc_caller: %p\n", blk->alloc_caller);
             kprintf("    hdr: addr=%p size=%u req=%u prev=%p next=%p\n",
                     (void*)blk, (unsigned)blk->size, (unsigned)blk->req_size,
@@ -214,7 +213,7 @@ static void kfree_nolock(void* ptr) {
 
 static void* krealloc_nolock(void* ptr, size_t new_size) {
     if (!ptr) return kmalloc_nolock(new_size);
-    if (new_size == 0) { kfree_nolock(ptr); return 0; }
+    if (new_size == 0) { kfree_nolock(ptr, __builtin_return_address(0)); return 0; }
     if (!heap_ptr_in_range(ptr)) {
         kprintf("heap: invalid realloc ptr=%p\n", ptr);
         return 0;
@@ -301,7 +300,7 @@ static void* krealloc_nolock(void* ptr, size_t new_size) {
     }
     size_t to_copy = old_req < new_req ? old_req : new_req;
     memcpy(n, ptr, to_copy);
-    kfree_nolock(ptr);
+    kfree_nolock(ptr, __builtin_return_address(0));
     /* record realloc caller on the new block too */
     {
         heap_block_header_t* nblk = (heap_block_header_t*)((uint8_t*)n - sizeof(heap_block_header_t));
@@ -333,9 +332,10 @@ void* kmalloc(size_t size) {
 }
 
 void kfree(void* ptr) {
+    void *caller = __builtin_return_address(0);
     unsigned long flags = 0;
     acquire_irqsave(&heap_lock, &flags);
-    kfree_nolock(ptr);
+    kfree_nolock(ptr, caller);
     release_irqrestore(&heap_lock, flags);
 }
 

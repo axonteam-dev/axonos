@@ -86,6 +86,8 @@ struct fs_file *fs_open(const char *path);
 ssize_t fs_read(struct fs_file *file, void *buf, size_t size, size_t offset);
 ssize_t fs_write(struct fs_file *file, const void *buf, size_t size, size_t offset);
 void fs_file_free(struct fs_file *file);
+/* Retain user-facing path spelling on an open handle (openat). */
+int fs_file_set_user_path(struct fs_file *file, const char *user_path);
 /* Read next chunk from directory/file using and advancing file->pos */
 ssize_t fs_readdir_next(struct fs_file *file, void *buf, size_t size);
 
@@ -116,5 +118,17 @@ void net_fs_file_destroy(struct fs_file *f);
 
 /* Called by thread_fd_close when closing a pipe end; f->type == FS_TYPE_PIPE. */
 void pipe_release_end(struct fs_file *f);
+
+/* Pipe end markers in fs_file.fs_private. Avoid NULL/1 — those collide with VFS. */
+#define PIPE_END_READ  ((void *)(uintptr_t)0x50595045u) /* 'PIPE' */
+#define PIPE_END_WRITE ((void *)(uintptr_t)0x50595057u) /* 'PIPW' */
+static inline int fs_pipe_is_write_end(const struct fs_file *f) {
+    if (!f) return 0;
+    return f->fs_private == PIPE_END_WRITE || f->fs_private == (void *)1;
+}
+static inline int fs_pipe_is_read_end(const struct fs_file *f) {
+    if (!f) return 0;
+    return f->fs_private == PIPE_END_READ || f->fs_private == NULL;
+}
 
 #endif /* INC_FS_H */

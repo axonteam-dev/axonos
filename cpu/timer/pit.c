@@ -1,7 +1,7 @@
 #include <pit.h>
 #include <apic_timer.h>
 #include <klog.h>
-#include <debug.h>
+#include <debug.h> 
 #include <pic.h>
 #include <idt.h>
 #include <serial.h>
@@ -12,19 +12,25 @@
 #include <smp.h>
 #include <loadavg.h>
 #include <power.h>
+#include <syscall.h>
 
 // Global variables
 volatile uint64_t pit_ticks = 0;
-volatile uint32_t pit_frequency = 1000; // Default 100 Hz
+volatile uint32_t pit_frequency = 250;
 volatile int pit_enabled = 0;
 /* Common tick source used by scheduler/userspace timeouts (monotonic). */
 volatile uint64_t timer_ticks = 0;
-volatile uint32_t timer_frequency = 1000;
+volatile uint32_t timer_frequency = 250;
 
 // PIT handler - called on IRQ 0
 void pit_handler(cpu_registers_t* regs) {
         pit_ticks++;
         timer_ticks++;
+        /* Publish now, but force this IRQ to return to the parent before any
+         * later timer tick is allowed to select the new child. */
+        int published_fork_child = 0;
+        if (regs && ((regs->cs & 3) == 3))
+                published_fork_child = syscall_publish_deferred_fork_child();
 
         /* Ensure ACPI/power requests progress even when system is otherwise idle at a prompt. */
         if (power_is_pending() && (!regs || ((regs->cs & 3) == 0))) {
@@ -37,13 +43,20 @@ void pit_handler(cpu_registers_t* regs) {
 
         if (!init) return;
         thread_wake_expired_timeouts();
-        /* Avoid full schedule from ring-3 IRQ on SMP; on UP, yield spinners when others wait. */
+        /* Userspace is BSP-only even when APs exist; preempt ring-3 on cpu0. */
         if (regs && ((regs->cs & 3) == 3)) {
-                if (smp_cpu_count() <= 1)
-                        thread_ring3_preempt_if_waiters();
+                if (smp_sched_cpu_id() == 0) {
+                        /* Match LAPIC: ~100 Hz forced preemption (~10 ms). */
+                        uint32_t quantum = pit_frequency / 100u;
+                        if (quantum < 1u)
+                                quantum = 1u;
+                        if (!published_fork_child &&
+                            (pit_ticks % quantum) == 0)
+                                thread_ring3_preempt_if_waiters();
+                }
                 return;
         }
-
+        
         /* SMP: never thread_schedule() from IRQ — nested scheduler + sched_lock corrupts state.
            Idle loops + IPI wake other CPUs; BSP is driven by syscalls/yield. */
         if ((pit_ticks % 10) == 0 && smp_cpu_count() <= 1) {
@@ -52,16 +65,19 @@ void pit_handler(cpu_registers_t* regs) {
         if (cirrusfb_is_ready()) {
                 cirrusfb_update_cursor();
         } else {
-                vbe_flush_full();
+                /* Match APIC: avoid full framebuffer blit on every timer IRQ. */
+                if ((pit_ticks % 25u) == 0u)
+                        vbe_flush_full();
                 vbefb_update_cursor();
         }
 }
 
 // Initialize PIT with default frequency (100 Hz)
 void pit_init() {
-
-        // Set default frequency (1000 Hz)
-        int freq = 1000;
+        
+        /* Linux-like HZ=250: enough scheduler resolution without IRQ livelock
+           on virtualized hardware. */
+        int freq = 250;
         pit_enabled = 1;
         pit_set_frequency(freq);
         // Set up PIT handler for IRQ 0
@@ -76,25 +92,25 @@ void pit_disable(void) {
     outb(PIT_COMMAND, PIT_CMD_CHANNEL0 | PIT_CMD_ACCESS_BOTH | PIT_CMD_MODE0 | PIT_CMD_BINARY);
     outb(PIT_CHANNEL0, 0);   // Low byte = 0
     outb(PIT_CHANNEL0, 0);   // High byte = 0
-
+    
     kprintf("PIT: Disabled\n");
 }
 
 // Set PIT frequency in Hz
 void pit_set_frequency(uint32_t frequency) {
         if (frequency == 0) return;
-
+        
         // Calculate divisor
         uint32_t divisor = PIT_FREQUENCY / frequency;
-
+        
         // Ensure divisor is in valid range (1-65535)
         if (divisor < 1) divisor = 1;
         if (divisor > 65535) divisor = 65535;
-
+        
         // Recalculate actual frequency
         pit_frequency = PIT_FREQUENCY / divisor;
         timer_frequency = pit_frequency;
-
+        
         // Set the divisor
         pit_set_divisor((uint16_t)divisor);
 }
@@ -105,7 +121,7 @@ void pit_set_divisor(uint16_t divisor) {
         // Use MODE2 (rate generator) to have linear down-counting, which simplifies
         // reading the current counter value for time interpolation
         outb(PIT_COMMAND, PIT_CMD_CHANNEL0 | PIT_CMD_ACCESS_BOTH | PIT_CMD_MODE2 | PIT_CMD_BINARY);
-
+        
         // Send divisor (low byte first, then high byte)
         outb(PIT_CHANNEL0, divisor & 0xFF);
         outb(PIT_CHANNEL0, (divisor >> 8) & 0xFF);

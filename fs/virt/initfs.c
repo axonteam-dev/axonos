@@ -287,6 +287,18 @@ static size_t find_cpio_start(const uint8_t *base, size_t archive_size) {
     return (size_t)-1;
 }
 
+static size_t find_next_cpio_stream(const uint8_t *base, size_t archive_size,
+                                    size_t bad_offset) {
+    size_t start = bad_offset + 4u;
+
+    if (!base || start >= archive_size)
+        return (size_t)-1;
+    size_t rel = find_cpio_start(base + start, archive_size - start);
+    if (rel == (size_t)-1 || rel > archive_size - start)
+        return (size_t)-1;
+    return start + rel;
+}
+
 /* Ensure all parent directories for `path` exist. Path must be absolute. */
 static void ensure_parent_dirs(const char *path) {
     if (!path || path[0] != '/') return;
@@ -554,6 +566,13 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
            Compare raw bytes from the module to avoid any struct/padding surprises. */
         const uint8_t *magic = base + offset;
         if (!((memcmp(magic, "070701", 6) == 0) || (memcmp(magic, "070702", 6) == 0))) {
+            size_t next = find_next_cpio_stream(base, archive_size, offset);
+            if (next != (size_t)-1) {
+                klogprintf("initfs: skipped corrupt cpio range [%zu..%zu) at entry #%d\n",
+                           offset, next, cpio_entry_num);
+                offset = next;
+                continue;
+            }
             klogprintf("initfs: cpio bad magic at offset %u entry #%d\n",
                        (unsigned)offset, cpio_entry_num);
             return -1;
@@ -561,6 +580,13 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
         /* additional plausibility check to avoid false positives where "070701"
            appears inside file data */
         if (!plausible_cpio_header(h, archive_size - offset)) {
+            size_t next = find_next_cpio_stream(base, archive_size, offset);
+            if (next != (size_t)-1) {
+                klogprintf("initfs: skipped implausible cpio range [%zu..%zu) at entry #%d\n",
+                           offset, next, cpio_entry_num);
+                offset = next;
+                continue;
+            }
             klogprintf("initfs: cpio implausible header at offset %u entry #%d\n",
                        (unsigned)offset, cpio_entry_num);
             return -1;

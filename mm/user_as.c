@@ -1,4 +1,5 @@
 #include <user_as.h>
+#include <mm.h>
 #include <user_map.h>
 #include <user_mm.h>
 #include <user_vma.h>
@@ -11,10 +12,39 @@
 #include <string.h>
 #include <thread.h>
 
+extern void kprintf(const char *fmt, ...);
+
 uintptr_t user_as_mmap_next = 0;
 uintptr_t user_as_mmap_hi = 0;
 uintptr_t user_as_brk_base = 0;
 uintptr_t user_as_brk_cur = 0;
+
+/* True when the thread owns a distinct page-table root (not the shared kernel L4). */
+static int user_as_has_private_mm(thread_t *t) {
+    mm_t *k = mm_kernel();
+    return t && t->mm && k && t->mm->pml4 && k->pml4 && t->mm->pml4 != k->pml4;
+}
+
+/* Map [lo,hi) for brk/teardown without collapsing private 4K ELF pages back to
+ * identity 2MiB (that stomped openrc back to busybox at 0x4030d0).
+ * Returns 0 on success, -1 if private anon install failed (fail closed). */
+static int user_as_ensure_range_for_exec(thread_t *tcur, uintptr_t lo, uintptr_t hi) {
+    if (hi <= lo || lo < 0x200000u || hi > (uintptr_t)MMIO_IDENTITY_LIMIT)
+        return 0;
+    if (user_as_has_private_mm(tcur)) {
+        /* Linux do_brk_flags: identity→anon zero; share baseline = oldmm. */
+        mm_t *share = tcur->mm_ptemplate ? tcur->mm_ptemplate : mm_kernel();
+        if (mm_privatize_identity_range_blank(tcur->mm, (uint64_t)lo, (uint64_t)hi) != 0)
+            return -1;
+        if (mm_make_private_range(tcur->mm, (uint64_t)lo, (uint64_t)hi, 0, share) != 0)
+            return -1;
+        return 0;
+    }
+    if (user_map_ensure_present_us_2m((uint64_t)lo, (uint64_t)hi) != 0)
+        return -1;
+    user_as_mmap_memset_zero_chunked(lo, (size_t)(hi - lo));
+    return 0;
+}
 
 uintptr_t user_as_stack_top_for_tid(uint64_t tid) {
     const uintptr_t top = (uintptr_t)USER_STACK_TOP;
@@ -221,6 +251,13 @@ void user_as_mmap_memset_zero_chunked(uintptr_t addr, size_t len) {
             (unsigned long long)addr, (unsigned long long)(uint64_t)len);
         return;
     }
+    /*
+     * Private mm: pages were installed as anon zero via do_brk_flags /
+     * do_anonymous_page. VA memset would hit identity phys while CR3 is still
+     * oldmm (vfork-exec load) or smash a sibling that still shares that PA.
+     */
+    if (user_as_has_private_mm(t))
+        return;
     const size_t chunk = 4u * 1024u * 1024u;
     if (len <= chunk) {
         memset((void *)addr, 0, len);
@@ -233,10 +270,29 @@ void user_as_mmap_memset_zero_chunked(uintptr_t addr, size_t len) {
 }
 
 void user_as_mmap_lazy_drop_present_pages(uintptr_t addr, size_t len) {
-    uintptr_t begin = addr & ~((uintptr_t)PAGE_SIZE_2M - 1);
-    uintptr_t end = (addr + len + (uintptr_t)PAGE_SIZE_2M - 1) & ~((uintptr_t)PAGE_SIZE_2M - 1);
-    for (uintptr_t va = begin; va < end; va += (uintptr_t)PAGE_SIZE_2M)
-        (void)unmap_page_2m((uint64_t)va);
+    /*
+     * Do NOT call unmap_page_2m() here: that clears the same VA in the kernel
+     * mm identity map. Page-table pages are accessed via VA==PA; punching a
+     * 128MiB+ hole under USER_MMAP_BASE then makes unmap_page_2m_on_l4 fault
+     * in the kernel (seen as Oops CR2=0x8117000 while dropping Go PROT_NONE).
+     *
+     * Private mm: unmap only in the process tables.
+     * Shared CR3: leave leaves present; PROT_NONE is enforced by VMA prot==0
+     * in the fault path (no demand-fill).
+     */
+    thread_t *t = thread_get_current_user();
+    if (!t)
+        t = thread_current();
+    mm_t *k = mm_kernel();
+    if (!t || !t->mm || !k || !t->mm->pml4 || t->mm->pml4 == k->pml4)
+        return;
+    mm_t *share = (t->mm_ptemplate && t->mm_ptemplate->pml4) ?
+        t->mm_ptemplate : k;
+    if (!share || !share->pml4)
+        return;
+    (void)mm_unmap_user_range(t->mm, share->pml4,
+                              (uint64_t)addr,
+                              (uint64_t)addr + (uint64_t)len);
 }
 
 void user_as_reset_on_exec(thread_t *tcur, uintptr_t brk_base) {
@@ -257,22 +313,55 @@ void user_as_reset_on_exec(thread_t *tcur, uintptr_t brk_base) {
 
 void user_as_set_brk_after_load(thread_t *tcur, uintptr_t elf_brk, uintptr_t image_hi) {
     const uintptr_t floor = 8u * 1024u * 1024u;
+    /* Static glibc __libc_setup_tls places the TCB in the brk slab (~fs:0x8003c0). */
+    const uintptr_t tls_window = 64u * 1024u;
     uintptr_t orig = elf_brk;
     uintptr_t brk = elf_brk;
     if (brk < floor) brk = floor;
     brk = user_mm_align_up(brk, 4096);
-    uintptr_t zero_lo = 0;
-    if (image_hi > 0x200000u && brk > image_hi)
-        zero_lo = image_hi;
-    else if (orig > 0x200000u && brk > orig)
-        zero_lo = orig;
-    if (zero_lo != 0 && brk > zero_lo && brk <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
-        (void)user_map_ensure_present_us_2m((uint64_t)zero_lo, (uint64_t)brk);
-        user_as_mmap_memset_zero_chunked(zero_lo, (size_t)(brk - zero_lo));
+    /*
+     * Legacy shared-CR3: zero image→brk gap.
+     * Private mm (Linux do_brk_flags): install anon zero pages for the initial
+     * brk/TLS window so identity leaves are never user backing for SET_FS.
+     * Do not prefault multi-MiB — further growth uses user_brk_ensure_range.
+     */
+    if (!user_as_has_private_mm(tcur)) {
+        uintptr_t zero_lo = 0;
+        if (image_hi > 0x200000u && brk > image_hi)
+            zero_lo = image_hi;
+        else if (orig > 0x200000u && brk > orig)
+            zero_lo = orig;
+        if (zero_lo != 0 && brk > zero_lo && brk <= (uintptr_t)MMIO_IDENTITY_LIMIT)
+            (void)user_as_ensure_range_for_exec(tcur, zero_lo, brk);
+    } else {
+        /*
+         * Raise brk to 8MiB for glibc TLS, but also materialize [elf_end, brk).
+         * Musl-static bash uses the classic &_end heap in that gap (fopen
+         * /etc/passwd → malloc); if those pages are missing, getpwuid fails
+         * and the prompt becomes "I have no name!".
+         */
+        uintptr_t gap_lo = orig;
+        if (image_hi > gap_lo)
+            gap_lo = image_hi;
+        gap_lo = user_mm_align_up(gap_lo, 4096);
+        if (gap_lo < brk && gap_lo > 0x200000u &&
+            user_as_ensure_range_for_exec(tcur, gap_lo, brk) != 0)
+            kprintf("exec-brk: anon gap failed lo=0x%llx brk=0x%llx\n",
+                (unsigned long long)gap_lo, (unsigned long long)brk);
+        uintptr_t hi = brk + tls_window;
+        if (hi > (uintptr_t)MMIO_IDENTITY_LIMIT)
+            hi = (uintptr_t)MMIO_IDENTITY_LIMIT;
+        if (hi > brk && user_as_ensure_range_for_exec(tcur, brk, hi) != 0)
+            kprintf("exec-brk: anon TLS window failed brk=0x%llx hi=0x%llx\n",
+                (unsigned long long)brk, (unsigned long long)hi);
     }
     if (tcur) {
         tcur->user_brk_base = brk;
         tcur->user_brk_cur = brk;
+        if (tcur->mm) {
+            tcur->mm->brk_base = brk;
+            tcur->mm->brk_current = brk;
+        }
         user_as_shared_publish_brk(tcur, brk, brk);
     } else {
         user_as_brk_base = brk;
@@ -281,6 +370,25 @@ void user_as_set_brk_after_load(thread_t *tcur, uintptr_t elf_brk, uintptr_t ima
 }
 
 void user_as_teardown_for_exec(thread_t *tcur, uintptr_t new_brk_base) {
+    /*
+     * Linux execve replaces the mm. When kernel_execve_from_path() already
+     * installed a fresh private mm, the old brk/mmap/heap live only in the
+     * discarded tree — do NOT scrub those VAs into the new mm.
+     *
+     * The old scrub (make_private_range / memset over [brk_lo,brk_hi)) walked
+     * still-shared identity leaves and zeroed/remapped the vfork parent's
+     * heap (fs≈0x8003c0, command name "ls" @ 0x801738 → parent #GP). It also
+     * stalled syscall 59 for many seconds on a grown ash heap.
+     */
+    if (user_as_has_private_mm(tcur)) {
+        uint64_t tid = (uint64_t)(tcur->tid ? tcur->tid : 1);
+        user_vma_remove_all_for_tid(tid);
+        user_as_reset_on_exec(tcur, new_brk_base);
+        user_as_reset_on_exec(NULL, new_brk_base);
+        return;
+    }
+
+    /* Legacy shared-CR3 boot path (no per-task mm yet). */
     uintptr_t brk_lo = (uintptr_t)-1;
     uintptr_t brk_hi = 0;
     int n = thread_get_count();
@@ -304,10 +412,8 @@ void user_as_teardown_for_exec(thread_t *tcur, uintptr_t new_brk_base) {
 
     user_vma_teardown_unmap_for_exec(tcur);
 
-    if (brk_hi > brk_lo && brk_lo >= 0x200000u && brk_hi <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
-        (void)user_map_ensure_present_us_2m((uint64_t)brk_lo, (uint64_t)brk_hi);
-        user_as_mmap_memset_zero_chunked(brk_lo, (size_t)(brk_hi - brk_lo));
-    }
+    if (brk_hi > brk_lo && brk_lo >= 0x200000u && brk_hi <= (uintptr_t)MMIO_IDENTITY_LIMIT)
+        user_as_ensure_range_for_exec(tcur, brk_lo, brk_hi);
 
     for (int i = 0; i < n; i++) {
         thread_t *t = thread_get_by_index(i);

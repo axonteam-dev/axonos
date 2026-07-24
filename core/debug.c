@@ -1,3 +1,9 @@
+/*
+ * core/debug.c
+ * QEMU debug tools
+ * Author: fcexx
+*/
+
 #include <stdarg.h>
 #include <stdint.h>
 #include <serial.h>
@@ -5,23 +11,18 @@
 
 #define QEMU_DEBUG_PORT 0x3f8
 
-static uint8_t is_transmit_empty(void)
-{
+uint8_t is_transmit_empty() {
     return inb(QEMU_DEBUG_PORT + 5) & 0x20;
 }
 
-static void write_serial(char a)
-{
-    while (!is_transmit_empty())
-        ;
+void write_serial(char a) {
+    while (is_transmit_empty() == 0);
     outb(QEMU_DEBUG_PORT, a);
 }
 
-static void print_num(int num)
-{
+void print_num(int num) {
     char buffer[12];
-    int i = 0;
-    int is_negative = 0;
+    int i = 0, is_negative = 0;
 
     if (num == 0) {
         write_serial('0');
@@ -35,15 +36,52 @@ static void print_num(int num)
         buffer[i++] = (num % 10) + '0';
         num /= 10;
     }
-    if (is_negative)
+    if (is_negative) {
         buffer[i++] = '-';
-    while (i > 0)
+    }
+    while (i > 0) {
         write_serial(buffer[--i]);
+    }
 }
 
-static void print_hex64(unsigned long long num, int uppercase)
-{
-    const char *hex = uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
+void print_uint(unsigned int num) {
+    char buffer[11];
+    int i = 0;
+
+    if (num == 0){
+        write_serial('0');
+        return;
+    }
+    while (num != 0) {
+        buffer[i++] = (num % 10) + '0';
+        num /= 10;
+    }
+    while (i > 0) {
+        write_serial(buffer[--i]);
+    }
+}
+
+void print_hex(unsigned int num) {
+    char hex_chars[] = "0123456789ABCDEF";
+    char buffer[9];
+    int i = 0;
+
+    if (num == 0) {
+        write_serial('0');
+        return;
+    }
+    while (num != 0) {
+        /* take the low nibble (0..15) */
+        buffer[i++] = hex_chars[num & 0xF];
+        num >>= 4;
+    }
+    while (i > 0) {
+        write_serial(buffer[--i]);
+    }
+
+}
+
+void print_u64(unsigned long long num) {
     char buffer[32];
     int i = 0;
 
@@ -52,18 +90,37 @@ static void print_hex64(unsigned long long num, int uppercase)
         return;
     }
     while (num != 0) {
+        buffer[i++] = '0' + (num % 10);
+        num /= 10;
+    }
+    while (i > 0) {
+        write_serial(buffer[--i]);
+    }
+}
+
+void print_hex64(unsigned long long num, int uppercase) {
+    const char *hex_low = "0123456789abcdef";
+    const char *hex_up = "0123456789ABCDEF";
+    const char *hex = uppercase ? hex_up : hex_low;
+    char buffer[32];
+    int i = 0;
+    if (num == 0) {
+        write_serial('0');
+        return;
+    }
+    while (num != 0) {
         buffer[i++] = hex[num & 0xF];
         num >>= 4;
     }
-    while (i > 0)
+    while (i > 0) {
         write_serial(buffer[--i]);
+    }
 }
 
-void qemu_debug_printf(const char *format, ...)
-{
+// qemu_debug_printf using stdarg
+void qemu_debug_printf(const char *format, ...) {
 #ifdef QEMU_LOG_ENABLE
     va_list args;
-
     va_start(args, format);
     const char *p = format;
 
@@ -72,16 +129,13 @@ void qemu_debug_printf(const char *format, ...)
             write_serial(*p++);
             continue;
         }
-        p++;
+        p++;  // Skip '%'
         int left = 0, zero_pad = 0, alt = 0;
-
+        // Parse flags
         while (*p == '-' || *p == '0' || *p == '#') {
-            if (*p == '-')
-                left = 1;
-            if (*p == '0')
-                zero_pad = 1;
-            if (*p == '#')
-                alt = 1;
+            if (*p == '-') left = 1;
+            if (*p == '0') zero_pad = 1;
+            if (*p == '#') alt = 1;
             p++;
         }
 
@@ -91,11 +145,9 @@ void qemu_debug_printf(const char *format, ...)
             p++;
         }
 
+        /* parse optional length modifiers: 'l' or 'll' */
         int lmod = 0;
-        while (*p == 'l') {
-            lmod++;
-            p++;
-        }
+        while (*p == 'l') { lmod++; p++; }
         char spec = *p ? *p++ : 0;
         char buf[64];
         int len = 0;
@@ -104,103 +156,103 @@ void qemu_debug_printf(const char *format, ...)
         if (spec == 's') {
             char *str = va_arg(args, char *);
             int slen = 0;
-            while (str[slen])
-                slen++;
-            int pad = width > slen ? width - slen : 0;
-            if (!left)
-                for (int i = 0; i < pad; i++)
-                    write_serial(pad_char);
-            for (int i = 0; i < slen; i++)
-                write_serial(str[i]);
-            if (left)
-                for (int i = 0; i < pad; i++)
-                    write_serial(' ');
-        } else if (spec == 'p') {
-            void *vp = va_arg(args, void *);
-            unsigned long long v = (unsigned long long)(uintptr_t)vp;
-            write_serial('0');
-            write_serial('x');
-            print_hex64(v, 0);
-        } else if (spec == 'u' || spec == 'd' || spec == 'i' || spec == 'x' || spec == 'X') {
-            int neg = 0;
-            int uppercase = (spec == 'X');
 
-            if (spec == 'd' || spec == 'i') {
-                if (lmod >= 2) {
-                    long long val = va_arg(args, long long);
-                    unsigned long long uval;
-                    if (val < 0) {
-                        neg = 1;
-                        uval = (unsigned long long)(-val);
-                    } else {
-                        uval = (unsigned long long)val;
-                    }
-                    if (uval == 0)
-                        buf[len++] = '0';
-                    else
-                        for (unsigned long long tmp = uval; tmp; tmp /= 10)
-                            buf[len++] = '0' + (tmp % 10);
-                } else {
-                    int val = va_arg(args, int);
-                    unsigned int uval;
-                    if (val < 0) {
-                        neg = 1;
-                        uval = (unsigned int)(-val);
-                    } else {
-                        uval = (unsigned int)val;
-                    }
-                    if (uval == 0)
-                        buf[len++] = '0';
-                    else
-                        for (unsigned int tmp = uval; tmp; tmp /= 10)
-                            buf[len++] = '0' + (tmp % 10);
-                }
-            } else if (spec == 'u') {
-                if (lmod >= 2) {
-                    unsigned long long val = va_arg(args, unsigned long long);
-                    if (val == 0)
-                        buf[len++] = '0';
-                    else
-                        for (unsigned long long tmp = val; tmp; tmp /= 10)
-                            buf[len++] = '0' + (tmp % 10);
-                } else {
-                    unsigned int val = va_arg(args, unsigned int);
-                    if (val == 0)
-                        buf[len++] = '0';
-                    else
-                        for (unsigned int tmp = val; tmp; tmp /= 10)
-                            buf[len++] = '0' + (tmp % 10);
-                }
+            while (str[slen]) slen++;
+            int pad = width > slen ? width - slen : 0;
+
+            if (!left) for (int i = 0; i < pad; i++) write_serial(pad_char);
+            for (int i = 0; i < slen; i++) write_serial(str[i]);
+
+            if (left) for (int i = 0; i < pad; i++) write_serial(' ');
+        } else if (spec == 'p') {
+            void *vp = va_arg(args, void*);
+            unsigned long long v = (unsigned long long)(uintptr_t)vp;
+
+            /* print as 0x... */
+            write_serial('0'); write_serial('x');
+            print_hex64(v, 0);
+        } else if (spec == 'u') {
+            if (lmod >= 2) {
+                unsigned long long val = va_arg(args, unsigned long long);
+                if (val == 0) buf[len++] = '0';
+                else { unsigned long long tmp = val; while (tmp) { buf[len++] = '0' + (tmp % 10); tmp /= 10; } }
+            } else if (lmod == 1) {
+                unsigned long val = va_arg(args, unsigned long);
+                if (val == 0) buf[len++] = '0';
+                else { unsigned long tmp = val; while (tmp) { buf[len++] = '0' + (tmp % 10); tmp /= 10; } }
             } else {
-                unsigned long long val = (lmod >= 2) ? va_arg(args, unsigned long long)
-                                                     : va_arg(args, unsigned int);
-                const char *hex = uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
-                if (val == 0)
-                    buf[len++] = '0';
-                else
-                    for (unsigned long long tmp = val; tmp; tmp >>= 4)
-                        buf[len++] = hex[tmp & 0xF];
+                unsigned int val = va_arg(args, unsigned int);
+                if (val == 0) buf[len++] = '0';
+                else { unsigned int tmp = val; while (tmp) { buf[len++] = '0' + (tmp % 10); tmp /= 10; } }
             }
 
-            int prefix = (spec == 'x' || spec == 'X') && alt ? 2 : 0;
-            int total_len = len + prefix + neg;
+            int pad = width > len ? width - len : 0;
+            if (!left) for (int i = 0; i < pad; i++) write_serial(pad_char);
+            for (int i = len - 1; i >= 0; i--) write_serial(buf[i]);
+
+            if (left) for (int i = 0; i < pad; i++) write_serial(' ');
+        } else if (spec == 'd' || spec == 'i') {
+            if (lmod >= 2) {
+                long long val = va_arg(args, long long);
+                unsigned long long uval; int neg = 0;
+
+                if (val < 0) { neg = 1; uval = (unsigned long long)(-val); } else uval = (unsigned long long)val;
+                if (uval == 0) buf[len++] = '0';
+                else { unsigned long long tmp = uval; while (tmp) { buf[len++] = '0' + (tmp % 10); tmp /= 10; } }
+                int total_len = len + neg;
+                int pad = width > total_len ? width - total_len : 0;
+
+                if (!left) for (int i = 0; i < pad; i++) write_serial(pad_char);
+                if (neg) write_serial('-');
+
+                for (int i = len - 1; i >= 0; i--) write_serial(buf[i]);
+                if (left) for (int i = 0; i < pad; i++) write_serial(' ');
+            } else {
+                int val = va_arg(args, int);
+                unsigned int uval; int neg = 0;
+
+                if (val < 0) { neg = 1; uval = (unsigned int)(-val); } else uval = (unsigned int)val;
+                if (uval == 0) buf[len++] = '0';
+                else { unsigned int tmp = uval; while (tmp) { buf[len++] = '0' + (tmp % 10); tmp /= 10; } }
+                int total_len = len + neg;
+            
+                int pad = width > total_len ? width - total_len : 0;
+                if (!left) for (int i = 0; i < pad; i++) write_serial(pad_char);
+                if (neg) write_serial('-');
+
+                for (int i = len - 1; i >= 0; i--) write_serial(buf[i]);
+                if (left) for (int i = 0; i < pad; i++) write_serial(' ');
+            }
+        } else if (spec == 'x' || spec == 'X') {
+            int uppercase = (spec == 'X');
+            if (lmod >= 2) {
+                unsigned long long val = va_arg(args, unsigned long long);
+                if (val == 0) buf[len++] = '0';
+                else { unsigned long long tmp = val; const char *hex = uppercase ? "0123456789ABCDEF" : "0123456789abcdef"; while (tmp) { buf[len++] = hex[tmp & 0xF]; tmp >>= 4; } }
+            } else if (lmod == 1) {
+                unsigned long val = va_arg(args, unsigned long);
+                if (val == 0) buf[len++] = '0';
+                else { unsigned long tmp = val; const char *hex = uppercase ? "0123456789ABCDEF" : "0123456789abcdef"; while (tmp) { buf[len++] = hex[tmp & 0xF]; tmp >>= 4; } }
+            } else {
+                unsigned int val = va_arg(args, unsigned int);
+                if (val == 0) buf[len++] = '0';
+                else { unsigned int tmp = val; const char *hex = uppercase ? "0123456789ABCDEF" : "0123456789abcdef"; while (tmp) { buf[len++] = hex[tmp & 0xF]; tmp >>= 4; } }
+            }
+            int prefix = alt ? 2 : 0;
+            int total_len = len + prefix;
             int pad = width > total_len ? width - total_len : 0;
-            if (!left)
-                for (int i = 0; i < pad; i++)
-                    write_serial(pad_char);
-            if (neg)
-                write_serial('-');
-            if (prefix) {
+
+            if (!left) for (int i = 0; i < pad; i++) write_serial(pad_char);
+            if (alt) {
                 write_serial('0');
                 write_serial(uppercase ? 'X' : 'x');
             }
-            for (int i = len - 1; i >= 0; i--)
-                write_serial(buf[i]);
-            if (left)
-                for (int i = 0; i < pad; i++)
-                    write_serial(' ');
+            for (int i = len - 1; i >= 0; i--) write_serial(buf[i]);
+
+            if (left) for (int i = 0; i < pad; i++) write_serial(' ');
         } else if (spec == 'c') {
-            write_serial((char)va_arg(args, int));
+            char c = (char)va_arg(args, int);
+            write_serial(c);
         } else if (spec == '%') {
             write_serial('%');
         } else if (spec) {
@@ -211,29 +263,30 @@ void qemu_debug_printf(const char *format, ...)
 #endif
 }
 
-void oom_serial_notify(unsigned long long syscall_num, const char *name)
-{
+void debug_serial_marker(const char *message) {
+    if (!message)
+        return;
+    while (*message) {
+        write_serial(*message);
+        outb(0xe9, (unsigned char)*message);
+        message++;
+    }
+    write_serial('\n');
+    outb(0xe9, '\n');
+}
+
+void oom_serial_notify(unsigned long long syscall_num, const char *name) {
     const char msg[] = "\r\n[OOM] syscall=";
+    int i;
+    for (i = 0; msg[i]; i++) write_serial(msg[i]);
     char buf[24];
     int n = 0;
     unsigned long long v = syscall_num;
-
-    for (int i = 0; msg[i]; i++)
-        write_serial(msg[i]);
-    if (v == 0)
-        buf[n++] = '0';
-    else
-        while (v) {
-            buf[n++] = '0' + (v % 10);
-            v /= 10;
-        }
-    while (n > 0)
-        write_serial(buf[--n]);
+    if (v == 0) buf[n++] = '0';
+    else { while (v) { buf[n++] = '0' + (v % 10); v /= 10; } }
+    while (n > 0) write_serial(buf[--n]);
     write_serial(' ');
-    if (name) {
-        for (int k = 0; name[k] && k < 32; k++)
-            write_serial(name[k]);
-    }
+    if (name) { int k = 0; while (name[k] && k < 32) { write_serial(name[k++]); } }
     write_serial('\r');
     write_serial('\n');
 }

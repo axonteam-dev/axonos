@@ -32,7 +32,6 @@ static size_t klog_early_used;
 #define KLOG_TS_MAX 48
 #define KLOG_MSG_MAX 900
 #define KLOG_OUT_MAX 1024
-static char klog_out[KLOG_OUT_MAX];
 
 uint64_t klog_tsc_base = 0;
 uint64_t klog_time_base_usec = 0;
@@ -51,8 +50,11 @@ static void klog_console_write_sync_tty(const char *s, size_t n) {
 	}
 	for (size_t i = 0; i < n; i++) {
 		console_set_cursor(tty->cursor_x, tty->cursor_y);
-		/* ANSI-aware path: prevents raw tail like "[H" from ESC[H in logs. */
-		kputchar((uint8_t)s[i], tty->current_attr ? tty->current_attr : 0x07);
+		/* Literal cells only: klog timestamps start with '['.  Feeding them
+		 * through kputchar's ANSI FSM after a stale ESC leaves "[H" glued onto
+		 * boot lines (looks like a broken login clear). */
+		console_putc_tty_literal((uint8_t)s[i],
+			tty->current_attr ? tty->current_attr : 0x07);
 		console_get_cursor(&tty->cursor_x, &tty->cursor_y);
 	}
 }
@@ -122,81 +124,106 @@ void klog_init(void) {
 }
 
 void klogprintf(const char *fmt, ...) {
-	unsigned long irqf;
-	acquire_irqsave(&klog_lock, &irqf);
+	/*
+	 * Format under the lock with IRQs off, then release before console/VFS.
+	 * Painting VBE/tty cell-by-cell with IF=0 froze the machine for seconds
+	 * per line (SSH connect sniff / any hot-path klog) and dropped NIC RX.
+	 */
+	char line[KLOG_OUT_MAX];
+	size_t outlen = 0;
+	int do_console = 0;
+	int early = 0;
+	int inited = 0;
 
-	char msg[KLOG_MSG_MAX];
-	va_list ap;
-	va_start(ap, fmt);
-	int n = vsnprintf(msg, sizeof msg, fmt, ap);
-	va_end(ap);
-	if (n < 0) {
-		release_irqrestore(&klog_lock, irqf);
-		return;
-	}
-	size_t len = (size_t)n;
-	if (len >= sizeof msg)
-		len = sizeof msg - 1;
-	if (len == 0 || msg[len - 1] != '\n') {
-		if (len + 1 < sizeof msg)
-			msg[len++] = '\n';
-		else if (len > 0)
-			msg[len - 1] = '\n';
-	}
+	{
+		unsigned long irqf;
+		acquire_irqsave(&klog_lock, &irqf);
 
-	char ts[KLOG_TS_MAX];
-	uint64_t usec = klog_get_time_us();
-	uint64_t secs = usec / 1000000;
-	uint64_t micros = usec % 1000000;
-	int tn = snprintf(ts, sizeof ts, "[%5llu.%06llu] ",
-			  (unsigned long long)secs, (unsigned long long)micros);
-	size_t tslen = 0;
-	if (tn > 0) {
-		if ((size_t)tn < sizeof ts)
-			tslen = (size_t)tn;
-		else
-			tslen = sizeof ts - 1u;
-	}
+		char msg[KLOG_MSG_MAX];
+		va_list ap;
+		va_start(ap, fmt);
+		int n = vsnprintf(msg, sizeof msg, fmt, ap);
+		va_end(ap);
+		if (n < 0) {
+			release_irqrestore(&klog_lock, irqf);
+			return;
+		}
+		size_t len = (size_t)n;
+		if (len >= sizeof msg)
+			len = sizeof msg - 1;
+		if (len == 0 || msg[len - 1] != '\n') {
+			if (len + 1 < sizeof msg)
+				msg[len++] = '\n';
+			else if (len > 0)
+				msg[len - 1] = '\n';
+		}
 
-	size_t outlen = tslen + len;
-	if (outlen + 1 > sizeof klog_out) {
-		size_t room = sizeof klog_out - tslen - 1u;
-		if (room > len)
-			room = len;
-		memcpy(klog_out, ts, tslen);
-		memcpy(klog_out + tslen, msg, room);
-		outlen = tslen + room;
-	} else {
-		memcpy(klog_out, ts, tslen);
-		memcpy(klog_out + tslen, msg, len);
-	}
-	klog_out[outlen] = '\0';
-
-	klog_console_write_sync_tty(klog_out, outlen);
-
-	if (!klog_inited) {
-		klog_early_append(klog_out, outlen);
-#ifdef QEMU_LOG_ENABLE
-		qemu_debug_printf("%s", klog_out);
+#ifdef KERNEL_LOG_TIME
+		char ts[KLOG_TS_MAX];
+		uint64_t usec = klog_get_time_us();
+		uint64_t secs = usec / 1000000;
+		uint64_t micros = usec % 1000000;
+		int tn = snprintf(ts, sizeof ts, "[%5llu.%06llu] ",
+				  (unsigned long long)secs, (unsigned long long)micros);
+		size_t tslen = 0;
+		if (tn > 0) {
+			if ((size_t)tn < sizeof ts)
+				tslen = (size_t)tn;
+			else
+				tslen = sizeof ts - 1u;
+		}
+		outlen = tslen + len;
+		if (outlen + 1 > sizeof line) {
+			size_t room = sizeof line - tslen - 1u;
+			if (room > len)
+				room = len;
+			memcpy(line, ts, tslen);
+			memcpy(line + tslen, msg, room);
+			outlen = tslen + room;
+		} else {
+			memcpy(line, ts, tslen);
+			memcpy(line + tslen, msg, len);
+		}
+		line[outlen] = '\0';
+		do_console = 1;
+#else
+		outlen = len;
+		if (outlen + 1 > sizeof line)
+			outlen = sizeof line - 1u;
+		memcpy(line, msg, outlen);
+		line[outlen] = '\0';
 #endif
+
+		inited = klog_inited;
+		if (!inited) {
+			klog_early_append(line, outlen);
+			early = 1;
+		}
+
 		release_irqrestore(&klog_lock, irqf);
-		return;
 	}
 
-	struct fs_file *f = fs_open("/var/log/kernel");
-	if (!f)
-		f = fs_create_file("/var/log/kernel");
-	if (f) {
-		size_t off = (size_t)f->size;
-		struct stat st;
-		if (vfs_fstat(f, &st) == 0 && st.st_size >= 0)
-			off = (size_t)st.st_size;
-		(void)fs_write(f, klog_out, outlen, off);
-		fs_file_free(f);
-	}
+	if (do_console)
+		klog_console_write_sync_tty(line, outlen);
 
 #ifdef QEMU_LOG_ENABLE
-	qemu_debug_printf("%s", klog_out);
+	qemu_debug_printf("%s", line);
 #endif
-	release_irqrestore(&klog_lock, irqf);
+
+	if (early)
+		return;
+
+	if (inited) {
+		struct fs_file *f = fs_open("/var/log/kernel");
+		if (!f)
+			f = fs_create_file("/var/log/kernel");
+		if (f) {
+			size_t off = (size_t)f->size;
+			struct stat st;
+			if (vfs_fstat(f, &st) == 0 && st.st_size >= 0)
+				off = (size_t)st.st_size;
+			(void)fs_write(f, line, outlen, off);
+			fs_file_free(f);
+		}
+	}
 }

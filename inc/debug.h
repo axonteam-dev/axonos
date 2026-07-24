@@ -5,11 +5,29 @@
 struct thread;
 typedef struct thread thread_t;
 
+/*
+ * Development console/serial traces (COW, pipe, fork child, ash-watch, …).
+ * Off by default. Enable:  make CFLAGS_EXTRA='-DDEVEL_DEBUG=1'
+ * or #define DEVEL_DEBUG 1 before including this header.
+ */
+#ifndef DEVEL_DEBUG
+#define DEVEL_DEBUG 0
+#endif
+
 #ifndef AXON_FORK_DEBUG
-#define AXON_FORK_DEBUG 1
+#define AXON_FORK_DEBUG DEVEL_DEBUG
+#endif
+
+void kprintf(const char *fmt, ...);
+
+#if DEVEL_DEBUG
+#define devel_printf(...) kprintf(__VA_ARGS__)
+#else
+#define devel_printf(...) ((void)0)
 #endif
 
 void qemu_debug_printf(const char *format, ...);
+void debug_serial_marker(const char *message);
 /* User-visible trace: writes to cur->fds[1] (stdout) and qemu_debug_printf. */
 void axon_user_dbg(thread_t *cur, const char *tag, int step, const char *msg,
     unsigned long long a, unsigned long long b, unsigned long long c);

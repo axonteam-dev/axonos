@@ -30,4 +30,7 @@ SECTIONS
 
     . = ALIGN(16);
     _end = .; PROVIDE(end = .);
+
+    /* Linux x86-64 static ET_EXEC images conventionally begin at 0x400000. */
+    ASSERT(_end <= 0x400000, "kernel overlaps fixed-address user ET_EXEC range")
 }

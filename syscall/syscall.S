@@ -23,6 +23,9 @@
 .extern syscall_return_to_shell
 .extern syscall_exec_trampoline_active
 .extern syscall_snapshot_user_regs
+.extern syscall_restore_user_fs_before_iretq
+.extern syscall_finalize_user_frame
+.extern syscall_maybe_vfork_wait
 .extern maybe_deliver_pending_signal
 
 // x86_64 SYSCALL entry point
@@ -146,14 +149,24 @@ syscall_entry64:
     /* Linux x86_64 syscall ABI: args 1..6 = rdi,rsi,rdx,r10,r8,r9.
        Here: a4 is saved r10. a5 must be saved r8, a6 must be saved r9. */
     movq    56(%rsp),  %r9      // a5 = user r8
-    pushq   48(%rsp)            // a6 = user r9 (7th arg on stack)
+    movq    48(%rsp),  %rax     // a6 = user r9
+    subq    $8, %rsp            // SysV call-site alignment padding
+    pushq   %rax                // 7th C argument at 8(%rsp) on callee entry
     call    syscall_do
-    addq    $8, %rsp
+    addq    $16, %rsp
+
+    /* vfork parent: sleep here (C returned). Retval passed/returned in rax —
+     * do not park it on this stack across yield (child may reuse kstack bind). */
+    movq    %rax, %rdi
+    call    syscall_maybe_vfork_wait
 
     // Check for pending signals and possibly deliver before returning to user
+    subq    $8, %rsp            // keep %rsp 16-byte aligned at CALL
     pushq   %rax
+    movq    %rax, %rdi
     call    maybe_deliver_pending_signal
     popq    %rax
+    addq    $8, %rsp
 
     // If userspace requested exit(), do not return back to ring3.
     // Jump back to kernel shell loop instead.
@@ -178,6 +191,23 @@ syscall_entry64:
 .L_do_write_rax:
     movq    %rax, 112(%rsp)
 .L_skip_write_rax:
+
+    /* fork children remain blocked until a timer has observed this parent back
+     * in ring 3 (or until its next syscall entry). Never publish a child while
+     * this live parent frame is still being finalized. */
+    /* Re-bind FS before iretq: after fork/vfork the child can lose MSR_FS_BASE
+     * across a schedule while the parent runs; BusyBox then dies in tcsetpgrp
+     * canary loads (%fs:0x28) with no further syscall logs. */
+    call    syscall_restore_user_fs_before_iretq
+    /* C helpers above may use caller-saved registers, but Linux syscall return
+     * preserves every GPR except rax/rcx/r11. Re-apply the owning thread's
+     * authoritative saved register image to the live frame immediately before
+     * the pops. This is required by glibc clone: its child keeps clone's zero in
+     * rdx across set_robust_list and then executes `mov %edx,%eax`. */
+    movq    %rsp, %rdi
+    call    syscall_finalize_user_frame
+    movq    %rsp, %rdi
+    call    syscall_epilogue_probe
 
     // Restore registers.
     popq    %r15
@@ -210,6 +240,51 @@ syscall_entry64:
     pushq   %r11
     pushq   $0x1B
     pushq   %rcx
+    clts
     iretq
 
+// Linux fork child: restore frame[0..15] and return through IRETQ.
+// rdi = frame; frame[0]=r15 .. frame[14]=rax .. frame[15]=user_rsp.
+.global syscall_child_return_from_frame
+syscall_child_return_from_frame:
+    cld
+    pushq   120(%rdi)       // user_rsp (deepest slot, matches syscall_entry64)
+    pushq   $0              // rax = 0 (child return value)
+    pushq   104(%rdi)       // rcx = user return RIP
+    pushq   96(%rdi)        // rdx
+    pushq   88(%rdi)        // rbx
+    pushq   80(%rdi)        // rbp
+    pushq   72(%rdi)        // rsi
+    pushq   64(%rdi)        // rdi
+    pushq   56(%rdi)        // r8
+    pushq   48(%rdi)        // r9
+    pushq   40(%rdi)        // r10
+    pushq   32(%rdi)        // r11 = user rflags
+    pushq   24(%rdi)        // r12
+    pushq   16(%rdi)        // r13
+    pushq   8(%rdi)         // r14
+    pushq   (%rdi)           // r15
+    popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %r11
+    popq    %r10
+    popq    %r9
+    popq    %r8
+    popq    %rdi
+    popq    %rsi
+    popq    %rbp
+    popq    %rbx
+    popq    %rdx
+    popq    %rcx
+    popq    %rax
+    pushq   $0x23
+    pushq   8(%rsp)
+    movq    $0x202, %r11
+    pushq   %r11
+    pushq   $0x1B
+    pushq   %rcx
+    clts
+    iretq
 

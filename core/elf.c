@@ -1651,8 +1651,6 @@ int kernel_execve_from_path(const char *path, const char *const argv[],
         } else {
             mm_release(new_mm);
         }
-        kprintf("execve: failed after activate rc=%d path=%s\n",
-                rc, path ? path : "?");
         return rc;
     }
 
@@ -1890,10 +1888,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         thread_t *tc = thread_current();
         if (elf_needs_private_user_pages(tc)) {
             uintptr_t tip_lo = final_stack > 0x8000u ? (final_stack - 0x8000u) : final_stack;
-            if (exec_map_stack_tip(tc, tip_lo, stack_top) != 0) {
-                kprintf("execve: failed to map stack tip (linux demand-stack)\n");
-                return -1;
-            }
+            if (exec_map_stack_tip(tc, tip_lo, stack_top) != 0) return -1;
         }
     }
 
@@ -1988,7 +1983,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
     uintptr_t fs_base = 0;
     if (aux_base == 0) {
         if (exec_seed_static_tls(stack_top, random_addr, &main_tls, &fs_base) != 0) {
-            kprintf("execve: failed to seed static TLS\n");
+            kprintf("axonOS: failed to seed static TLS\n");
             return -1;
         }
         msr_write_u64_local(MSR_FS_BASE_LOCAL, (uint64_t)fs_base);

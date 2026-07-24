@@ -1657,7 +1657,11 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 
 /* Pipe: kernel buffer + two fd ends. driver_private = pipe_t*,
  * fs_private = PIPE_END_READ / PIPE_END_WRITE (see fs.h). */
+/* Linux keeps PIPE_BUF at 4 KiB for atomicity but normally gives each pipe a
+ * 64 KiB ring. Archive pipelines must not block/wake on every single page. */
 #define PIPE_BUF_SIZE 4096
+#define PIPE_CAPACITY (64u * 1024u)
+#define PIPE_RW_CHUNK (64u * 1024u)
 typedef struct pipe {
     uint64_t id;
     uint8_t *buf;
@@ -2947,8 +2951,8 @@ static void net_rxq_drain_process_incoming(int budget) {
 }
 
 static void net_pump_listen_handshake(void) {
-    net_nic_drain_process_incoming(64);
-    net_rxq_drain_process_incoming(32);
+    net_nic_drain_process_incoming(8);
+    net_rxq_drain_process_incoming(4);
 }
 
 static void net_nic_discard_pending(int budget) {
@@ -3547,16 +3551,15 @@ static int net_udp_recv_into_pending(ksock_net_t *s) {
     }
 }
 
-static const net_tcp_conn_t *s_tcp_rx_match;
 static uint8_t s_net_pull_buf[NET_RXQ_BUF];
 
-static int net_send_l4_ipv4_cb(uint32_t dst_ip_be, uint8_t proto, const void *l4, size_t l4_len);
-static void net_tcp_post_tx_drain(void);
+static int net_send_l4_ipv4_cb(void *context, uint32_t dst_ip_be, uint8_t proto,
+                               const void *l4, size_t l4_len);
 
 /* During connect: queue only matching TCP; process ARP/ICMP/listen; drop LAN noise.
  * Blind drain_to_rxq flooded RXQ with UDP broadcasts and displaced SYN-ACK. */
-static void net_nic_drain_connect_priority(int budget) {
-    if (!s_tcp_rx_match || !g_net.ready) {
+static void net_nic_drain_connect_priority(const net_tcp_conn_t *match, int budget) {
+    if (!match || !g_net.ready) {
         net_nic_drain_to_rxq(budget);
         return;
     }
@@ -3564,7 +3567,7 @@ static void net_nic_drain_connect_priority(int budget) {
         int n = net_nic_pull_frame(s_net_pull_buf, sizeof(s_net_pull_buf));
         if (n <= 0)
             break;
-        if (net_tcp_match_frame(s_net_pull_buf, (size_t)n, g_net.ip_be, s_tcp_rx_match)) {
+        if (net_tcp_match_frame(s_net_pull_buf, (size_t)n, g_net.ip_be, match)) {
             if (net_rxq_push(s_net_pull_buf, (size_t)n) != 0) {
                 uint8_t drop[NET_RXQ_BUF];
                 (void)net_rxq_pop(drop, sizeof(drop));
@@ -3576,22 +3579,23 @@ static void net_nic_drain_connect_priority(int budget) {
     }
 }
 
-static int net_recv_frame_cb(void *buf, size_t cap) {
-    if (s_tcp_rx_match && g_net.ready) {
-        for (int pass = 0; pass < 16; pass++) {
-            int n = net_rxq_take_tcp_frame(s_tcp_rx_match, g_net.ip_be, buf, cap);
+static int net_recv_frame_cb(void *context, void *buf, size_t cap) {
+    const net_tcp_conn_t *match = (const net_tcp_conn_t *)context;
+    if (match && g_net.ready) {
+        for (int pass = 0; pass < 2; pass++) {
+            int n = net_rxq_take_tcp_frame(match, g_net.ip_be, buf, cap);
             if (n > 0) return n;
             if (g_net_tcp_connect_active)
-                net_nic_drain_connect_priority(64);
+                net_nic_drain_connect_priority(match, 16);
             else
-                net_nic_drain_to_rxq(32);
+                net_nic_drain_to_rxq(8);
         }
-        for (int nic = 0; nic < 32; nic++) {
+        for (int nic = 0; nic < 8; nic++) {
             int r = net_nic_pull_frame(s_net_pull_buf, sizeof(s_net_pull_buf));
             if (r <= 0)
                 return 0;
-            net_tcp_sniff_frame(s_net_pull_buf, (size_t)r, s_tcp_rx_match);
-            if (net_tcp_match_frame(s_net_pull_buf, (size_t)r, g_net.ip_be, s_tcp_rx_match)) {
+            net_tcp_sniff_frame(s_net_pull_buf, (size_t)r, match);
+            if (net_tcp_match_frame(s_net_pull_buf, (size_t)r, g_net.ip_be, match)) {
                 if ((size_t)r > cap)
                     return -1;
                 memcpy(buf, s_net_pull_buf, (size_t)r);
@@ -3608,26 +3612,22 @@ static uint64_t net_time_ms_cb(void) {
     return pit_get_time_ms();
 }
 
-static void net_yield_connect_cb(void) {
+static void net_yield_connect_cb(void *context) {
     /* Keep SYN-ACK path hot: priority drain + yield, no forced 1ms sleep. */
-    net_nic_drain_connect_priority(64);
-    thread_yield();
+    net_nic_drain_connect_priority((const net_tcp_conn_t *)context, 16);
+    thread_sleep(1);
 }
 
-static unsigned g_net_yield_spins;
-
-static void net_yield_cb(void) {
+static void net_yield_cb(void *context) {
     if (g_net_tcp_connect_active) {
-        net_yield_connect_cb();
+        net_yield_connect_cb(context);
         return;
     }
-    net_nic_drain_process_incoming(32);
-    net_rxq_drain_process_incoming(16);
-    g_net_yield_spins++;
-    if ((g_net_yield_spins & 63u) == 0u)
-        thread_sleep(1);
-    else
-        thread_yield();
+    net_nic_drain_process_incoming(8);
+    net_rxq_drain_process_incoming(8);
+    /* A yield-only blocking socket remains RUNNING and creates a busy ring of
+     * httpd children. Sleep makes the wait scheduler-visible and preemptible. */
+    thread_sleep(1);
 }
 
 static void net_tcp_return_frame_cb(const void *frame, size_t n) {
@@ -3642,7 +3642,7 @@ static void net_tcp_return_frame_cb(const void *frame, size_t n) {
 static void net_make_tcp_ops(net_tcp_ops_t *ops, net_tcp_conn_t *match) {
     if (!ops) return;
     memset(ops, 0, sizeof(*ops));
-    s_tcp_rx_match = match;
+    ops->context = match;
     ops->local_ip_be = g_net.ip_be;
     ops->send_l4 = net_send_l4_ipv4_cb;
     ops->recv_frame = net_recv_frame_cb;
@@ -4032,8 +4032,6 @@ static int net_tcp_dispatch_incoming(const uint8_t *frame, size_t n) {
             tc->src_port = dport;
             net_tcp_stage_peer_mac(tc, eth->src);
         }
-        g_tcp_xmit_mac_valid = 1;
-        memcpy(g_tcp_xmit_mac, eth->src, 6);
         {
             extern volatile uint64_t timer_ticks;
             uint32_t now = (uint32_t)timer_ticks;
@@ -4057,7 +4055,6 @@ static int net_tcp_dispatch_incoming(const uint8_t *frame, size_t n) {
                 (unsigned)((rip >> 24) & 0xFF), (unsigned)((rip >> 16) & 0xFF),
                 (unsigned)((rip >> 8) & 0xFF), (unsigned)(rip & 0xFF), (unsigned)sport);
         }
-        g_tcp_xmit_mac_valid = 0;
         {
             uint8_t drain[NET_RXQ_BUF];
             for (int di = 0; di < 4; di++) {
@@ -4104,52 +4101,21 @@ static int net_tcp_dispatch_incoming(const uint8_t *frame, size_t n) {
             (void)net_rxq_pop(drop, sizeof(drop));
             (void)net_rxq_push(frame, n);
         }
-        if (est->tcp.peer_mac_valid) {
-            g_tcp_xmit_mac_valid = 1;
-            memcpy(g_tcp_xmit_mac, est->tcp.peer_mac, 6);
-        }
-        net_tcp_ops_t ops;
-        net_make_tcp_ops(&ops, &est->tcp);
-        (void)net_tcp_service(&est->tcp, &ops, 64);
-        g_tcp_xmit_mac_valid = 0;
+        /* Queue only. Calling service here re-entered recv_frame -> dispatch
+         * recursively and multiplied work across every active connection. */
         return 1;
     }
     return 0;
 }
 
-/* Pull NIC immediately after TCP TX during connect (SYN-ACK often lands before next poll). */
-static void net_tcp_post_tx_drain(void) {
-    if (!g_net_tcp_connect_active || !s_tcp_rx_match || !g_net.ready)
-        return;
-    net_tcp_conn_t *c = (net_tcp_conn_t *)s_tcp_rx_match;
-    net_tcp_ops_t ops;
-    net_make_tcp_ops(&ops, c);
-    for (int i = 0; i < 64; i++) {
-        int r = net_nic_pull_frame(s_net_pull_buf, sizeof(s_net_pull_buf));
-        if (r <= 0)
-            break;
-        net_tcp_sniff_frame(s_net_pull_buf, (size_t)r, c);
-        if (net_tcp_match_frame(s_net_pull_buf, (size_t)r, g_net.ip_be, c)) {
-            if (net_rxq_push(s_net_pull_buf, (size_t)r) != 0) {
-                uint8_t drop[NET_RXQ_BUF];
-                (void)net_rxq_pop(drop, sizeof(drop));
-                (void)net_rxq_push(s_net_pull_buf, (size_t)r);
-            }
-            (void)net_tcp_service(c, &ops, 64);
-            if (c->established)
-                return;
-        } else {
-            (void)net_process_incoming_or_queue(s_net_pull_buf, (size_t)r);
-        }
-    }
-}
-
-static int net_send_l4_ipv4_cb(uint32_t dst_ip_be, uint8_t proto, const void *l4, size_t l4_len) {
+static int net_send_l4_ipv4_cb(void *context, uint32_t dst_ip_be, uint8_t proto,
+                               const void *l4, size_t l4_len) {
+    const net_tcp_conn_t *match = (const net_tcp_conn_t *)context;
     uint8_t dst_mac[6];
-    if (g_tcp_xmit_mac_valid) {
+    if (match && match->peer_mac_valid) {
+        memcpy(dst_mac, match->peer_mac, 6);
+    } else if (g_tcp_xmit_mac_valid) {
         memcpy(dst_mac, g_tcp_xmit_mac, 6);
-    } else if (s_tcp_rx_match && s_tcp_rx_match->peer_mac_valid) {
-        memcpy(dst_mac, s_tcp_rx_match->peer_mac, 6);
     } else if (net_resolve_next_hop_mac(dst_ip_be, dst_mac) != 0) {
         return -1;
     }
@@ -6273,43 +6239,9 @@ static int copy_to_user_safe(void *uptr, const void *kptr, size_t n) {
      * not take the user #PF COW path; without this, rt_sigaction(oldact) on a
      * still-shared stack page faults into uaccess-abort / hang. */
     if (t && t->mm && t->mm != mm_kernel()) {
-        mm_t *share = mm_kernel();
-        uintptr_t a = (uintptr_t)uptr;
-        uintptr_t end = a + n;
-        for (uintptr_t pg = a & ~0xFFFULL; pg < end; pg += 0x1000ULL) {
-            uint64_t leaf = 0;
-            if (mm_user_leaf_pa(t->mm, pg, 0, &leaf) != 0)
-                return -1;
-            if ((leaf & ~0xFFFULL) == pg &&
-                mm_privatize_identity_range(t->mm, pg, pg + 0x1000ULL) != 0)
-                return -1;
-            if (mm_user_leaf_pa(t->mm, pg, 1, &leaf) != 0) {
-                if (mm_cow_fault_page(t->mm, pg, share) != 0 ||
-                    mm_user_leaf_pa(t->mm, pg, 1, &leaf) != 0)
-                    return -1;
-            }
-        }
-        {
-            const uint8_t *src = (const uint8_t *)kptr;
-            size_t left = n;
-            uint64_t va = (uint64_t)a;
-            while (left) {
-                uint64_t leaf = 0;
-                if (mm_user_leaf_pa(t->mm, va, 1, &leaf) != 0)
-                    return -1;
-                uint64_t page = leaf & ~0xFFFULL;
-                uint64_t off = va & 0xFFFULL;
-                size_t chunk = (size_t)(0x1000ULL - off);
-                if (chunk > left)
-                    chunk = left;
-                memcpy((void *)(uintptr_t)(page + off), src, chunk);
-                invlpg((void *)(uintptr_t)va);
-                va += chunk;
-                src += chunk;
-                left -= chunk;
-            }
-            return 0;
-        }
+        mm_t *share = t->mm_ptemplate ? t->mm_ptemplate : mm_kernel();
+        return mm_copy_to_user(t->mm, share,
+                               (uint64_t)(uintptr_t)uptr, kptr, n);
     }
     if (uaccess_arm(t, uptr, n, &&fault, 0) != 0) return -1;
     {
@@ -6334,24 +6266,8 @@ static int copy_from_user_raw(void *kdst, const void *usrc, size_t n) {
      * under kernel CR3 after vfork detach saw sa_mask as sa_handler.
      */
     if (t && t->mm && t->mm != mm_kernel() && t->mm->pml4) {
-        uint8_t *dst = (uint8_t *)kdst;
-        size_t left = n;
-        uint64_t va = (uint64_t)(uintptr_t)usrc;
-        while (left) {
-            uint64_t leaf = 0;
-            if (mm_user_leaf_pa(t->mm, va, 0, &leaf) != 0)
-                return -1;
-            uint64_t page = leaf & ~0xFFFULL;
-            uint64_t off = va & 0xFFFULL;
-            size_t chunk = (size_t)(0x1000ULL - off);
-            if (chunk > left)
-                chunk = left;
-            memcpy(dst, (const void *)(uintptr_t)(page + off), chunk);
-            va += chunk;
-            dst += chunk;
-            left -= chunk;
-        }
-        return 0;
+        return mm_copy_from_user(t->mm, kdst,
+                                 (uint64_t)(uintptr_t)usrc, n);
     }
     if (uaccess_arm(t, usrc, n, &&fault, 0) != 0) return -1;
     {
@@ -6579,10 +6495,10 @@ static ssize_t net_sock_write_userspace(thread_t *cur, int fd, ksock_net_t *s, c
             total += (size_t)wr;
             if ((size_t)wr < chunk) break;
         }
-        (void)net_tcp_flush_tx(&s->tcp, &ops, 5000);
-        for (int p = 0; p < 8; p++) {
+        (void)net_tcp_flush_tx(&s->tcp, &ops, 250);
+        for (int p = 0; p < 2; p++) {
             e1000_poll();
-            (void)net_tcp_service(&s->tcp, &ops, 32);
+            (void)net_tcp_service(&s->tcp, &ops, 8);
             if (s->tcp.rx_len > 0)
                 break;
         }
@@ -6690,15 +6606,13 @@ static ssize_t net_sock_read_userspace(thread_t *cur, ksock_net_t *s, void *bufp
         if (!tmp) return -ENOMEM;
         size_t total = 0;
         for (;;) {
-            for (int pump = 0; pump < 16; pump++) {
+            for (int pump = 0; pump < 2; pump++) {
                 e1000_poll();
-                (void)net_tcp_service(&s->tcp, &ops, 32);
+                (void)net_tcp_service(&s->tcp, &ops, 8);
                 if (s->tcp.rx_len > 0)
                     break;
                 if (s->tcp.peer_rst)
                     break;
-                if ((pump & 3) == 3)
-                    thread_yield();
             }
             if (s->tcp.established && s->tcp.rx_len < sizeof(s->tcp.rx_buf))
                 (void)net_tcp_window_update(&s->tcp, &ops);
@@ -6708,9 +6622,9 @@ static ssize_t net_sock_read_userspace(thread_t *cur, ksock_net_t *s, void *bufp
                 total += (size_t)rr;
                 if (total >= chunk || rr < (int)(chunk - total))
                     break;
-                for (int pump = 0; pump < 16; pump++) {
+                for (int pump = 0; pump < 2; pump++) {
                     e1000_poll();
-                    (void)net_tcp_service(&s->tcp, &ops, 64);
+                    (void)net_tcp_service(&s->tcp, &ops, 8);
                 }
                 continue;
             }
@@ -7758,6 +7672,18 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             uint64_t parent_tid_ptr = a3;
             uint64_t child_tid_ptr = a4;
             uint64_t tls = a5;
+            if ((flags & CLONE_SIGHAND_OLD) && !(flags & CLONE_VM_OLD))
+                return ret_err(EINVAL);
+            if ((flags & CLONE_THREAD_OLD) &&
+                !(flags & CLONE_SIGHAND_OLD))
+                return ret_err(EINVAL);
+            if ((flags & CLONE_PARENT_SETTID_OLD) &&
+                !user_range_ok((const void *)(uintptr_t)parent_tid_ptr, 4))
+                return ret_err(EFAULT);
+            if ((flags & (CLONE_CHILD_SETTID_OLD |
+                          CLONE_CHILD_CLEARTID_OLD)) &&
+                !user_range_ok((const void *)(uintptr_t)child_tid_ptr, 4))
+                return ret_err(EFAULT);
 
             /* Always log — docker pthread_create is clone(CLONE_VM|THREAD)+stack. */
             {
@@ -7772,10 +7698,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         (int)(cur->tid ? cur->tid : 1));
             }
 
-            /* pthread / any clone with a child stack: share mm. Prefer CLONE_VM
-             * or CLONE_THREAD; if only a stack is present still treat as thread
-             * (never ENOSYS — that was killing Go cgo). */
-            if (child_stack != 0) {
+            /* Linux copy_thread(): a CLONE_VM task uses the caller-provided
+             * stack in the already shared mm. Never identity-map an assumed
+             * 8 MiB span: pthread stacks are ordinary mmap VMAs with guards. */
+            if (child_stack != 0 && (flags & CLONE_VM_OLD)) {
                 uint64_t saved_rcx = fork_caller_user_rip(cur);
                 if (!saved_rcx && cur->saved_syscall_frame)
                     saved_rcx = cur->saved_syscall_frame[13];
@@ -7785,27 +7711,17 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 uintptr_t child_rsp = (uintptr_t)child_stack;
                 if (child_rsp < 0x1000 || child_rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT)
                     return ret_err(EINVAL);
-                /* Classic clone has no stack_size; assume an 8MiB pthread stack. */
-                uintptr_t stack_span = 8u * 1024u * 1024u;
-                uintptr_t stack_lo = (child_rsp > stack_span) ? (child_rsp - stack_span) : 0x1000u;
-                {
-                    uintptr_t begin = (uintptr_t)saved_rcx & ~((uintptr_t)PAGE_SIZE_2M - 1);
-                    uintptr_t end = begin + (uintptr_t)PAGE_SIZE_2M;
-                    if (mark_user_identity_range_2m_sys((uint64_t)begin, (uint64_t)end) != 0)
-                        return ret_err(EINVAL);
-                    (void)user_map_ensure_present_us_2m(0x10000, 0x200000);
-                    (void)mark_user_identity_range_2m_sys(0x200000, (uint64_t)USER_STACK_TOP);
-                }
+                uintptr_t stack_lo = child_rsp & ~((uintptr_t)PAGE_SIZE_4K - 1u);
                 {
                     uintptr_t aligned = child_rsp & ~(uintptr_t)0xFULL;
-                    if (aligned >= stack_lo + 32u)
+                    if (aligned >= 0x1000u)
                         child_rsp = aligned;
                 }
                 {
-                    uintptr_t map_lo = stack_lo & ~((uintptr_t)PAGE_SIZE_2M - 1);
-                    uintptr_t map_hi = (child_rsp + 4096u) & ~((uintptr_t)PAGE_SIZE_2M - 1);
-                    if (map_hi <= map_lo) map_hi = map_lo + PAGE_SIZE_2M;
-                    if (mark_user_identity_range_2m_sys((uint64_t)map_lo, (uint64_t)map_hi) != 0)
+                    uint64_t pa = 0;
+                    if (!cur->mm ||
+                        mm_user_leaf_pa(cur->mm, saved_rcx, 0, &pa) != 0 ||
+                        mm_user_leaf_pa(cur->mm, child_rsp - 8u, 1, &pa) != 0)
                         return ret_err(EFAULT);
                 }
 
@@ -7897,15 +7813,20 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 strncpy(child->cwd, cur->cwd, sizeof(child->cwd) - 1);
                 child->cwd[sizeof(child->cwd) - 1] = '\0';
                 fork_inherit_fd_table(child, cur);
+                /* process_attach_thread ran before fd inheritance. A normal
+                 * clone(SIGCHLD) therefore had an empty canonical process fd
+                 * table: close()/CLOEXEC failed and pipe ends leaked across
+                 * rpm2cpio|cpio. Publish the inherited table once it exists.
+                 * CLONE_THREAD keeps the already-shared process table. */
+                if (!(flags & CLONE_THREAD_OLD))
+                    process_sync_from_thread(child->process, child);
                 child->user_brk_base = cur->user_brk_base;
                 child->user_brk_cur = cur->user_brk_cur;
                 child->user_mmap_next = cur->user_mmap_next;
                 child->user_mmap_hi = cur->user_mmap_hi;
                 {
-                    uintptr_t stack_end = child->user_stack_limit;
-                    uintptr_t min_next = user_mm_align_up(stack_end, (uintptr_t)PAGE_SIZE_2M);
-                    if (cur->user_mmap_next < min_next)
-                        cur->user_mmap_next = min_next;
+                    /* mmap owns the pthread stack VMA/cursor. clone must not
+                     * move the process mmap cursor based on a guessed span. */
                 }
 
                 uint32_t child_user_tid = (uint32_t)linux_task_tid(child);
@@ -7990,10 +7911,30 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             uint64_t tls = cl_buf[7];
             uint64_t saved_rcx = fork_caller_user_rip(cur);
             if (saved_rcx == 0) return ret_err(EINVAL);
-            /* clone3 with stack: create thread sharing parent's mm (CLONE_VM). */
-            enum { CLONE3_CLONE_THREAD = 0x00010000u };
-            int clone3_need_stack_copy = 0;
-            if (stack != 0) {
+            enum {
+                CLONE3_CLONE_VM = 0x00000100u,
+                CLONE3_CLONE_SIGHAND = 0x00000800u,
+                CLONE3_CLONE_THREAD = 0x00010000u,
+                CLONE3_CLONE_SETTLS = 0x00080000u,
+                CLONE3_PARENT_SETTID = 0x00100000u,
+                CLONE3_CHILD_CLEARTID = 0x00200000u,
+                CLONE3_CHILD_SETTID = 0x01000000u
+            };
+            if ((flags & CLONE3_CLONE_SIGHAND) &&
+                !(flags & CLONE3_CLONE_VM))
+                return ret_err(EINVAL);
+            if ((flags & CLONE3_CLONE_THREAD) &&
+                !(flags & CLONE3_CLONE_SIGHAND))
+                return ret_err(EINVAL);
+            if ((flags & CLONE3_PARENT_SETTID) &&
+                !user_range_ok((const void *)(uintptr_t)parent_tid_ptr, 4))
+                return ret_err(EFAULT);
+            if ((flags & (CLONE3_CHILD_SETTID |
+                          CLONE3_CHILD_CLEARTID)) &&
+                !user_range_ok((const void *)(uintptr_t)child_tid_ptr, 4))
+                return ret_err(EFAULT);
+            /* pthread clone3 uses an mmap-owned stack in the shared mm. */
+            if (stack != 0 && (flags & CLONE3_CLONE_VM)) {
                 clone3_dbg(cur, 1, "enter",
                     (unsigned long long)flags,
                     (unsigned long long)stack,
@@ -8012,19 +7953,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 uintptr_t child_rsp = stack_lo + (uintptr_t)stack_size;
                 if (child_rsp <= stack_lo || child_rsp > (uintptr_t)MMIO_IDENTITY_LIMIT)
                     return ret_err(EINVAL);
-                /* Ensure saved_rcx (return site) is user-accessible - otherwise child #PF on first instruction */
-                {
-                    uintptr_t begin = (uintptr_t)saved_rcx & ~((uintptr_t)PAGE_SIZE_2M - 1);
-                    uintptr_t end = begin + (uintptr_t)PAGE_SIZE_2M;
-                    if (mark_user_identity_range_2m_sys((uint64_t)begin, (uint64_t)end) != 0) {
-                        qemu_debug_printf("clone3: saved return site 0x%llx unmapped/privileged\n", (unsigned long long)saved_rcx);
-                        return ret_err(EINVAL);
-                    }
-                    /* Static/non-PIE harness globals may live below 2MiB; mark() only
-                       changes existing PTEs, so explicitly create the low user mapping. */
-                    (void)user_map_ensure_present_us_2m(0x10000, 0x200000);
-                    (void)mark_user_identity_range_2m_sys(0x200000, (uint64_t)USER_STACK_TOP);
-                }
                 /* RSP must be 16-byte aligned per x86-64 ABI (child may use movdqa/call) */
                 {
                     uintptr_t aligned = child_rsp & ~(uintptr_t)0xFULL;
@@ -8034,57 +7962,16 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (child_rsp <= stack_lo || child_rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT)
                     return ret_err(EINVAL);
 
-                uintptr_t map_lo = stack_lo & ~((uintptr_t)PAGE_SIZE_2M - 1);
-                uintptr_t map_hi = (child_rsp + 4096u) & ~((uintptr_t)PAGE_SIZE_2M - 1);
-                if (map_hi <= map_lo) map_hi = map_lo + PAGE_SIZE_2M;
-                if (map_hi <= map_lo || map_hi >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-                if (mark_user_identity_range_2m_sys((uint64_t)map_lo, (uint64_t)map_hi) != 0) return ret_err(EFAULT);
                 {
-                    uint64_t saved_rsp = cur->saved_user_rsp;
-                    uintptr_t parent_stack_top = user_stack_top_for_tid_like_exec(cur->tid ? cur->tid : 1);
-                    uintptr_t parent_slot_lo = (parent_stack_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
-                    uintptr_t child_slot_lo = stack_lo & ~0xFFFULL;
-                    /* Stack copy is for glibc pthread (CLONE_THREAD): parent RSP still on the old
-                       stack, new stack needs a relocated frame at its high end. axon-harness uses
-                       CLONE_VM only with a fresh buffer — never copy (was corrupting parent slot). */
-                    clone3_need_stack_copy = 0;
-                    if ((flags & CLONE3_CLONE_THREAD) &&
-                        saved_rsp >= stack_lo && saved_rsp < child_rsp) {
-                        clone3_need_stack_copy = 1;
-                    }
-                    if (clone3_need_stack_copy) {
-                        enum { CLONE3_STACK_COPY_MAX = 8192u };
-                        uintptr_t used_tail = 0;
-                        if (parent_stack_top > (uintptr_t)saved_rsp)
-                            used_tail = parent_stack_top - (uintptr_t)saved_rsp;
-                        if (used_tail == 0) used_tail = 4096;
-                        if (used_tail < 4096) used_tail = 4096;
-                        uintptr_t max_copy = (uintptr_t)CLONE3_STACK_COPY_MAX;
-                        if (used_tail < max_copy) max_copy = used_tail;
-                        uintptr_t copy_bytes = (uintptr_t)MMIO_IDENTITY_LIMIT - (uintptr_t)saved_rsp;
-                        if (copy_bytes > max_copy) copy_bytes = max_copy;
-                        if (copy_bytes >= 256) {
-                            uintptr_t copy_lo = child_rsp - copy_bytes;
-                            if (copy_lo < stack_lo)
-                                copy_lo = stack_lo;
-                            copy_bytes = child_rsp - copy_lo;
-                            if (copy_bytes >= 256) {
-                                memcpy((void *)copy_lo, (void *)(uintptr_t)saved_rsp, (size_t)copy_bytes);
-                                fork_reloc_range_u64(copy_lo, copy_bytes,
-                                    (uintptr_t)saved_rsp, (uintptr_t)saved_rsp + copy_bytes, copy_lo,
-                                    parent_slot_lo, parent_stack_top, child_slot_lo);
-                                clone3_dbg(cur, 5, "stack copy",
-                                    (unsigned long long)copy_bytes,
-                                    (unsigned long long)saved_rsp,
-                                    (unsigned long long)copy_lo);
-                            }
-                        }
-                    } else {
-                        clone3_dbg(cur, 5, "fresh stack skip copy",
-                            (unsigned long long)stack_lo,
-                            (unsigned long long)child_rsp,
-                            (unsigned long long)saved_rsp);
-                    }
+                    uint64_t pa = 0;
+                    if (!cur->mm ||
+                        mm_user_leaf_pa(cur->mm, saved_rcx, 0, &pa) != 0 ||
+                        mm_user_leaf_pa(cur->mm, child_rsp - 8u, 1, &pa) != 0)
+                        return ret_err(EFAULT);
+                    if ((flags & CLONE3_CLONE_SETTLS) &&
+                        (tls < 0x1000u ||
+                         mm_user_leaf_pa(cur->mm, tls, 0, &pa) != 0))
+                        return ret_err(EFAULT);
                 }
                 char child_name[32];
                 strncpy(child_name, cur->name, sizeof(child_name) - 1);
@@ -8134,12 +8021,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 child->sas_ss_sp = 0;
                 child->sas_ss_size = 0;
                 child->sas_ss_flags = SS_DISABLE;
-                if ((flags & 0x00080000u) && tls != 0 && tls >= 0x1000 && tls < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                if ((flags & CLONE3_CLONE_SETTLS) && tls != 0 &&
+                    tls >= 0x1000 && tls < (uint64_t)MMIO_IDENTITY_LIMIT) {
                     child->user_fs_base = tls;
-                    /* Ensure TLS region is user-accessible */
-                    uintptr_t tls_lo = ((uintptr_t)tls - 0x1000u) & ~((uintptr_t)PAGE_SIZE_2M - 1);
-                    uintptr_t tls_hi = ((uintptr_t)tls + 0x3000u + PAGE_SIZE_2M - 1) & ~((uintptr_t)PAGE_SIZE_2M - 1);
-                    (void)mark_user_identity_range_2m_sys((uint64_t)tls_lo, (uint64_t)tls_hi);
                 } else {
                     child->user_fs_base = cur->user_fs_base;
                 }
@@ -8174,34 +8058,24 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 strncpy(child->cwd, cur->cwd, sizeof(child->cwd)-1);
                 child->cwd[sizeof(child->cwd)-1] = '\0';
                 fork_inherit_fd_table(child, cur);
+                if (!(flags & CLONE3_CLONE_THREAD))
+                    process_sync_from_thread(child->process, child);
                 /* Shared mm (CLONE_VM): inherit brk/mmap state so child mmap doesn't overwrite parent's regions. */
                 child->user_brk_base = cur->user_brk_base;
                 child->user_brk_cur = cur->user_brk_cur;
                 child->user_mmap_next = cur->user_mmap_next;
                 child->user_mmap_hi = cur->user_mmap_hi;
-                /* Parent must not mmap into child's stack; bump parent's user_mmap_next above stack region. */
-                {
-                    uintptr_t stack_end = child->user_stack_limit;
-                    uintptr_t min_next = user_mm_align_up(stack_end, (uintptr_t)PAGE_SIZE_2M);
-                    if (cur->user_mmap_next < min_next)
-                        cur->user_mmap_next = min_next;
-                }
                 /* clone3 semantics: touch TID pointers only when the matching flags are set. */
-                enum {
-                    CLONE_PARENT_SETTID = 0x00100000u,
-                    CLONE_CHILD_CLEARTID = 0x00200000u,
-                    CLONE_CHILD_SETTID = 0x01000000u
-                };
-                if ((flags & CLONE_PARENT_SETTID) &&
-                    user_range_ok((const void *)(uintptr_t)parent_tid_ptr, 4)) {
-                    copy_to_user_safe((void*)(uintptr_t)parent_tid_ptr, &child->tid, 4);
+                uint32_t child_tid = (uint32_t)linux_task_tid(child);
+                if (flags & CLONE3_PARENT_SETTID) {
+                    copy_to_user_safe((void*)(uintptr_t)parent_tid_ptr,
+                                      &child_tid, 4);
                 }
-                if ((flags & CLONE_CHILD_SETTID) &&
-                    user_range_ok((const void *)(uintptr_t)child_tid_ptr, 4)) {
-                    copy_to_user_safe((void*)(uintptr_t)child_tid_ptr, &child->tid, 4);
+                if (flags & CLONE3_CHILD_SETTID) {
+                    copy_to_user_safe((void*)(uintptr_t)child_tid_ptr,
+                                      &child_tid, 4);
                 }
-                if ((flags & CLONE_CHILD_CLEARTID) &&
-                    user_range_ok((const void *)(uintptr_t)child_tid_ptr, 4)) {
+                if (flags & CLONE3_CHILD_CLEARTID) {
                     child->clear_child_tid = child_tid_ptr;
                 }
                 rebuild_syscall_frame(cur);
@@ -10423,7 +10297,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     net_pump_listen_handshake();
                     af = unix_acceptq_pop(s);
                     if (af) break;
-                    thread_yield();
+                    thread_sleep(1);
                 }
                 ksock_net_t *as = (ksock_net_t *)af->driver_private;
                 int nfd = thread_fd_alloc(af);
@@ -10616,10 +10490,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     }
                     memcpy(g_tcp_xmit_mac, nh_mac, 6);
                     g_tcp_xmit_mac_valid = 1;
+                    net_tcp_stage_peer_mac(&s->tcp, nh_mac);
                 }
                 /* ARP wait may have filled RXQ with unrelated frames — clear before SYN. */
                 net_rxq_flush();
-                net_nic_drain_connect_priority(32);
+                net_nic_drain_connect_priority(&s->tcp, 16);
 #if NET_TCP_TRACE
                 klogprintf("tcp: connect2 dst=%u.%u.%u.%u:%u sport=%u nb=%d gwmac=%d nh=%02x:%02x:%02x:%02x:%02x:%02x\n",
                     (unsigned)((s->peer_ip_be >> 24) & 0xFF), (unsigned)((s->peer_ip_be >> 16) & 0xFF),
@@ -11373,10 +11248,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if ((size_t)wr < chunk)
                         break;
                 }
-                (void)net_tcp_flush_tx(&s->tcp, &ops, 5000);
-                for (int p = 0; p < 64; p++) {
+                (void)net_tcp_flush_tx(&s->tcp, &ops, 250);
+                for (int p = 0; p < 2; p++) {
                     e1000_poll();
-                    (void)net_tcp_service(&s->tcp, &ops, 128);
+                    (void)net_tcp_service(&s->tcp, &ops, 8);
                     if (s->tcp.rx_len > 0 || s->tcp.peer_fin || s->tcp.peer_rst)
                         break;
                 }
@@ -13808,7 +13683,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 pipe_t *p = (pipe_t *)f->driver_private;
                 if (!p) return ret_err(EBADF);
                 size_t copied = 0;
-                void *tmp = copy_from_user_safe(bufp, cnt, PIPE_BUF_SIZE, &copied);
+                void *tmp = copy_from_user_safe(bufp, cnt, PIPE_RW_CHUNK, &copied);
                 if (!tmp) return ret_err(EFAULT);
                 ssize_t wr = pipe_write_bytes(p, tmp, copied, cur);
                 kfree(tmp);
@@ -14082,7 +13957,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 pipe_t *p = (pipe_t *)f->driver_private;
                 if (!p) return ret_err(EBADF);
                 if (!bufp || !user_range_ok(bufp, cnt)) return ret_err(EFAULT);
-                size_t to_read = cnt < (size_t)PIPE_BUF_SIZE ? cnt : (size_t)PIPE_BUF_SIZE;
+                size_t to_read = cnt < (size_t)PIPE_RW_CHUNK ? cnt : (size_t)PIPE_RW_CHUNK;
                 void *tmp = kmalloc(to_read);
                 if (!tmp) return ret_err(ENOMEM);
                 ssize_t rr = pipe_read_bytes(p, tmp, to_read, cur);
@@ -14937,9 +14812,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!pipefd_u || (uintptr_t)pipefd_u + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             pipe_t *p = (pipe_t *)kmalloc(sizeof(pipe_t));
             if (!p) { qemu_debug_printf("OOM: pipe pipe_t alloc\n"); return ret_err(ENOMEM); }
-            p->buf = (uint8_t *)kmalloc(PIPE_BUF_SIZE);
-            if (!p->buf) { qemu_debug_printf("OOM: pipe buf alloc %u\n", (unsigned)PIPE_BUF_SIZE); kfree(p); return ret_err(ENOMEM); }
-            p->size = PIPE_BUF_SIZE;
+            /* The ring uses one sentinel byte to distinguish full from empty. */
+            p->buf = (uint8_t *)kmalloc(PIPE_CAPACITY + 1u);
+            if (!p->buf) { qemu_debug_printf("OOM: pipe buf alloc %u\n", (unsigned)(PIPE_CAPACITY + 1u)); kfree(p); return ret_err(ENOMEM); }
+            p->size = PIPE_CAPACITY + 1u;
             p->id = ++pipe_next_id;
             p->head = p->tail = 0;
             p->refcount = 2;
@@ -15991,6 +15867,65 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                               (unsigned long long)a1);
             /* store exit status in wait format (status << 8) */
             if (cur) {
+                /*
+                 * Linux do_exit(): SYS_exit terminates only the calling task.
+                 * A non-leader CLONE_THREAD member must not zombify the TGID,
+                 * close the process fd table, remove process VMAs, reparent
+                 * children, or emit SIGCHLD. Resolver workers use exactly this
+                 * path after getaddrinfo().
+                 */
+                int thread_only = cur->process && cur->process->leader &&
+                                  cur->process->leader != cur;
+                if (thread_only) {
+                    int code = (int)a1;
+                    cur->exit_status = (code & 0xFF) << 8;
+                    if (user_range_ok(
+                            (const void *)(uintptr_t)cur->clear_child_tid, 4)) {
+                        uint32_t zero = 0;
+                        (void)copy_to_user_safe(
+                            (void *)(uintptr_t)cur->clear_child_tid,
+                            &zero, sizeof(zero));
+                        {
+                            extern int futex_syscall(uintptr_t uaddr, int op,
+                                int val, const void *timeout,
+                                uintptr_t uaddr2, int val3);
+                            (void)futex_syscall(
+                                (uintptr_t)cur->clear_child_tid,
+                                1 | 128, 1, NULL, 0, 0);
+                        }
+                    }
+                    cur->clear_child_tid = 0;
+                    sysv_shm_detach_all_for_tid(
+                        (uint64_t)(cur->tid ? cur->tid : 1));
+                    /* Drop only this task's clone-time fd references. The
+                     * process-owned descriptors remain open for its peers. */
+                    for (int fd = 0; fd < THREAD_MAX_FD; ++fd) {
+                        struct fs_file *f = cur->fds[fd];
+                        cur->fds[fd] = NULL;
+                        if (f)
+                            fs_file_free(f);
+                    }
+                    if (cur->mm_ptemplate) {
+                        mm_release(cur->mm_ptemplate);
+                        cur->mm_ptemplate = NULL;
+                    }
+                    if (cur->mm && cur->mm != mm_kernel()) {
+                        mm_t *shared_mm = cur->mm;
+                        cur->mm = NULL;
+                        (void)mm_switch_away_from(shared_mm);
+                        mm_release(shared_mm);
+                    }
+                    /* Detached task slots are reclaimed by the scheduler;
+                     * pthread_join synchronization is clear_child_tid/futex. */
+                    cur->parent_tid = -1;
+                    cur->waiter_tid = -1;
+                    cur->state = THREAD_TERMINATED;
+                    if (thread_get_current_user() == cur)
+                        thread_set_current_user(NULL);
+                    thread_schedule();
+                    for (;;)
+                        asm volatile("sti; hlt" ::: "memory");
+                }
                 int ignore_sigchld = (user_sig_actions[SIGCHLD].handler == SIG_IGN) ||
                     ((user_sig_actions[SIGCHLD].flags & SA_NOCLDWAIT) != 0);
                 int code = (int)a1;
@@ -16562,6 +16497,10 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         }
     }
     syscall_deferred_unblocks();
+    /* Timer IRQs only request rescheduling while the CPU is in kernel mode.
+     * Switch here, after syscall state is committed and before returning to
+     * ring 3, matching Linux's exit-to-user reschedule point. */
+    thread_cond_resched();
     if (num == SYS_set_robust_list && trace_t && trace_t->name[0] &&
         strstr(trace_t->name, "linuxrc"))
         devel_printf("robust-dispatch-return: tid=%llu\n",
@@ -16608,7 +16547,9 @@ void isr_syscall(cpu_registers_t* regs) {
         debug_dump_kernel_syscall_stack();
     }
     /* Match Linux x86_64 syscall ABI: args 4–6 are r10, r8, r9 (same as SYSCALL path in syscall.S). */
+    asm volatile("sti" ::: "memory");
     regs->rax = syscall_do(regs->rax, regs->rdi, regs->rsi, regs->rdx, regs->r10, regs->r8, regs->r9);
+    asm volatile("cli" ::: "memory");
     /* Same as syscall.S: vfork parent sleeps after C returns. */
     regs->rax = syscall_maybe_vfork_wait(regs->rax);
     /* Match wake_up_new_task ordering on the int 0x80 compatibility path. */

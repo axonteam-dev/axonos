@@ -307,7 +307,7 @@ static int vmwgfx_mmio_id_only_window(volatile uint32_t *reg) {
 }
 
 /*
- * Coarse scan (4K step) up to cap — used only after strict verify fails.
+ * Coarse scan (4K step) up to cap - used only after strict verify fails.
  * Confirmed later by svga_negotiate_id / pick_mode (false positives get dropped).
  */
 static int vmwgfx_scan_bar_for_reg_window_loose(uint64_t pa, uint64_t bar_sz, size_t *reg_off_out) {

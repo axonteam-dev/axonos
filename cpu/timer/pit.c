@@ -43,6 +43,13 @@ void pit_handler(cpu_registers_t* regs) {
 
         if (!init) return;
         thread_wake_expired_timeouts();
+        {
+                uint32_t resched_quantum = pit_frequency / 100u;
+                if (resched_quantum < 1u)
+                        resched_quantum = 1u;
+                if ((pit_ticks % resched_quantum) == 0)
+                        thread_request_resched();
+        }
         /* Userspace is BSP-only even when APs exist; preempt ring-3 on cpu0. */
         if (regs && ((regs->cs & 3) == 3)) {
                 if (smp_sched_cpu_id() == 0) {

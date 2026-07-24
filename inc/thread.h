@@ -202,6 +202,8 @@ thread_t* thread_create(void (*entry)(void), const char* name);
 thread_t* thread_create_blocked(void (*entry)(void), const char* name);
 void thread_yield();
 void thread_ring3_preempt_if_waiters(void);
+void thread_request_resched(void);
+void thread_cond_resched(void);
 void thread_schedule();
 thread_t* thread_current();
 void thread_stop(int pid);

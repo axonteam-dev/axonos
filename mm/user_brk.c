@@ -155,23 +155,24 @@ uint64_t user_syscall_brk(uint64_t req) {
     }
     if (req < *p_base || req >= top_limit) return (uint64_t)(*p_cur);
     if (req > *p_cur) {
+        uintptr_t grow_start = (uintptr_t)(*p_cur);
+        uintptr_t grow_len = (uintptr_t)(req - *p_cur);
         if (tcur && user_as_mmap_overlaps_user_stack(tcur, (uintptr_t)(*p_cur),
                 (uintptr_t)(req - *p_cur), NULL)) {
             return (uint64_t)(*p_cur);
         }
-        if (user_brk_ensure_range(tcur, (uintptr_t)(*p_cur), (uintptr_t)req) != 0)
+        /* Validate the complete transaction before changing page tables. The
+         * old order mapped first and only then discovered a VMA/kernel-heap
+         * collision, leaving libc's arena partially overlaid. */
+        if (user_as_mmap_overlaps_kernel_heap(grow_start, grow_len))
             return (uint64_t)(*p_cur);
-        if (tcur && user_as_mmap_overlaps_user_stack(tcur, (uintptr_t)(*p_cur),
-                (uintptr_t)(req - *p_cur), NULL))
-            return (uint64_t)(*p_cur);
-        if (user_as_mmap_overlaps_kernel_heap((uintptr_t)(*p_cur), (uintptr_t)(req - *p_cur)))
-            return (uint64_t)(*p_cur);
-        if (tcur && user_vma_overlaps_thread_range(tcur, (uintptr_t)(*p_cur),
-                (uintptr_t)(req - *p_cur))) {
+        if (tcur && user_vma_overlaps_thread_range(tcur, grow_start, grow_len)) {
             klogprintf("brk: refuse extend 0x%llx..0x%llx overlaps mapped VMA\n",
                 (unsigned long long)(*p_cur), (unsigned long long)req);
             return (uint64_t)(*p_cur);
         }
+        if (user_brk_ensure_range(tcur, grow_start, (uintptr_t)req) != 0)
+            return (uint64_t)(*p_cur);
         {
             mm_t *k = mm_kernel();
             int priv = tcur && tcur->mm && k && tcur->mm->pml4 && k->pml4 &&

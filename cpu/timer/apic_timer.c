@@ -243,6 +243,13 @@ void apic_timer_handler(cpu_registers_t* regs) {
     }
 
     thread_wake_expired_timeouts();
+    if (apic_timer_state.frequency > 0) {
+        uint32_t resched_quantum = apic_timer_state.frequency / 100u;
+        if (resched_quantum < 1u)
+            resched_quantum = 1u;
+        if ((apic_timer_ticks % resched_quantum) == 0)
+            thread_request_resched();
+    }
 
     /*
      * Bounded post-pipe sampler. Keep this deliberately tiny: it is diagnostic

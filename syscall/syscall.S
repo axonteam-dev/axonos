@@ -153,7 +153,12 @@ syscall_entry64:
     movq    48(%rsp),  %rax     // a6 = user r9
     subq    $8, %rsp            // SysV call-site alignment padding
     pushq   %rax                // 7th C argument at 8(%rsp) on callee entry
+    /* The user frame is now safe on the task's kernel stack. Linux enables
+     * maskable IRQs here; otherwise a blocking syscall stops timer and NIC
+     * progress for the whole BSP. */
+    sti
     call    syscall_do
+    cli
     addq    $16, %rsp
 
     /* vfork parent: sleep here (C returned). Retval passed/returned in rax —

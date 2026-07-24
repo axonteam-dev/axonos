@@ -35,6 +35,7 @@ static uint32_t sched_fifo_counter;
  */
 static thread_t* current_user[SMP_MAX_CPUS] = { NULL };
 static thread_t* idle_thread_by_cpu[SMP_MAX_CPUS];
+static volatile uint8_t need_resched[SMP_MAX_CPUS];
 int init = 0;
 static int init_user_tid = -1;
 
@@ -273,6 +274,9 @@ int thread_reap(int pid) {
 /* True if a TERMINATED child may be freed without wait4 (matches thread_schedule auto-reap). */
 static int thread_zombie_autoreap_ok(thread_t *t) {
         if (!t || t->state != THREAD_TERMINATED) return 0;
+        /* Never free the stack/object of the task executing this scheduler
+         * call. A later scheduling pass on another task will reclaim it. */
+        if (t == thread_current()) return 0;
         if (t == &main_thread || thread_is_any_idle(t)) return 0;
         if (t->waiter_tid >= 0) return 0;
         if (t->exit_status == (int)0x80000000) return 0;
@@ -930,8 +934,25 @@ thread_t* thread_current(void) {
         return current_cpu[smp_sched_cpu_id()];
 }
 
+void thread_request_resched(void) {
+        int cpu = smp_sched_cpu_id();
+        if (cpu >= 0 && cpu < SMP_MAX_CPUS)
+                need_resched[cpu] = 1;
+}
+
+void thread_cond_resched(void) {
+        int cpu = smp_sched_cpu_id();
+        if (cpu < 0 || cpu >= SMP_MAX_CPUS || !need_resched[cpu])
+                return;
+        need_resched[cpu] = 0;
+        thread_schedule();
+}
+
 /* If a ring-3 thread is spinning, run pthread helpers / syscall waiters (OpenSSL init). */
 void thread_ring3_preempt_if_waiters(void) {
+        int cpu = smp_sched_cpu_id();
+        if (cpu >= 0 && cpu < SMP_MAX_CPUS)
+                need_resched[cpu] = 0;
         thread_t *cur = thread_current();
         if (!cur || cur->ring != 3 || cur->state != THREAD_RUNNING)
                 return;
@@ -1039,8 +1060,11 @@ void thread_sleep(uint32_t ms) {
         thread_t *c = thread_current();
         if (!c)
                 return;
+        unsigned long irqf;
+        acquire_irqsave(&sched_lock, &irqf);
         c->sleep_until = (uint32_t)timer_ticks + thread_ms_to_timer_ticks(ms);
         c->state = THREAD_SLEEPING;
+        release_irqrestore(&sched_lock, irqf);
         thread_yield();
 }
 

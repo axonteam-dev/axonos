@@ -243,12 +243,9 @@ void kernel_sysfs_populate_default(void) {
 static int boot_try_run_init(void) {
     /* OpenRC-first when shipped; otherwise standard Linux init paths from initfs. */
     static const char *candidates[] = {
-        "/linuxrc",
-        "/sbin/openrc-init",
         "/sbin/init",
+        "/linuxrc",
         "/bin/sh",
-        "/init",
-        "/bin/init",
         NULL
     };
     for (int i = 0; candidates[i]; i++) {
@@ -339,6 +336,42 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         if (mb2_linux_shim_fill_bootparams(multiboot_magic, multiboot_info, axon_synth_bootparams,
                                            sizeof axon_synth_bootparams, "initfs") == 0)
             axon_boot_params_phys = (uint64_t)(uintptr_t)axon_synth_bootparams;
+    }
+
+    /*
+     * GRUB allocates very large Multiboot modules top-down. A ~550 MiB initfs
+     * can then straddle PCI/VRAM apertures once firmware BAR decoding is
+     * enabled (VMware failure observed at PA 0x917de830). Relocate it before
+     * PCI/video initialization into ordinary low RAM. The ramfs intentionally
+     * borrows regular-file data from this region, so it must remain reserved
+     * for the lifetime of the system.
+     *
+     * 0x42000000 is above the complete userspace VA layout and the preserved
+     * MB2/kzip areas, but remains below the conservative 2 GiB PCI-hole limit.
+     */
+    if (axon_boot_params_phys) {
+        uintptr_t rd_start = 0;
+        size_t rd_size = 0;
+        if (linux_bootparams_ramdisk((const void *)(uintptr_t)axon_boot_params_phys,
+                                     &rd_start, &rd_size) == 0) {
+            const uintptr_t safe_start = (uintptr_t)0x42000000u;
+            uintptr_t safe_end = 0;
+            uint64_t ram_bytes = (uint64_t)sysinfo_ram_mb() * 1024ULL * 1024ULL;
+            if (!__builtin_add_overflow(safe_start, rd_size, &safe_end) &&
+                rd_start != safe_start &&
+                safe_end + (32u * 1024u * 1024u) <= ram_bytes) {
+                memmove((void *)safe_start, (const void *)rd_start, rd_size);
+                uint8_t *bp = (uint8_t *)(uintptr_t)axon_boot_params_phys;
+                *(uint32_t *)(bp + LINUX_BOOTPARAM_OFF_RAMDISK_IMG) =
+                    (uint32_t)(uint64_t)safe_start;
+                *(uint32_t *)(bp + LINUX_BOOTPARAM_OFF_EXT_RD_IMG) =
+                    (uint32_t)((uint64_t)safe_start >> 32);
+                kprintf("initfs: relocated %llu bytes 0x%llx -> 0x%llx before PCI\n",
+                        (unsigned long long)rd_size,
+                        (unsigned long long)rd_start,
+                        (unsigned long long)safe_start);
+            }
+        }
     }
 
     /* Initialize heap EARLY and place it above kernel + initrd (Linux boot_params). */
@@ -451,6 +484,12 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         {
             uint64_t hs = (uint64_t)heap_start;
             uint64_t max_heap_end = (uint64_t)MMIO_IDENTITY_LIMIT;
+            /* The simple heap is a contiguous identity arena and does not yet
+             * split around E820/MMIO holes. Keep it below 2 GiB so VMware PCI
+             * BARs cannot become allocator memory after the large initfs is
+             * relocated out of the high GRUB module range. */
+            if (max_heap_end > 0x80000000ULL)
+                max_heap_end = 0x80000000ULL;
             if (max_heap_end > 4ULL * 1024ULL * 1024ULL)
                 max_heap_end -= 4ULL * 1024ULL * 1024ULL;
             if (hs < (uint64_t)USER_STACK_TOP) {

@@ -2428,6 +2428,12 @@ int mm_copy_to_user(mm_t *mm, mm_t *share_cmp_mm, uint64_t dst,
     while (done < len) {
         uint64_t va = dst + done;
         uint64_t page = va & ~0xFFFULL;
+        uint64_t existing = 0;
+        if (mm_user_leaf_pa(mm, page, 0, &existing) != 0)
+            return -1;
+        if ((existing & ~0xFFFULL) == page &&
+            mm_privatize_identity_range(mm, page, page + 0x1000ULL) != 0)
+            return -1;
         int cow = mm_cow_fault_page(mm, page, share_cmp_mm);
         if (cow != 0 && cow != -2)
             return -1;
@@ -2441,6 +2447,31 @@ int mm_copy_to_user(mm_t *mm, mm_t *share_cmp_mm, uint64_t dst,
         int rc = mm_user_leaf_pa_direct(mm, va, 1, &pa);
         if (rc == 0)
             memcpy((void *)(uintptr_t)pa, in + done, chunk);
+        mm_leave_direct_map(dm);
+        if (rc != 0)
+            return -1;
+        done += chunk;
+    }
+    return 0;
+}
+
+int mm_copy_from_user(mm_t *mm, void *dst, uint64_t src, size_t len) {
+    if (!mm || !dst || !len || src >= (uint64_t)MMIO_IDENTITY_LIMIT ||
+        len > (size_t)((uint64_t)MMIO_IDENTITY_LIMIT - src))
+        return -1;
+
+    uint8_t *out = (uint8_t *)dst;
+    size_t done = 0;
+    while (done < len) {
+        uint64_t va = src + done;
+        size_t chunk = 0x1000u - (size_t)(va & 0xFFFULL);
+        if (chunk > len - done)
+            chunk = len - done;
+        mm_dm_ctx_t dm = mm_enter_direct_map();
+        uint64_t pa = 0;
+        int rc = mm_user_leaf_pa_direct(mm, va, 0, &pa);
+        if (rc == 0)
+            memcpy(out + done, (const void *)(uintptr_t)pa, chunk);
         mm_leave_direct_map(dm);
         if (rc != 0)
             return -1;

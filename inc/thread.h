@@ -141,6 +141,7 @@ typedef struct thread {
         /* if non-negative, tid of thread waiting for this child (wait/waitpid) */
         int waiter_tid;
         /* fork/clone3: unblock child after parent syscall returns (avoid clobbering per-CPU syscall stack). */
+        /* Rare CLONE_THREAD deferral only; normal fork uses wake_up_new_task. */
         struct thread *fork_child_to_publish;
         /* Set by SYS_vfork; cleared when child exec/exits. Parent sleeps in
          * syscall_maybe_vfork_wait() AFTER syscall_do returns (asm frame intact). */

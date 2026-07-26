@@ -355,24 +355,40 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
 
     /*
      * PROT_NONE / large anon: Linux reserves VA without allocating frames.
-     * Go docker mallocinit does mmap(PROT_NONE) for arena space; previously we
-     * mm_make_private_range'd the whole span then unmapped it — tens of seconds
-     * and often ENOMEM. Punch a hole + VMA only; fault path commits on demand
-     * (and refuses PROT_NONE so access still SIGSEGVs until mprotect/mmap FIXED).
+     * Private file maps (libc.so via ld.so): same — demand-fill on #PF
+     * (filemap_fault). Eager fs_read of ~2MiB + frame_alloc made every
+     * dynamic execve feel like ~1s.
      */
     int mmap_vma_kind = (flags & MAP_SHARED) ?
         USER_VMA_KIND_SHM : USER_VMA_KIND_MMAP;
     int reserve_only = 0;
+    int file_lazy = 0;
+    struct fs_file *file_lazy_f = NULL;
+    uint64_t file_lazy_off = 0;
     if ((flags & MAP_ANONYMOUS) && !shared_mapping) {
         const int large_aligned = (len_u64 > (96ull << 20)) &&
             ((addr & ((uintptr_t)PAGE_SIZE_2M - 1)) == 0) &&
             ((len_u64 & ((uint64_t)PAGE_SIZE_2M - 1)) == 0);
         if (prot_none || large_aligned)
             reserve_only = 1;
+    } else if (!(flags & MAP_ANONYMOUS) && !shared_mapping &&
+               !(flags & MAP_POPULATE)) {
+        int fd = (int)(int64_t)a5;
+        off_t file_off = (off_t)(int64_t)a6;
+        if (fd >= 0 && fd < THREAD_MAX_FD && file_off >= 0) {
+            struct fs_file *f = tcur ? tcur->fds[fd] : cur->fds[fd];
+            if (!f) f = cur->fds[fd];
+            if (f && f->type == FS_TYPE_REG && f->size > 0 &&
+                !fbdev_is_fb0_file(f)) {
+                file_lazy = 1;
+                file_lazy_f = f;
+                file_lazy_off = (uint64_t)file_off;
+            }
+        }
     }
 
-    if (reserve_only) {
-        if (addr < anon_floor)
+    if (reserve_only || file_lazy) {
+        if (reserve_only && addr < anon_floor)
             return user_mm_ret_err(USER_MM_ENOMEM);
         /* Unmap in the process mm only — never punch kernel identity. */
         if (user_mmap_unmap_pages(tcur, addr, len) != 0)
@@ -391,7 +407,7 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         if (flags != 0) return user_mm_ret_err(USER_MM_ENOSYS);
         if (!reserve_only)
             user_as_mmap_memset_zero_chunked(addr, len);
-    } else {
+    } else if (!file_lazy) {
         int fd = (int)(int64_t)a5;
         off_t file_off = (off_t)(int64_t)a6;
         if (fd < 0 || fd >= THREAD_MAX_FD) return user_mm_ret_err(USER_MM_EBADF);
@@ -465,8 +481,13 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
             (unsigned long long)addr, (unsigned long long)len_u64);
         return user_mm_ret_err(USER_MM_ENOMEM);
     }
-    if (user_vma_add(vtid, addr, len, prot & 7, mmap_vma_kind) != 0)
+    if (file_lazy) {
+        if (user_vma_add_file(vtid, addr, len, prot & 7, USER_VMA_KIND_MMAP_LAZY,
+                              file_lazy_f, file_lazy_off) != 0)
+            return user_mm_ret_err(USER_MM_ENOSPC);
+    } else if (user_vma_add(vtid, addr, len, prot & 7, mmap_vma_kind) != 0) {
         return user_mm_ret_err(USER_MM_ENOSPC);
+    }
 
     uint64_t sum_next = (uint64_t)addr + len_u64;
     if (sum_next < (uint64_t)addr || sum_next > (uint64_t)top_limit)

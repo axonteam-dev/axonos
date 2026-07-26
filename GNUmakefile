@@ -7,6 +7,7 @@ FIND_PRUNE := -path './build' -prune -o \
 	-path './iso' -prune -o \
 	-path './userland' -prune -o \
 	-path './core/nss_dns_shim' -prune -o \
+	-path './core/nss_files_shim' -prune -o \
 	-path './syscall64' -prune -o \
 	-path './syscall64_split' -prune -o
 

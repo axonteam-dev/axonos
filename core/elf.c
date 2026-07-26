@@ -214,8 +214,9 @@ static int elf_copy_into_mm(mm_t *mm, uint64_t va, const void *src, size_t n) {
         size_t chunk = (size_t)(0x1000ULL - off);
         if (chunk > n)
             chunk = n;
+        /* Store via leaf PA (identity of phys). No invlpg(va): CR3 may still
+         * be mid-exec and the write never went through the user VA. */
         memcpy((void *)(uintptr_t)(page + off), s, chunk);
-        invlpg((void *)(uintptr_t)va);
         va += chunk;
         s += chunk;
         n -= chunk;
@@ -286,6 +287,7 @@ static int exec_map_stack_tip(thread_t *tc, uintptr_t tip_lo, uintptr_t tip_hi) 
     if (mm_make_private_range_bulk_zero_force(tc->mm, (uint64_t)tip_lo,
                                               (uint64_t)tip_hi, map_share) != 0)
         return -1;
+#if DEVEL_DEBUG
     for (uint64_t va = (uint64_t)tip_lo; va < (uint64_t)tip_hi; va += 0x1000ULL) {
         uint64_t cpa = 0, ppa = 0;
         if (mm_va_leaf_pa(tc->mm, va, &cpa) != 0)
@@ -304,6 +306,9 @@ static int exec_map_stack_tip(thread_t *tc, uintptr_t tip_lo, uintptr_t tip_hi) 
             return -1;
         }
     }
+#else
+    (void)oldmm;
+#endif
     return 0;
 }
 
@@ -954,46 +959,18 @@ void exec_ensure_user_mappings(void) {
     mark_broad_user_ranges_for_exec();
 }
 
-/* After replacing an ET_EXEC (busybox @ 0x400000) with a small PIE (openrc),
- * leftover .text/.data from the previous image stays identity-mapped and
- * executable. Scrub the tail so RIP cannot land in stale busybox or zeroed
- * .bss (double-kill: #PF then #UD at 0x63e2c0).
+/*
+ * Historical "scrub" allocated private zero pages for every VA from the new
+ * PIE's loaded_hi up to 8MiB (ls @ 0x400000 → ~0x426000..0x800000 ≈ 4MiB).
+ * That was ~1000× frame_alloc_zero + PT walks inside execve — ~1s under
+ * QEMU/VMware, and not Linux semantics (flush_old_exec unmaps; faults #PF).
  *
- * Do NOT scrub on busybox→busybox re-exec (/bin/mount, /bin/sh): keep_hi is
- * already ~0x63f000 and zeroing 0x63f000..0x800000 via still-shared fork page
- * tables wipes the parent's brk/heap. Init then dies right after wait4-reap
- * of the first sysinit child. */
+ * Fresh mm from mm_alloc() already ran mm_demote_user_identity(): the old
+ * busybox window is not user-accessible. PT_LOAD maps only the new image.
+ * Do not eager-zero the hole.
+ */
 static void exec_scrub_stale_image_tail(uint64_t keep_hi) {
-    /* Always cover the classic busybox ET_EXEC window. */
-    uint64_t scrub_lo = 0x400000ULL;
-    uint64_t scrub_end = 8ULL * 1024ULL * 1024ULL;
-    uintptr_t hb = heap_base_addr();
-    if (hb != 0 && (uint64_t)hb < scrub_end)
-        scrub_end = (uint64_t)hb;
-    /* Large ET_EXEC still occupies the busybox window — nothing stale to clear. */
-    if (keep_hi >= 0x600000ULL)
-        return;
-    /* Keep the newly loaded image; scrub only above it within the window. */
-    uint64_t begin = scrub_lo;
-    if (keep_hi > scrub_lo)
-        begin = (keep_hi + 0xFFFULL) & ~0xFFFULL;
-    if (begin >= scrub_end)
-        return;
-    thread_t *tc = thread_current();
-    if (!tc || tc->ring != 3)
-        tc = thread_get_current_user();
-    if (!tc || !elf_needs_private_user_pages(tc))
-        return;
-    mm_t *share = mm_kernel();
-    if (mm_make_private_range(tc->mm, begin, scrub_end, 0, share) != 0)
-        return;
-    (void)user_map_mprotect_range(begin, scrub_end, 3 /* PROT_READ|PROT_WRITE */);
-    {
-        static int scrub_log_left = 4;
-        if (scrub_log_left-- > 0)
-            devel_printf("exec-scrub: cleared stale image 0x%llx..0x%llx\n",
-                    (unsigned long long)begin, (unsigned long long)scrub_end);
-    }
+    (void)keep_hi;
 }
 
 static void exec_reset_shared_user_space(thread_t *owner, uintptr_t brk_base) {
@@ -1296,6 +1273,7 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
         out_info->e_type = eh.e_type;
         out_info->has_interp = has_interp;
         out_info->has_dynamic = has_dynamic;
+        out_info->lazy_segments = 0;
         if (has_interp) {
             strncpy(out_info->interp_path, interp_path, sizeof(out_info->interp_path) - 1);
             out_info->interp_path[sizeof(out_info->interp_path) - 1] = '\0';

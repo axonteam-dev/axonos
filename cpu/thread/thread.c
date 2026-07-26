@@ -1416,8 +1416,20 @@ void thread_unblock_fork_child(int pid) {
                 if (cpu >= 0 && cpu < SMP_MAX_CPUS)
                         t->bound_cpu = cpu;
                 if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING) {
+                        thread_t *cur = current_cpu[cpu >= 0 && cpu < SMP_MAX_CPUS ? cpu : 0];
                         t->sleep_until = 0;
+                        /*
+                         * Linux wake_up_new_task / place_entity: put the child
+                         * ahead of the forking parent so vfork/waitpid do not
+                         * sit an extra timer quantum (felt as ~1s under load).
+                         */
+                        if (cur && cur->sched_vruntime > 0)
+                                t->sched_vruntime = cur->sched_vruntime - 1;
+                        else
+                                t->sched_vruntime = 0;
                         thread_note_ready_nolock(t);
+                        /* note_ready bumps fifo_seq; win equal-vruntime ties. */
+                        t->sched_fifo_seq = 0;
                         woke = 1;
                 }
                 break;

@@ -76,6 +76,7 @@ typedef struct {
     uint16_t e_type;
     int has_interp;
     int has_dynamic;
+    int lazy_segments; /* PT_LOAD registered as file-backed demand-fill VMAs */
     char interp_path[192];
 } elf_load_info_t;
 

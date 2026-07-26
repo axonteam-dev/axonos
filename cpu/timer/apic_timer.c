@@ -229,10 +229,7 @@ void apic_timer_handler(cpu_registers_t* regs) {
     /* Charge CPU time before any schedule/publish side effects. */
     thread_account_timer_tick(regs && ((regs->cs & 3) == 3));
     process_itimer_tick(pit_get_time_ms());
-    /* A ring-3 interrupt proves the parent's fork-return IRETQ completed.
-     * It is now safe to make its fully initialized child runnable. Never also
-     * context-switch from this same IRQ: first return its complete interrupt
-     * frame to the parent, then let a later tick select the child. */
+    /* Safety net for rare deferred CLONE_THREAD wakes; normal fork wakes earlier. */
     int published_fork_child = 0;
     if (regs && ((regs->cs & 3) == 3))
         published_fork_child = syscall_publish_deferred_fork_child();
@@ -298,8 +295,15 @@ void apic_timer_handler(cpu_registers_t* regs) {
      */
     if (regs && ((regs->cs & 3) == 3) && smp_sched_cpu_id() == 0) {
         apic_eoi();
-        if (published_fork_child)
+        /*
+         * After wake_up_new_task from this IRQ, run the child on this tick.
+         * Skipping preempt here used to leave the child READY until the next
+         * quantum — with slow console SYNC that looked like a 1s post-fork stall.
+         */
+        if (published_fork_child) {
+            thread_ring3_preempt_if_waiters();
             return;
+        }
         /*
          * Linux-style scheduling granularity: account every timer tick, but
          * do not context-switch on every IRQ. Under VMware a switch can take

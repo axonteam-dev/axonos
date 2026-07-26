@@ -921,9 +921,8 @@ void syscall_deferred_unblocks(void) {
 }
 
 /*
- * Publish a fully initialized fork child only after the parent has completed
- * its return to ring 3. Called from a user-mode timer interrupt, or from the
- * parent's next syscall entry (whose previous return frame is already gone).
+ * Finish a deferred wake (CLONE_THREAD safety net / old paths).
+ * Normal fork/vfork now calls wake_up_new_task before clone returns (Linux).
  */
 int syscall_publish_deferred_fork_child(void) {
     thread_t *cur = thread_current();
@@ -935,13 +934,25 @@ int syscall_publish_deferred_fork_child(void) {
     int tid = (int)(child->tid ? child->tid : 1);
     cur->fork_child_to_publish = NULL;
     thread_unblock_fork_child(tid);
-    /* Ensure the newly runnable child is considered before the parent
-     * returns to a wait4/busy peer (same tick as wake_up_new_task). */
     thread_request_resched();
-    devel_printf("fork[30] publish after user return parent=%llu child=%d cr3=0x%llx\n",
-        (unsigned long long)(cur->tid ? cur->tid : 1), tid,
-        (unsigned long long)paging_read_cr3());
     return 1;
+}
+
+/*
+ * Linux kernel/fork.c wake_up_new_task(): child is runnable before the parent
+ * continues. Per-thread syscall stacks make an immediate wake safe; the old
+ * "defer until ring3/timer" gate was not Linux semantics and delayed vfork/ls.
+ */
+static void fork_wake_up_new_task(thread_t *parent, thread_t *child)
+{
+    if (!parent || !child)
+        return;
+    int ctid = (int)(child->tid ? child->tid : 1);
+    /* Refresh child GPRs from the parent's syscall snapshot while blocked. */
+    parent->fork_child_to_publish = child;
+    syscall_deferred_unblocks();
+    parent->fork_child_to_publish = NULL;
+    thread_unblock_fork_child(ctid);
 }
 
 /* Linux wait_for_vfork_done: block parent until child execs or exits. */
@@ -964,10 +975,10 @@ uint64_t syscall_maybe_vfork_wait(uint64_t parent_ret) {
 
     if (cur->state != THREAD_BLOCKED && !thread_block_current_atomic())
         thread_block(parent_tid);
+    /* Safety net: child should already be runnable from wake_up_new_task. */
     if (cur->fork_child_to_publish) {
         thread_t *child = cur->fork_child_to_publish;
         cur->fork_child_to_publish = NULL;
-        /* CLONE_VM child must not carry Soft_COW fork markers. */
         child->fork_child_user_rip = 0;
         syscall_bind_kstack_for_thread(child);
         thread_unblock_fork_child((int)(child->tid ? child->tid : 1));
@@ -1445,15 +1456,8 @@ static void fork_stop_child(thread_t *child) {
 void axon_user_dbg(thread_t *cur, const char *tag, int step, const char *msg,
     unsigned long long a, unsigned long long b, unsigned long long c) {
 #if AXON_FORK_DEBUG
-    char buf[256];
-    int n = snprintf(buf, sizeof(buf),
-        "%s[%d] %s a=0x%llx b=0x%llx c=0x%llx\n",
-        tag ? tag : "dbg", step, msg ? msg : "",
-        a, b, c);
-    if (n > 0 && (size_t)n < sizeof(buf)) {
-        if (cur && cur->fds[1])
-            (void)fs_write(cur->fds[1], buf, (size_t)n, cur->fds[1]->pos);
-    }
+    /* Serial only — never write fork traces to the interactive tty. That was
+     * not Linux behavior and each fs_write() to fbcon made post-fork stalls. */
     qemu_debug_printf("%s[%d] %s tid=%llu a=0x%llx b=0x%llx c=0x%llx\n",
         tag ? tag : "dbg", step, msg ? msg : "",
         (unsigned long long)(cur && cur->tid ? cur->tid : 0),
@@ -8069,19 +8073,15 @@ static uint64_t do_linux_fork(thread_t *cur,
              */
             if (share_mm)
                 child->fork_child_user_rip = 0;
-            {
-                int ctid = (int)(child->tid ? child->tid : 1);
-                /* Real fork semantics: parent returns child's pid immediately, while
-                 * fork_child_return_entry returns 0 in the child. Unblock the child
-                 * after syscall_do_inner() unwinds so no scheduler handoff can snapshot
-                 * this syscall stack and later iretq through a corrupted return frame. */
-                cur->fork_child_to_publish = child;
-                /* Plain fork: parent continues immediately (Linux). Freeze only
-                 * on SYS_vfork via process_set_vfork_parent there. */
-                fork_dbg(cur, 8, "defer child",
-                    (unsigned long long)(cur->tid ? cur->tid : 1),
-                    (unsigned long long)ctid, 0);
-            }
+            /*
+             * Linux: wake_up_new_task before copy_process returns. Parent then
+             * returns the child's pid (or waits in wait_for_vfork_done for VFORK).
+             * Child enters userspace via fork_child_return_entry with rax=0.
+             */
+            fork_wake_up_new_task(cur, child);
+            fork_dbg(cur, 8, "wake_up_new_task",
+                (unsigned long long)(cur->tid ? cur->tid : 1),
+                (unsigned long long)(child->tid ? child->tid : 1), 0);
             fork_dbg(cur, 9, "return pid",
                 (unsigned long long)process_pid(child), 0, 0);
             return process_pid(child);
@@ -8152,6 +8152,7 @@ static uint64_t kernel_clone(thread_t *parent,
 	if (args->flags & CLONE_VFORK) {
 		if (!parent->process)
 			return ret_err(EINVAL);
+		/* Linux: child already woken in do_linux_fork; then parent waits. */
 		process_set_vfork_parent(child_process, parent->process);
 		parent->vfork_waiting = 1;
 		parent->vfork_saved_ret = nr;
@@ -17851,17 +17852,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
     }
     syscall_deferred_unblocks();
     /*
-     * Linux wake_up_new_task(): make the fork/clone child runnable before any
-     * schedule point. thread_cond_resched() used to run first, so a busy peer
-     * (htop) could keep the parent off-CPU forever with fork_child_to_publish
-     * still set — the child sat THREAD_BLOCKED until Ctrl+C's pgrp wake looked
-     * like a "kick", then a second SIGINT actually killed the app.
+     * Fork/vfork already woke the child (wake_up_new_task). Schedule before
+     * returning to userspace so a BLOCKED vfork parent yields to the child
+     * immediately — same point as Linux's preemption after wake_up_new_task.
      */
     (void)syscall_publish_deferred_fork_child();
-    /* Timer IRQs only request rescheduling while the CPU is in kernel mode.
-     * Switch here, after syscall state is committed and before returning to
-     * ring 3, matching Linux's exit-to-user reschedule point. */
-    thread_cond_resched();
+    if (num == SYS_fork || num == SYS_vfork || num == SYS_clone || num == SYS_clone3)
+        thread_schedule();
+    else
+        thread_cond_resched();
     if (num == SYS_set_robust_list && trace_t && trace_t->name[0] &&
         strstr(trace_t->name, "linuxrc"))
         devel_printf("robust-dispatch-return: tid=%llu\n",

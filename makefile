@@ -22,15 +22,27 @@ ISO_IMAGE := $(BUILD_DIR)/axonos.iso
 STUB_SRC := boot/kzip_stub.c
 STUB_OBJ := $(BUILD_DIR)/$(STUB_SRC:.c=.c.o)
 
+# Linux-style kernel config (config.cfg → auto.conf + autoconf.h)
+CONFIG_FILE ?= config.cfg
+GENCONFIG := scripts/genconfig.sh
+AUTOCONF_DIR := $(BUILD_DIR)/include
+AUTO_CONF := $(AUTOCONF_DIR)/config/auto.conf
+AUTOCONF_H := $(AUTOCONF_DIR)/generated/autoconf.h
+
+# Sync auto.conf to CONFIG_FILE before -include (handles for-production switch).
+$(shell mkdir -p $(AUTOCONF_DIR)/config $(AUTOCONF_DIR)/generated && \
+	$(GENCONFIG) $(CONFIG_FILE) $(AUTOCONF_DIR) >/dev/null)
+-include $(AUTO_CONF)
+
+# y and m both mean "enabled / linked in" until real modules exist.
+config_enabled = $(filter y m,$(1))
+
 CC := gcc -m64
-# Optional: make CFLAGS_EXTRA='-DDEVEL_DEBUG=1' for COW/pipe/fork console traces.
+# Optional: make CFLAGS_EXTRA='-DDEVEL_DEBUG=1' still works as an override.
 CFLAGS_EXTRA ?=
 OPTFLAGS ?= -g
-CFLAGS := $(OPTFLAGS) -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel -Iinc -MMD -MP $(CFLAGS_EXTRA)
-PRODUCTION_CFLAGS := -DAXON_PRODUCTION=1 -DDEVEL_DEBUG=0 \
-	-DAXON_FORK_DEBUG=0 -DNET_TCP_TRACE=0 \
-	-DAXON_WGET_DNS_TRACE=0 -DKBD_DEBUG=0 \
-	-UQEMU_LOG_ENABLE -DKERNEL_LOG_TIME=1
+CFLAGS := $(OPTFLAGS) -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel \
+	-Iinc -I$(AUTOCONF_DIR) -include kconfig.h -MMD -MP $(CFLAGS_EXTRA)
 
 CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -path './userland' -prune -o -path './core/nss_dns_shim' -prune -o -path './core/nss_files_shim' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
 COBJS := $(patsubst %.c,$(BUILD_DIR)/%.c.o,$(CSRCS))
@@ -63,12 +75,21 @@ ASCII_PF2 := $(BUILD_DIR)/fonts/ascii.pf2
 ASCII_PF2_BLOB_OBJ := $(BUILD_DIR)/fonts/ascii_pf2_blob.o
 ASCII_PF2_SRC := $(firstword $(wildcard /usr/share/grub/ascii.pf2 /boot/grub/fonts/ascii.pf2))
 
-.PHONY: all kernel iso clean run for-production
+.PHONY: all kernel iso clean run for-production config oldconfig
 
 all: iso
 
+# Regenerate autoconf when config.cfg changes (or on `make config`).
+$(AUTO_CONF) $(AUTOCONF_H): $(CONFIG_FILE) $(GENCONFIG)
+	@$(GENCONFIG) $(CONFIG_FILE) $(AUTOCONF_DIR)
+
+config: $(AUTO_CONF)
+	@echo "Active config: $(CONFIG_FILE)"
+	@echo "  auto.conf:  $(AUTO_CONF)"
+	@echo "  autoconf.h: $(AUTOCONF_H)"
+
 for-production:
-	@$(MAKE) OPTFLAGS='-O0 -g0' CFLAGS_EXTRA='$(PRODUCTION_CFLAGS)' iso
+	@$(MAKE) CONFIG_FILE=config.production.cfg OPTFLAGS='-O0 -g0' iso
 
 kernel: $(KERNEL_BIN)
 
@@ -77,7 +98,7 @@ $(BUILD_DIR)/%.asm.o: %.asm
 	@echo "NASM		$<"
 	@$(ASM) $(ASM_ELF_FLAGS) -o $@ $<
 
-$(BUILD_DIR)/%.c.o: %.c
+$(BUILD_DIR)/%.c.o: %.c $(AUTOCONF_H)
 	@mkdir -p $(dir $@)
 	@echo "CC		$<"
 	@$(CC) $(CFLAGS) -c -o $@ $<
@@ -85,7 +106,7 @@ $(BUILD_DIR)/%.c.o: %.c
 -include $(DEPS)
 
 # Build rule for GAS .S files (with C preprocessor)
-$(BUILD_DIR)/%.S.o: %.S
+$(BUILD_DIR)/%.S.o: %.S $(AUTOCONF_H)
 	@mkdir -p $(dir $@)
 	@echo "CC		$<"
 	@$(CC) $(CFLAGS) -c -o $@ $<
@@ -247,3 +268,7 @@ archive:
 
 clean:
 	@rm -rf $(BUILD_DIR)
+
+# Show resolved options from the active config file.
+oldconfig: config
+	@grep -vE '^(# Generated|# m is|$)' $(AUTO_CONF) || true

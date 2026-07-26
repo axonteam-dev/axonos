@@ -13,6 +13,8 @@ enum {
     USER_VMA_KIND_ELF_LOAD = 4,
 };
 
+struct fs_file;
+
 typedef struct {
     int used;
     uint64_t tid;
@@ -20,7 +22,14 @@ typedef struct {
     size_t len;
     int prot;
     int kind;
+    /* File-backed MAP_PRIVATE (lazy): page at addr+i ← file at file_off+i. */
+    struct fs_file *file;
+    uint64_t file_off;
 } user_vma_t;
+
+/* Register a file-backed lazy VMA (retains file). kind: MMAP_LAZY or ELF_LOAD. */
+int user_vma_add_file(uint64_t tid, uintptr_t addr, size_t len, int prot, int kind,
+                      struct fs_file *file, uint64_t file_off);
 
 void user_vma_remove_all_for_tid(uint64_t tid);
 /* Unmap page tables for all VMAs in runner's address space and drop metadata. */

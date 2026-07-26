@@ -651,7 +651,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     mmio_init();
     ramfs_register();
     /* Create /dev in ramfs before initfs so it is always visible in ls / and before getty runs */
+#ifdef EXT2_SUPPORT
     ext2_register();
+#endif
 
     /* sysfs, procfs, devfs mount — only via SYS_mount from userspace (e.g. init) */
 
@@ -745,7 +747,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     user_init();
 
     // Registering all disk file systems
+#ifdef FAT32_SUPPORT
     fat32_register();
+#endif
 
     if (e1000_init() != 0) {
         klogprintf("net: e1000 not found\n");
@@ -1060,17 +1064,33 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         struct fs_file *lt = fs_create_file("/etc/localtime");
         if (lt) fs_file_free(lt);
     }
-    /* /etc/profile: sourced by login shells (getty->login->sh -l). Sets PS1 and TERM for vim. */
+    /*
+     * /etc/profile: login shells (getty→login→sh -l).
+     * GNU ls colors like Debian: TERM must match DIR_COLORS (linux), then
+     * eval "$(dircolors -b …)" sets LS_COLORS, alias enables --color=auto.
+     * Do not hardcode LS_COLORS; do not use TERM=builtin_ansi (dircolors
+     * emits an empty LS_COLORS for unknown TERM → ls stays monochrome).
+     */
     {
         static const char profile[] =
-            "export TERM=builtin_ansi\n"
+            "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
+            "export TERM=linux\n"
             "export USER=root\n"
             "export LOGNAME=root\n"
             "export HOME=/root\n"
             "export PS1='\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[1;37m\\w\\033[0m \\$ '\n"
             "export OPENSSL_CONF=/etc/ssl/openssl.cnf\n"
             "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n"
-            "export SSL_CERT_DIR=/etc/ssl/certs\n";
+            "export SSL_CERT_DIR=/etc/ssl/certs\n"
+            "if [ -x /usr/bin/dircolors ]; then\n"
+            "  if [ -r /etc/DIR_COLORS ]; then\n"
+            "    eval \"$(dircolors -b /etc/DIR_COLORS)\"\n"
+            "  else\n"
+            "    eval \"$(dircolors -b)\"\n"
+            "  fi\n"
+            "  alias ls='ls --color=auto'\n"
+            "  alias grep='grep --color=auto'\n"
+            "fi\n";
         struct fs_file *pf = fs_create_file("/etc/profile");
         if (!pf) pf = fs_open("/etc/profile");
         if (pf) {
@@ -1083,12 +1103,23 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
      * Interactive non-login bash (typing `bash`) reads this. Musl-static bash
      * caches getpwuid at startup; if that fails the prompt stays
      * "I have no name!" unless PS1 is overridden without \\u.
+     * Color setup mirrors Debian /etc/skel/.bashrc (dircolors + ls alias).
      */
     {
         static const char bashrc[] =
+            "export TERM=${TERM:-linux}\n"
             "export USER=${USER:-root}\n"
             "export LOGNAME=${LOGNAME:-root}\n"
             "export HOME=${HOME:-/root}\n"
+            "if [ -x /usr/bin/dircolors ]; then\n"
+            "  if [ -r /etc/DIR_COLORS ]; then\n"
+            "    eval \"$(dircolors -b /etc/DIR_COLORS)\"\n"
+            "  else\n"
+            "    eval \"$(dircolors -b)\"\n"
+            "  fi\n"
+            "  alias ls='ls --color=auto'\n"
+            "  alias grep='grep --color=auto'\n"
+            "fi\n"
             "if [ \"${UID:-0}\" = 0 ] || [ \"$(id -u 2>/dev/null)\" = 0 ]; then\n"
             "  PS1='\\[\\033[1;31m\\]root\\[\\033[0m\\]@\\h \\[\\033[0;37m\\]\\w\\[\\033[0m\\]\\$ '\n"
             "fi\n";
@@ -1200,22 +1231,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         }
         (void)fs_chmod("/usr/share/udhcpc/default.script", S_IFREG | 0755);
     }
-    /* /etc/termcap: vt102/linux with arrow keys (ku/kd/kr/kl) so vim moves cursor correctly */
-    {
-        static const char termcap[] =
-            "vt102|vt100|linux|linux-term:"
-            /* 1280x800 / 8x16 fbcon ≈ 160×50; ioctl winsize overrides for other vmwgfx modes */
-            "co#160:li#50:cl=\\E[2J\\E[H:cm=\\E[%i%d;%dH:nd=\\E[C:up=\\E[A:"
-            "ce=\\E[K:cd=\\E[J:so=\\E[7m:se=\\E[0m:us=\\E[4m:ue=\\E[0m:"
-            "ku=\\E[A:kd=\\E[B:kr=\\E[C:kl=\\E[D:"
-            "ti=\\E[?1049h:te=\\E[?1049l:\n";
-        struct fs_file *tc = fs_create_file("/etc/termcap");
-        if (!tc) tc = fs_open("/etc/termcap");
-        if (tc) {
-            fs_write(tc, termcap, sizeof(termcap) - 1, 0);
-            fs_file_free(tc);
-        }
-    }
+    /* No /etc/termcap stub: ncurses uses terminfo from initfs (…/terminfo/l/linux). */
 
     /* OpenRC init scripts use #!/sbin/openrc-run; some initfs builds only ship
      * /usr/sbin/openrc-run. */

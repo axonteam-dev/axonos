@@ -199,11 +199,8 @@ syscall_entry64:
 .L_skip_write_rax:
 
     /*
-     * Linux wake_up_new_task(): the child becomes runnable before fork returns.
-     * Publication cannot schedule from here; timer preemption ignores ring 0,
-     * and every task owns its syscall stack. This removes the old timer/next-
-     * syscall gate that could leave a child blocked forever when its parent
-     * returned to userspace and slept without another tick-driven publication.
+     * Safety net: normal fork already woke the child in C (wake_up_new_task).
+     * This only drains a rare deferred CLONE_THREAD publish.
      */
     call    syscall_publish_deferred_fork_child
     /* Re-bind FS before iretq: after fork/vfork the child can lose MSR_FS_BASE

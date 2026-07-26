@@ -10,9 +10,26 @@
 #include <string.h>
 #include <thread.h>
 #include <heap.h>
+#include <fs.h>
 
 static user_vma_t g_user_vmas[USER_VMA_MAX];
 static spinlock_t g_user_vma_lock;
+
+static void user_vma_drop_file_nolock(user_vma_t *v) {
+    if (!v || !v->file)
+        return;
+    struct fs_file *f = v->file;
+    v->file = NULL;
+    v->file_off = 0;
+    fs_file_free(f);
+}
+
+static void user_vma_clear_nolock(user_vma_t *v) {
+    if (!v || !v->used)
+        return;
+    user_vma_drop_file_nolock(v);
+    v->used = 0;
+}
 
 static user_vma_t *user_vma_mm_storage(mm_t *mm, int create) {
     if (!mm)
@@ -45,10 +62,13 @@ int user_vma_add_mm(mm_t *mm, uintptr_t addr, size_t len, int prot, int kind) {
     for (int i = 0; i < USER_VMA_MAX; ++i) {
         if (!vmas[i].used) {
             vmas[i].used = 1;
+            vmas[i].tid = 0;
             vmas[i].addr = addr;
             vmas[i].len = len;
             vmas[i].prot = prot;
             vmas[i].kind = kind;
+            vmas[i].file = NULL;
+            vmas[i].file_off = 0;
             release_irqrestore(&g_user_vma_lock, fl);
             return 0;
         }
@@ -86,6 +106,10 @@ int user_vma_clone_mm(mm_t *dst, mm_t *src) {
     unsigned long fl;
     acquire_irqsave(&g_user_vma_lock, &fl);
     memcpy(target, source, sizeof(user_vma_t) * USER_VMA_MAX);
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (target[i].used && target[i].file)
+            fs_file_get(target[i].file);
+    }
     release_irqrestore(&g_user_vma_lock, fl);
     return 0;
 }
@@ -123,6 +147,8 @@ static int user_vma_add_nolock(uint64_t tid, uintptr_t addr, size_t len, int pro
             g_user_vmas[i].len = len;
             g_user_vmas[i].prot = prot;
             g_user_vmas[i].kind = kind;
+            g_user_vmas[i].file = NULL;
+            g_user_vmas[i].file_off = 0;
             return 0;
         }
     }
@@ -138,7 +164,15 @@ static int user_vma_split_at_nolock(uint64_t tid, uintptr_t split_va) {
     uintptr_t right_addr = split_va;
     int prot = v->prot;
     int kind = v->kind;
+    struct fs_file *file = v->file;
+    uint64_t file_off = v->file_off;
     if (user_vma_add_nolock(tid, right_addr, right_len, prot, kind) != 0) return -1;
+    user_vma_t *right = user_vma_find_containing_nolock(tid, right_addr);
+    if (right && file) {
+        fs_file_get(file);
+        right->file = file;
+        right->file_off = file_off + (uint64_t)left_len;
+    }
     v->len = left_len;
     return 0;
 }
@@ -183,6 +217,11 @@ static int user_vma_split_runner_at_nolock(thread_t *runner,
         g_user_vmas[free_i] = *v;
         g_user_vmas[free_i].addr = split_va;
         g_user_vmas[free_i].len = (size_t)(end - split_va);
+        if (g_user_vmas[free_i].file) {
+            fs_file_get(g_user_vmas[free_i].file);
+            g_user_vmas[free_i].file_off =
+                v->file_off + (uint64_t)(split_va - v->addr);
+        }
         v->len = (size_t)(split_va - v->addr);
     }
     return 0;
@@ -211,6 +250,11 @@ static int user_vma_split_mm_at_nolock(user_vma_t *vmas,
         vmas[free_i] = *v;
         vmas[free_i].addr = split_va;
         vmas[free_i].len = (size_t)(end - split_va);
+        if (vmas[free_i].file) {
+            fs_file_get(vmas[free_i].file);
+            vmas[free_i].file_off =
+                v->file_off + (uint64_t)(split_va - v->addr);
+        }
         v->len = (size_t)(split_va - v->addr);
     }
     return 0;
@@ -309,13 +353,13 @@ int user_vma_unmap_range(uint64_t tid, uintptr_t addr, size_t len) {
                 uintptr_t a = g_user_vmas[i].addr;
                 uintptr_t e = a + g_user_vmas[i].len;
                 if (!(e <= addr || a >= end))
-                    g_user_vmas[i].used = 0;
+                    user_vma_clear_nolock(&g_user_vmas[i]);
             }
             if (mm_vmas && mm_vmas[i].used) {
                 uintptr_t a = mm_vmas[i].addr;
                 uintptr_t e = a + mm_vmas[i].len;
                 if (!(e <= addr || a >= end))
-                    mm_vmas[i].used = 0;
+                    user_vma_clear_nolock(&mm_vmas[i]);
             }
         }
     } else {
@@ -326,7 +370,7 @@ int user_vma_unmap_range(uint64_t tid, uintptr_t addr, size_t len) {
             uintptr_t a = g_user_vmas[i].addr;
             uintptr_t e = a + g_user_vmas[i].len;
             if (e <= addr || a >= end) continue;
-            g_user_vmas[i].used = 0;
+            user_vma_clear_nolock(&g_user_vmas[i]);
         }
     }
     release_irqrestore(&g_user_vma_lock, fl);
@@ -511,7 +555,8 @@ void user_vma_remove_all_for_tid(uint64_t tid) {
     unsigned long fl = 0;
     acquire_irqsave(&g_user_vma_lock, &fl);
     for (int i = 0; i < USER_VMA_MAX; i++) {
-        if (g_user_vmas[i].used && g_user_vmas[i].tid == tid) g_user_vmas[i].used = 0;
+        if (g_user_vmas[i].used && g_user_vmas[i].tid == tid)
+            user_vma_clear_nolock(&g_user_vmas[i]);
     }
     release_irqrestore(&g_user_vma_lock, fl);
 }
@@ -537,7 +582,7 @@ void user_vma_teardown_unmap_for_exec(thread_t *runner) {
                 user_as_mmap_memset_zero_chunked(a, (size_t)(e - a));
             }
         }
-        g_user_vmas[i].used = 0;
+        user_vma_clear_nolock(&g_user_vmas[i]);
     }
     release_irqrestore(&g_user_vma_lock, fl);
 }
@@ -628,13 +673,51 @@ int user_vma_clone_for_tid(uint64_t from_tid, uint64_t to_tid) {
         if (user_vma_add_nolock(to_tid, g_user_vmas[i].addr, g_user_vmas[i].len,
                 g_user_vmas[i].prot, g_user_vmas[i].kind) != 0) {
             for (int j = 0; j < USER_VMA_MAX; j++) {
-                if (g_user_vmas[j].used && g_user_vmas[j].tid == to_tid) g_user_vmas[j].used = 0;
+                if (g_user_vmas[j].used && g_user_vmas[j].tid == to_tid)
+                    user_vma_clear_nolock(&g_user_vmas[j]);
             }
             rc = -1;
             break;
         }
+        user_vma_t *dst = user_vma_find_containing_nolock(to_tid, g_user_vmas[i].addr);
+        if (dst && g_user_vmas[i].file) {
+            fs_file_get(g_user_vmas[i].file);
+            dst->file = g_user_vmas[i].file;
+            dst->file_off = g_user_vmas[i].file_off;
+        }
     }
     release_irqrestore(&g_user_vma_lock, fl);
+    return rc;
+}
+
+int user_vma_add_file(uint64_t tid, uintptr_t addr, size_t len, int prot, int kind,
+                      struct fs_file *file, uint64_t file_off) {
+    if (!file || len == 0)
+        return -1;
+    if (kind != USER_VMA_KIND_MMAP_LAZY && kind != USER_VMA_KIND_ELF_LOAD)
+        kind = USER_VMA_KIND_MMAP_LAZY;
+    unsigned long fl = 0;
+    int rc;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    rc = user_vma_add_nolock(tid, addr, len, prot, kind);
+    if (rc == 0) {
+        user_vma_t *v = user_vma_find_containing_nolock(tid, addr);
+        if (!v) {
+            rc = -1;
+        } else {
+            if (v->file)
+                user_vma_drop_file_nolock(v);
+            fs_file_get(file);
+            v->file = file;
+            v->file_off = file_off;
+        }
+    }
+    release_irqrestore(&g_user_vma_lock, fl);
+    if (rc == 0) {
+        thread_t *owner = thread_get((int)tid);
+        if (owner && owner->mm)
+            (void)user_vma_add_mm(owner->mm, addr, len, prot, kind);
+    }
     return rc;
 }
 
@@ -654,7 +737,9 @@ int user_vma_fault_lazy_anon(uint64_t cr2) {
     for (int i = 0; i < USER_VMA_MAX; i++) {
         if (!g_user_vmas[i].used) continue;
         if (!user_vma_tid_matches_runner_mm_nolock(t, (uint64_t)g_user_vmas[i].tid)) continue;
-        if (g_user_vmas[i].kind != USER_VMA_KIND_MMAP_LAZY) continue;
+        if (g_user_vmas[i].kind != USER_VMA_KIND_MMAP_LAZY &&
+            g_user_vmas[i].kind != USER_VMA_KIND_ELF_LOAD)
+            continue;
         uint64_t a64 = (uint64_t)g_user_vmas[i].addr;
         uint64_t end64 = a64 + (uint64_t)g_user_vmas[i].len;
         if (end64 < a64) continue;
@@ -672,6 +757,7 @@ int user_vma_fault_lazy_anon(uint64_t cr2) {
         release_irqrestore(&g_user_vma_lock, fl);
         return 0;
     }
+    user_vma_t hit_copy = *hit;
     uint64_t hit_end = (uint64_t)hit->addr + (uint64_t)hit->len;
     if (hit_end < (uint64_t)hit->addr || (uint64_t)cr2 >= hit_end) {
         release_irqrestore(&g_user_vma_lock, fl);
@@ -685,37 +771,45 @@ int user_vma_fault_lazy_anon(uint64_t cr2) {
         release_irqrestore(&g_user_vma_lock, fl);
         return 0;
     }
-    uint64_t chunk_end = (uint64_t)va2m + (uint64_t)PAGE_SIZE_2M;
-    size_t zlen = (size_t)PAGE_SIZE_2M;
-    if (chunk_end > hit_end) {
-        zlen = (size_t)(hit_end - (uint64_t)va2m);
-        if (zlen == 0 || zlen > (size_t)PAGE_SIZE_2M) {
-            release_irqrestore(&g_user_vma_lock, fl);
-            return 0;
-        }
-    }
     release_irqrestore(&g_user_vma_lock, fl);
-    (void)zlen;
-    /*
-     * Linux do_anonymous_page: one 4K zero page. Never map_page_2m(va,va) +
-     * memset of a 2MiB chunk (zeros vfork parent phys / sibling anon pages).
-     */
-    {
-        mm_t *k = mm_kernel();
-        if (t->mm && k && t->mm->pml4 && k->pml4 && t->mm->pml4 != k->pml4) {
-            mm_t *share = t->mm_ptemplate ? t->mm_ptemplate : k;
-            uint64_t lo = (uint64_t)cr2 & ~0xFFFULL;
-            uint64_t hi = lo + 0x1000ULL;
-            if (mm_privatize_identity_range_blank(t->mm, lo, hi) != 0)
-                return 0;
-            if (mm_make_private_range_noyield(t->mm, lo, hi, 0, share) != 0)
-                return 0;
-            return 1;
-        }
+
+    uint64_t lo = (uint64_t)cr2 & ~0xFFFULL;
+    uint64_t hi = lo + 0x1000ULL;
+    mm_t *k = mm_kernel();
+    if (!(t->mm && k && t->mm->pml4 && k->pml4 && t->mm->pml4 != k->pml4)) {
+        if (map_page_2m((uint64_t)va2m, (uint64_t)va2m, PG_PRESENT | PG_RW | PG_US) != 0)
+            return 0;
+        memset((void *)(uintptr_t)lo, 0, 0x1000u);
+        return 1;
     }
-    if (map_page_2m((uint64_t)va2m, (uint64_t)va2m, PG_PRESENT | PG_RW | PG_US) != 0)
+    mm_t *share = t->mm_ptemplate ? t->mm_ptemplate : k;
+    if (mm_privatize_identity_range_blank(t->mm, lo, hi) != 0)
         return 0;
-    memset((void *)(uintptr_t)((uint64_t)cr2 & ~0xFFFULL), 0, 0x1000u);
+    if (mm_make_private_range_noyield(t->mm, lo, hi, 0, share) != 0)
+        return 0;
+
+    /* Linux filemap_fault: fill one page from the backing file. */
+    if (hit_copy.file) {
+        uint64_t leaf = 0;
+        if (mm_va_leaf_pa(t->mm, lo, &leaf) != 0)
+            return 0;
+        uint64_t page = leaf & ~0xFFFULL;
+        if (page == lo)
+            return 0;
+        uint64_t foff = hit_copy.file_off + (lo - (uint64_t)hit_copy.addr);
+        size_t n = 0x1000u;
+        if (foff < (uint64_t)hit_copy.file->size) {
+            uint64_t avail = (uint64_t)hit_copy.file->size - foff;
+            if (avail < n)
+                n = (size_t)avail;
+            ssize_t nr = fs_read(hit_copy.file, (void *)(uintptr_t)page, n, (size_t)foff);
+            if (nr < 0)
+                return 0;
+            if ((size_t)nr < 0x1000u)
+                memset((void *)(uintptr_t)(page + (size_t)nr), 0, 0x1000u - (size_t)nr);
+        }
+        /* else: past EOF — page already zero from privatize blank */
+    }
     return 1;
 }
 
@@ -783,12 +877,33 @@ int user_vma_fault_nonpresent(uint64_t cr2, uint64_t err) {
                     return 0;
                 return 1;
             }
-            /* Linux do_anonymous_page: commit one 4K page. Filling a whole 2MiB
-             * chunk re-zeroed sibling anon pages in the same huge leaf. */
+            /* Linux do_anonymous_page / filemap_fault: one 4K page. */
             if (mm_privatize_identity_range_blank(t->mm, lo, hi) != 0)
                 return 0;
             if (mm_make_private_range_noyield(t->mm, lo, hi, 0, share) != 0)
                 return 0;
+            if (hit_copy.file) {
+                uint64_t leaf = 0;
+                if (mm_va_leaf_pa(t->mm, lo, &leaf) != 0)
+                    return 0;
+                uint64_t page = leaf & ~0xFFFULL;
+                if (page == lo)
+                    return 0;
+                uint64_t foff = hit_copy.file_off + (lo - (uint64_t)hit_copy.addr);
+                size_t n = 0x1000u;
+                if (foff < (uint64_t)hit_copy.file->size) {
+                    uint64_t avail = (uint64_t)hit_copy.file->size - foff;
+                    if (avail < n)
+                        n = (size_t)avail;
+                    ssize_t nr = fs_read(hit_copy.file, (void *)(uintptr_t)page, n,
+                                         (size_t)foff);
+                    if (nr < 0)
+                        return 0;
+                    if ((size_t)nr < 0x1000u)
+                        memset((void *)(uintptr_t)(page + (size_t)nr), 0,
+                               0x1000u - (size_t)nr);
+                }
+            }
             return 1;
         }
     }
@@ -799,7 +914,7 @@ int user_vma_fault_nonpresent(uint64_t cr2, uint64_t err) {
         if (map_page_2m((uint64_t)va2m, (uint64_t)va2m, PG_PRESENT | PG_RW | PG_US) != 0)
             return 0;
     }
-    if (hit_copy.kind == USER_VMA_KIND_MMAP_LAZY) {
+    if (hit_copy.kind == USER_VMA_KIND_MMAP_LAZY && !hit_copy.file) {
         uint64_t hit_end = (uint64_t)hit_copy.addr + (uint64_t)hit_copy.len;
         uint64_t chunk_end = (uint64_t)va2m + (uint64_t)PAGE_SIZE_2M;
         size_t zlen = (size_t)PAGE_SIZE_2M;

@@ -56,13 +56,17 @@ void pit_handler(cpu_registers_t* regs) {
         /* Userspace is BSP-only even when APs exist; preempt ring-3 on cpu0. */
         if (regs && ((regs->cs & 3) == 3)) {
                 if (smp_sched_cpu_id() == 0) {
-                        /* Match LAPIC: ~100 Hz forced preemption (~10 ms). */
-                        uint32_t quantum = pit_frequency / 100u;
-                        if (quantum < 1u)
-                                quantum = 1u;
-                        if (!published_fork_child &&
-                            (pit_ticks % quantum) == 0)
+                        /* Match LAPIC: ~100 Hz forced preemption (~10 ms).
+                         * After wake_up_new_task on this tick, preempt immediately. */
+                        if (published_fork_child) {
                                 thread_ring3_preempt_if_waiters();
+                        } else {
+                                uint32_t quantum = pit_frequency / 100u;
+                                if (quantum < 1u)
+                                        quantum = 1u;
+                                if ((pit_ticks % quantum) == 0)
+                                        thread_ring3_preempt_if_waiters();
+                        }
                 }
                 return;
         }

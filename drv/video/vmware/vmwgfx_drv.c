@@ -756,6 +756,11 @@ static int vmwgfx_fifo_append_u32(vmwgfx_ctx_t *ctx, uint32_t value) {
 static void vmwgfx_fifo_submit_update(vmwgfx_ctx_t *ctx, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 	if (!ctx->fifo_va || w == 0 || h == 0)
 		return;
+	/*
+	 * Backpressure only. Do not SYNC on the common tty path — cirrusfb
+	 * rate-limits display_sync. If the ring is still full after a kick,
+	 * drop this UPDATE; a later dirty flush will refresh the rect.
+	 */
 	if (vmwgfx_fifo_free_bytes(ctx) < 20) {
 		svga_reg_write32(ctx, SVGA_REG_SYNC, 1);
 		vmwgfx_io_barrier();

@@ -30,14 +30,20 @@ static inline uint8_t seq_read(uint8_t reg) {
 	return inb(VGA_SEQ_DATA);
 }
 
+/* g_fb = draw target (RAM shadow when available). g_vram = host scanout. */
 static void *g_fb = NULL;
+static void *g_vram = NULL;
+static void *g_shadow = NULL;
 static uint32_t g_width = 0;
 static uint32_t g_height = 0;
 static uint32_t g_pitch = 0;
 static uint32_t g_bpp = 0;
 static uint32_t g_fb_size = 0;
+static uint32_t g_shadow_bytes = 0;
 static int g_ready = 0;
 static int g_hwcursor_ok = 0;
+static int g_fb_sync_pending = 0;
+static uint64_t g_last_sync_ticks = 0;
 
 static uint32_t g_cols = 0;
 static uint32_t g_rows = 0;
@@ -59,12 +65,15 @@ static int g_logo_visible = 0;
 static int g_swcursor_visible = 1;
 static uint64_t g_swcursor_last_phase = 0;
 
-/* Coalesce SVGA FIFO updates: many glyphs -> one dirty rect + one SYNC. */
+/* Coalesce: many glyphs -> one dirty rect -> shadow→VRAM copy + UPDATE. */
 static int g_fb_dirty = 0;
 static uint32_t g_dirty_x0 = 0, g_dirty_y0 = 0, g_dirty_x1 = 0, g_dirty_y1 = 0;
 static int g_batch_depth = 0;
 static int g_hwcursor_deferred = 0;
 static uint32_t g_hwcursor_def_x = 0, g_hwcursor_def_y = 0;
+
+extern volatile uint64_t timer_ticks;
+extern volatile uint32_t timer_frequency;
 
 static void fb_dirty_mark(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 	if (w == 0 || h == 0) return;
@@ -88,15 +97,51 @@ static void fb_dirty_mark(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 
 static void hwcursor_set_pos(uint32_t x, uint32_t y);
 
+/* Kick SVGA FIFO at most ~60 Hz — never SYNC on every tty write(). */
+static void cirrusfb_kick_sync_rate_limited(void) {
+	uint32_t hz = timer_frequency ? timer_frequency : 250u;
+	uint32_t gap = hz / 60u;
+	if (gap < 1u)
+		gap = 1u;
+	if ((timer_ticks - g_last_sync_ticks) < (uint64_t)gap) {
+		g_fb_sync_pending = 1;
+		return;
+	}
+	g_last_sync_ticks = timer_ticks;
+	g_fb_sync_pending = 0;
+	video_display_sync();
+}
+
 static void cirrusfb_flush_dirty(void) {
 	if (!g_fb_dirty || !g_ready) return;
 	/* Nested tty write batches: keep dirty until outermost end_batch. */
 	if (g_batch_depth > 0) return;
+	uint32_t x0 = g_dirty_x0;
+	uint32_t y0 = g_dirty_y0;
 	uint32_t w = g_dirty_x1 - g_dirty_x0 + 1;
 	uint32_t h = g_dirty_y1 - g_dirty_y0 + 1;
-	video_flush_region_pixels(g_dirty_x0, g_dirty_y0, w, h);
-	video_display_sync();
+	/*
+	 * Paint into RAM shadow; push only the dirty rect to VRAM. Scrolling and
+	 * glyph blits on a PCI BAR (even WB) are multi-100ms under VMware/QEMU —
+	 * that alone made `ls` feel ~0.8s when the console scrolled.
+	 */
+	if (g_shadow && g_vram && g_fb == g_shadow) {
+		uint32_t bpp = (g_bpp + 7) / 8;
+		size_t row_bytes = (size_t)w * bpp;
+		for (uint32_t y = 0; y < h; y++) {
+			uint8_t *src = (uint8_t *)g_shadow + (size_t)(y0 + y) * g_pitch + (size_t)x0 * bpp;
+			uint8_t *dst = (uint8_t *)g_vram + (size_t)(y0 + y) * g_pitch + (size_t)x0 * bpp;
+			memcpy(dst, src, row_bytes);
+		}
+	}
+	video_flush_region_pixels(x0, y0, w, h);
 	g_fb_dirty = 0;
+	/*
+	 * Never SYNC inside tty write(): QEMU/VMware turn SVGA_REG_SYNC into a
+	 * long VM-exit. Mark pending; cirrusfb_update_cursor() (timer) kicks
+	 * at most ~60 Hz so the FIFO drains without stalling syscalls.
+	 */
+	g_fb_sync_pending = 1;
 }
 
 void cirrusfb_begin_batch(void) {
@@ -317,7 +362,8 @@ static void hwcursor_init(void) {
 	   SR12 bits = 0, SR14 bit 3 = 0, and we write to that VRAM offset. */
 	g_hwcursor_offset = g_fb_size - HW_CURSOR_BYTES;
 	g_hwcursor_offset &= ~0x3FFu; /* align to 1KB */
-	g_hwcursor_data = (uint8_t*)g_fb + g_hwcursor_offset;
+	/* Cursor plane lives in real VRAM, never in the RAM shadow. */
+	g_hwcursor_data = (uint8_t *)(g_vram ? g_vram : g_fb) + g_hwcursor_offset;
 
 	/* Clear cursor bitmap to transparent (10 pattern = 0xAA) */
 	memset(g_hwcursor_data, 0xAA, HW_CURSOR_BYTES);
@@ -396,7 +442,7 @@ static void hwcursor_enable(int enable) {
 int cirrusfb_init(void *fb, uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp, uint32_t fb_size,
                   int hw_cursor) {
 	if (!fb || width == 0 || height == 0) return -1;
-	g_fb = fb;
+	g_vram = fb;
 	g_width = width;
 	g_height = height;
 	g_pitch = pitch;
@@ -409,6 +455,19 @@ int cirrusfb_init(void *fb, uint32_t width, uint32_t height, uint32_t pitch, uin
 	extern void *kmalloc(size_t);
 	extern void kfree(void*);
 	if (g_textbuf) { kfree(g_textbuf); g_textbuf = NULL; }
+	if (g_shadow) { kfree(g_shadow); g_shadow = NULL; }
+	g_shadow_bytes = pitch * height;
+	g_shadow = kmalloc(g_shadow_bytes);
+	if (g_shadow) {
+		memset(g_shadow, 0, g_shadow_bytes);
+		g_fb = g_shadow;
+		klogprintf("fbcon: RAM shadow %u bytes (scroll/glyphs off VRAM)\n",
+		           (unsigned)g_shadow_bytes);
+	} else {
+		g_fb = g_vram;
+		g_shadow_bytes = 0;
+		klogprintf("fbcon: no shadow (drawing directly to VRAM)\n");
+	}
 	g_textbuf = (cell_t*)kmalloc(g_cols * g_rows * sizeof(cell_t));
 	if (!g_textbuf) return -1;
 
@@ -422,6 +481,8 @@ int cirrusfb_init(void *fb, uint32_t width, uint32_t height, uint32_t pitch, uin
 	g_swcursor_visible = 1;
 	g_swcursor_last_phase = 0;
 	g_fb_dirty = 0;
+	g_fb_sync_pending = 0;
+	g_last_sync_ticks = 0;
 	g_ready = 1;
 
 	cirrusfb_clear(WHITE_ON_BLACK);
@@ -933,6 +994,9 @@ void cirrusfb_putchar(uint8_t ch, uint8_t attr) {
 
 void cirrusfb_update_cursor(void) {
 	if (!g_ready) return;
+	/* Drain a deferred SVGA SYNC from a prior flush (rate-limit gap). */
+	if (g_fb_sync_pending)
+		cirrusfb_kick_sync_rate_limited();
 	if (g_hwcursor_ok) {
 		/* Hardware cursor blinks automatically. */
 		return;

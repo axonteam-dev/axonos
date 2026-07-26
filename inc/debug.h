@@ -11,8 +11,8 @@ typedef struct thread thread_t;
 
 /*
  * Development console/serial traces (COW, pipe, fork child, ash-watch, …).
- * Off by default. Enable:  make CFLAGS_EXTRA='-DDEVEL_DEBUG=1'
- * or #define DEVEL_DEBUG 1 before including this header.
+ * Off by default. Prefer config.cfg (DEVEL_DEBUG=y), or override with
+ * make CFLAGS_EXTRA='-DDEVEL_DEBUG=1'.
  */
 #ifndef DEVEL_DEBUG
 #define DEVEL_DEBUG 0

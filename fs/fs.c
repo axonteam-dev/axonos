@@ -657,6 +657,15 @@ ssize_t fs_write(struct fs_file *file, const void *buf, size_t size, size_t offs
     return -1;
 }
 
+void fs_file_get(struct fs_file *file) {
+    if (!file)
+        return;
+    if (file->refcount < 1)
+        file->refcount = 1;
+    else
+        file->refcount++;
+}
+
 void fs_file_free(struct fs_file *file) {
     if (!file) return;
     /* reference-counted: decrement and only free when zero */

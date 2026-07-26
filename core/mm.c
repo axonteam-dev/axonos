@@ -1158,15 +1158,24 @@ int mm_demote_user_identity(mm_t *mm) {
     const uint64_t brk_unmap_lo = MM_ASH_WATCH_LO;
     const uint64_t brk_unmap_hi = MM_ASH_WATCH_HI;
 
-    for (uint64_t va = lo; va < hi; va += PAGE_SIZE_2M) {
-        if (hlo && hhi > hlo && va >= (uint64_t)hlo && va < (uint64_t)hhi)
+    /*
+     * Walk one L2 table at a time (1GiB / 512×2MiB). Dup shared L3/L2 once,
+     * then strip PG_US on every leaf in-range — not once per 2MiB with full
+     * L4→L3→L2 rewalk (that dominated mm_alloc/execve).
+     */
+    for (uint64_t l2_base = lo & ~((1ULL << 30) - 1ULL); l2_base < hi;
+         l2_base += (1ULL << 30)) {
+        uint64_t range_lo = l2_base < lo ? lo : l2_base;
+        uint64_t range_hi = l2_base + (1ULL << 30);
+        if (range_hi > hi)
+            range_hi = hi;
+        if (range_lo >= range_hi)
+            continue;
+        if (hlo && hhi > hlo && range_lo >= (uint64_t)hlo && range_hi <= (uint64_t)hhi)
             continue;
 
-        int l4i = (int)((va >> 39) & 0x1FF);
-        int l3i = (int)((va >> 30) & 0x1FF);
-        int l2i = (int)((va >> 21) & 0x1FF);
-        int unmap_identity =
-            (va < brk_unmap_hi && (va + PAGE_SIZE_2M) > brk_unmap_lo);
+        int l4i = (int)((range_lo >> 39) & 0x1FF);
+        int l3i = (int)((range_lo >> 30) & 0x1FF);
 
         uint64_t ke4 = k->pml4[l4i];
         uint64_t e4 = mm->pml4[l4i];
@@ -1186,7 +1195,7 @@ int mm_demote_user_identity(mm_t *mm) {
         if (!(e3 & PG_PRESENT) || !pt_page_pa_ok(e3))
             continue;
         if (e3 & PG_PS_2M)
-            continue; /* 1GiB leaf — leave alone */
+            continue;
 
         uint64_t ke3 = 0;
         if ((ke4 & PG_PRESENT) && !(ke4 & PG_PS_2M) && pt_page_pa_ok(ke4)) {
@@ -1203,34 +1212,44 @@ int mm_demote_user_identity(mm_t *mm) {
         }
 
         uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
-        uint64_t e2 = l2[l2i];
-        if (!(e2 & PG_PRESENT))
-            continue;
-        if (e2 & PG_PS_2M) {
-            uint64_t pa2 = e2 & ~(PAGE_SIZE_2M - 1ULL);
-            if (unmap_identity && pa2 == va)
-                l2[l2i] = 0; /* brk slab only */
-            else
-                l2[l2i] = e2 & ~PG_US;
-            invlpg((void *)(uintptr_t)va);
-            continue;
-        }
-        if (!pt_page_pa_ok(e2))
-            continue;
-        uint64_t ke2 = 0;
-        if ((ke3 & PG_PRESENT) && !(ke3 & PG_PS_2M) && pt_page_pa_ok(ke3)) {
-            uint64_t *kl2 = (uint64_t *)(uintptr_t)(ke3 & ~0xFFFULL);
-            ke2 = kl2[l2i];
-        }
-        if (mm_pte_same_pt_page(e2, ke2) || !mm_owns_pt_page(mm, (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL))) {
-            uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
-            uint64_t *n1 = dup_pt_page(mm, l1);
-            if (!n1)
-                return -1;
-            l2[l2i] = ((uint64_t)(uintptr_t)n1) | (e2 & 0xFFFULL);
-            e2 = l2[l2i];
-        }
-        {
+        int l2i_begin = (int)((range_lo >> 21) & 0x1FF);
+        int l2i_end = (int)(((range_hi - 1ULL) >> 21) & 0x1FF);
+        for (int l2i = l2i_begin; l2i <= l2i_end; l2i++) {
+            uint64_t va = l2_base + ((uint64_t)l2i << 21);
+            if (va < lo || va >= hi)
+                continue;
+            if (hlo && hhi > hlo && va >= (uint64_t)hlo && va < (uint64_t)hhi)
+                continue;
+            int unmap_identity =
+                (va < brk_unmap_hi && (va + PAGE_SIZE_2M) > brk_unmap_lo);
+
+            uint64_t e2 = l2[l2i];
+            if (!(e2 & PG_PRESENT))
+                continue;
+            if (e2 & PG_PS_2M) {
+                uint64_t pa2 = e2 & ~(PAGE_SIZE_2M - 1ULL);
+                if (unmap_identity && pa2 == va)
+                    l2[l2i] = 0;
+                else
+                    l2[l2i] = e2 & ~PG_US;
+                continue;
+            }
+            if (!pt_page_pa_ok(e2))
+                continue;
+            uint64_t ke2 = 0;
+            if ((ke3 & PG_PRESENT) && !(ke3 & PG_PS_2M) && pt_page_pa_ok(ke3)) {
+                uint64_t *kl2 = (uint64_t *)(uintptr_t)(ke3 & ~0xFFFULL);
+                ke2 = kl2[l2i];
+            }
+            if (mm_pte_same_pt_page(e2, ke2) ||
+                !mm_owns_pt_page(mm, (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL))) {
+                uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
+                uint64_t *n1 = dup_pt_page(mm, l1);
+                if (!n1)
+                    return -1;
+                l2[l2i] = ((uint64_t)(uintptr_t)n1) | (e2 & 0xFFFULL);
+                e2 = l2[l2i];
+            }
             uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
             for (int i = 0; i < 512; i++) {
                 uint64_t e1 = l1[i];
@@ -1244,7 +1263,6 @@ int mm_demote_user_identity(mm_t *mm) {
                 else
                     l1[i] = e1 & ~PG_US;
             }
-            invlpg((void *)(uintptr_t)va);
         }
     }
     return 0;

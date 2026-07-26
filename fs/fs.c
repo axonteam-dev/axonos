@@ -692,6 +692,10 @@ void fs_file_free(struct fs_file *file) {
         epoll_fs_file_destroy(file);
         return;
     }
+    if (file->type == FS_TYPE_EVENTFD) {
+        eventfd_fs_file_destroy(file);
+        return;
+    }
     for (int i = 0; i < g_drivers_count; i++) {
         struct fs_driver *drv = g_drivers[i];
         if (!drv || !drv->ops) continue;

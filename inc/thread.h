@@ -53,6 +53,8 @@ typedef struct thread {
         uid_t uid;
         uid_t euid;
         uid_t suid;
+        /* Linux iopl(2) level 0..3 (CAP_SYS_RAWIO); used by Xorg xf86EnableIOPorts. */
+        uint8_t iopl;
         gid_t gid;
         gid_t egid;
         gid_t sgid;

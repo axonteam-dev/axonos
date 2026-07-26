@@ -211,6 +211,18 @@ static void devfs_tty_newline(struct devfs_tty *tty, int tty_on_vga) {
         console_set_cursor(tty->cursor_x, tty->cursor_y);
 }
 
+static void devfs_tty_store_xy(struct devfs_tty *tty, uint32_t x, uint32_t y, uint8_t ch) {
+    uint32_t cols = devfs_tty_cols();
+    uint32_t rows = devfs_tty_rows();
+    if (!tty || !tty->screen || cols == 0 || rows == 0)
+        return;
+    if (y >= rows) y = rows - 1;
+    if (x >= cols) x = cols - 1;
+    size_t off = ((size_t)y * cols + x) * 2;
+    tty->screen[off] = ch;
+    tty->screen[off + 1] = tty->current_attr;
+}
+
 static void devfs_tty_store_at_cursor(struct devfs_tty *tty, uint8_t ch) {
     uint32_t cols = devfs_tty_cols();
     uint32_t rows = devfs_tty_rows();
@@ -425,8 +437,56 @@ void devfs_tty_console_write(const char *s, size_t n) {
     struct devfs_tty *tty = devfs_get_tty_by_index(devfs_get_active());
     if (!tty)
         return;
-    for (size_t i = 0; i < n; i++)
+    console_begin_tty_batch();
+    /*
+     * Fast path: coalesce printable runs with the same attr into one
+     * cirrusfb_putch_run() (single dirty rect) — Linux fbcon-style.
+     */
+    for (size_t i = 0; i < n; ) {
+        uint8_t ch = (uint8_t)s[i];
+        ch = devfs_tty_acs_translate(ch, tty->acs_mode);
+        if (ch >= 0x20u && ch != 0x7Fu && !tty->insert_mode &&
+            cirrusfb_is_ready()) {
+            uint32_t cols = devfs_tty_cols();
+            size_t j = i;
+            while (j < n) {
+                uint8_t c = devfs_tty_acs_translate((uint8_t)s[j], tty->acs_mode);
+                if (c < 0x20u || c == 0x7Fu)
+                    break;
+                if (tty->cursor_x + (uint32_t)(j - i) >= cols)
+                    break;
+                j++;
+            }
+            if (j > i) {
+                uint32_t run = (uint32_t)(j - i);
+                uint8_t tmp[256];
+                const uint8_t *p = (const uint8_t *)s + i;
+                if (tty->acs_mode) {
+                    if (run > sizeof(tmp))
+                        run = (uint32_t)sizeof(tmp);
+                    for (uint32_t k = 0; k < run; k++)
+                        tmp[k] = devfs_tty_acs_translate((uint8_t)s[i + k], 1);
+                    p = tmp;
+                }
+                for (uint32_t k = 0; k < run; k++)
+                    devfs_tty_store_xy(tty, tty->cursor_x + k, tty->cursor_y, p[k]);
+                cirrusfb_putch_run(tty->cursor_x, tty->cursor_y, p, run,
+                                   tty->current_attr);
+                tty->cursor_x += run;
+                if (tty->cursor_x >= cols) {
+                    tty->cursor_x = 0;
+                    if (tty->cursor_y + 1 < devfs_tty_rows())
+                        tty->cursor_y++;
+                }
+                i += run;
+                continue;
+            }
+        }
         devfs_tty_emit_byte(tty, 1, (uint8_t)s[i]);
+        i++;
+    }
+    console_set_cursor(tty->cursor_x, tty->cursor_y);
+    console_end_tty_batch();
 }
 
 static void devfs_tty_emit_byte(struct devfs_tty *tty, int tty_on_vga, uint8_t ch) {
@@ -437,8 +497,6 @@ static void devfs_tty_emit_byte(struct devfs_tty *tty, int tty_on_vga, uint8_t c
     }
     if (ch == '\r') {
         tty->cursor_x = 0;
-        if (tty_on_vga)
-            console_set_cursor(tty->cursor_x, tty->cursor_y);
         return;
     }
     if (ch == '\b' || ch == 0x7F) {
@@ -471,10 +529,7 @@ static void devfs_tty_emit_byte(struct devfs_tty *tty, int tty_on_vga, uint8_t c
         else
             console_putch_xy(tty->cursor_x, tty->cursor_y, ch, tty->current_attr);
         devfs_tty_advance_cursor(tty);
-        if (cirrusfb_is_ready())
-            cirrusfb_set_cursor(tty->cursor_x, tty->cursor_y);
-        else
-            console_set_cursor(tty->cursor_x, tty->cursor_y);
+        /* Do not touch HW cursor here; console_end_tty_batch / CSI paths sync it. */
     } else {
         /* store_at_cursor already wrote the glyph; virtual path only advances. */
         uint32_t cols = devfs_tty_cols();
@@ -1323,10 +1378,13 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
     if (!t) return -1;
     int idx = t->id;
     const char *s = (const char*)buf;
+    const int tty_on_vga_batch = (idx == devfs_active);
+    if (tty_on_vga_batch)
+        console_begin_tty_batch();
     for (size_t i = 0; i < size; i++) {
         char ch = s[i];
         {
-            const int tty_on_vga = (idx == devfs_active);
+            const int tty_on_vga = tty_on_vga_batch;
             /* Parse ANSI for every VC; drive VGA only when this tty is visible. */
             struct devfs_tty *tty = t;
             /* Hot path: ESC[2JESC[H (clear then home) - many apps use this */
@@ -1811,6 +1869,10 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
             }
         }
     }
+    if (tty_on_vga_batch) {
+        console_set_cursor(t->cursor_x, t->cursor_y);
+        console_end_tty_batch();
+    }
     /* Also append written chars to stdout/stderr ring buffers if applicable */
     if (file->path) {
         int which = -1;
@@ -1915,13 +1977,15 @@ int devfs_fill_stat(struct fs_file *file, struct stat *st) {
         return 0;
     }
 
-    /* /dev/fb0: size = framebuffer bytes (Linux fbdev-like) */
+    /* /dev/fb0: Linux fb major 29, minor 0 */
     if (strcmp(p, "/dev/fb0") == 0) {
+        st->st_dev = MKDEV(0, 1); /* arbitrary containing device */
         st->st_ino = 2100;
         st->st_mode = (mode_t)(S_IFCHR | 0666);
         st->st_nlink = 1;
         st->st_uid = 0;
         st->st_gid = 0;
+        st->st_rdev = MKDEV(FB_MAJOR, 0);
         st->st_size = (off_t)fbdev_byte_len();
         return 0;
     }

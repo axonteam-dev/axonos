@@ -906,6 +906,7 @@ int vboxsvga_kernel_init(void) {
 
 	fbdev_register_linear(vd->mmio_base, g_vbox.fb_pa + (uint64_t)g_vbox.fb_offset,
 	                      (size_t)usable, vd->width, vd->height, vd->pitch, vd->bpp);
+	fbdev_sysfs_publish(g_vbox.bus, g_vbox.device, g_vbox.function);
 
 	klogprintf("vboxsvga: ready %02x:%02x.%u %ux%u@%u fb=%p pa=0x%llx\n",
 	           g_vbox.bus, g_vbox.device, g_vbox.function,

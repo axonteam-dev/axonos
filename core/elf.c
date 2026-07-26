@@ -265,9 +265,11 @@ static int exec_map_stack_tip(thread_t *tc, uintptr_t tip_lo, uintptr_t tip_hi) 
         return -1;
     tip_lo &= ~0xFFFULL;
     tip_hi = (tip_hi + 0xFFFULL) & ~0xFFFULL;
-    /* Cap tip — never prefault the whole 8MiB slot. */
-    if (tip_hi - tip_lo > 256u * 1024u)
-        tip_lo = tip_hi - 256u * 1024u;
+    /* Cap tip — never prefault the whole 8MiB slot. Linux ARG_MAX is large;
+     * 256KiB was too small for bash -c "$(curl …/install.sh)" (~34KiB script
+     * plus env) when the tip started below stack_top-256K. Keep 2MiB headroom. */
+    if (tip_hi - tip_lo > 2u * 1024u * 1024u)
+        tip_lo = tip_hi - 2u * 1024u * 1024u;
     /*
      * Linux get_arg_page(bprm->mm): install the tip only in the nascent mm.
      * The old mm is consulted solely to reject accidental frame sharing.

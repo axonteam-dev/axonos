@@ -256,20 +256,9 @@ int vbe_init_from_multiboot(uint32_t multiboot_magic, uint64_t multiboot_info) {
 				(void*)(uintptr_t)fb_addr, width, height, (unsigned)g_bpp, (unsigned)g_pitch, g_backbuf);
 			qemu_debug_printf("vbe: mapped fb_phys=%p -> fb_va=%p backbuf=%p width=%u height=%u bpp=%u pitch=%u\n",
 				(void*)(uintptr_t)fb_addr, fb_va, g_backbuf, (unsigned)width, (unsigned)height, (unsigned)bpp, (unsigned)pitch);
-			/* Quick visual sanity test: fill first few scanlines with color bars if 32bpp */
-			if (g_bpp == 32 && g_frontbuf) {
-				uint32_t *fbp = (uint32_t*)g_frontbuf;
-				uint32_t scan = g_pitch / 4;
-				for (uint32_t y2 = 0; y2 < (g_height < 64 ? g_height : 64); y2++) {
-					uint32_t color;
-					if ((y2 / 16) % 3 == 0) color = 0x00FF0000; /* red */
-					else if ((y2 / 16) % 3 == 1) color = 0x0000FF00; /* green */
-					else color = 0x000000FF; /* blue */
-					for (uint32_t x2 = 0; x2 < g_width; x2++) {
-						fbp[y2 * scan + x2] = color;
-					}
-				}
-			}
+			/* Do not scribble test pattern into the front buffer: on some hosts
+			 * GRUB's FB phys overlaps the relocated initrd, and early fills
+			 * destroyed cpio headers (bad magic a few hundred bytes in). */
 			return 1;
 		}
 

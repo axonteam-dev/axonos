@@ -59,6 +59,9 @@ NSS_DNS_SHIM := $(BUILD_DIR)/nss_dns/shim
 NSS_DNS_BLOB_OBJ := $(BUILD_DIR)/nss_dns/shim_blob.o
 NSS_FILES_SHIM := $(BUILD_DIR)/nss_files/shim
 NSS_FILES_BLOB_OBJ := $(BUILD_DIR)/nss_files/shim_blob.o
+ASCII_PF2 := $(BUILD_DIR)/fonts/ascii.pf2
+ASCII_PF2_BLOB_OBJ := $(BUILD_DIR)/fonts/ascii_pf2_blob.o
+ASCII_PF2_SRC := $(firstword $(wildcard /usr/share/grub/ascii.pf2 /boot/grub/fonts/ascii.pf2))
 
 .PHONY: all kernel iso clean run for-production
 
@@ -144,7 +147,25 @@ $(CA_TRUST_BLOB_OBJ): $(CA_TRUST_PEM)
 	objcopy --redefine-sym $$START=ca_trust_pem_start --redefine-sym $$END=ca_trust_pem_end $@.tmp $@ && \
 	rm -f $@.tmp
 
-$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(NSS_FILES_BLOB_OBJ) $(CA_TRUST_BLOB_OBJ) $(PAYLOAD_COBJS)
+$(ASCII_PF2):
+	@mkdir -p $(dir $@)
+	@if [ -n "$(ASCII_PF2_SRC)" ] && [ -f "$(ASCII_PF2_SRC)" ]; then \
+		cp "$(ASCII_PF2_SRC)" $@; \
+	else \
+		echo "warning: no host ascii.pf2 — font blob empty" >&2; \
+		printf '' > $@; \
+	fi
+
+$(ASCII_PF2_BLOB_OBJ): $(ASCII_PF2)
+	@echo "LD(BIN) [ascii.pf2]	$<"
+	@ld -r -b binary -o $@.tmp $< && \
+	START=$$(nm $@.tmp | awk '$$3 ~ /^_binary_.*_start$$/ {print $$3; exit}') && \
+	END=$$(nm $@.tmp | awk '$$3 ~ /^_binary_.*_end$$/ {print $$3; exit}') && \
+	test -n "$$START" && test -n "$$END" && \
+	objcopy --redefine-sym $$START=ascii_pf2_blob_start --redefine-sym $$END=ascii_pf2_blob_end $@.tmp $@ && \
+	rm -f $@.tmp
+
+$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(NSS_FILES_BLOB_OBJ) $(CA_TRUST_BLOB_OBJ) $(ASCII_PF2_BLOB_OBJ) $(PAYLOAD_COBJS)
 	@mkdir -p $(BUILD_DIR)
 	@echo "LD		$@"
 	@ld -m elf_x86_64 -T linker.payload.ld -o $@ $^
@@ -181,6 +202,10 @@ $(GRUB_DIR):
 
 iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg archive
 	@cp $(KERNEL_ELF) $(ISO_BOOT)/axonos.elf
+	@mkdir -p $(GRUB_DIR)/fonts
+	@if [ -f /usr/share/grub/ascii.pf2 ]; then cp /usr/share/grub/ascii.pf2 $(GRUB_DIR)/fonts/; fi
+	@if [ -f /usr/share/grub/unicode.pf2 ]; then cp /usr/share/grub/unicode.pf2 $(GRUB_DIR)/fonts/; fi
+	@if [ -f /usr/share/grub/euro.pf2 ]; then cp /usr/share/grub/euro.pf2 $(GRUB_DIR)/fonts/; fi
 	@grub-mkrescue -o $(ISO_IMAGE) $(ISO_DIR) 2>/dev/null || { \
 		@echo "grub-mkrescue failed: try installing grub-pc-bin or xorriso" >&2; exit 1; \
 	}

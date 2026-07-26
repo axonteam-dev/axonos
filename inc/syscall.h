@@ -77,6 +77,8 @@ typedef struct syscall_frame {
 #define SYS_shmctl  31
 #define SYS_brk     12
 #define SYS_pipe    22
+#define SYS_eventfd 284
+#define SYS_eventfd2 290
 #define SYS_dup3    292
 #define SYS_pipe2   293
 #define SYS_arch_prctl 158
@@ -127,6 +129,9 @@ typedef struct syscall_frame {
 #define SYS_preadv 295
 #define SYS_pwritev 296
 #define SYS_pwrite64 18
+/* Linux x86_64: I/O privilege (Xorg xf86EnableIOPorts). */
+#define SYS_iopl   172
+#define SYS_ioperm 173
 
 /* AxonOS: resolve hostname via DNS, returns IPv4 in network byte order */
 #define SYS_resolve 1000

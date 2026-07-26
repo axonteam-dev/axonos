@@ -1178,6 +1178,7 @@ int vmwgfx_kernel_init(void) {
 
 	fbdev_register_linear(vd->mmio_base, g_vmwgfx.fb_pa + (uint64_t)g_vmwgfx.fb_offset,
 	                      (size_t)usable, vd->width, vd->height, vd->pitch, vd->bpp);
+	fbdev_sysfs_publish(g_vmwgfx.bus, g_vmwgfx.device, g_vmwgfx.function);
 
 	klogprintf("vmwgfx: ready %02x:%02x.%u %ux%u@%u fb=%p pa=0x%llx\n",
 	           g_vmwgfx.bus, g_vmwgfx.device, g_vmwgfx.function,

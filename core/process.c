@@ -111,7 +111,8 @@ void process_attach_thread(process_t *process, thread_t *thread) {
      * CLONE_THREAD peers must not overwrite leader (that broke kill/ps).
      * Unify process->pid with leader->tid so /proc and kill share one namespace.
      */
-    if (!process->leader) {
+    int first_attach = (process->leader == NULL);
+    if (first_attach) {
         process->leader = thread;
         process->pid = thread->tid ? thread->tid : 1;
         if (next_pid <= process->pid)
@@ -141,8 +142,17 @@ void process_attach_thread(process_t *process, thread_t *thread) {
                (size_t)process->ngroups * sizeof(gid_t));
     process->umask = thread->umask;
     memcpy(process->cwd, thread->cwd, sizeof(process->cwd));
-    for (int i = 0; i < PROCESS_MAX_FD; ++i)
-        process->fds[i] = thread->fds[i];
+    /*
+     * Publish fds only on the first attach (leader / new process).
+     * CLONE_THREAD peers arrive with empty thread->fds; copying that over the
+     * shared process table wiped stdin/stdout so the next open()/socket()
+     * reused fd 0/1/2. write() via syscall_fd_get then hit a socket instead of
+     * the tty → curl error 23 ("passed N returned 0").
+     */
+    if (first_attach) {
+        for (int i = 0; i < PROCESS_MAX_FD; ++i)
+            process->fds[i] = thread->fds[i];
+    }
     release_irqrestore(&process_lock, flags);
 }
 

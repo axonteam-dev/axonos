@@ -18,6 +18,9 @@
 static mm_t g_kernel_mm;
 static int g_mm_ready = 0;
 static int mm_va_leaf_entry(mm_t *mm, uint64_t va, uint64_t *entry_out);
+static int mm_va_leaf_entry_direct(mm_t *mm, uint64_t va, uint64_t *entry_out);
+static int mm_user_leaf_pa_direct(mm_t *mm, uint64_t va, int write,
+                                  uint64_t *pa_out);
 
 typedef struct mm_alloc_node {
     void *raw;
@@ -650,11 +653,28 @@ int mm_clear_range_private(mm_t *mm, uint64_t *share_l4, uint64_t va_begin, uint
             continue;
         }
         uint64_t ent2 = l2[l2i];
+        uint64_t page2m_lo = va & ~((uint64_t)PAGE_SIZE_2M - 1ULL);
+        uint64_t page2m_hi = page2m_lo + PAGE_SIZE_2M;
         if (ent2 & PG_PS_2M) {
-            l2[l2i] = 0;
-            invlpg((void *)(uintptr_t)va);
-            va = (va & ~((uint64_t)PAGE_SIZE_2M - 1ULL)) + PAGE_SIZE_2M;
-            continue;
+            if (begin <= page2m_lo && end >= page2m_hi) {
+                l2[l2i] = 0;
+                invlpg((void *)(uintptr_t)page2m_lo);
+                va = page2m_hi;
+                continue;
+            }
+            if (split_2m_to_4k(mm, l2, l2i, va) != 0) {
+                mm_leave_direct_map(dm);
+                return -1;
+            }
+            if (mm_fork_private_pt_path(mm, share_l4, va, &l2, &l2i, &l1) != 0) {
+                mm_leave_direct_map(dm);
+                return -1;
+            }
+            ent2 = l2[l2i];
+            if (ent2 & PG_PS_2M) {
+                mm_leave_direct_map(dm);
+                return -1;
+            }
         }
         if (l1) {
             int l1i = (int)((va >> 12) & 0x1FF);
@@ -703,9 +723,15 @@ int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
      * leave equivalent (split/private) tables behind, but never a half-unmapped
      * VMA.
      */
+    /*
+     * Use mm_va_leaf_pa (not mm_user_leaf_pa): mm_demote_user_identity clears
+     * PG_US on the mmap window. Requiring US made unmap a no-op success while
+     * leaving demoted identity leaves mapped — pthread stacks then saw RAM
+     * garbage (musl cancelbuf → #GP on non-canonical rax).
+     */
     for (uint64_t va = begin; va < end; ) {
         uint64_t mapped_pa = 0;
-        if (mm_user_leaf_pa(mm, va, 0, &mapped_pa) != 0) {
+        if (mm_va_leaf_pa(mm, va, &mapped_pa) != 0) {
             va += PAGE_SIZE_4K;
             continue;
         }
@@ -735,7 +761,7 @@ int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
     /* Commit pass: no allocations or fallible splits remain. */
     for (uint64_t va = begin; va < end; ) {
         uint64_t mapped_pa = 0;
-        if (mm_user_leaf_pa(mm, va, 0, &mapped_pa) != 0) {
+        if (mm_va_leaf_pa(mm, va, &mapped_pa) != 0) {
             va += PAGE_SIZE_4K;
             continue;
         }
@@ -749,21 +775,37 @@ int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
         uint64_t page2m_lo = va & ~((uint64_t)PAGE_SIZE_2M - 1ULL);
         uint64_t page2m_hi = page2m_lo + PAGE_SIZE_2M;
         if (ent2 & PG_PS_2M) {
-            if (!(ent2 & PG_US) || (ent2 & PG_SOFT_OWNED))
+            /*
+             * Only drop a whole 2MiB leaf when the unmap span covers it.
+             * Partial clears must stay 4K — wiping the huge leaf destroyed
+             * sibling anon pages (curl TLS body) → write(stdout) EFAULT →
+             * curl error 23 ("passed N returned 0").
+             */
+            if (ent2 & PG_SOFT_OWNED)
                 goto out;
-            l2[l2i] = 0;
-            if ((caller_cr3 & ~0xFFFULL) == mm_cr3) {
-                paging_write_cr3(caller_cr3);
-                invlpg((void *)(uintptr_t)page2m_lo);
-                paging_write_cr3(mm_direct_map_cr3());
+            if (begin <= page2m_lo && end >= page2m_hi) {
+                l2[l2i] = 0;
+                if ((caller_cr3 & ~0xFFFULL) == mm_cr3) {
+                    paging_write_cr3(caller_cr3);
+                    invlpg((void *)(uintptr_t)page2m_lo);
+                    paging_write_cr3(mm_direct_map_cr3());
+                }
+                va = page2m_hi;
+                continue;
             }
-            va = page2m_hi;
-            continue;
+            if (split_2m_to_4k(mm, l2, l2i, va) != 0)
+                goto out;
+            if (mm_fork_private_pt_path(mm, share_l4, va,
+                                        &l2, &l2i, &l1) != 0)
+                goto out;
+            ent2 = l2[l2i];
+            if (ent2 & PG_PS_2M)
+                goto out;
         }
         if (l1) {
             int l1i = (int)((va >> 12) & 0x1FF);
             uint64_t old = l1[l1i];
-            if ((old & (PG_PRESENT | PG_US)) == (PG_PRESENT | PG_US)) {
+            if (old & PG_PRESENT) {
                 uint64_t old_pa = old & PG_ADDR_MASK;
                 l1[l1i] = 0;
                 if ((caller_cr3 & ~0xFFFULL) == mm_cr3) {
@@ -854,8 +896,21 @@ static int mm_privatize_identity_range_ex(mm_t *mm, uint64_t va_begin, uint64_t 
             mm_user_frame_put(newp);
             goto out;
         }
-        if (seed_from_live)
-            memcpy(newp, (void *)(uintptr_t)pa, (size_t)PAGE_SIZE_4K);
+        if (seed_from_live) {
+            /*
+             * Identity PA==VA may be a hole under swapper (USER_MMAP demote /
+             * PROT_NONE) while still present in this mm. Seed under the process
+             * L4 — never memcpy from identity through the direct-map CR3.
+             */
+            if (pa == (va & ~0xFFFULL)) {
+                uint64_t proc = (uint64_t)(uintptr_t)mm->pml4;
+                paging_write_cr3(proc);
+                memcpy(newp, (void *)(uintptr_t)va, (size_t)PAGE_SIZE_4K);
+                paging_write_cr3(mm_direct_map_cr3());
+            } else {
+                memcpy(newp, (void *)(uintptr_t)pa, (size_t)PAGE_SIZE_4K);
+            }
+        }
         if (mm_map_4k_sharedaware(mm, share->pml4, va, (uint64_t)(uintptr_t)newp,
                                   PG_RW | PG_US | PG_SOFT_OWNED) != 0) {
             mm_user_frame_put(newp);
@@ -2067,6 +2122,40 @@ static int mm_active_pte_flags(uint64_t va, uint64_t *flags_out) {
     return (*flags_out & PG_PRESENT) ? 0 : -1;
 }
 
+/* Split a present 2MiB/1GiB leaf so do_wp_page can replace a single 4K page. */
+static int mm_split_huge_leaf_for_va(mm_t *mm, uint64_t va) {
+    if (!mm || !mm->pml4)
+        return -1;
+    va &= ~0xFFFULL;
+    int l4i = (int)((va >> 39) & 0x1FF);
+    int l3i = (int)((va >> 30) & 0x1FF);
+    int l2i = (int)((va >> 21) & 0x1FF);
+    uint64_t e4 = mm->pml4[l4i];
+    if (!(e4 & PG_PRESENT) || (e4 & PG_PS_2M) || !pt_page_pa_ok(e4))
+        return -1;
+    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
+    uint64_t e3 = l3[l3i];
+    if (!(e3 & PG_PRESENT))
+        return -1;
+    if (e3 & PG_PS_2M) {
+        if (split_l3_1g_to_l2(mm, l3, l3i) != 0)
+            return -1;
+        e3 = l3[l3i];
+    }
+    if (!pt_page_pa_ok(e3) || (e3 & PG_PS_2M))
+        return -1;
+    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
+    uint64_t e2 = l2[l2i];
+    if (!(e2 & PG_PRESENT))
+        return -1;
+    if (e2 & PG_PS_2M) {
+        if (split_2m_to_4k(mm, l2, l2i, va) != 0)
+            return -1;
+        invlpg((void *)(uintptr_t)va);
+    }
+    return 0;
+}
+
 int mm_cow_fault_page(mm_t *mm, uint64_t va, mm_t *share_cmp_mm) {
     if (!mm || !mm->pml4) return -1;
     uint64_t pg = va & ~0xFFFULL;
@@ -2088,21 +2177,50 @@ int mm_cow_fault_page(mm_t *mm, uint64_t va, mm_t *share_cmp_mm) {
     mm_dm_ctx_t dm = mm_enter_direct_map();
     int rc = -1;
     uint64_t old_pte = 0;
-    if (mm_va_leaf_entry(mm, pg, &old_pte) != 0) {
+    if (mm_va_leaf_entry_direct(mm, pg, &old_pte) != 0) {
         rc = -2;
         goto out;
     }
-    /* Lunaix-style: only SOFT_COW write-protect faults are COW candidates.
-     * Ordinary RO (RELRO/mprotect) must not become writable here. */
-    if ((old_pte & (PG_PRESENT | PG_US | PG_RW | PG_SOFT_COW |
-                    PG_SOFT_OWNED)) !=
-        (PG_PRESENT | PG_US | PG_SOFT_COW | PG_SOFT_OWNED)) {
+    /* Huge Soft_COW / WP leaves must be split before a 4K private replacement. */
+    if (old_pte & PG_PS_2M) {
+        if (mm_split_huge_leaf_for_va(mm, pg) != 0) {
+            rc = -1;
+            goto out;
+        }
+        if (mm_va_leaf_entry_direct(mm, pg, &old_pte) != 0) {
+            rc = -2;
+            goto out;
+        }
+    }
+    /*
+     * Linux do_wp_page: Soft_COW write-protect faults get a private copy.
+     * Soft_OWNED is optional — fork also Soft_COW-marks identity leaves that
+     * never held a frame ref (parent ash heap). Ordinary RO (RELRO/mprotect)
+     * has no Soft_COW and must not become writable here.
+     */
+    if ((old_pte & (PG_PRESENT | PG_US | PG_RW | PG_SOFT_COW)) !=
+        (PG_PRESENT | PG_US | PG_SOFT_COW)) {
         rc = -2;
         goto out;
     }
     uint64_t old_pa = old_pte & PG_ADDR_MASK;
+    int old_owned = (old_pte & PG_SOFT_OWNED) != 0;
 
-    /* Lunaix/Linux do_wp_page: a write to COW always gets a private copy. */
+    /* Exclusive owned Soft_COW: reuse the frame (Linux reuse_swap_page path). */
+    if (old_owned && frame_refcount(old_pa) == 1) {
+        int map_rc;
+        if (share_cmp_mm && share_cmp_mm != mm && share_cmp_mm->pml4) {
+            map_rc = mm_map_4k_sharedaware(mm, share_cmp_mm->pml4, pg, old_pa,
+                                            PG_RW | PG_US | PG_SOFT_OWNED);
+        } else {
+            map_rc = mm_map_4k_private_force(mm, pg, old_pa,
+                                             PG_RW | PG_US | PG_SOFT_OWNED);
+        }
+        rc = (map_rc == 0) ? 0 : -1;
+        goto out;
+    }
+
+    /* Lunaix/Linux do_wp_page: a write to shared COW always gets a private copy. */
     uint64_t service_cr3 = paging_read_cr3();
     if (syscall_pipe_watch_active) {
         static int cow_stage_left = 12;
@@ -2152,7 +2270,7 @@ int mm_cow_fault_page(mm_t *mm, uint64_t va, mm_t *share_cmp_mm) {
     asm volatile("mfence" ::: "memory");
     uint64_t new_pte = 0;
     uint64_t writable_pa = 0;
-    if (mm_va_leaf_entry(mm, pg, &new_pte) != 0) {
+    if (mm_va_leaf_entry_direct(mm, pg, &new_pte) != 0) {
         rc = -3;
         goto out;
     }
@@ -2176,18 +2294,20 @@ int mm_cow_fault_page(mm_t *mm, uint64_t va, mm_t *share_cmp_mm) {
         rc = -7;
         goto out;
     }
-    if (mm_user_leaf_pa(mm, pg, 1, &writable_pa) != 0 ||
+    if (mm_user_leaf_pa_direct(mm, pg, 1, &writable_pa) != 0 ||
         (writable_pa & PG_ADDR_MASK) != (new_pte & PG_ADDR_MASK)) {
         rc = -8;
         goto out;
     }
     if (syscall_pipe_watch_active)
-        devel_printf("cow-verify-pa: va=0x%llx pa=0x%llx old=0x%llx refs=%u\n",
+        devel_printf("cow-verify-pa: va=0x%llx pa=0x%llx old=0x%llx refs=%u owned=%d\n",
                 (unsigned long long)pg,
                 (unsigned long long)writable_pa,
                 (unsigned long long)old_pa,
-                frame_refcount(old_pa));
-    frame_release(old_pa);
+                frame_refcount(old_pa), old_owned);
+    /* Identity Soft_COW leaves never took a frame ref — do not release PA==VA. */
+    if (old_owned)
+        frame_release(old_pa);
     if (syscall_pipe_watch_active)
         devel_printf("cow-release: va=0x%llx old=0x%llx refs=%u\n",
                 (unsigned long long)pg,
@@ -2229,11 +2349,42 @@ int mm_break_cow_range_for_write(mm_t *mm, mm_t *share_cmp_mm,
             continue;
         if (!(pte & PG_SOFT_COW))
             continue;
-        if (!(pte & PG_SOFT_OWNED) ||
-            mm_cow_fault_page(mm, va, share_cmp_mm) != 0)
+        /* Soft_COW identity leaves have no Soft_OWNED — still break on write. */
+        if (mm_cow_fault_page(mm, va, share_cmp_mm) != 0)
             return -1;
     }
     return 0;
+}
+
+/*
+ * Linux do_wp_page for a present write fault on a private writable mapping
+ * that is not Soft_COW (stale identity / demoted US leaf left RO). RELRO and
+ * mprotect(PROT_READ) must keep vma_writable==0 so this returns -1 → SIGSEGV.
+ */
+int mm_wp_fault_writable(mm_t *mm, uint64_t va, mm_t *share_cmp_mm) {
+    if (!mm || !mm->pml4)
+        return -1;
+    uint64_t pg = va & ~0xFFFULL;
+    if (pg < 0x1000ULL || pg >= (uint64_t)MMIO_IDENTITY_LIMIT)
+        return -1;
+    if (mm_cow_fault_page(mm, va, share_cmp_mm) == 0)
+        return 0;
+    /* Copy-privatize identity (or remake a private RW leaf). */
+    if (mm_privatize_identity_range(mm, pg, pg + 0x1000ULL) == 0) {
+        uint64_t pte = 0;
+        if (mm_va_leaf_entry(mm, pg, &pte) == 0 &&
+            (pte & (PG_PRESENT | PG_RW | PG_US)) ==
+                (PG_PRESENT | PG_RW | PG_US) &&
+            !(pte & PG_SOFT_COW))
+            return 0;
+    }
+    if (mm_make_private_range_noyield(mm, pg, pg + 0x1000ULL, 1,
+                                      share_cmp_mm) == 0)
+        return 0;
+    if (mm_make_private_range_noyield(mm, pg, pg + 0x1000ULL, 0,
+                                      share_cmp_mm) == 0)
+        return 0;
+    return -1;
 }
 
 /* True when `mm` already owns a private 4K leaf at `va` (not still sharing
@@ -2426,6 +2577,111 @@ int mm_user_leaf_pa(mm_t *mm, uint64_t va, int write, uint64_t *pa_out) {
     return rc;
 }
 
+/*
+ * Linux get_user_pages-ish: writable private Soft_OWNED leaf at `page`.
+ * Identity leaves in the USER_MMAP window are often holes under swapper CR3
+ * (demote / PROT_NONE) — never memcpy through PA==VA there (nasm read →
+ * copy_to_user Oops CR2≈0x82xxxx). Always finish with a real frame PA.
+ */
+static int mm_ensure_soft_owned_writable(mm_t *mm, mm_t *share_cmp_mm,
+                                         uint64_t page) {
+    if (!mm || !mm->pml4 || page >= (uint64_t)MMIO_IDENTITY_LIMIT)
+        return -1;
+    page &= ~0xFFFULL;
+    mm_t *share = share_cmp_mm ? share_cmp_mm : mm_kernel();
+    uint64_t existing = 0;
+    if (mm_user_leaf_pa(mm, page, 0, &existing) == 0) {
+        if ((existing & ~0xFFFULL) == page) {
+            if (mm_privatize_identity_range(mm, page, page + 0x1000ULL) != 0)
+                return -1;
+        }
+        int cow = mm_cow_fault_page(mm, page, share);
+        if (cow != 0 && cow != -2)
+            return -1;
+        if (mm_user_leaf_pa(mm, page, 1, &existing) == 0 &&
+            (existing & ~0xFFFULL) != page)
+            return 0;
+        /* Present but not a private frame — force private RW. */
+        if (mm_wp_fault_writable(mm, page, share) == 0 &&
+            mm_user_leaf_pa(mm, page, 1, &existing) == 0 &&
+            (existing & ~0xFFFULL) != page)
+            return 0;
+    }
+    /*
+     * Demand-fill (lazy mmap / not-yet-touched malloc arena). Same as
+     * user_vma_fault_nonpresent for private anon — one Soft_OWNED zero page.
+     * Only when a VMA/brk already permits the write (do not invent mappings).
+     */
+    {
+        thread_t *t = thread_get_current_user();
+        if (!t)
+            t = thread_current();
+        int allowed = 0;
+        if (t && t->mm == mm) {
+            uintptr_t brk_base = t->mm->brk_base ? t->mm->brk_base : t->user_brk_base;
+            uintptr_t brk_cur = t->mm->brk_current ? t->mm->brk_current
+                                                   : t->user_brk_cur;
+            if (brk_base && page >= (uint64_t)brk_base && page < (uint64_t)brk_cur)
+                allowed = 1;
+            else if (user_vma_allows_write(t, (uintptr_t)page))
+                allowed = 1;
+        }
+        if (!allowed)
+            return -1;
+    }
+    if (mm_privatize_identity_range_blank(mm, page, page + 0x1000ULL) != 0)
+        return -1;
+    if (mm_make_private_range_noyield(mm, page, page + 0x1000ULL, 0, share) != 0)
+        return -1;
+    if (mm_user_leaf_pa(mm, page, 1, &existing) != 0)
+        return -1;
+    if ((existing & ~0xFFFULL) == page)
+        return -1;
+    return 0;
+}
+
+/* Copy through Soft_OWNED frame PA under swapper — never user VA / identity. */
+static int mm_user_memcpy_via_pa(mm_t *mm, uint64_t va, void *kbuf, size_t n,
+                                 int to_user) {
+    if (!mm || !kbuf || n == 0)
+        return -1;
+    mm_dm_ctx_t dm = mm_enter_direct_map();
+    uint64_t pa = 0;
+    int rc;
+    if (to_user)
+        rc = mm_user_leaf_pa_direct(mm, va, 1, &pa);
+    else {
+        rc = mm_user_leaf_pa_direct(mm, va, 0, &pa);
+        if (rc != 0) {
+            uint64_t ent = 0;
+            if (mm_va_leaf_entry_direct(mm, va & ~0xFFFULL, &ent) == 0 &&
+                (ent & PG_PRESENT)) {
+                pa = (ent & PG_ADDR_MASK) + (va & 0xFFFULL);
+                rc = 0;
+            }
+        }
+    }
+    if (rc == 0) {
+        uint64_t pa_page = pa & ~0xFFFULL;
+        uint64_t va_page = va & ~0xFFFULL;
+        if (pa_page == va_page) {
+            /*
+             * Still identity: swapper may have a hole. Read/write the user VA
+             * under this mm's L4 only long enough to bounce through kbuf path
+             * is wrong for to_user (kbuf is source). Refuse — caller must
+             * re-ensure Soft_OWNED.
+             */
+            rc = -1;
+        } else if (to_user) {
+            memcpy((void *)(uintptr_t)pa, kbuf, n);
+        } else {
+            memcpy(kbuf, (const void *)(uintptr_t)pa, n);
+        }
+    }
+    mm_leave_direct_map(dm);
+    return rc;
+}
+
 int mm_copy_to_user(mm_t *mm, mm_t *share_cmp_mm, uint64_t dst,
                     const void *src, size_t len) {
     if (!mm || !src || !len || dst >= (uint64_t)MMIO_IDENTITY_LIMIT ||
@@ -2437,27 +2693,14 @@ int mm_copy_to_user(mm_t *mm, mm_t *share_cmp_mm, uint64_t dst,
     while (done < len) {
         uint64_t va = dst + done;
         uint64_t page = va & ~0xFFFULL;
-        uint64_t existing = 0;
-        if (mm_user_leaf_pa(mm, page, 0, &existing) != 0)
-            return -1;
-        if ((existing & ~0xFFFULL) == page &&
-            mm_privatize_identity_range(mm, page, page + 0x1000ULL) != 0)
-            return -1;
-        int cow = mm_cow_fault_page(mm, page, share_cmp_mm);
-        if (cow != 0 && cow != -2)
+        if (mm_ensure_soft_owned_writable(mm, share_cmp_mm, page) != 0)
             return -1;
 
         size_t chunk = 0x1000u - (size_t)(va & 0xFFFULL);
         if (chunk > len - done)
             chunk = len - done;
 
-        mm_dm_ctx_t dm = mm_enter_direct_map();
-        uint64_t pa = 0;
-        int rc = mm_user_leaf_pa_direct(mm, va, 1, &pa);
-        if (rc == 0)
-            memcpy((void *)(uintptr_t)pa, in + done, chunk);
-        mm_leave_direct_map(dm);
-        if (rc != 0)
+        if (mm_user_memcpy_via_pa(mm, va, (void *)(uintptr_t)(in + done), chunk, 1) != 0)
             return -1;
         done += chunk;
     }
@@ -2473,17 +2716,34 @@ int mm_copy_from_user(mm_t *mm, void *dst, uint64_t src, size_t len) {
     size_t done = 0;
     while (done < len) {
         uint64_t va = src + done;
+        uint64_t page = va & ~0xFFFULL;
         size_t chunk = 0x1000u - (size_t)(va & 0xFFFULL);
         if (chunk > len - done)
             chunk = len - done;
-        mm_dm_ctx_t dm = mm_enter_direct_map();
-        uint64_t pa = 0;
-        int rc = mm_user_leaf_pa_direct(mm, va, 0, &pa);
-        if (rc == 0)
-            memcpy(out + done, (const void *)(uintptr_t)pa, chunk);
-        mm_leave_direct_map(dm);
-        if (rc != 0)
-            return -1;
+        /*
+         * Prefer Soft_OWNED PA under swapper. If the leaf is still identity
+         * (or !US after demote), bounce under the process L4 — reads only.
+         */
+        if (mm_user_memcpy_via_pa(mm, va, out + done, chunk, 0) == 0) {
+            done += chunk;
+            continue;
+        }
+        {
+            mm_dm_ctx_t dm = mm_enter_direct_map();
+            uint64_t ent = 0;
+            int rc = -1;
+            if (mm_va_leaf_entry_direct(mm, page, &ent) == 0 &&
+                (ent & PG_PRESENT)) {
+                uint64_t proc = (uint64_t)(uintptr_t)mm->pml4;
+                paging_write_cr3(proc);
+                memcpy(out + done, (const void *)(uintptr_t)va, chunk);
+                paging_write_cr3(mm_direct_map_cr3());
+                rc = 0;
+            }
+            mm_leave_direct_map(dm);
+            if (rc != 0)
+                return -1;
+        }
         done += chunk;
     }
     return 0;

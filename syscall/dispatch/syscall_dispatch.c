@@ -28,11 +28,13 @@
 #include <smp.h>
 #include <loadavg.h>
 #include <console.h>
+#include <font.h>
 #include <ramfs.h>
 #include <dhcp.h>
 #include <debug.h>
 #include <klog.h>
 #include <fbdev.h>
+#include <uapi_linux_fb.h>
 #include <power.h>
 #include <iothread.h>
 #include <stdio.h>
@@ -162,6 +164,9 @@ void syscall_user_fatal_exit(int signo) {
     if (!cur || cur->ring != 3)
         cur = thread_get_current_user();
     if (cur && cur->ring == 3) {
+        process_t *proc = cur->process;
+        thread_t *leader = (proc && proc->leader) ? proc->leader : cur;
+        int status = signo & 0x7f; /* WIFSIGNALED / WTERMSIG */
         {
             thread_t *cu = thread_get_current_user();
             qemu_debug_printf("fatal-exit: signo=%d cur_tid=%llu cur_name=%s parent=%d pgid=%d current_user=%llu/%s\n",
@@ -181,41 +186,75 @@ void syscall_user_fatal_exit(int signo) {
                 (unsigned long long)(cu && cu->tid ? cu->tid : 0),
                 (cu && cu->name[0]) ? cu->name : "(none)");
         }
-        if (cur->attached_tty >= 0)
-            devfs_tty_leave_alt_screen(cur->attached_tty);
-        devfs_tty_remove_waiter_from_all_ttys((int)(cur->tid ? cur->tid : 1));
-        /* A synchronous user exception is a per-process SIGSEGV-style death,
-           not exit_group(). Do not reap peers here: forked OpenRC children often
-           share pgid/session with PID1, and killing by group can terminate init. */
-        cur->exit_status = signo & 0x7f; /* WIFSIGNALED / WTERMSIG */
-        process_release_vfork_parent(cur->process, PROCESS_VFORK_FATAL);
-        process_mark_zombie(cur->process, cur->exit_status);
-        sysv_shm_detach_all_for_tid((uint64_t)(cur->tid ? cur->tid : 1));
-        user_vma_remove_all_for_tid((uint64_t)(cur->tid ? cur->tid : 1));
-        thread_close_all_fds(cur);
-        cur->state = THREAD_TERMINATED;
-        if (cur->parent_tid >= 0) {
-            thread_t *pt = thread_get(cur->parent_tid);
+        /*
+         * Linux default for synchronous SIGSEGV/SIGILL/SIGBUS: kill the whole
+         * thread group (do_group_exit). Releasing only the faulting CLONE_THREAD
+         * member's mm left the leader running on a freed address space and
+         * wedged the shell (no prompt after curl's DNS worker #PF).
+         */
+        if (leader->attached_tty >= 0)
+            devfs_tty_leave_alt_screen(leader->attached_tty);
+        {
+            int nt = thread_get_count();
+            for (int i = 0; i < nt; i++) {
+                thread_t *t = thread_get_by_index(i);
+                if (!t || t->ring != 3 || t->state == THREAD_TERMINATED)
+                    continue;
+                int same = 0;
+                if (proc && t->process == proc)
+                    same = 1;
+                else if (!proc && t == cur)
+                    same = 1;
+                if (!same)
+                    continue;
+                devfs_tty_remove_waiter_from_all_ttys(
+                    (int)(t->tid ? t->tid : 1));
+                if (t->waiter_tid >= 0) {
+                    int w = t->waiter_tid;
+                    t->waiter_tid = -1;
+                    thread_unblock(w);
+                }
+                t->pending_signals = 0;
+                t->exit_status = status;
+                t->state = THREAD_TERMINATED;
+                sysv_shm_detach_all_for_tid((uint64_t)(t->tid ? t->tid : 1));
+                if (t->mm_ptemplate) {
+                    mm_release(t->mm_ptemplate);
+                    t->mm_ptemplate = NULL;
+                }
+                if (t->mm && t->mm != mm_kernel()) {
+                    mm_t *m = t->mm;
+                    t->mm = NULL;
+                    if (t == cur)
+                        (void)mm_switch_away_from(m);
+                    mm_release(m);
+                }
+            }
+        }
+        user_vma_remove_all_for_tid((uint64_t)(leader->tid ? leader->tid : 1));
+        thread_close_all_fds(leader);
+        process_release_vfork_parent(proc, PROCESS_VFORK_FATAL);
+        process_mark_zombie(proc, status);
+        if (proc) {
+            process_t *init_process = NULL;
+            int init_tid = thread_get_init_user_tid();
+            thread_t *init_thread = init_tid >= 0 ? thread_get(init_tid) : NULL;
+            if (init_thread)
+                init_process = init_thread->process;
+            process_reparent_children(proc, init_process);
+        }
+        if (leader->parent_tid >= 0) {
+            thread_t *pt = thread_get(leader->parent_tid);
             if (pt) {
                 thread_set_pending_signal(pt, SIGCHLD);
                 thread_unblock((int)(pt->tid ? pt->tid : 1));
-                if (cur->attached_tty >= 0 && pt->attached_tty == cur->attached_tty)
-                    devfs_set_tty_fg_pgrp(cur->attached_tty, pt->pgid);
+                if (leader->attached_tty >= 0 &&
+                    pt->attached_tty == leader->attached_tty)
+                    devfs_set_tty_fg_pgrp(leader->attached_tty, pt->pgid);
             }
         }
-        if (cur->waiter_tid >= 0)
-            thread_unblock(cur->waiter_tid);
-        if (cur->mm_ptemplate) {
-            mm_release(cur->mm_ptemplate);
-            cur->mm_ptemplate = NULL;
-        }
-        if (cur->mm && cur->mm != mm_kernel()) {
-            mm_t *dead_mm = cur->mm;
-            cur->mm = NULL;
-            /* Leave dead_mm before release. Never load g_kernel_mm (stale L3). */
-            (void)mm_switch_away_from(dead_mm);
-            mm_release(dead_mm);
-        }
+        if (leader->waiter_tid >= 0)
+            thread_unblock(leader->waiter_tid);
     }
     thread_set_current_user(NULL);
     thread_schedule();
@@ -236,6 +275,36 @@ static int user_read_u8(const void *uaddr, uint8_t *out);
 /* Close every fd, collapsing aliases so a wrong refcount cannot double-free. */
 static void thread_close_all_fds(thread_t *cur) {
     if (!cur) return;
+    process_t *proc = cur->process;
+    /*
+     * Authoritative table is process->fds. CLONE_THREAD workers open DNS/TCP
+     * sockets into that table while leader->fds[n] stays NULL. Walking only
+     * the leader's mirror left those sockets in ksock_registry after curl
+     * exit — they stole the next curl's UDP DNS replies → error 6.
+     */
+    if (proc) {
+        for (int i = 0; i < PROCESS_MAX_FD && i < THREAD_MAX_FD; i++) {
+            struct fs_file *f = proc->fds[i];
+            if (!f) continue;
+            int n = 0;
+            for (int j = i; j < PROCESS_MAX_FD && j < THREAD_MAX_FD; j++) {
+                if (proc->fds[j] != f) continue;
+                proc->fds[j] = NULL;
+                proc->fd_cloexec[j] = 0;
+                n++;
+            }
+            int nt = thread_get_count();
+            for (int ti = 0; ti < nt; ti++) {
+                thread_t *t = thread_get_by_index(ti);
+                if (!t || t->process != proc) continue;
+                for (int j = 0; j < THREAD_MAX_FD; j++)
+                    if (t->fds[j] == f)
+                        t->fds[j] = NULL;
+            }
+            for (int k = 0; k < n; k++)
+                fs_file_free(f);
+        }
+    }
     for (int i = 0; i < THREAD_MAX_FD; i++) {
         struct fs_file *f = cur->fds[i];
         if (!f) continue;
@@ -243,10 +312,6 @@ static void thread_close_all_fds(thread_t *cur) {
         for (int j = i; j < THREAD_MAX_FD; j++) {
             if (cur->fds[j] == f) {
                 cur->fds[j] = NULL;
-                if (cur->process && cur->process->fds[j] == f) {
-                    cur->process->fds[j] = NULL;
-                    cur->process->fd_cloexec[j] = 0;
-                }
                 n++;
             }
         }
@@ -1524,6 +1589,24 @@ static void exit_group_reap_peer_threads(thread_t *cur) {
             t->waiter_tid = -1;
             thread_unblock(w);
         }
+        /*
+         * Drop this peer's fd refs. Same rules as non-leader SYS_exit:
+         * inherit (leader still mirrors) → one fs_file_free; worker-opened
+         * process slot → leave for leader thread_close_all_fds; orphan → free.
+         */
+        for (int fd = 0; fd < THREAD_MAX_FD; fd++) {
+            struct fs_file *f = t->fds[fd];
+            t->fds[fd] = NULL;
+            if (!f)
+                continue;
+            if (cur->process && cur->process->fds[fd] == f) {
+                thread_t *lead = cur->process->leader;
+                if (lead && lead != t && lead->fds[fd] == f)
+                    fs_file_free(f);
+                continue;
+            }
+            fs_file_free(f);
+        }
         t->exit_status = 9; /* WTERMSIG: SIGKILL */
         t->state = THREAD_TERMINATED;
     }
@@ -1617,8 +1700,15 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define EPERM   1
 #define ENOENT  2
 #define EBADF   9
+#define E2BIG   7
 #define EFAULT  14
 #define EINVAL  22
+/* Linux MAX_ARG_STRLEN: one argv/env string may be up to 32 pages.
+ * A 4KiB cap broke `bash -c "$(curl …/install.sh)"` (script ~34KiB) —
+ * execve silently truncated the -c payload → syntax error near 'fi'. */
+#ifndef MAX_ARG_STRLEN
+#define MAX_ARG_STRLEN (132u * 1024u)
+#endif
 #define ENOTTY  25
 #define ESRCH   3
 #define ENOSYS  38
@@ -1636,6 +1726,7 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define EIO     5
 #define EEXIST  17
 #define EADDRINUSE 98
+#define EADDRNOTAVAIL 99
 #define EACCES  13
 #define EBUSY   16
 #define ENOTDIR 20
@@ -1654,6 +1745,8 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define ENODEV   19
 #define ETIMEDOUT 110
 #define ECONNREFUSED 111
+#define EALREADY 114
+#define EINPROGRESS 115
 #ifndef ECONNRESET
 #define ECONNRESET 104
 #endif
@@ -1683,6 +1776,111 @@ int syscall_pipe_watch_owner_tid;
 
 static ssize_t pipe_read_bytes(pipe_t *p, void *buf, size_t cnt, thread_t *cur);
 static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t *cur);
+
+/* Linux eventfd(2): 64-bit counter used by curl's async DNS waiter. */
+enum {
+    EFD_SEMAPHORE_K = 00000001,
+    EFD_CLOEXEC_K   = 02000000,
+    EFD_NONBLOCK_K  = 00004000
+};
+typedef struct eventfd {
+    uint64_t count;
+    int nonblock;
+    int semaphore;
+    int reader_waiter_tid;
+    int writer_waiter_tid;
+    spinlock_t lock;
+} eventfd_t;
+
+void eventfd_fs_file_destroy(struct fs_file *f) {
+    if (!f || f->type != FS_TYPE_EVENTFD) return;
+    eventfd_t *e = (eventfd_t *)f->driver_private;
+    f->driver_private = NULL;
+    if (e) {
+        unsigned long fl = 0;
+        acquire_irqsave(&e->lock, &fl);
+        if (e->reader_waiter_tid >= 0) {
+            thread_unblock(e->reader_waiter_tid);
+            e->reader_waiter_tid = -1;
+        }
+        if (e->writer_waiter_tid >= 0) {
+            thread_unblock(e->writer_waiter_tid);
+            e->writer_waiter_tid = -1;
+        }
+        release_irqrestore(&e->lock, fl);
+        kfree(e);
+    }
+    if (f->path) {
+        kfree((void *)f->path);
+        f->path = NULL;
+    }
+    kfree(f);
+}
+
+static ssize_t eventfd_read_bytes(eventfd_t *e, void *buf, size_t cnt, thread_t *cur) {
+    if (!e || !buf) return -EINVAL;
+    if (cnt < 8) return -EINVAL;
+    for (;;) {
+        unsigned long fl = 0;
+        acquire_irqsave(&e->lock, &fl);
+        if (e->count == 0) {
+            if (e->nonblock) {
+                release_irqrestore(&e->lock, fl);
+                return -EAGAIN;
+            }
+            int tid = (int)(cur && cur->tid ? cur->tid : 1);
+            e->reader_waiter_tid = tid;
+            release_irqrestore(&e->lock, fl);
+            thread_block(tid);
+            thread_yield();
+            continue;
+        }
+        uint64_t val;
+        if (e->semaphore) {
+            val = 1;
+            e->count--;
+        } else {
+            val = e->count;
+            e->count = 0;
+        }
+        int wtid = e->writer_waiter_tid;
+        e->writer_waiter_tid = -1;
+        release_irqrestore(&e->lock, fl);
+        memcpy(buf, &val, 8);
+        if (wtid >= 0) thread_unblock(wtid);
+        return 8;
+    }
+}
+
+static ssize_t eventfd_write_bytes(eventfd_t *e, const void *buf, size_t cnt, thread_t *cur) {
+    if (!e || !buf) return -EINVAL;
+    if (cnt < 8) return -EINVAL;
+    uint64_t add = 0;
+    memcpy(&add, buf, 8);
+    if (add == (uint64_t)-1) return -EINVAL;
+    for (;;) {
+        unsigned long fl = 0;
+        acquire_irqsave(&e->lock, &fl);
+        if (e->count > (uint64_t)-1 - add) {
+            if (e->nonblock) {
+                release_irqrestore(&e->lock, fl);
+                return -EAGAIN;
+            }
+            int tid = (int)(cur && cur->tid ? cur->tid : 1);
+            e->writer_waiter_tid = tid;
+            release_irqrestore(&e->lock, fl);
+            thread_block(tid);
+            thread_yield();
+            continue;
+        }
+        e->count += add;
+        int rtid = e->reader_waiter_tid;
+        e->reader_waiter_tid = -1;
+        release_irqrestore(&e->lock, fl);
+        if (rtid >= 0) thread_unblock(rtid);
+        return 8;
+    }
+}
 
 void pipe_release_end(struct fs_file *f) {
     if (!f || f->type != FS_TYPE_PIPE || !f->driver_private) return;
@@ -2232,23 +2430,12 @@ static void unix_socket_cleanup(ksock_net_t *s) {
     if (s->unix_listening) {
         struct fs_file *pf = NULL;
         while ((pf = unix_acceptq_pop(s)) != NULL) {
-            if (pf->driver_private) {
-                ksock_net_t *ps = (ksock_net_t *)pf->driver_private;
-                if (ps->unix_conn) {
-                    unix_stream_conn_t *c = ps->unix_conn;
-                    unsigned long fl = 0;
-                    acquire_irqsave(&c->lock, &fl);
-                    c->closed[ps->unix_end] = 1;
-                    c->refs--;
-                    int refs = c->refs;
-                    release_irqrestore(&c->lock, fl);
-                    if (refs <= 0) kfree(c);
-                    ps->unix_conn = NULL;
-                }
-                kfree(ps);
-            }
-            if (pf->path) kfree((void *)pf->path);
-            kfree(pf);
+            /*
+             * Queued accepts are ksock_register'd. Raw kfree left stale
+             * registry slots → UAF on later lookup/teardown. Mirror TCP
+             * accept rollback: net_fs_file_destroy → ksock_drop.
+             */
+            net_fs_file_destroy(pf);
         }
     }
     if (s->unix_conn) {
@@ -5051,6 +5238,7 @@ typedef struct __attribute__((packed)) {
     uint16_t sin6_port;
     uint32_t sin6_flowinfo;
     uint8_t sin6_addr[16];
+    uint32_t sin6_scope_id; /* Linux ABI: sizeof(sockaddr_in6) == 28 */
 } sockaddr_in6_k;
 
 static void sockaddr_in6_v4mapped_fill(sockaddr_in6_k *s6, uint32_t ip_be, uint16_t port_host)
@@ -5103,16 +5291,14 @@ static int user_sockaddr_to_ipv4_peer(const void *addr_u, size_t addrlen, sockad
             memcpy(&out->sin_addr, s6.sin6_addr + 12, 4);
             return 0;
         }
-        int lo6 = 1;
-        for (int i = 0; i < 15; i++) {
-            if (s6.sin6_addr[i]) lo6 = 0;
-        }
-        if (lo6 && s6.sin6_addr[15] == 1) {
-            out->sin_addr = 0x0100007Fu; /* 127.0.0.1 s_addr as on Linux LE */
-            return 0;
-        }
-        /* No IPv6 stack: not EAFNOSUPPORT — glibc/wget treats that as fatal and may surface bogus OOM. */
-        return ENETUNREACH;
+        /*
+         * No real IPv6 stack. Do not map ::1 → 127.0.0.1: musl AI_ADDRCONFIG
+         * probes connect(::1) and treats success as "IPv6 is configured". On
+         * kernels without IPv6 that probe must fail with an allowlisted errno
+         * (EADDRNOTAVAIL/ENETUNREACH/…) or getaddrinfo returns EAI_SYSTEM and
+         * curl fails immediately with "Could not resolve host".
+         */
+        return EADDRNOTAVAIL;
     }
     /* Same as IPv6: avoid EAFNOSUPPORT so glibc can try other addresses / paths. */
     return ENETUNREACH;
@@ -6601,7 +6787,7 @@ static ssize_t net_sock_write_kbuf(ksock_net_t *s, const void *buf, size_t cnt) 
     return (ssize_t)total;
 }
 
-/* ---------- Linux epoll (level-triggered; EPOLLET accepted as level) ---------- */
+/* ---------- Linux epoll (LT default; EPOLLET + EPOLLRDHUP + close-auto-del) ---------- */
 enum {
     EPOLL_CTL_ADD_K = 1,
     EPOLL_CTL_DEL_K = 2,
@@ -6619,6 +6805,7 @@ enum {
     POLLERR_K = 0x008,
     POLLHUP_K = 0x010,
     POLLNVAL_K = 0x020,
+    POLLRDHUP_K = 0x2000,
     EPOLL_MAX_ITEMS = 256,
     EPOLL_CLOEXEC_K = 02000000
 };
@@ -6632,6 +6819,7 @@ typedef struct {
     int fd;
     uint32_t events;
     uint64_t data;
+    uint8_t et_delivered; /* EPOLLET: already reported while still ready */
 } epoll_item_t;
 
 typedef struct {
@@ -6651,6 +6839,24 @@ void epoll_fs_file_destroy(struct fs_file *f) {
         f->path = NULL;
     }
     kfree(f);
+}
+
+static int epoll_find_item(kepoll_t *ep, int fd);
+
+/* Drop fd from every epoll set owned by this process (Linux close semantics). */
+void epoll_notify_fd_closed(thread_t *thr, int fd) {
+    if (!thr || fd < 0) return;
+    struct fs_file **table = thr->process ? thr->process->fds : thr->fds;
+    if (!table) return;
+    for (int i = 0; i < THREAD_MAX_FD; i++) {
+        struct fs_file *f = table[i];
+        if (!f || f->type != SYSCALL_FTYPE_EPOLL || !f->driver_private) continue;
+        kepoll_t *ep = (kepoll_t *)f->driver_private;
+        int idx = epoll_find_item(ep, fd);
+        if (idx < 0) continue;
+        ep->items[idx] = ep->items[ep->nitems - 1];
+        ep->nitems--;
+    }
 }
 
 /* Shared readiness used by poll and epoll (level-triggered). */
@@ -6710,6 +6916,10 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
                 if ((events & POLLOUT_K) && !unix_stream_peer_closed(s) &&
                     unix_stream_avail_to_write(s) > 0)
                     revents |= POLLOUT_K;
+                if ((events & POLLRDHUP_K) && unix_stream_peer_closed(s))
+                    revents |= POLLRDHUP_K;
+                if (unix_stream_peer_closed(s) && unix_stream_avail_to_read(s) == 0)
+                    revents |= POLLHUP_K;
             }
         } else if (s->tcp_listening) {
             net_pump_listen_handshake();
@@ -6722,6 +6932,10 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
             if ((events & POLLOUT_K) && !unix_stream_peer_closed(s) &&
                 unix_stream_avail_to_write(s) > 0)
                 revents |= POLLOUT_K;
+            if ((events & POLLRDHUP_K) && unix_stream_peer_closed(s))
+                revents |= POLLRDHUP_K;
+            if (unix_stream_peer_closed(s) && unix_stream_avail_to_read(s) == 0)
+                revents |= POLLHUP_K;
         } else if ((events & POLLIN_K) && s->sock_domain == AF_PACKET_LOCAL) {
             if (!packet_sock_has_data(s))
                 net_packet_pump_rx(16);
@@ -6752,6 +6966,12 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
             net_pump_tcp_sock(s, 1);
             if (s->tcp.rx_len > 0 || s->tcp.peer_fin || s->tcp.peer_rst || s->tcp.ooo_valid)
                 revents |= POLLIN_K;
+            if ((events & POLLRDHUP_K) && s->tcp.peer_fin)
+                revents |= POLLRDHUP_K;
+            if (s->tcp.peer_rst)
+                revents |= POLLERR_K | POLLHUP_K;
+            else if (s->tcp.peer_fin && s->tcp.rx_len == 0 && !s->tcp.ooo_valid)
+                revents |= POLLHUP_K;
         }
         return revents;
     }
@@ -6772,21 +6992,36 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
             if (p->refcount < 2) revents |= POLLHUP_K;
         } else {
             if ((events & POLLIN_K) && used > 0) revents |= POLLIN_K;
-            if (p->refcount < 2) revents |= POLLHUP_K;
+            if (p->refcount < 2) {
+                revents |= POLLHUP_K;
+                if (events & POLLRDHUP_K) revents |= POLLRDHUP_K;
+            }
         }
+        return revents;
+    }
+    if (f->type == FS_TYPE_EVENTFD && f->driver_private) {
+        eventfd_t *e = (eventfd_t *)f->driver_private;
+        unsigned long fl = 0;
+        acquire_irqsave(&e->lock, &fl);
+        uint64_t c = e->count;
+        release_irqrestore(&e->lock, fl);
+        if ((events & POLLIN_K) && c > 0) revents |= POLLIN_K;
+        if ((events & POLLOUT_K) && c != (uint64_t)-1) revents |= POLLOUT_K;
         return revents;
     }
     if (events & POLLOUT_K) revents |= POLLOUT_K;
     if (events & POLLIN_K) {
-        if (f->type != FS_TYPE_DIR) {
-            if ((size_t)f->pos < (size_t)f->size)
-                revents |= POLLIN_K;
-            else if (f->path &&
-                     (strcmp(f->path, "/dev/null") == 0 ||
-                      strcmp(f->path, "/dev/zero") == 0 ||
-                      strcmp(f->path, "/dev/random") == 0 ||
-                      strcmp(f->path, "/dev/urandom") == 0))
-                revents |= POLLIN_K;
+        if (f->type == FS_TYPE_DIR) {
+            revents |= POLLIN_K;
+        } else if ((size_t)f->pos < (size_t)f->size) {
+            revents |= POLLIN_K;
+        } else if (f->path &&
+                   (strcmp(f->path, "/dev/null") == 0 ||
+                    strcmp(f->path, "/dev/zero") == 0 ||
+                    strcmp(f->path, "/dev/random") == 0 ||
+                    strcmp(f->path, "/dev/urandom") == 0 ||
+                    strcmp(f->path, "/dev/full") == 0)) {
+            revents |= POLLIN_K;
         }
     }
     return revents;
@@ -6794,7 +7029,8 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
 
 static int epoll_interest_to_poll(uint32_t ev) {
     short pe = 0;
-    if (ev & (EPOLLIN_K | EPOLLPRI_K | EPOLLRDHUP_K)) pe |= POLLIN_K;
+    if (ev & (EPOLLIN_K | EPOLLPRI_K)) pe |= POLLIN_K;
+    if (ev & EPOLLRDHUP_K) pe |= POLLRDHUP_K | POLLIN_K;
     if (ev & EPOLLOUT_K) pe |= POLLOUT_K;
     /* ERR/HUP are always reported by Linux when they occur. */
     pe |= POLLERR_K | POLLHUP_K;
@@ -6803,15 +7039,13 @@ static int epoll_interest_to_poll(uint32_t ev) {
 
 static uint32_t poll_to_epoll_revents(short revents, uint32_t interest) {
     uint32_t out = 0;
-    if (revents & POLLIN_K) out |= EPOLLIN_K;
-    if (revents & POLLOUT_K) out |= EPOLLOUT_K;
+    if ((interest & EPOLLIN_K) && (revents & POLLIN_K)) out |= EPOLLIN_K;
+    if ((interest & EPOLLPRI_K) && (revents & POLLIN_K)) out |= EPOLLPRI_K;
+    if ((interest & EPOLLOUT_K) && (revents & POLLOUT_K)) out |= EPOLLOUT_K;
+    if ((interest & EPOLLRDHUP_K) && (revents & POLLRDHUP_K)) out |= EPOLLRDHUP_K;
+    /* ERR/HUP always reported even if not in interest (Linux). */
     if (revents & POLLERR_K) out |= EPOLLERR_K;
     if (revents & POLLHUP_K) out |= EPOLLHUP_K;
-    /* Always include ERR/HUP even if not in interest (Linux). */
-    if (!(interest & (EPOLLIN_K | EPOLLPRI_K | EPOLLOUT_K | EPOLLRDHUP_K))) {
-        /* still OK */
-    }
-    (void)interest;
     return out;
 }
 
@@ -6896,7 +7130,7 @@ static ssize_t net_sock_read_userspace(thread_t *cur, ksock_net_t *s, void *bufp
             net_tcp_ops_t cops;
             net_make_tcp_ops(&cops, &s->tcp);
             e1000_poll();
-            if (net_tcp_connect_poll(&s->tcp, &cops, 200) == 0)
+            if (net_tcp_connect_poll(&s->tcp, &cops, 0) == 0)
                 s->connected = 1;
         }
         if (!s->connected || (!s->tcp.established && !s->tcp.peer_rst)) {
@@ -8030,16 +8264,18 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (child_rsp < 0x1000 || child_rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT)
                     return ret_err(EINVAL);
                 uintptr_t stack_lo = child_rsp & ~((uintptr_t)PAGE_SIZE_4K - 1u);
-                {
-                    uintptr_t aligned = child_rsp & ~(uintptr_t)0xFULL;
-                    if (aligned >= 0x1000u)
-                        child_rsp = aligned;
-                }
+                /*
+                 * Linux copy_thread(): use newsp exactly. musl __clone does
+                 *   and $-16,%rsi; sub $8,%rsi; mov %arg,(%rsi)
+                 * so RSP is 8 mod 16 on entry; the child pops the start arg
+                 * then call. Rounding RSP down to 16 bytes drops that slot
+                 * and SIGSEGVs in the pthread child (curl DNS worker).
+                 */
                 {
                     uint64_t pa = 0;
                     if (!cur->mm ||
                         mm_user_leaf_pa(cur->mm, saved_rcx, 0, &pa) != 0 ||
-                        mm_user_leaf_pa(cur->mm, child_rsp - 8u, 1, &pa) != 0)
+                        mm_user_leaf_pa(cur->mm, child_rsp, 1, &pa) != 0)
                         return ret_err(EFAULT);
                 }
 
@@ -8085,13 +8321,16 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 child->user_stack_limit = (uint64_t)child_rsp;
                 child->ring = 3;
 
+                /*
+                 * Linux copy_process/CLONE_SETTLS: only install the child's
+                 * FS base. The TCB lives in the caller-provided pthread stack
+                 * (already mmap'd). Stamping identity US/RW over that range
+                 * re-shared Soft_COW/identity leaves into a private stack and
+                 * musl's child then SIGSEGVs on the first TCB store.
+                 */
                 if ((flags & CLONE_SETTLS_OLD) && tls >= 0x1000 &&
                     tls < (uint64_t)MMIO_IDENTITY_LIMIT) {
                     child->user_fs_base = tls;
-                    uintptr_t tls_lo = ((uintptr_t)tls - 0x1000u) & ~((uintptr_t)PAGE_SIZE_2M - 1);
-                    uintptr_t tls_hi = ((uintptr_t)tls + 0x3000u + PAGE_SIZE_2M - 1) &
-                        ~((uintptr_t)PAGE_SIZE_2M - 1);
-                    (void)mark_user_identity_range_2m_sys((uint64_t)tls_lo, (uint64_t)tls_hi);
                 } else {
                     child->user_fs_base = cur->user_fs_base;
                 }
@@ -8120,9 +8359,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         process_t *pp = process_create_init();
                         if (pp) process_attach_thread(pp, cur);
                     }
-                    child->process = cur->process;
-                    if (cur->process && !cur->process->leader)
-                        process_attach_thread(cur->process, cur);
+                    if (cur->process) {
+                        if (!cur->process->leader)
+                            process_attach_thread(cur->process, cur);
+                        process_attach_thread(cur->process, child);
+                    } else {
+                        child->process = NULL;
+                    }
                     child->sid = cur->sid;
                     child->pgid = cur->pgid;
                 } else {
@@ -8141,12 +8384,16 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 strncpy(child->cwd, cur->cwd, sizeof(child->cwd) - 1);
                 child->cwd[sizeof(child->cwd) - 1] = '\0';
+                /*
+                 * CLONE_THREAD: do NOT process_sync_from_thread(leader) here.
+                 * That copied leader->fds over the shared process table and
+                 * wiped UDP DNS sockets opened by earlier workers (leader
+                 * slots stay NULL). Orphaned ksocks stayed in the registry
+                 * and stole the next curl's replies (error 6); mid-download
+                 * loss truncated bash -c "$(curl …)" → syntax error near fi.
+                 * fork_inherit still refcounts onto the child thread slots.
+                 */
                 fork_inherit_fd_table(child, cur);
-                /* process_attach_thread ran before fd inheritance. A normal
-                 * clone(SIGCHLD) therefore had an empty canonical process fd
-                 * table: close()/CLOEXEC failed and pipe ends leaked across
-                 * rpm2cpio|cpio. Publish the inherited table once it exists.
-                 * CLONE_THREAD keeps the already-shared process table. */
                 if (!(flags & CLONE_THREAD_OLD))
                     process_sync_from_thread(child->process, child);
                 child->user_brk_base = cur->user_brk_base;
@@ -8282,12 +8529,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 uintptr_t child_rsp = stack_lo + (uintptr_t)stack_size;
                 if (child_rsp <= stack_lo || child_rsp > (uintptr_t)MMIO_IDENTITY_LIMIT)
                     return ret_err(EINVAL);
-                /* RSP must be 16-byte aligned per x86-64 ABI (child may use movdqa/call) */
-                {
-                    uintptr_t aligned = child_rsp & ~(uintptr_t)0xFULL;
-                    if (aligned >= stack_lo + 128u)
-                        child_rsp = aligned;
-                }
+                /* Linux clone3: sp = stack + stack_size, no kernel re-align. */
                 if (child_rsp <= stack_lo || child_rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT)
                     return ret_err(EINVAL);
 
@@ -8376,9 +8618,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         process_t *pp = process_create_init();
                         if (pp) process_attach_thread(pp, cur);
                     }
-                    child->process = cur->process;
-                    if (cur->process && !cur->process->leader)
-                        process_attach_thread(cur->process, cur);
+                    if (cur->process) {
+                        if (!cur->process->leader)
+                            process_attach_thread(cur->process, cur);
+                        process_attach_thread(cur->process, child);
+                    } else {
+                        child->process = NULL;
+                    }
                     child->sid = cur->sid;
                     child->pgid = cur->pgid;
                 } else {
@@ -8397,6 +8643,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 strncpy(child->cwd, cur->cwd, sizeof(child->cwd)-1);
                 child->cwd[sizeof(child->cwd)-1] = '\0';
+                /* See clone(): never sync leader→process on CLONE_THREAD. */
                 fork_inherit_fd_table(child, cur);
                 if (!(flags & CLONE3_CLONE_THREAD))
                     process_sync_from_thread(child->process, child);
@@ -9553,11 +9800,15 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 char domainname[65];
             } u;
             memset(&u, 0, sizeof(u));
-            /* Keep it simple and stable. */
-            snprintf(u.sysname, sizeof(u.sysname), "%s", OS_NAME);
+            /*
+             * Linux ABI: utsname.sysname must be "Linux". Homebrew and most
+             * userspace gate on `uname -s` / $(uname). Branding stays in
+             * version /etc/os-release, not in sysname.
+             */
+            snprintf(u.sysname, sizeof(u.sysname), "Linux");
             snprintf(u.nodename, sizeof(u.nodename), "axoniso");
-            snprintf(u.release, sizeof(u.release), "%s", OS_VERSION);
-            snprintf(u.version, sizeof(u.version), "%s", OS_NAME);
+            snprintf(u.release, sizeof(u.release), "%s-%s", OS_VERSION, OS_NAME);
+            snprintf(u.version, sizeof(u.version), "#1 SMP %s %s", OS_NAME, OS_PREFIX);
             snprintf(u.machine, sizeof(u.machine), "x86_64");
             snprintf(u.domainname, sizeof(u.domainname), "local");
             if (copy_to_user_safe(up, &u, sizeof(u)) != 0) return ret_err(EFAULT);
@@ -9627,7 +9878,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
             if (!iov_u) return ret_err(EFAULT);
             if (iovcnt <= 0 || iovcnt > 64) return ret_err(EINVAL);
-            struct fs_file *f = cur->fds[fd];
+            struct fs_file *f = syscall_fd_get(cur, fd);
             if (!f) return ret_err(EBADF);
 
             struct iovec_k { uint64_t base; uint64_t len; };
@@ -10351,6 +10602,12 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             int is_write_end = fs_pipe_is_write_end(f);
                             release_irqrestore(&p->lock, fl);
                             if (!is_write_end && (used > 0 || p->refcount < 2)) can_r = 1;
+                        } else if (f->type == FS_TYPE_EVENTFD && f->driver_private) {
+                            eventfd_t *e = (eventfd_t *)f->driver_private;
+                            unsigned long fl = 0;
+                            acquire_irqsave(&e->lock, &fl);
+                            if (e->count > 0) can_r = 1;
+                            release_irqrestore(&e->lock, fl);
                         } else {
                             if (f->type == FS_TYPE_DIR) can_r = 1;
                             else if ((size_t)f->pos < (size_t)f->size) can_r = 1;
@@ -10373,7 +10630,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                 net_make_tcp_ops(&ops, &s->tcp);
                                 if (s->tcp.connect_pending) {
                                     e1000_poll();
-                                    if (net_tcp_connect_poll(&s->tcp, &ops, 200) == 0) {
+                                    /* timeout 0: progress only — never abort pending SYN. */
+                                    if (net_tcp_connect_poll(&s->tcp, &ops, 0) == 0) {
                                         s->connected = 1;
                                         can_w = 1;
                                     } else if (s->tcp.connect_refused) {
@@ -10396,6 +10654,12 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             int is_write_end = fs_pipe_is_write_end(f);
                             release_irqrestore(&p->lock, fl);
                             if (is_write_end && free > 0) can_w = 1;
+                        } else if (f->type == FS_TYPE_EVENTFD && f->driver_private) {
+                            eventfd_t *e = (eventfd_t *)f->driver_private;
+                            unsigned long fl = 0;
+                            acquire_irqsave(&e->lock, &fl);
+                            if (e->count != (uint64_t)-1) can_w = 1;
+                            release_irqrestore(&e->lock, fl);
                         } else {
                             /* regular files: writable */
                             can_w = 1;
@@ -10668,7 +10932,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (s->sock_domain == AF_INET_LOCAL) {
                 sockaddr_in_k sa;
                 int pr = user_sockaddr_to_ipv4_peer(addr_u, addrlen, &sa);
-                if (pr != 0) return ret_err(pr);
+                if (pr != 0) {
+                    static int bind_fail_left = 8;
+                    if (bind_fail_left-- > 0)
+                        klogprintf("net: bind peer-parse err=%d tid=%d\n", pr,
+                                   t ? (int)t->tid : -1);
+                    return ret_err(pr);
+                }
                 uint16_t port = be16(sa.sin_port);
                 if (port == 0) port = net_alloc_ephemeral_port();
                 if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
@@ -10745,22 +11015,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 int nfd = thread_fd_alloc(af);
                 if (nfd < 0) {
-                    if (af->driver_private) {
-                        ksock_net_t *as = (ksock_net_t *)af->driver_private;
-                        if (as->unix_conn) {
-                            unix_stream_conn_t *c = as->unix_conn;
-                            unsigned long fl = 0;
-                            acquire_irqsave(&c->lock, &fl);
-                            c->closed[as->unix_end] = 1;
-                            c->refs--;
-                            int refs = c->refs;
-                            release_irqrestore(&c->lock, fl);
-                            if (refs <= 0) kfree(c);
-                        }
-                        kfree(as);
-                    }
-                    if (af->path) kfree((void *)af->path);
-                    kfree(af);
+                    net_fs_file_destroy(af);
                     return ret_err(EMFILE);
                 }
                 if (addr_u && addrlen_u && user_range_ok(addrlen_u, 4)) {
@@ -10872,15 +11127,19 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 srv_f->driver_private = srv;
                 srv_f->refcount = 1;
                 if (ksock_register(srv) != 0) {
-                    net_fs_file_destroy(srv_f);
+                    /* Not registered: tear down without registry. conn refs==2. */
+                    srv->unix_conn = NULL;
+                    kfree(srv_p);
+                    kfree(srv_f);
+                    kfree(srv);
                     kfree(conn);
                     return ret_err(ENOMEM);
                 }
 
                 if (unix_acceptq_push(listener, srv_f) != 0) {
-                    kfree(srv_p);
-                    kfree(srv_f);
-                    kfree(srv);
+                    /* Registered — drop via destructor (clears registry). Client
+                     * never attached; free the leftover conn after srv drops its ref. */
+                    net_fs_file_destroy(srv_f);
                     kfree(conn);
                     return ret_err(EAGAIN);
                 }
@@ -10947,6 +11206,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return 0;
                 }
                 if (net_ensure_ipv4() != 0) return ret_err(ENETDOWN);
+                /* Must check before teardown — curl may poll-retry the same fd. */
+                if (s->tcp.connect_pending && !s->tcp.established)
+                    return ret_err(EALREADY);
+                if (s->connected && s->tcp.established)
+                    return ret_err(EISCONN);
                 if (s->tcp.used) {
                     net_tcp_ops_t close_ops;
                     net_make_tcp_ops(&close_ops, &s->tcp);
@@ -10992,11 +11256,20 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 #else
                 g_net_tcp_sniff_left = 0;
 #endif
+                /* Linux: O_NONBLOCK connect sends SYN and returns EINPROGRESS;
+                 * completion is via poll/select + SO_ERROR. curl/musl rely on this. */
+                uint32_t conn_tmo = s->nonblock ? 0u : 6000u;
                 g_net_tcp_connect_active = 1;
-                int rc = net_tcp_connect(&s->tcp, &ops, s->peer_ip_be, s->peer_port, s->local_port, 6000);
+                int rc = net_tcp_connect(&s->tcp, &ops, s->peer_ip_be, s->peer_port, s->local_port, conn_tmo);
                 g_net_tcp_connect_active = 0;
                 g_net_tcp_sniff_left = 0;
+                if (!s->tcp.peer_mac_valid && g_tcp_xmit_mac_valid)
+                    net_tcp_stage_peer_mac(&s->tcp, g_tcp_xmit_mac);
                 g_tcp_xmit_mac_valid = 0;
+                if (s->nonblock && rc == 0 && s->tcp.connect_pending && !s->tcp.established) {
+                    s->connected = 0;
+                    return ret_err(EINPROGRESS);
+                }
                 if (rc == -3) {
                     klogprintf("tcp: connect refused dst=%u.%u.%u.%u:%u\n",
                         (unsigned)((s->peer_ip_be >> 24) & 0xFF), (unsigned)((s->peer_ip_be >> 16) & 0xFF),
@@ -11245,12 +11518,15 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge &&
                 optval_u && olen >= 4) {
                 int soerr = 0;
-                if (s->tcp.connect_pending)
+                if (s->tcp.connect_pending) {
+                    /* Still in progress: Linux reports 0 here; EINPROGRESS is only from connect(). */
                     soerr = 0;
-                else if (s->tcp.connect_refused)
+                } else if (s->tcp.connect_refused) {
                     soerr = ECONNREFUSED;
-                else if (s->tcp.peer_rst)
+                    s->tcp.connect_refused = 0; /* Linux: SO_ERROR clears on read */
+                } else if (s->tcp.peer_rst) {
                     soerr = ECONNRESET;
+                }
                 if (copy_to_user_safe(optval_u, &soerr, 4) != 0) return ret_err(EFAULT);
                 olen = 4;
                 if (copy_to_user_safe(optlen_u, &olen, 4) != 0) return ret_err(EFAULT);
@@ -11282,7 +11558,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             size_t tolen = (size_t)a6;
             thread_t *t = thread_get_current_user();
             if (!t) t = thread_current();
-            int dbg_wget = AXON_WGET_DNS_TRACE && t && t->name[0] && strstr(t->name, "wget");
+            int dbg_wget = AXON_WGET_DNS_TRACE && t && t->name[0] &&
+                           (strstr(t->name, "wget") || strstr(t->name, "curl"));
             ksock_net_t *s = NULL;
             if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
             if (s->sock_domain == AF_NETLINK_LOCAL) {
@@ -11873,7 +12150,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return ret_err(EFAULT);
             thread_t *t = thread_get_current_user();
             if (!t) t = thread_current();
-            int dbg_wget = AXON_WGET_DNS_TRACE && t && t->name[0] && strstr(t->name, "wget");
+            int dbg_wget = AXON_WGET_DNS_TRACE && t && t->name[0] &&
+                           (strstr(t->name, "wget") || strstr(t->name, "curl"));
             ksock_net_t *s = NULL;
             if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
             if (s->sock_domain == AF_NETLINK_LOCAL) {
@@ -12952,16 +13230,23 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 const char *a_u = (const char*)(uintptr_t)a_up;
                 if (!a_u || !user_range_ok(a_u, 1)) { kfree((void*)kargv); kfree(path); return ret_err(EFAULT); }
-                size_t L = user_strnlen_bounded(a_u, 4096);
+                size_t L = user_strnlen_bounded(a_u, (size_t)MAX_ARG_STRLEN + 1u);
+                if (L > (size_t)MAX_ARG_STRLEN) {
+                    for (int j = 0; j < i; j++) kfree((void *)kargv[j]);
+                    kfree((void *)kargv);
+                    kfree(path);
+                    return ret_err(E2BIG);
+                }
                 char *ks = (char*)kmalloc(L + 1);
                 if (!ks) { qemu_debug_printf("OOM execve: argv[%d] L=%llu\n", i, (unsigned long long)(L+1)); for (int j=0;j<i;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(ENOMEM); }
-                if (!user_range_ok(a_u, L + 1) || copy_from_user_raw(ks, a_u, L + 1) != 0) {
+                if (L > 0 && (!user_range_ok(a_u, L) || copy_from_user_raw(ks, a_u, L) != 0)) {
                     kfree(ks);
                     for (int j=0;j<i;j++) kfree((void*)kargv[j]);
                     kfree((void*)kargv);
                     kfree(path);
                     return ret_err(EFAULT);
                 }
+                ks[L] = '\0';
                 kargv[i] = ks;
             }
             kargv[argc] = NULL;
@@ -12994,10 +13279,27 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     }
                     const char *e_u = (const char*)(uintptr_t)e_up;
                     if (!e_u || !user_range_ok(e_u, 1)) { for (int j=0;j<i;j++) kfree((void*)kenvp[j]); kfree(kenvp); for (int j=0;j<argc;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(EFAULT); }
-                    size_t L = user_strnlen_bounded(e_u, 4096);
+                    size_t L = user_strnlen_bounded(e_u, (size_t)MAX_ARG_STRLEN + 1u);
+                    if (L > (size_t)MAX_ARG_STRLEN) {
+                        for (int j = 0; j < i; j++) kfree((void *)kenvp[j]);
+                        kfree(kenvp);
+                        for (int j = 0; j < argc; j++) kfree((void *)kargv[j]);
+                        kfree((void *)kargv);
+                        kfree(path);
+                        return ret_err(E2BIG);
+                    }
                     char *ks = (char*)kmalloc(L + 1);
                     if (!ks) { qemu_debug_printf("OOM execve: envp[%d] L=%llu\n", i, (unsigned long long)(L+1)); for (int j=0;j<i;j++) kfree((void*)kenvp[j]); kfree(kenvp); for (int j=0;j<argc;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(ENOMEM); }
-                    if (!user_range_ok(e_u, L + 1) || copy_from_user_raw(ks, e_u, L + 1) != 0) { kfree(ks); for (int j=0;j<i;j++) kfree((void*)kenvp[j]); kfree(kenvp); for (int j=0;j<argc;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(EFAULT); }
+                    if (L > 0 && (!user_range_ok(e_u, L) || copy_from_user_raw(ks, e_u, L) != 0)) {
+                        kfree(ks);
+                        for (int j = 0; j < i; j++) kfree((void *)kenvp[j]);
+                        kfree(kenvp);
+                        for (int j = 0; j < argc; j++) kfree((void *)kargv[j]);
+                        kfree((void *)kargv);
+                        kfree(path);
+                        return ret_err(EFAULT);
+                    }
+                    ks[L] = '\0';
                     kenvp[i] = ks;
                 }
                 kenvp[envc] = NULL;
@@ -13684,6 +13986,49 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return ret_err(ENOTTY);
             }
 
+            /* Linux fbdev ioctls on /dev/fb0 (Xorg Driver "fbdev"). */
+            if (fbdev_is_fb0_file(f)) {
+                if (req == FBIOGET_VSCREENINFO) {
+                    struct fb_var_screeninfo v;
+                    if (!argp) return ret_err(EFAULT);
+                    if (!fbdev_is_active()) return ret_err(ENODEV);
+                    fbdev_get_var(&v);
+                    if (copy_to_user_safe(argp, &v, sizeof(v)) != 0) return ret_err(EFAULT);
+                    return 0;
+                }
+                if (req == FBIOPUT_VSCREENINFO) {
+                    struct fb_var_screeninfo v;
+                    if (!argp) return ret_err(EFAULT);
+                    if (copy_from_user_raw(&v, argp, sizeof(v)) != 0) return ret_err(EFAULT);
+                    int rc = fbdev_check_var(&v);
+                    return rc < 0 ? ret_err(-rc) : 0;
+                }
+                if (req == FBIOGET_FSCREENINFO) {
+                    struct fb_fix_screeninfo fi;
+                    if (!argp) return ret_err(EFAULT);
+                    if (!fbdev_is_active()) return ret_err(ENODEV);
+                    fbdev_get_fix(&fi);
+                    if (copy_to_user_safe(argp, &fi, sizeof(fi)) != 0) return ret_err(EFAULT);
+                    return 0;
+                }
+                if (req == FBIOPAN_DISPLAY) {
+                    struct fb_var_screeninfo v;
+                    if (!argp) return ret_err(EFAULT);
+                    if (copy_from_user_raw(&v, argp, sizeof(v)) != 0) return ret_err(EFAULT);
+                    int rc = fbdev_check_var(&v);
+                    if (rc < 0) return ret_err(-rc);
+                    fbdev_flush_display();
+                    return 0;
+                }
+                if (req == FBIOBLANK)
+                    return 0;
+                if (req == FBIO_WAITFORVSYNC) {
+                    fbdev_flush_display();
+                    return 0;
+                }
+                return ret_err(ENOTTY);
+            }
+
             /* Block-device ioctls for /dev/sdX,/dev/hdX (needed by mkfs.vfat and friends). */
             if (req == BLKSSZGET || req == BLKBSZGET || req == BLKGETSIZE || req == BLKGETSIZE64) {
                 if (!argp) return ret_err(EFAULT);
@@ -14171,7 +14516,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             /* KDGKBTYPE (0x4B33): get keyboard type. BusyBox chvt uses this to validate console fd. */
             if (req == 0x4B33) {
                 if (argp && user_range_ok(argp, 1)) {
-                    char kbd_type = 0; /* 0 = PC/XT style */
+                    char kbd_type = 0x02; /* KB_101 — Linux always answers this */
                     if (copy_to_user_safe(argp, &kbd_type, 1) == 0 && devfs_is_tty_file(f))
                         return 0;
                 }
@@ -14181,6 +14526,243 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             /* For the remaining tty-specific ioctls, require a real tty file. */
             if (!devfs_is_tty_file(f)) {
                 return ret_err(ENOTTY);
+            }
+
+            /*
+             * Linux console font ioctls (include/uapi/linux/kd.h).
+             * BusyBox loadfont/setfont use KDFONTOP; older tools use PIO_FONT*.
+             * Font payload is PSF-decoded in userspace — NOT GRUB .pf2.
+             */
+            {
+                enum {
+                    GIO_FONT_I = 0x4B60,
+                    PIO_FONT_I = 0x4B61,
+                    GIO_UNIMAP_I = 0x4B66,
+                    PIO_UNIMAP_I = 0x4B67,
+                    PIO_UNIMAPCLR_I = 0x4B68,
+                    GIO_FONTX_I = 0x4B6B,
+                    PIO_FONTX_I = 0x4B6C,
+                    PIO_FONTRESET_I = 0x4B6D,
+                    KDFONTOP_I = 0x4B72,
+                    KD_FONT_OP_SET = 0,
+                    KD_FONT_OP_GET = 1,
+                    KD_FONT_OP_SET_DEFAULT = 2,
+                    KD_FONT_OP_SET_TALL = 4,
+                    KD_FONT_OP_GET_TALL = 5
+                };
+                if (req == PIO_FONTRESET_I) {
+                    font_init_default();
+                    con_unimap_clear();
+                    font_notify_changed();
+                    return 0;
+                }
+                /* Unicode → glyph map (BusyBox setfont after KDFONTOP). */
+                if (req == PIO_UNIMAPCLR_I) {
+                    /* struct unimapinit advice — optional; Linux ignores contents. */
+                    (void)argp;
+                    con_unimap_clear();
+                    return 0;
+                }
+                if (req == PIO_UNIMAP_I) {
+                    struct unimapdesc_k {
+                        uint16_t entry_ct;
+                        uint16_t _pad0;
+                        uint32_t _pad1;
+                        uint64_t entries;
+                    } ud;
+                    if (!argp || copy_from_user_raw(&ud, argp, sizeof(ud)) != 0)
+                        return ret_err(EFAULT);
+                    if (ud.entry_ct == 0) {
+                        con_unimap_clear();
+                        return 0;
+                    }
+                    if (ud.entry_ct > 8192 || !ud.entries)
+                        return ret_err(EINVAL);
+                    size_t need = (size_t)ud.entry_ct * 4u; /* struct unipair */
+                    void *pairs = kmalloc(need);
+                    if (!pairs) return ret_err(ENOMEM);
+                    if (copy_from_user_raw(pairs, (const void *)(uintptr_t)ud.entries, need) != 0) {
+                        kfree(pairs);
+                        return ret_err(EFAULT);
+                    }
+                    int rc = con_unimap_set(ud.entry_ct, pairs);
+                    kfree(pairs);
+                    return rc < 0 ? ret_err(-rc) : 0;
+                }
+                if (req == GIO_UNIMAP_I) {
+                    struct unimapdesc_k {
+                        uint16_t entry_ct;
+                        uint16_t _pad0;
+                        uint32_t _pad1;
+                        uint64_t entries;
+                    } ud;
+                    if (!argp || copy_from_user_raw(&ud, argp, sizeof(ud)) != 0)
+                        return ret_err(EFAULT);
+                    unsigned have = 0;
+                    int rc = con_unimap_get(&have, NULL, 0);
+                    if (rc < 0) return ret_err(-rc);
+                    if (!ud.entries) {
+                        ud.entry_ct = (uint16_t)(have > 0xFFFFu ? 0xFFFFu : have);
+                        if (copy_to_user_safe(argp, &ud, sizeof(ud)) != 0)
+                            return ret_err(EFAULT);
+                        return 0;
+                    }
+                    if (ud.entry_ct < have)
+                        return ret_err(ENOMEM); /* Linux: ENOSPC-ish via ENOMEM for small buf */
+                    size_t need = (size_t)have * 4u;
+                    void *pairs = kmalloc(need ? need : 1);
+                    if (!pairs) return ret_err(ENOMEM);
+                    rc = con_unimap_get(&have, pairs, have);
+                    if (rc == 0 &&
+                        copy_to_user_safe((void *)(uintptr_t)ud.entries, pairs, need) != 0)
+                        rc = -EFAULT;
+                    kfree(pairs);
+                    if (rc < 0) return ret_err(-rc);
+                    ud.entry_ct = (uint16_t)have;
+                    if (copy_to_user_safe(argp, &ud, sizeof(ud)) != 0)
+                        return ret_err(EFAULT);
+                    return 0;
+                }
+                if (req == PIO_FONT_I) {
+                    /* Expanded form: 256 glyphs × 32 bytes, width=8. */
+                    if (!argp) return ret_err(EFAULT);
+                    size_t need = 256u * 32u;
+                    uint8_t *buf = (uint8_t *)kmalloc(need);
+                    if (!buf) return ret_err(ENOMEM);
+                    if (copy_from_user_raw(buf, argp, need) != 0) {
+                        kfree(buf);
+                        return ret_err(EFAULT);
+                    }
+                    int rc = font_load_kd(8, 32, 256, buf, 32);
+                    kfree(buf);
+                    return rc < 0 ? ret_err(-rc) : 0;
+                }
+                if (req == GIO_FONT_I) {
+                    if (!argp) return ret_err(EFAULT);
+                    size_t need = 256u * 32u;
+                    uint8_t *buf = (uint8_t *)kmalloc(need);
+                    if (!buf) return ret_err(ENOMEM);
+                    uint32_t w = 0, h = 0, cc = 0;
+                    int rc = font_export_kd(&w, &h, &cc, buf, need, 32);
+                    if (rc == 0 && copy_to_user_safe(argp, buf, need) != 0)
+                        rc = -EFAULT;
+                    kfree(buf);
+                    return rc < 0 ? ret_err(-rc) : 0;
+                }
+                if (req == PIO_FONTX_I || req == GIO_FONTX_I) {
+                    struct consolefontdesc_k {
+                        uint16_t charcount;
+                        uint16_t charheight;
+                        uint32_t _pad;
+                        uint64_t chardata;
+                    } cfd;
+                    if (!argp || copy_from_user_raw(&cfd, argp, sizeof(cfd)) != 0)
+                        return ret_err(EFAULT);
+                    if (cfd.charcount == 0 || cfd.charcount > 512 ||
+                        cfd.charheight == 0 || cfd.charheight > 32)
+                        return ret_err(EINVAL);
+                    size_t need = (size_t)cfd.charcount * (size_t)cfd.charheight;
+                    if (req == PIO_FONTX_I) {
+                        if (!cfd.chardata) return ret_err(EFAULT);
+                        uint8_t *buf = (uint8_t *)kmalloc(need);
+                        if (!buf) return ret_err(ENOMEM);
+                        if (copy_from_user_raw(buf, (const void *)(uintptr_t)cfd.chardata, need) != 0) {
+                            kfree(buf);
+                            return ret_err(EFAULT);
+                        }
+                        /* PIO_FONTX: width fixed to 8, rows = charheight (tall). */
+                        int rc = font_load_kd(8, cfd.charheight, cfd.charcount, buf, cfd.charheight);
+                        kfree(buf);
+                        return rc < 0 ? ret_err(-rc) : 0;
+                    }
+                    /* GIO_FONTX — width 8 only (classic VGA cell). */
+                    uint32_t w = 0, h = 0, cc = 0;
+                    int rc = font_export_kd(&w, &h, &cc, NULL, 0, 0);
+                    if (rc < 0) return ret_err(-rc);
+                    if (w != 8) return ret_err(EINVAL);
+                    cfd.charcount = (uint16_t)(cc > 512 ? 512 : cc);
+                    cfd.charheight = (uint16_t)h;
+                    if (cfd.chardata) {
+                        size_t out_need = (size_t)cfd.charcount * (size_t)cfd.charheight;
+                        uint8_t *buf = (uint8_t *)kmalloc(out_need);
+                        if (!buf) return ret_err(ENOMEM);
+                        rc = font_export_kd(&w, &h, &cc, buf, out_need, h);
+                        if (rc == 0 &&
+                            copy_to_user_safe((void *)(uintptr_t)cfd.chardata, buf, out_need) != 0)
+                            rc = -EFAULT;
+                        kfree(buf);
+                    }
+                    if (rc < 0) return ret_err(-rc);
+                    if (copy_to_user_safe(argp, &cfd, sizeof(cfd)) != 0)
+                        return ret_err(EFAULT);
+                    return 0;
+                }
+                if (req == KDFONTOP_I) {
+                    struct console_font_op_k {
+                        uint32_t op;
+                        uint32_t flags;
+                        uint32_t width;
+                        uint32_t height;
+                        uint32_t charcount;
+                        uint32_t _pad;
+                        uint64_t data;
+                    } cfo;
+                    if (!argp || copy_from_user_raw(&cfo, argp, sizeof(cfo)) != 0)
+                        return ret_err(EFAULT);
+                    if (cfo.op == KD_FONT_OP_SET_DEFAULT) {
+                        font_init_default();
+                        font_notify_changed();
+                        return 0;
+                    }
+                    if (cfo.op == KD_FONT_OP_SET || cfo.op == KD_FONT_OP_SET_TALL) {
+                        if (cfo.width == 0 || cfo.height == 0 || cfo.charcount == 0 ||
+                            cfo.width > FONT_MAX_CELL_W || cfo.height > FONT_MAX_CELL_H ||
+                            cfo.charcount > 512)
+                            return ret_err(EINVAL);
+                        if (!cfo.data) return ret_err(EFAULT);
+                        uint32_t vpitch = (cfo.op == KD_FONT_OP_SET_TALL) ? cfo.height : 32u;
+                        uint32_t bpr = (cfo.width + 7u) / 8u;
+                        size_t need = (size_t)cfo.charcount * (size_t)vpitch * bpr;
+                        if (need == 0 || need > (4u * 1024u * 1024u))
+                            return ret_err(EINVAL);
+                        uint8_t *buf = (uint8_t *)kmalloc(need);
+                        if (!buf) return ret_err(ENOMEM);
+                        if (copy_from_user_raw(buf, (const void *)(uintptr_t)cfo.data, need) != 0) {
+                            kfree(buf);
+                            return ret_err(EFAULT);
+                        }
+                        int rc = font_load_kd(cfo.width, cfo.height, cfo.charcount, buf, vpitch);
+                        kfree(buf);
+                        return rc < 0 ? ret_err(-rc) : 0;
+                    }
+                    if (cfo.op == KD_FONT_OP_GET || cfo.op == KD_FONT_OP_GET_TALL) {
+                        uint32_t w = 0, h = 0, cc = 0;
+                        uint32_t vpitch = (cfo.op == KD_FONT_OP_GET_TALL) ? 0 : 32u;
+                        int rc = font_export_kd(&w, &h, &cc, NULL, 0, 16);
+                        if (rc < 0) return ret_err(-rc);
+                        if (cfo.op == KD_FONT_OP_GET_TALL)
+                            vpitch = h;
+                        cfo.width = w;
+                        cfo.height = h;
+                        cfo.charcount = cc;
+                        if (cfo.data) {
+                            uint32_t bpr = (w + 7u) / 8u;
+                            size_t need = (size_t)cc * (size_t)vpitch * bpr;
+                            uint8_t *buf = (uint8_t *)kmalloc(need);
+                            if (!buf) return ret_err(ENOMEM);
+                            rc = font_export_kd(&w, &h, &cc, buf, need, vpitch);
+                            if (rc == 0 &&
+                                copy_to_user_safe((void *)(uintptr_t)cfo.data, buf, need) != 0)
+                                rc = -EFAULT;
+                            kfree(buf);
+                            if (rc < 0) return ret_err(-rc);
+                        }
+                        if (copy_to_user_safe(argp, &cfo, sizeof(cfo)) != 0)
+                            return ret_err(EFAULT);
+                        return 0;
+                    }
+                    return ret_err(EINVAL);
+                }
             }
             if (req == 0x5606) { /* VT_ACTIVATE: BusyBox passes vt as value; glibc may pass int* */
                 int vt = -1;
@@ -14234,7 +14816,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             const void *bufp = (const void*)(uintptr_t)a2;
             size_t cnt = (size_t)a3;
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
-            struct fs_file *f = cur->fds[fd];
+            /* Prefer process fd table (CLONE_FILES / CLONE_THREAD). */
+            struct fs_file *f = syscall_fd_get(cur, fd);
             if (!f) return ret_err(EBADF);
             if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
                 ksock_net_t *s = (ksock_net_t *)f->driver_private;
@@ -14250,6 +14833,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (!tmp) return ret_err(EFAULT);
                 ssize_t wr = pipe_write_bytes(p, tmp, copied, cur);
                 kfree(tmp);
+                return (wr >= 0) ? (uint64_t)wr : ret_err((int)-wr);
+            }
+            if (f->type == FS_TYPE_EVENTFD && f->driver_private) {
+                eventfd_t *e = (eventfd_t *)f->driver_private;
+                if (cnt < 8) return ret_err(EINVAL);
+                uint64_t v = 0;
+                if (copy_from_user_raw(&v, bufp, 8) != 0) return ret_err(EFAULT);
+                ssize_t wr = eventfd_write_bytes(e, &v, 8, cur);
                 return (wr >= 0) ? (uint64_t)wr : ret_err((int)-wr);
             }
             size_t total = 0;
@@ -14280,7 +14871,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
             if (!iov_u) return ret_err(EFAULT);
             if (iovcnt <= 0 || iovcnt > 64) return ret_err(EINVAL);
-            struct fs_file *f = cur->fds[fd];
+            struct fs_file *f = syscall_fd_get(cur, fd);
             if (!f) return ret_err(EBADF);
 
             struct iovec_k { uint64_t base; uint64_t len; };
@@ -14325,6 +14916,12 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     ssize_t rr;
                     if (f->type == FS_TYPE_PIPE && fs_pipe_is_read_end(f) && f->driver_private) {
                         rr = pipe_read_bytes((pipe_t *)f->driver_private, tmp, chunk, cur);
+                    } else if (f->type == FS_TYPE_EVENTFD && f->driver_private) {
+                        if (chunk < 8) {
+                            kfree(tmp);
+                            return (total > 0) ? total : ret_err(EINVAL);
+                        }
+                        rr = eventfd_read_bytes((eventfd_t *)f->driver_private, tmp, 8, cur);
                     } else {
                         rr = fs_read(f, tmp, chunk, f->pos);
                     }
@@ -14419,7 +15016,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             struct fs_file *f = cur->fds[fd];
             if (!f) return ret_err(EBADF);
             /* pread on pipes/sockets is invalid (doesn't use/advance file position). */
-            if (f->type == SYSCALL_FTYPE_SOCKET || f->type == FS_TYPE_PIPE) return ret_err(ESPIPE);
+            if (f->type == SYSCALL_FTYPE_SOCKET || f->type == FS_TYPE_PIPE ||
+                f->type == FS_TYPE_EVENTFD || f->type == FS_TYPE_EPOLL)
+                return ret_err(ESPIPE);
             if (!bufp || !user_range_ok(bufp, cnt)) return ret_err(EFAULT);
 
             uint64_t total = 0;
@@ -14498,7 +15097,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (is_init_user(cur))
                 g_dl_read_seen++;
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
-            struct fs_file *f = cur->fds[fd];
+            struct fs_file *f = syscall_fd_get(cur, fd);
             if (!f) return ret_err(EBADF);
             if (cur && cur->name[0] && strstr(cur->name, "openrc")) {
                 static int openrc_read_dbg_left = 24;
@@ -14528,6 +15127,16 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (copy_to_user_safe(bufp, tmp, (size_t)rr) != 0) { kfree(tmp); return ret_err(EFAULT); }
                 }
                 kfree(tmp);
+                return (rr >= 0) ? (uint64_t)rr : ret_read_err(rr);
+            }
+            if (f->type == FS_TYPE_EVENTFD && f->driver_private) {
+                eventfd_t *e = (eventfd_t *)f->driver_private;
+                if (!bufp || !user_range_ok(bufp, cnt)) return ret_err(EFAULT);
+                if (cnt < 8) return ret_err(EINVAL);
+                uint64_t v = 0;
+                ssize_t rr = eventfd_read_bytes(e, &v, 8, cur);
+                if (rr > 0 && copy_to_user_safe(bufp, &v, 8) != 0)
+                    return ret_err(EFAULT);
                 return (rr >= 0) ? (uint64_t)rr : ret_read_err(rr);
             }
             if (!bufp || !user_range_ok(bufp, cnt)) {
@@ -14727,9 +15336,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
              * thread_get_current_user() can point at another process's fd
              * table and spuriously return POLLNVAL (OpenSSH: invalid rfd). */
             thread_t *poll_thr = cur;
-            int is_wget_proc = (poll_thr && poll_thr->name[0] && strstr(poll_thr->name, "wget")) ? 1 : 0;
-            int is_apm_proc = (poll_thr && poll_thr->name[0] && strstr(poll_thr->name, "apm")) ? 1 : 0;
-            int is_git_proc = (poll_thr && poll_thr->name[0] && strstr(poll_thr->name, "git")) ? 1 : 0;
             int is_udhcpc_proc = (poll_thr && poll_thr->name[0] && strstr(poll_thr->name, "udhcpc")) ? 1 : 0;
             if (num == 271) {
                 /* Minimal ppoll: ignore sigmask/sigsetsize, translate timespec->ms for poll(). */
@@ -14743,14 +15349,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (ms == 0 && ts.tv_nsec > 0) ms = 1;
                     if (ms > 0x7FFFFFFFULL) ms = 0x7FFFFFFFULL;
                     timeout = (int)ms;
-                } else {
-                    /* Cap NULL-timeout ppoll so userland can't block forever on network. */
-                    if (is_wget_proc || is_apm_proc || is_git_proc) timeout = 1000;
                 }
+                /* Do NOT cap infinite poll for wget/git — that truncated HTTPS bodies. */
             } else {
                 timeout = (int)a3; /* milliseconds, -1 means infinite */
-                /* Some tools can block forever on network poll(-1); cap so process can progress. */
-                if (timeout < 0 && (is_wget_proc || is_apm_proc || is_git_proc)) timeout = 1000;
             }
             if (nfds < 0 || nfds > 1024) return ret_err(EINVAL);
             volatile int elapsed = 0;
@@ -14774,8 +15376,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!kbuf) return ret_err(ENOMEM);
             if (copy_from_user_raw(kbuf, ufds, bytes) != 0) { kfree(kbuf); return ret_err(EFAULT); }
 
-            enum { POLLIN = 0x001, POLLOUT = 0x004, POLLERR = 0x008, POLLHUP = 0x010, POLLNVAL = 0x020 };
-
             auto_check:
             {
                 /* htop refresh loops live inside one poll/getdents window on SMP
@@ -14791,137 +15391,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 for (int i = 0; i < nfds; i++) {
                     int fd = *(int*)((uint8_t*)kbuf + i * entry_size + 0);
                     short events = *(short*)((uint8_t*)kbuf + i * entry_size + 4);
-                    short revents = 0;
-                    /* Linux/POSIX: negative fd is ignored (revents=0), not POLLNVAL. */
-                    if (fd < 0) {
-                        revents = 0;
-                    } else if (fd >= THREAD_MAX_FD) {
-                        revents = POLLNVAL;
-                    } else {
-                        struct fs_file *f = syscall_fd_get(poll_thr, fd);
-                        if (!f) {
-                            revents = POLLNVAL;
-                        } else {
-                            /* tty */
-                            if (devfs_is_tty_file(f)) {
-                                int tidx = devfs_get_tty_index_from_file(f);
-                                if (tidx < 0) tidx = devfs_get_active();
-                                if ((events & POLLIN) && devfs_tty_available(tidx) > 0) revents |= POLLIN;
-                                if (events & POLLOUT) revents |= POLLOUT;
-                            } else if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
-                                ksock_net_t *s = (ksock_net_t *)f->driver_private;
-                                if (events & POLLOUT) {
-                                    if (s->unix_domain_stub) {
-                                        if (!s->unix_listening && s->connected && !unix_stream_peer_closed(s) && unix_stream_avail_to_write(s) > 0)
-                                            revents |= POLLOUT;
-                                    } else if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge) {
-                                        revents |= POLLOUT;
-                                    } else if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
-                                        net_tcp_ops_t ops;
-                                        net_make_tcp_ops(&ops, &s->tcp);
-                                        if (s->tcp.connect_pending) {
-                                            e1000_poll();
-                                            if (net_tcp_connect_poll(&s->tcp, &ops, 200) == 0) {
-                                                s->connected = 1;
-                                                revents |= POLLOUT;
-                                            } else if (s->tcp.connect_refused) {
-                                                revents |= POLLERR | POLLHUP;
-                                            }
-                                        } else {
-                                            e1000_poll();
-                                            (void)net_tcp_service(&s->tcp, &ops, 64);
-                                            if (s->tcp.established) revents |= POLLOUT;
-                                            if (s->tcp.peer_rst) revents |= POLLERR | POLLHUP;
-                                        }
-                                    } else {
-                                        revents |= POLLOUT;
-                                    }
-                                }
-                                if ((events & POLLIN) && s->sock_domain == AF_NETLINK_LOCAL) {
-                                    if (s->nl_rx_off < s->nl_rx_len) revents |= POLLIN;
-                                } else if (s->unix_domain_stub) {
-                                    if (s->unix_listening) {
-                                        if ((events & POLLIN) && s->unix_accept_count > 0) revents |= POLLIN;
-                                    } else if (s->connected) {
-                                        if ((events & POLLIN) && (unix_stream_avail_to_read(s) > 0 || unix_stream_peer_closed(s))) revents |= POLLIN;
-                                        if ((events & POLLOUT) && !unix_stream_peer_closed(s) && unix_stream_avail_to_write(s) > 0) revents |= POLLOUT;
-                                    }
-                                } else if (s->tcp_listening) {
-                                    net_pump_listen_handshake();
-                                    if ((events & POLLIN) && s->unix_accept_count > 0) revents |= POLLIN;
-                                } else if (s->unix_conn && s->type_base == SOCK_STREAM_LOCAL &&
-                                           s->protocol == IPPROTO_TCP_LOCAL && s->connected) {
-                                    if ((events & POLLIN) && (unix_stream_avail_to_read(s) > 0 || unix_stream_peer_closed(s))) revents |= POLLIN;
-                                    if ((events & POLLOUT) && !unix_stream_peer_closed(s) && unix_stream_avail_to_write(s) > 0) revents |= POLLOUT;
-                                } else if ((events & POLLIN) && s->sock_domain == AF_PACKET_LOCAL) {
-                                    if (!packet_sock_has_data(s))
-                                        net_packet_pump_rx(16);
-                                    if (packet_sock_has_data(s)) revents |= POLLIN;
-                                } else if ((events & POLLIN) &&
-                                           ((s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) ||
-                                            (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge))) {
-                                    if (s->rx_has_pending) revents |= POLLIN;
-                                    else {
-                                        uint32_t sip = 0;
-                                        uint16_t sport = 0;
-                                        int rn = net_recv_udp_datagram(s, s->rx_pending, sizeof(s->rx_pending), 0, &sip, &sport);
-                                        if (rn > 0) {
-                                            ksock_rx_pending_install(s, rn);
-                                            s->rx_pending_src_ip_be = sip;
-                                            s->rx_pending_src_port = sport;
-                                            revents |= POLLIN;
-                                        }
-                                    }
-                                } else if ((events & POLLIN) && s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
-                                    if (s->tcp.connect_pending) {
-                                        net_tcp_ops_t ops;
-                                        net_make_tcp_ops(&ops, &s->tcp);
-                                        (void)net_tcp_connect_poll(&s->tcp, &ops, 0);
-                                    }
-                                    net_pump_tcp_sock(s, 1);
-                                    if (s->tcp.rx_len > 0 || s->tcp.peer_fin || s->tcp.peer_rst || s->tcp.ooo_valid) revents |= POLLIN;
-                                }
-                            } else if (usb_is_devfs_file(f)) {
-                                if (events & POLLOUT) revents |= POLLOUT;
-                                /* MVP: no async IN queue yet, keep POLLIN clear unless future IRQ path adds data. */
-                            } else if (f->type == FS_TYPE_PIPE && f->driver_private) {
-                                pipe_t *p = (pipe_t *)f->driver_private;
-                                unsigned long fl = 0;
-                                acquire_irqsave(&p->lock, &fl);
-                                size_t used = (p->head >= p->tail) ? (p->head - p->tail) : (p->size - p->tail + p->head);
-                                size_t free = (p->size > 1) ? ((p->size - 1) - used) : 0;
-                                int is_write_end = fs_pipe_is_write_end(f);
-                                release_irqrestore(&p->lock, fl);
-                                if (is_write_end) {
-                                    if ((events & POLLOUT) && free > 0) revents |= POLLOUT;
-                                    if (p->refcount < 2) revents |= POLLHUP;
-                                } else {
-                                    if ((events & POLLIN) && used > 0) revents |= POLLIN;
-                                    if (p->refcount < 2) revents |= POLLHUP;
-                                }
-                            } else {
-                                /* regular file / char device */
-                                if (events & POLLOUT)
-                                    revents |= POLLOUT;
-                                if (events & POLLIN) {
-                                    if (f->type != FS_TYPE_DIR) {
-                                        if ((size_t)f->pos < (size_t)f->size)
-                                            revents |= POLLIN;
-                                        else if (f->path &&
-                                                 (strcmp(f->path, "/dev/null") == 0 ||
-                                                  strcmp(f->path, "/dev/zero") == 0 ||
-                                                  strcmp(f->path, "/dev/random") == 0 ||
-                                                  strcmp(f->path, "/dev/urandom") == 0 ||
-                                                  strcmp(f->path, "/dev/full") == 0))
-                                            revents |= POLLIN;
-                                    } else {
-                                        /* directories: indicate readable */
-                                        revents |= POLLIN;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    short revents = fd_poll_revents(poll_thr, fd, events);
                     *(short*)((uint8_t*)kbuf + i * entry_size + 6) = revents; /* revents slot at offset 6 */
                     if (revents) ready++;
                 }
@@ -14971,7 +15441,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         for (int i = 0; i < nfds && n_tty_waiting < (int)(sizeof(tty_waiting)/sizeof(tty_waiting[0])); i++) {
                             int fd = *(int*)((uint8_t*)kbuf + i * entry_size + 0);
                             short events = *(short*)((uint8_t*)kbuf + i * entry_size + 4);
-                            if (fd < 0 || fd >= THREAD_MAX_FD || !(events & POLLIN)) continue;
+                            if (fd < 0 || fd >= THREAD_MAX_FD || !(events & POLLIN_K)) continue;
                             struct fs_file *f = syscall_fd_get(poll_thr, fd);
                             if (!f || !devfs_is_tty_file(f)) continue;
                             int tidx = devfs_get_tty_index_from_file(f);
@@ -15010,7 +15480,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     for (int i = 0; i < nfds && n_tty_waiting < (int)(sizeof(tty_waiting)/sizeof(tty_waiting[0])); i++) {
                         int fd = *(int*)((uint8_t*)kbuf + i * entry_size + 0);
                         short events = *(short*)((uint8_t*)kbuf + i * entry_size + 4);
-                        if (fd < 0 || fd >= THREAD_MAX_FD || !(events & POLLIN)) continue;
+                        if (fd < 0 || fd >= THREAD_MAX_FD || !(events & POLLIN_K)) continue;
                         struct fs_file *f = syscall_fd_get(poll_thr, fd);
                         if (!f || !devfs_is_tty_file(f)) continue;
                         int tidx = devfs_get_tty_index_from_file(f);
@@ -15441,6 +15911,45 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             return 0;
         }
+        case SYS_eventfd:
+        case SYS_eventfd2: {
+            /* int eventfd(unsigned int initval, int flags) / eventfd2 */
+            unsigned int initval = (unsigned int)a1;
+            int flags = (num == SYS_eventfd2) ? (int)a2 : 0;
+            if (flags & ~(EFD_CLOEXEC_K | EFD_NONBLOCK_K | EFD_SEMAPHORE_K))
+                return ret_err(EINVAL);
+            eventfd_t *e = (eventfd_t *)kmalloc(sizeof(*e));
+            struct fs_file *f = (struct fs_file *)kmalloc(sizeof(*f));
+            char *path = (char *)kmalloc(16);
+            if (!e || !f || !path) {
+                if (e) kfree(e);
+                if (f) kfree(f);
+                if (path) kfree(path);
+                return ret_err(ENOMEM);
+            }
+            memset(e, 0, sizeof(*e));
+            memset(f, 0, sizeof(*f));
+            e->count = (uint64_t)initval;
+            e->nonblock = (flags & EFD_NONBLOCK_K) ? 1 : 0;
+            e->semaphore = (flags & EFD_SEMAPHORE_K) ? 1 : 0;
+            e->reader_waiter_tid = e->writer_waiter_tid = -1;
+            e->lock.lock = 0;
+            snprintf(path, 16, "anon_inode:[eventfd]");
+            f->path = path;
+            f->type = FS_TYPE_EVENTFD;
+            f->driver_private = e;
+            f->refcount = 1;
+            int fd = thread_fd_alloc(f);
+            if (fd < 0) {
+                kfree(e);
+                kfree(path);
+                kfree(f);
+                return ret_err(EMFILE);
+            }
+            if (cur->process && (flags & EFD_CLOEXEC_K))
+                cur->process->fd_cloexec[fd] = 1;
+            return (uint64_t)fd;
+        }
         case SYS_close: {
             int fd = (int)a1;
             boot_io_log(cur, "close", fd, 0);
@@ -15504,7 +16013,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 cs.st_mode = (uint32_t)st.st_mode;
                 cs.st_uid = (uint32_t)st.st_uid;
                 cs.st_gid = (uint32_t)st.st_gid;
-                cs.st_rdev = 0;
+                cs.st_rdev = (uint64_t)st.st_rdev;
                 cs.st_size = (int64_t)st.st_size;
                 cs.st_blksize = 4096;
                 cs.st_blocks = (st.st_size + 511) / 512;
@@ -15565,7 +16074,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 cs.st_mode = (uint32_t)st.st_mode;
                 cs.st_uid = (uint32_t)st.st_uid;
                 cs.st_gid = (uint32_t)st.st_gid;
-                cs.st_rdev = 0;
+                cs.st_rdev = (uint64_t)st.st_rdev;
                 cs.st_size = (int64_t)st.st_size;
                 cs.st_blksize = 4096;
                 cs.st_blocks = (st.st_size + 511) / 512;
@@ -15700,7 +16209,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 cs.st_mode = (uint32_t)st.st_mode;
                 cs.st_uid = (uint32_t)st.st_uid;
                 cs.st_gid = (uint32_t)st.st_gid;
-                cs.st_rdev = 0;
+                cs.st_rdev = (uint64_t)st.st_rdev;
                 cs.st_size = (int64_t)st.st_size;
                 cs.st_blksize = 4096;
                 cs.st_blocks = (st.st_size + 511) / 512;
@@ -15984,6 +16493,32 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return 0;
             }
             return ret_err(EINVAL);
+        }
+        case SYS_iopl: {
+            /* Linux: iopl(level) — set I/O privilege level 0..3. Needs CAP_SYS_RAWIO. */
+            unsigned long level = (unsigned long)a1;
+            if (level > 3)
+                return ret_err(EINVAL);
+            if (!cur || cur->euid != 0)
+                return ret_err(EPERM);
+            /* IOPL is recorded; port I/O still goes through kernel PCI helpers.
+             * Returning success matches Linux CAP_SYS_RAWIO for privileged tasks. */
+            cur->iopl = (uint8_t)level;
+            return 0;
+        }
+        case SYS_ioperm: {
+            /* Linux: ioperm(from, num, turn_on) — I/O bitmap for ports < 0x10000. */
+            unsigned long from = (unsigned long)a1;
+            unsigned long num = (unsigned long)a2;
+            int turn_on = (int)a3;
+            if (from >= 0x10000UL || num > 0x10000UL || from + num > 0x10000UL)
+                return ret_err(EINVAL);
+            if (!cur || cur->euid != 0)
+                return ret_err(EPERM);
+            (void)turn_on;
+            /* Full TSS I/O bitmap not wired; privilege check + success is the Linux ABI
+             * Xorg expects before probing VGA ports / PCI. */
+            return 0;
         }
         case SYS_arch_prctl: {
             /* Linux x86_64 arch_prctl(code, addr) — rdi=code, rsi=addr */
@@ -16551,13 +17086,30 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     cur->clear_child_tid = 0;
                     sysv_shm_detach_all_for_tid(
                         (uint64_t)(cur->tid ? cur->tid : 1));
-                    /* Drop only this task's clone-time fd references. The
-                     * process-owned descriptors remain open for its peers. */
+                    /*
+                     * Drop this task's fd refs. process->fds is shared:
+                     * - Inherit (leader still mirrors the slot): drop the
+                     *   extra fork_inherit ref only.
+                     * - open/socket by this thread into process->fds: close
+                     *   and clear the process slot. Leaving bound UDP DNS
+                     *   sockets in ksock_registry stole replies from the
+                     *   leader / next curl (error 6 after a successful run).
+                     */
                     for (int fd = 0; fd < THREAD_MAX_FD; ++fd) {
                         struct fs_file *f = cur->fds[fd];
                         cur->fds[fd] = NULL;
-                        if (f)
-                            fs_file_free(f);
+                        if (!f)
+                            continue;
+                        if (cur->process && cur->process->fds[fd] == f) {
+                            thread_t *lead = cur->process->leader;
+                            if (lead && lead != cur && lead->fds[fd] == f) {
+                                fs_file_free(f);
+                                continue;
+                            }
+                            cur->process->fds[fd] = NULL;
+                            cur->process->fd_cloexec[fd] = 0;
+                        }
+                        fs_file_free(f);
                     }
                     if (cur->mm_ptemplate) {
                         mm_release(cur->mm_ptemplate);
@@ -16927,6 +17479,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 ep->items[ep->nitems].fd = fd;
                 ep->items[ep->nitems].events = ev.events;
                 ep->items[ep->nitems].data = ev.data;
+                ep->items[ep->nitems].et_delivered = 0;
                 ep->nitems++;
                 return 0;
             }
@@ -16934,6 +17487,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (idx < 0) return ret_err(ENOENT);
             ep->items[idx].events = ev.events;
             ep->items[idx].data = ev.data;
+            ep->items[idx].et_delivered = 0; /* re-arm edge trigger */
             return 0;
         }
         case 232: /* epoll_wait */
@@ -16966,12 +17520,23 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (it->events == 0) continue; /* disabled after ONESHOT */
                     short want = (short)epoll_interest_to_poll(it->events);
                     short rev = fd_poll_revents(wait_thr, it->fd, want);
-                    if (!rev) continue;
+                    if (!rev) {
+                        it->et_delivered = 0; /* edge re-arms when not ready */
+                        continue;
+                    }
                     uint32_t erev = poll_to_epoll_revents(rev, it->events);
-                    if (!erev) continue;
+                    if (!erev) {
+                        it->et_delivered = 0;
+                        continue;
+                    }
+                    /* EPOLLET: deliver once per ready period until quiesced. */
+                    if ((it->events & EPOLLET_K) && it->et_delivered)
+                        continue;
                     outbuf[nout].events = erev;
                     outbuf[nout].data = it->data;
                     nout++;
+                    if (it->events & EPOLLET_K)
+                        it->et_delivered = 1;
                     if (it->events & EPOLLONESHOT_K)
                         it->events = 0;
                 }

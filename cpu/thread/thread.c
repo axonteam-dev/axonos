@@ -923,6 +923,8 @@ int thread_fd_close(int fd) {
         cur->process->fds[fd] = NULL;
         cur->process->fd_cloexec[fd] = 0;
     }
+    /* Linux: close() auto-removes fd from all epoll interest lists. */
+    epoll_notify_fd_closed(cur, fd);
     fs_file_free(f);
     return 0;
 }

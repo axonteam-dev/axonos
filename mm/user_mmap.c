@@ -104,9 +104,21 @@ static int user_mmap_install_pages(uintptr_t addr, size_t len, uintptr_t top_lim
         if (t && t->mm && k && t->mm->pml4 && k->pml4 &&
             t->mm->pml4 != k->pml4) {
             mm_t *share = t->mm_ptemplate ? t->mm_ptemplate : k;
-            if (mm_privatize_identity_range_blank(t->mm, req_lo, req_hi) != 0)
+            if (!share || !share->pml4)
                 return -1;
-            return mm_make_private_range(t->mm, req_lo, req_hi, 0, share);
+            /*
+             * Linux do_mmap/do_anonymous_page: private anon → fresh zero pages.
+             * mm_demote_user_identity leaves !US identity; unmap must see those
+             * (mm_va_leaf_pa). Only clear [req_lo,req_hi) — wiping the whole
+             * covering 2MiB destroyed sibling anon maps (curl body buffer) so
+             * the later write(stdout) copy_from_user EFAULT'd → curl error 23.
+             */
+            if (mm_unmap_user_range(t->mm, share->pml4, req_lo, req_hi) != 0)
+                return -1;
+            if (mm_make_private_range_bulk_zero_force(t->mm, req_lo, req_hi,
+                                                     share) != 0)
+                return -1;
+            return 0;
         }
     }
     uintptr_t map_begin = addr & ~((uintptr_t)PAGE_SIZE_2M - 1);

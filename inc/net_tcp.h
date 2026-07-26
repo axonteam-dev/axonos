@@ -27,7 +27,10 @@ typedef struct {
     int connect_pending; /* nonblocking connect: SYN sent, awaiting SYN-ACK */
     int connect_peer_pkts; /* RX TCP segments from peer during connect (debug) */
     int connect_refused; /* valid RST while connecting: SO_ERROR/errno = ECONNREFUSED */
+    uint64_t connect_syn_ms; /* last SYN (re)transmit time for nonblocking poll */
     int peer_fin;
+    int peer_fin_pending; /* FIN seen but rcv_nxt has not reached fin seq yet */
+    uint32_t peer_fin_seq; /* seq of FIN (after any payload on that segment) */
     int peer_rst;
     uint32_t dst_ip_be;
     uint16_t dst_port;
@@ -44,8 +47,8 @@ typedef struct {
      * represent normal VMware/NAT reordering and used to silently lose tails
      * when an in-order retransmit overlapped the saved segment.
      */
-#define NET_TCP_OOO_SLOTS 8
-#define NET_TCP_OOO_BYTES 1536
+#define NET_TCP_OOO_SLOTS 16
+#define NET_TCP_OOO_BYTES 1600
     uint8_t ooo_buf[NET_TCP_OOO_SLOTS][NET_TCP_OOO_BYTES];
     size_t ooo_len[NET_TCP_OOO_SLOTS];
     uint32_t ooo_seq[NET_TCP_OOO_SLOTS];

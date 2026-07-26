@@ -30,6 +30,7 @@
 #include <ext2.h>
 #include <ramfs.h>
 #include <sysfs.h>
+#include <fbdev.h>
 #include <procfs.h>
 #include <initfs.h>
 #include <bootparam.h>
@@ -48,6 +49,7 @@
 #include <klog.h>
 #include <boot_logo.h>
 #include <debug.h>
+#include <font.h>
 #include <vbe.h>
 #include <cirrus.h>
 #include <vmwgfx.h>
@@ -236,6 +238,8 @@ void kernel_sysfs_populate_default(void) {
     }
     usb_sysfs_populate_default();
     pci_sysfs_init();  /* /sys/bus/pci/devices для lspci */
+    /* Video registers /dev/fb0 before /sys exists — publish graphics sysfs now. */
+    fbdev_sysfs_publish_late();
     keyboard_publish_sysfs();
     mouse_publish_sysfs();
 }
@@ -346,20 +350,89 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
      * borrows regular-file data from this region, so it must remain reserved
      * for the lifetime of the system.
      *
-     * 0x42000000 is above the complete userspace VA layout and the preserved
-     * MB2/kzip areas, but remains below the conservative 2 GiB PCI-hole limit.
+     * Prefer PA above USER_STACK_TOP so the identity heap can sit after the
+     * initrd. Never land on the Multiboot/GRUB linear framebuffer — gfxterm
+     * kprintf would then paint glyphs into the cpio (classic "bad magic" a few
+     * hundred bytes in). Linux keeps initrd in memblock-reserved RAM for the
+     * same reason.
      */
     if (axon_boot_params_phys) {
         uintptr_t rd_start = 0;
         size_t rd_size = 0;
         if (linux_bootparams_ramdisk((const void *)(uintptr_t)axon_boot_params_phys,
                                      &rd_start, &rd_size) == 0) {
-            const uintptr_t safe_start = (uintptr_t)0x42000000u;
-            uintptr_t safe_end = 0;
+            uint64_t fb_lo = 0, fb_hi = 0;
+            if (multiboot_magic == 0x36d76289u && multiboot_info != 0) {
+                uint8_t *p = (uint8_t *)(uintptr_t)multiboot_info;
+                uint32_t total_size = *(uint32_t *)p;
+                if (total_size >= 16u && total_size <= (64u * 1024u * 1024u)) {
+                    uint32_t off = 8;
+                    while (off + 8u <= total_size) {
+                        uint32_t tag_type = *(uint32_t *)(p + off);
+                        uint32_t tag_size = *(uint32_t *)(p + off + 4);
+                        if (tag_size < 8u) break;
+                        if ((uint64_t)off + (uint64_t)tag_size > (uint64_t)total_size) break;
+                        if (tag_type == 0u) break;
+                        if (tag_type == 8u && tag_size >= 32u) {
+                            uint64_t fb_addr = *(uint64_t *)(p + off + 8);
+                            uint32_t pitch = *(uint32_t *)(p + off + 16);
+                            uint32_t height = *(uint32_t *)(p + off + 24);
+                            if (fb_addr && fb_addr != 0xB8000ULL && fb_addr != 0xB0000ULL &&
+                                pitch && height) {
+                                uint64_t fb_sz = (uint64_t)pitch * (uint64_t)height;
+                                if (fb_sz > 0 && fb_addr + fb_sz > fb_addr) {
+                                    fb_lo = fb_addr;
+                                    fb_hi = fb_addr + fb_sz;
+                                }
+                            }
+                            break;
+                        }
+                        off += (tag_size + 7u) & ~7u;
+                    }
+                }
+            }
+
             uint64_t ram_bytes = (uint64_t)sysinfo_ram_mb() * 1024ULL * 1024ULL;
-            if (!__builtin_add_overflow(safe_start, rd_size, &safe_end) &&
-                rd_start != safe_start &&
-                safe_end + (32u * 1024u * 1024u) <= ram_bytes) {
+            const uintptr_t candidates[] = {
+                (uintptr_t)0x42000000u,
+                (uintptr_t)USER_STACK_TOP + (32u * 1024u * 1024u),
+                (uintptr_t)0x48000000u,
+                (uintptr_t)0x50000000u,
+            };
+            uintptr_t safe_start = 0;
+            for (unsigned ci = 0; ci < sizeof(candidates) / sizeof(candidates[0]); ci++) {
+                uintptr_t cand = candidates[ci];
+                uintptr_t cand_end = 0;
+                if (__builtin_add_overflow(cand, rd_size, &cand_end))
+                    continue;
+                if ((uint64_t)cand_end + (32ull * 1024ull * 1024ull) > ram_bytes)
+                    continue;
+                if (fb_hi > fb_lo) {
+                    uint64_t a0 = (uint64_t)cand, a1 = (uint64_t)cand_end;
+                    if (a0 < fb_hi && fb_lo < a1) {
+                        /* Candidate overlaps GRUB FB — try just after the FB. */
+                        uint64_t after = (fb_hi + 0x1fffffull) & ~0x1fffffull;
+                        if (after < (uint64_t)USER_STACK_TOP + (16ull * 1024ull * 1024ull))
+                            after = (uint64_t)USER_STACK_TOP + (32ull * 1024ull * 1024ull);
+                        if (after > (uint64_t)(uintptr_t)-1)
+                            continue;
+                        cand = (uintptr_t)after;
+                        if (__builtin_add_overflow(cand, rd_size, &cand_end))
+                            continue;
+                        if ((uint64_t)cand_end + (32ull * 1024ull * 1024ull) > ram_bytes)
+                            continue;
+                        a0 = (uint64_t)cand;
+                        a1 = (uint64_t)cand_end;
+                        if (a0 < fb_hi && fb_lo < a1)
+                            continue;
+                    }
+                }
+                if ((uintptr_t)rd_start == cand)
+                    break; /* already safe */
+                safe_start = cand;
+                break;
+            }
+            if (safe_start && (uintptr_t)rd_start != safe_start) {
                 memmove((void *)safe_start, (const void *)rd_start, rd_size);
                 uint8_t *bp = (uint8_t *)(uintptr_t)axon_boot_params_phys;
                 *(uint32_t *)(bp + LINUX_BOOTPARAM_OFF_RAMDISK_IMG) =
@@ -370,6 +443,13 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         (unsigned long long)rd_size,
                         (unsigned long long)rd_start,
                         (unsigned long long)safe_start);
+                if (fb_hi > fb_lo)
+                    kprintf("initfs: avoided GRUB fb [0x%llx..0x%llx)\n",
+                            (unsigned long long)fb_lo, (unsigned long long)fb_hi);
+            } else if (fb_hi > fb_lo) {
+                uint64_t a0 = (uint64_t)rd_start, a1 = (uint64_t)rd_start + (uint64_t)rd_size;
+                if (a0 < fb_hi && fb_lo < a1)
+                    kprintf("initfs: WARNING ramdisk overlaps GRUB fb — cpio may be corrupted by console\n");
             }
         }
     }
@@ -513,6 +593,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 (void*)heap_base_addr(),
                 sysinfo_ram_mb(),
                 (void*)(uintptr_t)_end, (void*)mods_end);
+        /* Default 8x16 until VFS/console.pf2 (or explicit pf2 load). */
+        font_init_default();
     }
 
     gdt_init();
@@ -694,6 +776,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         for (;;);
     }
 
+    /* Optional runtime .pf2 from initfs (/etc/fonts/console.pf2, …). */
+    font_try_load_console_pf2();
+
     klogprintf("boot: post-initfs setup (devfs, disks, /etc)...\n");
 
     /* register devfs and mount at /dev so /dev/tty0, /dev/console etc. exist before init/getty */
@@ -841,6 +926,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 "pid        /var/run/nginx.pid;\n"
                 "\n"
                 "events {\n"
+                "    # packaged nginx has no epoll module; kernel epoll ABI is ready\n"
                 "    use poll;\n"
                 "    worker_connections  256;\n"
                 "}\n"
@@ -1030,6 +1116,24 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         if (ifile) {
             fs_write(ifile, issue, sizeof(issue) - 1, 0);
             fs_file_free(ifile);
+        }
+    }
+    /* Linux os-release: tools use ID_LIKE=linux; uname sysname is separately "Linux". */
+    {
+        static const char osrel[] =
+            "NAME=\"" OS_NAME "\"\n"
+            "PRETTY_NAME=\"" OS_NAME " " OS_VERSION "\"\n"
+            "ID=axonos\n"
+            "ID_LIKE=linux\n"
+            "VERSION=\"" OS_VERSION "\"\n"
+            "VERSION_ID=\"" OS_VERSION "\"\n"
+            "HOME_URL=\"https://axont.ru\"\n";
+        struct fs_file *of = fs_create_file("/etc/os-release");
+        if (!of) of = fs_open("/etc/os-release");
+        if (of) {
+            (void)vfs_ftruncate(of, 0);
+            fs_write(of, osrel, sizeof(osrel) - 1, 0);
+            fs_file_free(of);
         }
     }
     /* /etc/securetty: TTY devices from which root can log in */

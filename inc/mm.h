@@ -122,6 +122,8 @@ int mm_cow_mark_all_user_writable_child_l4(mm_t *child, uint64_t *parent_l4,
 int mm_cow_fault_page(mm_t *mm, uint64_t va, mm_t *share_cmp_mm);
 int mm_break_cow_range_for_write(mm_t *mm, mm_t *share_cmp_mm,
                                  uint64_t va_begin, uint64_t va_end);
+/* Linux do_wp_page for present write on a private writable VMA/brk page. */
+int mm_wp_fault_writable(mm_t *mm, uint64_t va, mm_t *share_cmp_mm);
 
 /* Fork child entry: copy up to max_pages live parent pages into child when parent
  * has diverged from shared read-only COW (parent writable or child already private).

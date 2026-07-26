@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <uapi_linux_fb.h>
 
 struct fs_file;
 
@@ -19,3 +20,18 @@ int fbdev_mmap_user(uintptr_t addr, size_t len, size_t file_off);
 
 void fbdev_copy_to(void *dst, size_t offset, size_t n);
 void fbdev_copy_from(size_t offset, const void *src, size_t n);
+
+void fbdev_get_var(struct fb_var_screeninfo *v);
+void fbdev_get_fix(struct fb_fix_screeninfo *f);
+/* Validate FBIOPUT_VSCREENINFO / pan; 0 or -errno. */
+int fbdev_check_var(const struct fb_var_screeninfo *v);
+void fbdev_flush_display(void);
+
+/*
+ * Linux sysfs for Xorg libfbdevhw:
+ *   /sys/bus/pci/devices/0000:BB:DD.F/graphics/fb0/   (PCI probe)
+ *   /sys/class/graphics/fb0 -> ../../devices/platform/axonfb.0  (non-PCI Option "fbdev")
+ */
+void fbdev_sysfs_publish(uint8_t bus, uint8_t device, uint8_t function);
+/* Call after sysfs_register()/mount — early video init runs before /sys exists. */
+void fbdev_sysfs_publish_late(void);

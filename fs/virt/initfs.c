@@ -141,6 +141,25 @@ struct __attribute__((packed)) cpio_newc_header {
 };
 typedef char initfs_cpio_hdr_sz_chk[sizeof(struct cpio_newc_header) == 110u ? 1 : -1];
 
+/* Linux init/initramfs.c — name field padded with N_ALIGN, then body, then 4-byte pad.
+ * Padding is relative to the *stream* start (writer's offset 0), not absolute PA.
+ * Absolute (off+3)&~3 is wrong when the stream is preceded by a short prefix. */
+#define CPIO_HDRLEN 110u
+#define CPIO_N_ALIGN(len) ((((uint32_t)(len) + 1u) & ~3u) + 2u)
+
+static size_t cpio_newc_data_off(size_t stream_start, size_t header_off, uint32_t namesize) {
+    size_t rel = header_off - stream_start;
+    return stream_start + rel + (size_t)CPIO_HDRLEN + (size_t)CPIO_N_ALIGN(namesize);
+}
+
+static size_t cpio_newc_next_off(size_t stream_start, size_t header_off,
+                                 uint32_t namesize, uint32_t filesize) {
+    size_t rel = header_off - stream_start;
+    size_t next_rel = rel + (size_t)CPIO_HDRLEN + (size_t)CPIO_N_ALIGN(namesize) + (size_t)filesize;
+    next_rel = (next_rel + 3u) & ~3u;
+    return stream_start + next_rel;
+}
+
 static uint32_t hex_to_uint(const char *hex, size_t length) {
     uint32_t r = 0;
     for (size_t i = 0; i < length; i++) {
@@ -188,10 +207,12 @@ static int plausible_cpio_header(const struct cpio_newc_header *h, size_t remain
     if (namesize == 0 || namesize > 65536) return 0;
     /* header + namesize must fit */
     if (sizeof(*h) + namesize > remaining) return 0;
-    /* file data must fit (with 4-byte alignment for data start) */
-    size_t after_name = sizeof(*h) + namesize;
-    size_t file_data_offset = (after_name + 3) & ~3u;
+    /* Linux: data at hdr + 110 + N_ALIGN(namesize); body then 4-aligned next */
+    size_t file_data_offset = (size_t)CPIO_HDRLEN + (size_t)CPIO_N_ALIGN(namesize);
+    size_t next_rel = file_data_offset + (size_t)filesize;
+    next_rel = (next_rel + 3u) & ~3u;
     if (file_data_offset + (size_t)filesize > remaining) return 0;
+    if (next_rel > remaining) return 0;
     return 1;
 }
 
@@ -201,6 +222,7 @@ static int cpio_newc_walk_reaches_trailer_from(const uint8_t *base, size_t lim, 
     if (!base || lim < sizeof(struct cpio_newc_header) || start > lim) return 0;
     if (start + sizeof(struct cpio_newc_header) > lim) return 0;
     size_t offset = start;
+    const size_t stream_start = start;
     while (offset + sizeof(struct cpio_newc_header) <= lim) {
         const struct cpio_newc_header *h = (const struct cpio_newc_header *)(base + offset);
         const uint8_t *magic = base + offset;
@@ -208,82 +230,78 @@ static int cpio_newc_walk_reaches_trailer_from(const uint8_t *base, size_t lim, 
         if (!plausible_cpio_header(h, lim - offset)) return 0;
         uint32_t namesize = hex_to_uint(h->c_namesize, 8);
         uint32_t filesize = hex_to_uint(h->c_filesize, 8);
-        size_t header_size = sizeof(struct cpio_newc_header);
-        size_t name_offset = offset + header_size;
+        size_t name_offset = offset + CPIO_HDRLEN;
         if (name_offset + namesize > lim) return 0;
         const char *name = (const char *)(base + name_offset);
-    if (strcmp(name, "TRAILER!!!") == 0) return 1;
-        char target[512];
-        initfs_normalize_target(target, sizeof(target), name);
-        size_t after_name = name_offset + namesize;
-        size_t file_data_offset = (after_name + 3) & ~3u;
+        if (strcmp(name, "TRAILER!!!") == 0) return 1;
+        size_t file_data_offset = cpio_newc_data_off(stream_start, offset, namesize);
         if (file_data_offset + filesize > lim) return 0;
-        if (strcmp(target, "/") == 0) {
-            size_t next_root = file_data_offset + filesize;
-            if (next_root <= offset || next_root > lim) return 0;
-            next_root = (next_root + 3) & ~3u;
-            if (next_root <= offset) return 0;
-            offset = next_root;
-            continue;
-        }
-        size_t next = file_data_offset + filesize;
+        size_t next = cpio_newc_next_off(stream_start, offset, namesize, filesize);
         if (next <= offset || next > lim) return 0;
-        next = (next + 3) & ~3u;
-        if (next <= offset) return 0;
         offset = next;
     }
     return 0;
 }
 
+/* Cheap: first entry + next header look like newc (no full-archive walk). */
+static int cpio_newc_looks_like_stream_at(const uint8_t *base, size_t archive_size, size_t i) {
+    if (!base || i + sizeof(struct cpio_newc_header) > archive_size) return 0;
+    if (!(memcmp(base + i, "070701", 6) == 0 || memcmp(base + i, "070702", 6) == 0)) return 0;
+    const struct cpio_newc_header *h = (const struct cpio_newc_header *)(base + i);
+    if (!plausible_cpio_header(h, archive_size - i)) return 0;
+    uint32_t namesize = hex_to_uint(h->c_namesize, 8);
+    uint32_t filesize = hex_to_uint(h->c_filesize, 8);
+    if (CPIO_HDRLEN + (size_t)namesize > archive_size - i) return 0;
+    const char *name = (const char *)(base + i + CPIO_HDRLEN);
+    if (namesize == 0 || name[namesize - 1] != '\0') return 0;
+    if (strcmp(name, "TRAILER!!!") == 0) return 1;
+    size_t next = cpio_newc_next_off(i, i, namesize, filesize);
+    if (next <= i || next + 6 > archive_size) return 0;
+    const uint8_t *nm = base + next;
+    return (memcmp(nm, "070701", 6) == 0 || memcmp(nm, "070702", 6) == 0) ? 1 : 0;
+}
+
 /* Find a reliable starting offset of a cpio newc stream within a buffer.
-   Prefer offset 0 if magic + plausible header (do not require plausible_cpio_name on
-   entry 0 — rejecting it pushed find_cpio_start to a false "070701" inside file data).
-   For i>0: cheap next-header heuristic, then full walk to TRAILER!!! (walk is authoritative).
-   Do not require plausible_cpio_name here — it could skip the real stream and match a later
-   accidental 070701 inside the same prefix. */
+ * Linux unpack_to_rootfs: skip leading NUL pads, start only on 4-aligned '0' when
+ * possible. Also accept a short non-NUL prefix (e.g. "./init\\n" from `cpio -v` /
+ * redirected stdout) — magic may sit at an unaligned offset; stream-relative
+ * N_ALIGN padding still parses that correctly. Scan every byte in a bounded
+ * prefix (step-4 misses offset 7). */
 static size_t find_cpio_start(const uint8_t *base, size_t archive_size) {
     if (!base || archive_size < sizeof(struct cpio_newc_header)) return (size_t)-1;
 
-    /* fast path: archive begins with magic + plausible header (packed struct required). */
-    if ((memcmp(base, "070701", 6) == 0 || memcmp(base, "070702", 6) == 0) &&
-        plausible_cpio_header((const struct cpio_newc_header *)base, archive_size)) {
-            return 0;
+    size_t skip = 0;
+    while (skip < archive_size && skip < 4096u && base[skip] == 0)
+        skip++;
+
+    if (skip + sizeof(struct cpio_newc_header) <= archive_size &&
+        (memcmp(base + skip, "070701", 6) == 0 || memcmp(base + skip, "070702", 6) == 0) &&
+        plausible_cpio_header((const struct cpio_newc_header *)(base + skip), archive_size - skip)) {
+        /* Prefer Linux 4-aligned stream starts when the magic is already aligned. */
+        if ((skip & 3u) == 0u)
+            return skip;
+        if (cpio_newc_looks_like_stream_at(base, archive_size, skip))
+            return skip;
     }
 
-    /* Slow scan: bounded prefix only (aligned steps). Allow large prepended blobs
-       (e.g. microcode, vendor headers) before the main newc ramdisk. */
     size_t scan_limit = archive_size;
     if (scan_limit > (16u * 1024u * 1024u)) scan_limit = (16u * 1024u * 1024u);
-    for (size_t i = 0; i + sizeof(struct cpio_newc_header) <= scan_limit; i += 4) {
+    size_t cheap_hit = (size_t)-1;
+    for (size_t i = skip; i + sizeof(struct cpio_newc_header) <= scan_limit; i++) {
         if (!(memcmp(base + i, "070701", 6) == 0 || memcmp(base + i, "070702", 6) == 0)) continue;
-        const struct cpio_newc_header *h = (const struct cpio_newc_header *)(base + i);
-        if (!plausible_cpio_header(h, archive_size - i)) continue;
-        uint32_t namesize = hex_to_uint(h->c_namesize, 8);
-        uint32_t filesize = hex_to_uint(h->c_filesize, 8);
-        if (sizeof(*h) + (size_t)namesize > archive_size - i) continue;
-        const char *name = (const char *)(base + i + sizeof(*h));
-        if (namesize == 0 || name[namesize - 1] != '\0') continue;
-
-        /* Empty cpio: single TRAILER record (no following header). */
-        if (strcmp(name, "TRAILER!!!") == 0) {
-            if (cpio_newc_walk_reaches_trailer_from(base, archive_size, i)) return i;
-            continue;
-        }
-
-        /* Otherwise require a plausible next newc header (file or TRAILER). */
-        size_t after_name = sizeof(*h) + (size_t)namesize;
-        size_t file_data_offset = (after_name + 3) & ~3u;
-        size_t next = file_data_offset + (size_t)filesize;
-        next = (next + 3) & ~3u;
-        if (next <= file_data_offset) continue;
-        if (i + next + 6 <= archive_size) {
-            const uint8_t *nm = base + i + next;
-            if (memcmp(nm, "070701", 6) == 0 || memcmp(nm, "070702", 6) == 0) {
-                if (cpio_newc_walk_reaches_trailer_from(base, archive_size, i)) return i;
-            }
+        if (!cpio_newc_looks_like_stream_at(base, archive_size, i)) continue;
+        if (cheap_hit == (size_t)-1)
+            cheap_hit = i;
+        /* Confirm with trailer walk only for early offsets (prefix / pad). */
+        if (i < 4096u) {
+            if (cpio_newc_walk_reaches_trailer_from(base, archive_size, i))
+                return i;
+            if (i < 64u)
+                return i;
         }
     }
-
+    if (cheap_hit != (size_t)-1)
+        return cheap_hit;
     return (size_t)-1;
 }
 
@@ -557,6 +575,7 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
     if (found != 0)
         klogprintf("initfs: cpio stream offset %zu (embedded / prefixed)\n", found);
     offset = found;
+    size_t stream_start = found;
     qemu_debug_printf("initfs: --- cpio entries (before unpack) ---\n");
 
     int saw_trailer = 0;
@@ -566,15 +585,34 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
            Compare raw bytes from the module to avoid any struct/padding surprises. */
         const uint8_t *magic = base + offset;
         if (!((memcmp(magic, "070701", 6) == 0) || (memcmp(magic, "070702", 6) == 0))) {
+            /* Linux: NUL padding between concatenated archives */
+            if (magic[0] == 0) {
+                size_t z = offset;
+                while (z < archive_size && base[z] == 0 && (z - offset) < 512u) z++;
+                if (z > offset && (z & 3u) == 0u &&
+                    z + 6 <= archive_size &&
+                    (memcmp(base + z, "070701", 6) == 0 || memcmp(base + z, "070702", 6) == 0)) {
+                    offset = z;
+                    stream_start = z; /* concatenated newc member (Linux Reset→Start) */
+                    continue;
+                }
+            }
             size_t next = find_next_cpio_stream(base, archive_size, offset);
             if (next != (size_t)-1) {
                 klogprintf("initfs: skipped corrupt cpio range [%zu..%zu) at entry #%d\n",
                            offset, next, cpio_entry_num);
                 offset = next;
+                stream_start = next;
                 continue;
             }
-            klogprintf("initfs: cpio bad magic at offset %u entry #%d\n",
-                       (unsigned)offset, cpio_entry_num);
+            klogprintf("initfs: cpio bad magic at offset %u entry #%d (bytes %02x %02x %02x %02x %02x %02x)\n",
+                       (unsigned)offset, cpio_entry_num,
+                       offset + 0 < archive_size ? base[offset + 0] : 0,
+                       offset + 1 < archive_size ? base[offset + 1] : 0,
+                       offset + 2 < archive_size ? base[offset + 2] : 0,
+                       offset + 3 < archive_size ? base[offset + 3] : 0,
+                       offset + 4 < archive_size ? base[offset + 4] : 0,
+                       offset + 5 < archive_size ? base[offset + 5] : 0);
             return -1;
         }
         /* additional plausibility check to avoid false positives where "070701"
@@ -585,6 +623,7 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
                 klogprintf("initfs: skipped implausible cpio range [%zu..%zu) at entry #%d\n",
                            offset, next, cpio_entry_num);
                 offset = next;
+                stream_start = next;
                 continue;
             }
             klogprintf("initfs: cpio implausible header at offset %u entry #%d\n",
@@ -593,8 +632,7 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
         }
         uint32_t namesize = hex_to_uint(h->c_namesize, 8);
         uint32_t filesize = hex_to_uint(h->c_filesize, 8);
-        size_t header_size = sizeof(struct cpio_newc_header);
-        size_t name_offset = offset + header_size;
+        size_t name_offset = offset + CPIO_HDRLEN;
         if (name_offset + namesize > archive_size) {
             klogprintf("initfs: error: name extends past archive\n");
             return -1;
@@ -605,9 +643,8 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
             saw_trailer = 1;
             break;
         }
-        /* compute data offset (header + namesize aligned to 4) */
-        size_t after_name = name_offset + namesize;
-        size_t file_data_offset = (after_name + 3) & ~3u;
+        /* Linux N_ALIGN name pad + 4-byte body pad, relative to stream start */
+        size_t file_data_offset = cpio_newc_data_off(stream_start, offset, namesize);
         if (file_data_offset + filesize > archive_size) {
             klogprintf("initfs: error: file data extends past archive for %s\n", name);
             return -1;
@@ -627,14 +664,9 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
 
         if (strcmp(target, "/") == 0) {
             /* Ignore root pseudo-entry like "." */
-            size_t next_root = file_data_offset + filesize;
+            size_t next_root = cpio_newc_next_off(stream_start, offset, namesize, filesize);
             if (next_root <= offset || next_root > archive_size) {
                 klogprintf("initfs: cpio bad root skip at offset %u\n", (unsigned)offset);
-                return -1;
-            }
-            next_root = (next_root + 3) & ~3u;
-            if (next_root <= offset) {
-                klogprintf("initfs: cpio root align wrap at offset %u\n", (unsigned)offset);
                 return -1;
             }
             offset = next_root;
@@ -774,19 +806,11 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
             /* other types (device, fifo...) - skip for now */
             //kprintf("initfs: skipping special file %s (mode %o)\n", target, mode);
         }
-        /* advance offset to next header (file data aligned to 4).
-           Protect against malformed tag_size/filesize that would yield zero
-           or overflow and cause an infinite loop. */
-        size_t next = file_data_offset + filesize;
-        /* Basic sanity: next must be greater than current offset and within archive */
+        /* advance offset to next header (Linux N_ALIGN + 4-byte body pad). */
+        size_t next = cpio_newc_next_off(stream_start, offset, namesize, filesize);
         if (next <= offset || next > archive_size) {
-            klogprintf("initfs: cpio bad next offset=%u next=%zu fsz=%u path tail (see debug)\n",
+            klogprintf("initfs: cpio bad next offset=%u next=%zu fsz=%u\n",
                        (unsigned)offset, (size_t)next, (unsigned)filesize);
-            return -1;
-        }
-        next = (next + 3) & ~3u;
-        if (next <= offset) {
-            klogprintf("initfs: cpio next align wrap at offset %u\n", (unsigned)offset);
             return -1;
         }
         offset = next;
@@ -876,6 +900,14 @@ static int initfs_module_overlaps_heap(uintptr_t mod_start, size_t mod_size) {
     return mod_start < h1 && mod_end > h0;
 }
 
+/*
+ * When the boot ramdisk overlaps the heap we must copy it. Borrowed ramfs
+ * nodes keep pointers into that buffer for the life of the boot image —
+ * never kfree it after unpack (UAF on every /etc read/write).
+ */
+static void *s_initfs_heap_archive;
+static size_t s_initfs_heap_archive_sz;
+
 static int initfs_unpack_ramdisk_region(const void *mod_ptr, size_t mod_size) {
     uintptr_t a = (uintptr_t)mod_ptr;
     /* Do not kmalloc+memcpy whole initrd (~35+ MiB): risks OOM, corrupts canaries on huge
@@ -897,9 +929,14 @@ static int initfs_unpack_ramdisk_region(const void *mod_ptr, size_t mod_size) {
         return -12;
     }
     memcpy(buf, mod_ptr, mod_size);
-    int r = unpack_cpio_newc(buf, mod_size);
-    kfree(buf);
-    return r;
+    if (s_initfs_heap_archive) {
+        /* Only one relocated archive is expected; keep the old one alive too. */
+        klogprintf("initfs: warning: replacing relocated archive without free\n");
+    }
+    s_initfs_heap_archive = buf;
+    s_initfs_heap_archive_sz = mod_size;
+    (void)s_initfs_heap_archive_sz;
+    return unpack_cpio_newc(buf, mod_size);
 }
 
 /* Recursively list VFS entries via qemu_debug_printf for debugging. */

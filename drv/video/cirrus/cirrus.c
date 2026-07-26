@@ -428,6 +428,7 @@ int cirrus_kernel_init(void) {
 		if (vis > (size_t)g_cirrus_ctx.fb_len) vis = (size_t)g_cirrus_ctx.fb_len;
 		fbdev_register_linear(vd->mmio_base, g_cirrus_ctx.fb_pa, vis,
 		                      vd->width, vd->height, vd->pitch, vd->bpp);
+		fbdev_sysfs_publish(g_cirrus_ctx.bus, g_cirrus_ctx.device, g_cirrus_ctx.function);
 	}
 
 	klogprintf("cirrus: ready %02x:%02x.%u mode=%ux%u@%u fb=%p pa=0x%llx len=%u\n",

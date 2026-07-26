@@ -19,6 +19,7 @@
 #include <mm.h>
 #include <frame.h>
 #include <user_map.h>
+#include <user_vma.h>
 #include <exec.h>
 #include <vsyscall.h>
 #include <keyboard.h>
@@ -479,6 +480,27 @@ static void page_fault_handler(cpu_registers_t* regs) {
                         }
                         if (cow_rc == 0)
                                 return;
+                        /*
+                         * Linux do_wp_page: present write on a private writable
+                         * VMA/brk that is not Soft_COW (stale identity leaf,
+                         * demoted US, or Soft_COW without Soft_OWNED that the
+                         * strict path rejected). RELRO keeps prot without WRITE.
+                         */
+                        {
+                                uint64_t tid = ut->tid ? ut->tid : 1;
+                                int brk_wr = 0;
+                                uintptr_t brk_base = ut->mm->brk_base ?
+                                    ut->mm->brk_base : ut->user_brk_base;
+                                uintptr_t brk_cur = ut->mm->brk_current ?
+                                    ut->mm->brk_current : ut->user_brk_cur;
+                                if (brk_base != 0 && (uintptr_t)cr2 >= brk_base &&
+                                    (uintptr_t)cr2 < brk_cur)
+                                        brk_wr = 1;
+                                if (!user_vma_is_shared_page(tid, (uintptr_t)cr2) &&
+                                    (brk_wr || user_vma_allows_write(ut, (uintptr_t)cr2)) &&
+                                    mm_wp_fault_writable(ut->mm, cr2, share) == 0)
+                                        return;
+                        }
                 }
         }
         /* Demand-fill only for !present (after do_wp_page above). */
@@ -713,10 +735,21 @@ pte_dump_done:
             }
             /* User faults must not freeze the whole CPU — that masked the
              * post-getpid hang as a silent lockup with a blinking cursor. */
-            kprintf("user-pf-fatal: killing after unhandled #PF rip=0x%llx cr2=0x%llx err=0x%llx\n",
-                    (unsigned long long)regs->rip,
-                    (unsigned long long)cr2,
-                    (unsigned long long)regs->error_code);
+            {
+                extern thread_t *thread_current(void);
+                extern thread_t *thread_get_current_user(void);
+                thread_t *ft = thread_current();
+                if (!ft || ft->ring != 3)
+                    ft = thread_get_current_user();
+                kprintf("user-pf-fatal: tid=%llu name=%s rip=0x%llx cr2=0x%llx err=0x%llx fs=0x%llx rsp=0x%llx\n",
+                        (unsigned long long)(ft && ft->tid ? ft->tid : 0),
+                        (ft && ft->name[0]) ? ft->name : "?",
+                        (unsigned long long)regs->rip,
+                        (unsigned long long)cr2,
+                        (unsigned long long)regs->error_code,
+                        (unsigned long long)(ft ? ft->user_fs_base : 0),
+                        (unsigned long long)regs->rsp);
+            }
             if (regs->rip == 0 && regs->rsp >= 0x200000ULL &&
                 regs->rsp + 16ULL < (uint64_t)MMIO_IDENTITY_LIMIT) {
                 uint64_t *sp = (uint64_t *)(uintptr_t)regs->rsp;
@@ -742,8 +775,25 @@ static void gp_fault_handler(cpu_registers_t* regs){
                 gt = thread_get_current_user();
             mm_dbg_ash_watch_thread("GPF-ash-rip", gt);
         }
+        {
+            extern thread_t *thread_current(void);
+            extern thread_t *thread_get_current_user(void);
+            thread_t *gt = thread_current();
+            if (!gt || gt->ring != 3)
+                gt = thread_get_current_user();
+            kprintf("user-gpf-fatal: tid=%llu name=%s rip=0x%llx err=0x%llx rsp=0x%llx fs=0x%llx rax=0x%llx rbx=0x%llx\n",
+                    (unsigned long long)(gt && gt->tid ? gt->tid : 0),
+                    (gt && gt->name[0]) ? gt->name : "?",
+                    (unsigned long long)regs->rip,
+                    (unsigned long long)regs->error_code,
+                    (unsigned long long)regs->rsp,
+                    (unsigned long long)(gt ? gt->user_fs_base : 0),
+                    (unsigned long long)regs->rax,
+                    (unsigned long long)regs->rbx);
+        }
         syscall_user_fatal_exit(11); /* SIGSEGV */
     }
+    
     (void)regs;
     for(;;){ asm volatile("sti; hlt" ::: "memory"); }
 }

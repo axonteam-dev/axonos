@@ -9648,18 +9648,17 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             };
             if (clk < 0 || clk > 15) return ret_err(EINVAL);
             int64_t sec, nsec;
+            uint64_t mono_us = time_monotonic_us();
             if (clk == CLOCK_REALTIME || clk == CLOCK_REALTIME_COARSE) {
                 rtc_datetime_t dt;
                 rtc_read_datetime(&dt);
                 uint64_t secs = rtc_datetime_to_epoch(&dt);
-                uint64_t sub = pit_get_time_ms() % 1000ULL;
                 sec = (int64_t)secs;
-                nsec = (int64_t)(sub * 1000000ULL);
+                nsec = (int64_t)((mono_us % 1000000ull) * 1000ull);
             } else {
-                /* Monotonic, raw, coarse, boottime, thread/process CPU: PIT since boot */
-                uint64_t ms = pit_get_time_ms();
-                sec = (int64_t)(ms / 1000ULL);
-                nsec = (int64_t)((ms % 1000ULL) * 1000000ULL);
+                /* Monotonic / boottime: TSC-backed µs when calibrated. */
+                sec = (int64_t)(mono_us / 1000000ull);
+                nsec = (int64_t)((mono_us % 1000000ull) * 1000ull);
             }
             struct timespec_k { int64_t tv_sec; int64_t tv_nsec; } ts;
             ts.tv_sec = sec;
@@ -9676,7 +9675,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             rtc_datetime_t dt;
             rtc_read_datetime(&dt);
             uint64_t secs = rtc_datetime_to_epoch(&dt);
-            uint64_t usec = (uint64_t)(pit_get_time_ms() % 1000ULL) * 1000ULL;
+            uint64_t usec = time_monotonic_us() % 1000000ull;
             tv.tv_sec = (int64_t)secs;
             tv.tv_usec = (int64_t)usec;
             if (copy_to_user_safe(tv_u, &tv, sizeof(tv)) != 0) return ret_err(EFAULT);

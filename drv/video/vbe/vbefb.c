@@ -373,7 +373,7 @@ void vbefb_update_cursor(void) {
 	if (!vbe_is_available()) return;
 	/* Blink based on absolute monotonic time so it remains stable even if
 	   timer IRQs are delayed by load/exception handling (catch-up on next tick). */
-	const uint64_t period_ticks = 500; /* ~500ms when timer_ticks is 1ms */
+	const uint64_t period_ticks = 2; /* ~500ms when timer_ticks is 1ms */
 	uint64_t phase = (period_ticks != 0) ? (timer_ticks / period_ticks) : 0;
 	if (phase == cursor_blink_last_phase) return;
 	cursor_blink_last_phase = phase;

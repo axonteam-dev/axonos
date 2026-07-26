@@ -41,6 +41,10 @@ bool apic_timer_is_running(void);
 bool apic_timer_is_calibrated(void);
 
 void apic_timer_calibrate(void);
+/* Measure real IRQ rate and rescale initial-count toward target_hz. */
+uint32_t apic_timer_refine(uint32_t target_hz, uint32_t sample_ms);
+/* Measure only and publish that Hz as timer_frequency (exact wall time). */
+uint32_t apic_timer_commit_measured(uint32_t sample_ms);
 void apic_timer_set_frequency(uint32_t freq_hz);
 void apic_timer_sleep_ms(uint32_t ms);
 void apic_timer_sleep_us(uint32_t us);

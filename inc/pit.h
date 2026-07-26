@@ -35,6 +35,7 @@ void pit_handler(cpu_registers_t* regs);
 void pit_sleep_ms(uint32_t milliseconds);
 uint64_t pit_get_ticks();
 uint64_t pit_get_time_ms();
+uint64_t pit_get_time_us(void);
 uint64_t pit_get_frequency();
 
 // global variables

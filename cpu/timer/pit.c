@@ -177,10 +177,15 @@ uint64_t pit_get_ticks() {
 
 // Get time in milliseconds since boot
 uint64_t pit_get_time_ms() {
+        return pit_get_time_us() / 1000ull;
+}
+
+/* Tick-resolution microseconds (no TSC). Prefer time_monotonic_us() for apps. */
+uint64_t pit_get_time_us(void) {
         uint64_t freq = timer_frequency;
         if (freq == 0)
                 return 0;
-        return (timer_ticks * 1000) / freq;
+        return (timer_ticks * 1000000ull) / freq;
 }
 
 uint64_t pit_get_frequency() {

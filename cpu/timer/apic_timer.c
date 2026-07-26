@@ -28,21 +28,41 @@ apic_timer_state_t apic_timer_state = {0};
 static const uint8_t apic_dividers[] = {0x3, 0x0, 0x1, 0x2, 0x8, 0x9, 0xA, 0xB};
 static const uint32_t divider_values[] = {16, 2, 4, 8, 32, 64, 128, 1};
 
+/* Last programmed period (for refine rescale). */
+static uint8_t g_timer_div_reg = 0x3;
+static uint32_t g_timer_div_val = 16;
+static uint32_t g_timer_init_count = 0;
+
 // Find best divider for target frequency
 static uint8_t find_best_divider(uint32_t target_freq, uint32_t base_freq, uint32_t* out_count) {
-    for (int i = 0; i < 8; i++) {
+    if (!target_freq || !base_freq || !out_count)
+        return 0x3;
+    /* Prefer divider 16 — same as calibration — then fall back. */
+    static const int order[] = { 0, 1, 2, 3, 4, 5, 6, 7 }; /* indices into divider_values */
+    for (unsigned oi = 0; oi < sizeof(order) / sizeof(order[0]); oi++) {
+        int i = order[oi];
         uint32_t div = divider_values[i];
-        uint32_t count = (base_freq / div) / target_freq;
-
-        if (count > 0 && count <= 0xFFFFF) {
-            *out_count = count;
+        uint64_t count = (uint64_t)base_freq / ((uint64_t)div * (uint64_t)target_freq);
+        if (count >= 10ull && count <= 0xFFFFFull) {
+            *out_count = (uint32_t)count;
             return apic_dividers[i];
         }
     }
 
-    // Fallback to divider 16
-    *out_count = base_freq / 16 / target_freq;
+    /* Fallback to divider 16 */
+    uint64_t c = (uint64_t)base_freq / (16ull * (uint64_t)target_freq);
+    if (c < 10ull) c = 10ull;
+    if (c > 0xFFFFFull) c = 0xFFFFFull;
+    *out_count = (uint32_t)c;
     return 0x3;
+}
+
+static uint32_t divider_val_for_reg(uint8_t reg) {
+    for (int i = 0; i < 8; i++) {
+        if (apic_dividers[i] == (reg & 0x0Fu))
+            return divider_values[i];
+    }
+    return 16;
 }
 
 /* Calibrate APIC timer base frequency against PIT ticks.
@@ -50,17 +70,24 @@ static uint8_t find_best_divider(uint32_t target_freq, uint32_t base_freq, uint3
 static uint32_t quick_calibrate(void) {
     const uint32_t divider = 16;
     const uint32_t sample_ms = sysinfo_is_hypervisor() ? 250u : 100u;
+    uint32_t pit_hz = pit_frequency ? pit_frequency : 250u;
+    /* Convert wall sample to PIT ticks — never treat ticks as milliseconds.
+     * Old code waited N ticks but divided as if N were ms; at HZ=250 that
+     * made base_hz ~4× too high and the periodic timer ~4× too slow. */
+    uint64_t sample_ticks = ((uint64_t)pit_hz * (uint64_t)sample_ms + 999ull) / 1000ull;
+    if (sample_ticks < 5ull)
+        sample_ticks = 5ull;
     uint64_t pit_start = pit_get_ticks();
-    uint64_t wait_guard = pit_start + sample_ms + 1000; /* avoid infinite wait if PIT broken */
+    uint64_t wait_guard = pit_start + sample_ticks + (uint64_t)pit_hz; /* +1s guard */
     uint32_t spin_guard = 0;
-    const uint32_t max_spins = 5000000;
+    const uint32_t max_spins = 50000000;
 
     /* One-shot, masked: we only read CURRENT counter and don't need interrupts. */
     apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_ONESHOT, true);
     apic_write(LAPIC_TIMER_DIV_REG, 0x3); /* divider=16 */
     apic_write(LAPIC_TIMER_INIT_REG, 0xFFFFFFFFu);
 
-    while ((pit_get_ticks() - pit_start) < sample_ms) {
+    while ((pit_get_ticks() - pit_start) < sample_ticks) {
         uint64_t now = pit_get_ticks();
         if (now > wait_guard) break;
         if (++spin_guard >= max_spins) break; /* interrupts may be disabled here */
@@ -74,11 +101,11 @@ static uint32_t quick_calibrate(void) {
 
     uint64_t pit_delta = pit_get_ticks() - pit_start;
     if (pit_delta >= 5 && elapsed > 0) {
-        /* base_hz = elapsed * divider / (pit_delta / 1000) */
-        uint64_t base_hz = ((uint64_t)elapsed * (uint64_t)divider * 1000ULL) / pit_delta;
+        /* base_hz = bus_counts * divider / seconds = counts * div * pit_hz / ticks */
+        uint64_t base_hz = ((uint64_t)elapsed * (uint64_t)divider * (uint64_t)pit_hz) / pit_delta;
         if (base_hz >= 1000000ULL && base_hz <= 2000000000ULL) {
-            kprintf("APIC: calibrated against PIT: elapsed=%u pit_delta=%llu -> base=%u Hz\n",
-                    elapsed, (unsigned long long)pit_delta, (unsigned)base_hz);
+            kprintf("APIC: calibrated against PIT: elapsed=%u pit_delta=%llu (%ums) -> base=%u Hz\n",
+                    elapsed, (unsigned long long)pit_delta, sample_ms, (unsigned)base_hz);
             return (uint32_t)base_hz;
         }
     }
@@ -371,27 +398,158 @@ void apic_timer_start(uint32_t freq_hz) {
         apic_timer_stop();
     }
 
-    kprintf("APIC: Starting at %u Hz\n", freq_hz);
+    if (freq_hz == 0)
+        freq_hz = 250u;
 
-    uint32_t count;
+    uint32_t count = 0;
     uint8_t divider = find_best_divider(freq_hz, apic_timer_state.base_frequency, &count);
 
-    // Apply limits
     if (count < 10) count = 10;
     if (count > 0xFFFFF) count = 0xFFFFF;
 
-    // Configure timer (program LVT first, then load initial count)
+    kprintf("APIC: Starting at %u Hz (div=%u count=%u base=%u)\n",
+            freq_hz, divider_val_for_reg(divider), count,
+            apic_timer_state.base_frequency);
+
     apic_write(LAPIC_TIMER_DIV_REG, divider);
     apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_PERIODIC, false);
     apic_write(LAPIC_TIMER_INIT_REG, count);
 
-    // Update state
+    g_timer_div_reg = divider;
+    g_timer_div_val = divider_val_for_reg(divider);
+    g_timer_init_count = count;
+
     apic_timer_state.frequency = freq_hz;
     if (!pit_is_enabled())
-        timer_frequency = freq_hz ? freq_hz : 1000u;
+        timer_frequency = freq_hz;
     apic_timer_state.running = true;
     apic_timer_state.mode = APIC_TIMER_PERIODIC;
     apic_timer_ticks = 0;
+}
+
+/*
+ * Measure IRQ rate over ~sample_ms and rescale initial-count toward target_hz.
+ * Uses PIT while enabled (elapsed from actual PIT ticks — not the nominal ms),
+ * else TSC. Returns measured Hz *before* rescale.
+ */
+uint32_t apic_timer_refine(uint32_t target_hz, uint32_t sample_ms) {
+    if (!apic_timer_state.running || !g_timer_init_count || target_hz == 0)
+        return apic_timer_state.frequency;
+    if (sample_ms < 50u)
+        sample_ms = 50u;
+    if (sample_ms > 1000u)
+        sample_ms = 1000u;
+
+    uint64_t t0 = apic_timer_ticks;
+    uint64_t elapsed_us = 0;
+
+    if (pit_is_enabled()) {
+        uint32_t pit_hz = pit_frequency ? pit_frequency : 250u;
+        uint64_t need = ((uint64_t)pit_hz * (uint64_t)sample_ms + 999ull) / 1000ull;
+        if (need < 5ull)
+            need = 5ull;
+        uint64_t p0 = pit_get_ticks();
+        while ((pit_get_ticks() - p0) < need)
+            asm volatile("pause" ::: "memory");
+        uint64_t got = pit_get_ticks() - p0;
+        /* Exact wall time from ticks we actually waited (avoids ceil bias → slow timer). */
+        elapsed_us = (got * 1000000ull) / (uint64_t)pit_hz;
+    } else if (klog_tsc_per_us) {
+        uint64_t wall0 = time_monotonic_us();
+        uint64_t deadline = wall0 + (uint64_t)sample_ms * 1000ull;
+        while (time_monotonic_us() < deadline)
+            asm volatile("pause" ::: "memory");
+        elapsed_us = time_monotonic_us() - wall0;
+    } else {
+        return apic_timer_state.frequency;
+    }
+
+    uint64_t irq_delta = apic_timer_ticks - t0;
+    if (irq_delta < 2ull || elapsed_us < 1000ull)
+        return apic_timer_state.frequency;
+
+    uint64_t measured_hz = (irq_delta * 1000000ull) / elapsed_us;
+    if (measured_hz < 10ull || measured_hz > 10000ull) {
+        kprintf("APIC: refine rejected measured=%llu Hz\n",
+                (unsigned long long)measured_hz);
+        return apic_timer_state.frequency;
+    }
+
+    /*
+     * count_new = count_old * measured / target
+     * Slow timer (measured < target) → smaller count → faster IRQs.
+     */
+    uint64_t new_count = ((uint64_t)g_timer_init_count * measured_hz + (target_hz / 2u)) /
+                         (uint64_t)target_hz;
+    if (new_count < 10ull)
+        new_count = 10ull;
+    if (new_count > 0xFFFFFull)
+        new_count = 0xFFFFFull;
+
+    kprintf("APIC: refine target=%u measured=%llu Hz count %u -> %u\n",
+            target_hz, (unsigned long long)measured_hz,
+            g_timer_init_count, (unsigned)new_count);
+
+    if ((uint32_t)new_count != g_timer_init_count) {
+        g_timer_init_count = (uint32_t)new_count;
+        apic_write(LAPIC_TIMER_DIV_REG, g_timer_div_reg);
+        apic_write(LAPIC_TIMER_INIT_REG, g_timer_init_count);
+        apic_timer_ticks = 0;
+    }
+
+    if (g_timer_div_val)
+        apic_timer_state.base_frequency =
+            (uint32_t)(((uint64_t)g_timer_init_count * (uint64_t)g_timer_div_val) *
+                       (uint64_t)target_hz);
+
+    return (uint32_t)measured_hz;
+}
+
+/* Measure only — publish the real IRQ rate as the time base. */
+uint32_t apic_timer_commit_measured(uint32_t sample_ms) {
+    if (!apic_timer_state.running)
+        return apic_timer_state.frequency;
+    if (sample_ms < 50u)
+        sample_ms = 50u;
+
+    uint64_t t0 = apic_timer_ticks;
+    uint64_t elapsed_us = 0;
+
+    if (pit_is_enabled()) {
+        uint32_t pit_hz = pit_frequency ? pit_frequency : 250u;
+        uint64_t need = ((uint64_t)pit_hz * (uint64_t)sample_ms + 999ull) / 1000ull;
+        if (need < 5ull)
+            need = 5ull;
+        uint64_t p0 = pit_get_ticks();
+        while ((pit_get_ticks() - p0) < need)
+            asm volatile("pause" ::: "memory");
+        uint64_t got = pit_get_ticks() - p0;
+        elapsed_us = (got * 1000000ull) / (uint64_t)pit_hz;
+    } else if (klog_tsc_per_us) {
+        uint64_t wall0 = time_monotonic_us();
+        uint64_t deadline = wall0 + (uint64_t)sample_ms * 1000ull;
+        while (time_monotonic_us() < deadline)
+            asm volatile("pause" ::: "memory");
+        elapsed_us = time_monotonic_us() - wall0;
+    } else {
+        return apic_timer_state.frequency;
+    }
+
+    uint64_t irq_delta = apic_timer_ticks - t0;
+    if (irq_delta < 2ull || elapsed_us < 1000ull)
+        return apic_timer_state.frequency;
+
+    uint64_t measured_hz = (irq_delta * 1000000ull) / elapsed_us;
+    if (measured_hz < 10ull || measured_hz > 10000ull)
+        return apic_timer_state.frequency;
+
+    apic_timer_state.frequency = (uint32_t)measured_hz;
+    if (!pit_is_enabled())
+        timer_frequency = (uint32_t)measured_hz;
+
+    kprintf("APIC: committed time base %u Hz (measured)\n",
+            (unsigned)measured_hz);
+    return (uint32_t)measured_hz;
 }
 
 void apic_timer_start_oneshot(uint32_t microseconds) {

@@ -685,27 +685,28 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     /* Enable APIC timer if it behaves sanely; otherwise keep PIT.
        Real hardware can hang or run at wildly wrong rate with bad APIC calibration. */
-    apic_timer_start(100);
+    /*
+     * Bring up LAPIC timekeeping against the still-running PIT, refine the
+     * period so wall time is accurate, then switch off IRQ0. Prefer 500 Hz
+     * (2 ms) for snappier sleeps; 1 kHz can livelock under VMware.
+     */
+    const uint32_t apic_hz = 500u;
+    apic_timer_start(apic_hz);
     {
-        uint64_t apic_start = apic_timer_ticks;
-        uint64_t pit_start = pit_get_ticks();
-        while ((pit_get_ticks() - pit_start) < 200) {
-            asm volatile("pause");
-        }
-        uint64_t apic_delta = apic_timer_ticks - apic_start;
-        /* At 100 Hz over ~200 ms we expect around 20 ticks; allow wide tolerance. */
-        int apic_ok = (apic_delta >= 5 && apic_delta <= 80);
+        uint32_t measured = apic_timer_refine(apic_hz, 200u);
+        int apic_ok = (measured >= apic_hz / 4u && measured <= apic_hz * 4u);
         if (apic_ok) {
-            apic_timer_stop();
+            /* Converge count while PIT is still the wall reference. */
+            for (int pass = 0; pass < 3; pass++) {
+                measured = apic_timer_refine(apic_hz, 120u);
+                uint32_t err = (measured > apic_hz) ? (measured - apic_hz)
+                                                    : (apic_hz - measured);
+                if (err * 100u <= apic_hz) /* within 1% */
+                    break;
+            }
             pit_disable();
             pic_mask_irq(0);
-            /*
-             * Linux commonly uses HZ=250.  A 1 kHz periodic LAPIC interrupt
-             * can remain continuously pending under VMware when the handler
-             * and context switch exceed 1 ms, starving ring-3 completely.
-             */
-            apic_timer_start(250);
-            /* Confirm APIC is actually ticking at the new rate; otherwise revert to PIT. */
+            /* Confirm IRQs still arrive; otherwise fall back to PIT. */
             uint64_t t0 = apic_timer_ticks;
             if (klog_tsc_per_us) {
                 uint64_t wait_start = time_monotonic_us();
@@ -718,13 +719,19 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                     asm volatile("pause" ::: "memory");
             }
             if (apic_timer_ticks == t0) {
-                kprintf("APIC: no ticks after 250Hz start, falling back to PIT\n");
+                kprintf("APIC: no ticks after switch, falling back to PIT\n");
                 apic_timer_stop();
                 pic_unmask_irq(0);
                 pit_init();
+            } else {
+                /* Last rescale vs TSC, then publish *measured* Hz as the time base. */
+                (void)apic_timer_refine(apic_hz, 150u);
+                measured = apic_timer_commit_measured(150u);
+                klog_reanchor_tsc();
+                kprintf("APIC: timekeeping live at %u Hz\n", measured);
             }
         } else {
-            kprintf("APIC: unstable (%llu ticks/200ms), using PIT\n", (unsigned long long)apic_delta);
+            kprintf("APIC: unstable (measured %u Hz), using PIT\n", measured);
             apic_timer_stop();
         }
     }

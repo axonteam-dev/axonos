@@ -59,15 +59,68 @@ static void klog_console_write_sync_tty(const char *s, size_t n) {
 	}
 }
 
+static uint64_t klog_rdtsc(void) {
+	uint32_t lo, hi;
+	asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+	return ((uint64_t)hi << 32) | lo;
+}
+
 static uint64_t klog_get_time_us(void);
 
 void klog_calibrate_tsc(void) {
-	/* VM TSC hints can be inconsistent with the virtual timer. Keep klog on
-	 * the same tick clock as sleep/poll/uptime so log time cannot drift. */
+	/*
+	 * Measure TSC against the PIT tick clock (while IRQ0 still runs).
+	 * Gives microsecond resolution for clock_gettime / gettimeofday; the
+	 * tick clock alone only steps every 4 ms at HZ=250.
+	 */
 	klog_tsc_hz = 0;
 	klog_tsc_per_us = 0;
 	klog_tsc_base = 0;
 	klog_time_base_usec = 0;
+
+	uint32_t pit_hz = pit_frequency ? pit_frequency : 250u;
+	uint64_t sample_ticks = (uint64_t)pit_hz / 10ull; /* ~100 ms */
+	if (sample_ticks < 10ull)
+		sample_ticks = 10ull;
+
+	/* Align to a tick edge so the window is clean. */
+	uint64_t edge = pit_get_ticks();
+	uint32_t spins = 0;
+	while (pit_get_ticks() == edge && ++spins < 50000000u)
+		asm volatile("pause" ::: "memory");
+	edge = pit_get_ticks();
+	uint64_t tsc0 = klog_rdtsc();
+	uint64_t target = edge + sample_ticks;
+	spins = 0;
+	while (pit_get_ticks() < target && ++spins < 200000000u)
+		asm volatile("pause" ::: "memory");
+	uint64_t tsc1 = klog_rdtsc();
+	uint64_t got = pit_get_ticks() - edge;
+	if (got < 5ull || tsc1 <= tsc0)
+		return;
+
+	uint64_t us = (got * 1000000ull) / (uint64_t)pit_hz;
+	if (us == 0)
+		return;
+	uint64_t per_us = (tsc1 - tsc0) / us;
+	if (per_us < 1ull || per_us > 100000ull)
+		return; /* reject absurd rates (<1 MHz or >100 GHz TSC) */
+
+	klog_tsc_per_us = per_us;
+	klog_tsc_hz = per_us * 1000000ull;
+	klog_tsc_base = tsc1;
+	klog_time_base_usec = (pit_get_ticks() * 1000000ull) / (uint64_t)pit_hz;
+	kprintf("TSC: calibrated %llu MHz (per_us=%llu)\n",
+		(unsigned long long)(klog_tsc_hz / 1000000ull),
+		(unsigned long long)klog_tsc_per_us);
+}
+
+void klog_reanchor_tsc(void) {
+	if (!klog_tsc_per_us)
+		return;
+	/* Keep TSC µs continuous with the tick clock after APIC takes over. */
+	klog_tsc_base = klog_rdtsc();
+	klog_time_base_usec = pit_get_time_us();
 }
 
 uint64_t time_monotonic_us(void) {
@@ -79,7 +132,12 @@ uint64_t time_monotonic_ms(void) {
 }
 
 static uint64_t klog_get_time_us(void) {
-	return pit_get_time_ms() * 1000;
+	if (klog_tsc_per_us) {
+		uint64_t tsc = klog_rdtsc();
+		uint64_t delta = tsc - klog_tsc_base;
+		return klog_time_base_usec + delta / klog_tsc_per_us;
+	}
+	return pit_get_time_us();
 }
 
 static void klog_early_append(const char *p, size_t n) {

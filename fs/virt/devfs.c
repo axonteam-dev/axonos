@@ -372,13 +372,10 @@ static void devfs_tty_virtual_putc(struct devfs_tty *tty, uint8_t c) {
         tty->cursor_x = 0;
         return;
     }
+    /* Non-destructive BS/DEL — same as Linux console (cursor left only). */
     if (c == '\b' || c == 0x7F) {
-        if (tty->cursor_x > 0) {
+        if (tty->cursor_x > 0)
             tty->cursor_x--;
-            size_t off = ((size_t)tty->cursor_y * cols + tty->cursor_x) * 2;
-            tty->screen[off] = ' ';
-            tty->screen[off + 1] = tty->current_attr;
-        }
         return;
     }
     if (c == '\t') {
@@ -499,17 +496,15 @@ static void devfs_tty_emit_byte(struct devfs_tty *tty, int tty_on_vga, uint8_t c
         tty->cursor_x = 0;
         return;
     }
+    /*
+     * BS (0x08): Linux VT moves the cursor left and does NOT erase.
+     * Shells/nano use \b to walk left when editing; erasing here wiped the
+     * tail of the line as the cursor moved (looked like "left arrow clears").
+     * Destructive backspace is the app's job: "\b \b" or CSI sequences.
+     */
     if (ch == '\b' || ch == 0x7F) {
-        if (tty->cursor_x > 0) {
+        if (tty->cursor_x > 0)
             tty->cursor_x--;
-            devfs_tty_store_at_cursor(tty, ' ');
-            if (tty_on_vga) {
-                if (cirrusfb_is_ready())
-                    cirrusfb_putch_xy(tty->cursor_x, tty->cursor_y, ' ', tty->current_attr);
-                else
-                    console_putch_xy(tty->cursor_x, tty->cursor_y, ' ', tty->current_attr);
-            }
-        }
         return;
     }
     if (ch == '\t') {

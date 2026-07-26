@@ -351,18 +351,12 @@ static void kputchar_vga_text_nolock(uint8_t character, uint8_t attribute_byte)
 		}
 		set_cursor_nolock(offset);
 	}
-	else if (character == '\b')
+	else if (character == '\b' || character == 0x7F)
 	{
-		/* Move left one cell, clear it; do not wrap from column 0 to previous line.
-		 * Use the cell's current attribute so the erased cell doesn't change color (TTY). */
+		/* Non-destructive BS: cursor left only (Linux vt). Do not clear the cell. */
 		uint16_t col = (uint16_t)((offset / 2) % MAX_COLS);
 		if (col > 0) {
 			offset -= 2;
-			{
-				uint8_t *vga = (uint8_t *)VIDEO_ADDRESS;
-				uint8_t attr = vga[offset + 1]; /* preserve existing cell attribute */
-				write_nolock(' ', attr, offset);
-			}
 			set_cursor_nolock(offset);
 		}
 	}

@@ -11,7 +11,8 @@ static uint64_t avenrun[3];
 
 static void calc_load(uint64_t *load, uint64_t exp, int active) {
 	uint64_t a = *load;
-	*load = (a * exp + (uint64_t)active * (LOAD_FIXED_1 - exp)) >> 16;
+	uint64_t active_scaled = (uint64_t)active * LOAD_FIXED_1;
+	*load = (a * exp + active_scaled * (LOAD_FIXED_1 - exp)) >> 16;
 }
 
 void loadavg_second_tick(void) {

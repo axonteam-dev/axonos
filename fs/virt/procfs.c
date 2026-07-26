@@ -30,6 +30,9 @@ struct procfs_handle {
 	int pid;
 	int file_id; /* pid_file: 0=cmdline,1=stat,2=status,3=statm; sys/plain: ids; pid_fd_link: fd number */
 	size_t pos;
+	int is_task;
+	char *cache;
+	size_t cache_len;
 };
 
 static struct fs_driver procfs_driver;
@@ -60,6 +63,150 @@ static int procfs_tgid(const thread_t *t) {
     if (t->process)
         return (int)t->process->pid;
     return (int)(t->tid ? t->tid : 0);
+}
+
+/* True if this thread should appear as /proc/<tgid> (one entry per TGID). */
+static int procfs_is_tgid_dir(const thread_t *t) {
+    if (!t || t->tid == 0 || t->ring != 3)
+        return 0;
+    if (t->state == THREAD_TERMINATED) {
+        if (!t->process || t->process->state != PROCESS_ZOMBIE)
+            return 0;
+    }
+    if (t->process) {
+        if (t->process->leader)
+            return t->process->leader == t;
+        /* No leader pointer: only the lowest-tid member of the group. */
+        int cnt = thread_get_count();
+        for (int i = 0; i < cnt; i++) {
+            thread_t *o = thread_get_by_index(i);
+            if (!o || o->process != t->process)
+                continue;
+            if (o->tid && o->tid < t->tid)
+                return 0;
+        }
+        return 1;
+    }
+    /* Orphan ring-3 thread: publish by tid, unless a real process owns that pid. */
+    if (process_find((uint64_t)(unsigned)t->tid))
+        return 0;
+    return 1;
+}
+
+static int procfs_append_dirent(char **buf, size_t *len, size_t *cap,
+                                const char *name, uint32_t ino, uint8_t ftype) {
+    if (!buf || !len || !cap || !name)
+        return -1;
+    size_t namelen = strlen(name);
+    if (namelen == 0 || namelen > 255)
+        return -1;
+    size_t rec_len = (8 + namelen + 3) & ~3u;
+    if (*len + rec_len > *cap) {
+        size_t ncap = *cap ? *cap * 2 : 4096;
+        while (ncap < *len + rec_len)
+            ncap *= 2;
+        char *nbuf = (char *)kmalloc(ncap);
+        if (!nbuf)
+            return -1;
+        if (*buf && *len)
+            memcpy(nbuf, *buf, *len);
+        if (*buf)
+            kfree(*buf);
+        *buf = nbuf;
+        *cap = ncap;
+    }
+    uint8_t *out = (uint8_t *)(*buf + *len);
+    memset(out, 0, rec_len);
+    struct ext2_dir_entry de;
+    de.inode = ino;
+    de.rec_len = (uint16_t)rec_len;
+    de.name_len = (uint8_t)namelen;
+    de.file_type = ftype;
+    memcpy(out, &de, 8);
+    memcpy(out + 8, name, namelen);
+    *len += rec_len;
+    return 0;
+}
+
+/* Snapshot /proc root so getdents byte offsets stay stable (no duplicate PIDs). */
+static int procfs_build_root_dir(struct procfs_handle *h) {
+    if (!h)
+        return -1;
+    char *buf = NULL;
+    size_t len = 0, cap = 0;
+    static const char *top[] = {
+        "meminfo", "cpuinfo", "uptime", "loadavg", "mounts", "filesystems",
+        "stat", "partitions", "sys", "bus", "tty", "ttydebug", "net", "scsi"
+    };
+    for (size_t ti = 0; ti < sizeof(top) / sizeof(top[0]); ti++) {
+        const char *name = top[ti];
+        uint8_t ft = (strcmp(name, "sys") == 0 || strcmp(name, "bus") == 0 ||
+                      strcmp(name, "tty") == 0 || strcmp(name, "net") == 0 ||
+                      strcmp(name, "scsi") == 0)
+                         ? EXT2_FT_DIR
+                         : EXT2_FT_REG_FILE;
+        if (procfs_append_dirent(&buf, &len, &cap, name,
+                                 (uint32_t)(1000 + (uint32_t)ti), ft) != 0) {
+            if (buf)
+                kfree(buf);
+            return -1;
+        }
+    }
+
+    /* Dedup by TGID — bitmap covers typical userspace pid space. */
+    enum { SEEN_MAX = 4096 };
+    uint8_t seen[(SEEN_MAX + 7) / 8];
+    memset(seen, 0, sizeof(seen));
+    int cnt = thread_get_count();
+    for (int i = 0; i < cnt; i++) {
+        thread_t *t = thread_get_by_index(i);
+        if (!procfs_is_tgid_dir(t))
+            continue;
+        int tgid = procfs_tgid(t);
+        if (tgid <= 0)
+            continue;
+        if (tgid < SEEN_MAX) {
+            unsigned bi = (unsigned)tgid;
+            if (seen[bi >> 3] & (uint8_t)(1u << (bi & 7)))
+                continue;
+            seen[bi >> 3] |= (uint8_t)(1u << (bi & 7));
+        } else {
+            /* Rare high pid: linear check against already-emitted numeric names. */
+            char needle[32];
+            int nl = snprintf(needle, sizeof(needle), "%d", tgid);
+            if (nl <= 0)
+                continue;
+            int dup = 0;
+            size_t off = 0;
+            while (off + 8 <= len) {
+                struct ext2_dir_entry *de = (struct ext2_dir_entry *)(buf + off);
+                if (de->rec_len < 8)
+                    break;
+                if (de->name_len == (uint8_t)nl &&
+                    memcmp(buf + off + 8, needle, (size_t)nl) == 0) {
+                    dup = 1;
+                    break;
+                }
+                off += de->rec_len;
+            }
+            if (dup)
+                continue;
+        }
+        char namebuf[32];
+        int nlen = snprintf(namebuf, sizeof(namebuf), "%d", tgid);
+        if (nlen <= 0)
+            continue;
+        if (procfs_append_dirent(&buf, &len, &cap, namebuf,
+                                 (uint32_t)((uint32_t)(tgid + 1) & 0xffffffffu),
+                                 EXT2_FT_DIR) != 0) {
+            if (buf)
+                kfree(buf);
+            return -1;
+        }
+    }
+    h->cache = buf;
+    h->cache_len = len;
+    return 0;
 }
 
 static void procfs_sanitize_comm(char *comm, size_t cap) {
@@ -197,7 +344,8 @@ static uint64_t procfs_sum_unique_user_rss_kb(void) {
 }
 
 static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
-    int pid = (int)(uintptr_t)priv;
+    struct procfs_handle *h = (struct procfs_handle *)priv;
+    int pid = h ? h->pid : 0;
     if (!buf || size == 0) return 0;
     thread_t *t = procfs_thread_by_id(pid);
     /*
@@ -239,7 +387,7 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
     /* /proc/<pid>/stat expects USER_HZ units (typically 100). */
     uint64_t utime = 0;
     uint64_t stime = 0;
-    if (t->process) {
+    if (t->process && h && !h->is_task) {
         /* Linux: /proc/<tgid>/stat utime/stime are thread-group totals. */
         int cnt = thread_get_count();
         for (int i = 0; i < cnt; i++) {
@@ -269,7 +417,7 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
         (unsigned long long)stime,
         0ll, 0ll,
         prio, t->nice,
-        1, 0,
+        (t->process && h && !h->is_task) ? ({ int _n=0, _c=thread_get_count(); for(int _i=0;_i<_c;_i++){ thread_t *_th=thread_get_by_index(_i); if(_th && _th->process==t->process) _n++; } _n; }) : 1, 0,
         (unsigned long long)starttime,
         (unsigned long long)mem.vsize_bytes,
         mem.rss_pages,
@@ -470,28 +618,52 @@ static ssize_t procfs_show_kernel_stat(char *buf, size_t size, void *priv) {
 		n = 1;
 	uint64_t user = 0, nice = 0, system = 0, idle = 0;
 	thread_cpu_times_user_hz(&user, &nice, &system, &idle);
+	/* Linux btime: seconds since Epoch at boot. CMOS→unix is optional; 0 is valid. */
+	uint64_t btime = 0;
 	size_t w = 0;
-	w += (size_t)snprintf(buf + w, (w < size) ? (size - w) : 0,
-			      "cpu  %llu %llu %llu %llu 0 0 0 0 0 0\n",
-			      (unsigned long long)user,
-			      (unsigned long long)nice,
-			      (unsigned long long)system,
-			      (unsigned long long)idle);
-	/* Per-CPU breakdown is approximate: all charge BSP until SMP accounting. */
+	int wr = snprintf(buf + w, (w < size) ? (size - w) : 0,
+			  "cpu  %llu %llu %llu %llu 0 0 0 0 0 0\n",
+			  (unsigned long long)user,
+			  (unsigned long long)nice,
+			  (unsigned long long)system,
+			  (unsigned long long)idle);
+	if (wr < 0) return 0;
+	w += (size_t)wr;
 	for (int i = 0; i < n && w < size; i++) {
-		int wr = snprintf(buf + w, (w < size) ? (size - w) : 0,
-				  "cpu%d %llu %llu %llu %llu 0 0 0 0 0 0\n", i,
-				  (unsigned long long)(i == 0 ? user : 0),
-				  (unsigned long long)(i == 0 ? nice : 0),
-				  (unsigned long long)(i == 0 ? system : 0),
-				  (unsigned long long)(i == 0 ? idle : 0));
+		uint64_t cu = 0, cn = 0, cs = 0, ci = 0;
+		thread_cpu_times_user_hz_cpu(i, &cu, &cn, &cs, &ci);
+		wr = snprintf(buf + w, (w < size) ? (size - w) : 0,
+			      "cpu%d %llu %llu %llu %llu 0 0 0 0 0 0\n", i,
+			      (unsigned long long)cu,
+			      (unsigned long long)cn,
+			      (unsigned long long)cs,
+			      (unsigned long long)ci);
 		if (wr < 0)
 			break;
 		w += (size_t)wr;
 	}
-	w += (size_t)snprintf(buf + w, (w < size) ? (size - w) : 0,
-			      "intr 0\nctxt 0\nbtime 0\nprocesses %d\nprocs_running %d\nprocs_blocked 0\n",
-			      thread_get_count(), thread_runnable_nonidle_count());
+	/* Always emit the trailer htop/glibc expect — even if cpu lines filled the buf. */
+	{
+		char trailer[160];
+		int tl = snprintf(trailer, sizeof(trailer),
+				  "intr 0\nctxt 0\nbtime %llu\nprocesses %d\nprocs_running %d\nprocs_blocked 0\n",
+				  (unsigned long long)btime,
+				  thread_get_count(), thread_runnable_nonidle_count());
+		if (tl > 0) {
+			size_t need = (size_t)tl;
+			if (w + need > size) {
+				/* Prefer keeping btime over the last per-cpu lines. */
+				if (need < size) {
+					w = size - need;
+					memcpy(buf + w, trailer, need);
+					w = size;
+				}
+			} else {
+				memcpy(buf + w, trailer, need);
+				w += need;
+			}
+		}
+	}
 	if (w > size)
 		w = size;
 	return (ssize_t)w;
@@ -527,24 +699,55 @@ static ssize_t procfs_show_partitions(char *buf, size_t size, void *priv) {
 	return (ssize_t)w;
 }
 
+/* Map internal driver names to Linux /proc/mounts fstype strings. */
+static const char *procfs_mount_fstype(const char *drv_name, int is_root) {
+    if (is_root)
+        return "rootfs";
+    if (!drv_name)
+        return "unknown";
+    if (strcmp(drv_name, "procfs") == 0)
+        return "proc";
+    if (strcmp(drv_name, "devfs") == 0)
+        return "devtmpfs";
+    if (strcmp(drv_name, "sysfs") == 0)
+        return "sysfs";
+    if (strcmp(drv_name, "ramfs") == 0)
+        return "ramfs";
+    return drv_name;
+}
+
 /* Linux-like /proc/mounts backed by VFS mount table */
 static ssize_t procfs_show_mounts(char *buf, size_t size, void *priv) {
     (void)priv;
     if (!buf || size == 0) return 0;
     size_t w = 0;
     int n = fs_mount_count();
+    int have_root = 0;
     for (int i = 0; i < n; i++) {
         char mpath[64];
-        char fstype[32];
-        if (fs_mount_get(i, mpath, sizeof(mpath), fstype, sizeof(fstype)) != 0) continue;
-        /* source mountpoint fstype options dump pass */
+        char drv[32];
+        if (fs_mount_get(i, mpath, sizeof(mpath), drv, sizeof(drv)) != 0) continue;
+        int is_root = (mpath[0] == '/' && mpath[1] == '\0');
+        if (is_root)
+            have_root = 1;
+        const char *fstype = procfs_mount_fstype(drv, is_root);
+        /* Linux: source mountpoint fstype options dump pass */
+        const char *src = is_root ? "rootfs" : fstype;
         int wr = snprintf(buf + w, (w < size) ? (size - w) : 0,
                           "%s %s %s rw,relatime 0 0\n",
-                          fstype, mpath, fstype);
+                          src, mpath, fstype);
         if (wr < 0) break;
         w += (size_t)wr;
         if (w >= size) { w = size; break; }
     }
+    /* BusyBox mount(1) requires a "/" line in /proc/mounts. */
+    if (!have_root && w < size) {
+        int wr = snprintf(buf + w, size - w, "rootfs / rootfs rw 0 0\n");
+        if (wr > 0)
+            w += (size_t)wr;
+    }
+    if (w > size)
+        w = size;
     return (ssize_t)w;
 }
 
@@ -672,6 +875,58 @@ static ssize_t procfs_write(struct fs_file *file, const void *buf, size_t size, 
 	return -1;
 }
 
+/* Generate /proc plain-file body for file_id (meminfo/stat/mounts/...). */
+static ssize_t procfs_generate_plain(int file_id, char *buf, size_t cap) {
+	if (!buf || cap == 0) return 0;
+	if (file_id == 10) return procfs_show_meminfo(buf, cap, NULL);
+	if (file_id == 11) return procfs_show_uptime(buf, cap, NULL);
+	if (file_id == 12) return procfs_show_cpuinfo(buf, cap, NULL);
+	if (file_id == 13) return procfs_show_partitions(buf, cap, NULL);
+	if (file_id == 14) return procfs_show_loadavg(buf, cap, NULL);
+	if (file_id == 15) return procfs_show_kernel_stat(buf, cap, NULL);
+	if (file_id == 16) return procfs_show_mounts(buf, cap, NULL);
+	if (file_id == 17) return procfs_show_filesystems(buf, cap, NULL);
+	if (file_id == 40) return procfs_show_scsi(buf, cap, NULL);
+	if (file_id == 41 || file_id == 42) return procfs_show_pci(buf, cap, NULL);
+	if (file_id == 30) return usb_proc_bus_devices_show(buf, cap, NULL);
+	if (file_id == 31) return devfs_tty_debug_dump(buf, cap);
+	if (file_id == 50) return procfs_net_snap_tcp(buf, cap);
+	if (file_id == 51) return procfs_net_snap_udp(buf, cap);
+	if (file_id == 52) return procfs_net_snap_tcp6(buf, cap);
+	if (file_id == 53) return procfs_net_snap_udp6(buf, cap);
+	if (file_id == 54) return procfs_net_snap_raw(buf, cap);
+	if (file_id == 55) return procfs_net_snap_raw6(buf, cap);
+	if (file_id == 56) return procfs_net_snap_unix(buf, cap);
+	if (file_id == 57) return procfs_net_snap_arp(buf, cap);
+	if (file_id == 58) return procfs_net_snap_dev(buf, cap);
+	if (file_id == 59) return procfs_net_snap_route(buf, cap);
+	if (file_id == 60) return procfs_net_snap_dhcp(buf, cap);
+	return 0;
+}
+
+/* Snapshot plain /proc file at open (or lazily on first read). */
+static void procfs_fill_kind7_cache(struct procfs_handle *h, struct fs_file *f) {
+	if (!h || !f || h->kind != 7 || h->cache)
+		return;
+	size_t cap = 4096;
+	if (h->file_id >= 50 && h->file_id <= 56)
+		cap = 65536;
+	else if (h->file_id == 15)
+		cap = 8192; /* cpu + cpu0..N + btime trailer */
+	h->cache = (char *)kmalloc(cap);
+	if (!h->cache)
+		return;
+	ssize_t full = procfs_generate_plain(h->file_id, h->cache, cap);
+	if (full > 0) {
+		f->size = (size_t)full;
+		h->cache_len = f->size;
+	} else {
+		/* Keep empty snapshot (len 0) so read returns EOF, not "missing". */
+		h->cache_len = 0;
+		f->size = 0;
+	}
+}
+
 static int procfs_create(const char *path, struct fs_file **out_file) {
     (void)path; (void)out_file;
     return -1;
@@ -714,6 +969,8 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
         h->kind = 1; /* root */
         f->type = FS_TYPE_DIR;
         f->size = 0;
+        if (procfs_build_root_dir(h) == 0)
+            f->size = h->cache_len;
     } else {
 		/* parse /proc/<id>[/name...] */
 		const char *p = path + 6; /* after "/proc/" */
@@ -777,8 +1034,9 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 			h->kind = 7;
 			h->file_id = 13;
 			f->type = FS_TYPE_REG;
-			f->size = 4096; /* approximate */
+			f->size = 0;
 			f->driver_private = h;
+			procfs_fill_kind7_cache(h, f);
 			*out_file = f;
 			return 0;
 		}
@@ -796,8 +1054,9 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				h->kind = 7;
 				h->file_id = 40;
 				f->type = FS_TYPE_REG;
-				f->size = 4096;
+				f->size = 0;
 				f->driver_private = h;
+				procfs_fill_kind7_cache(h, f);
 				*out_file = f;
 				return 0;
 			}
@@ -811,8 +1070,8 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				h->kind = 7; f->type = FS_TYPE_REG;
 				f->size = 0;
 				f->driver_private = h;
-				/* size computed later on read */
 				h->file_id = 10; /* meminfo */
+				procfs_fill_kind7_cache(h, f);
 				*out_file = f;
 				return 0;
 			}
@@ -821,6 +1080,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				f->size = 0;
 				f->driver_private = h;
 				h->file_id = 11; /* uptime */
+				procfs_fill_kind7_cache(h, f);
 				*out_file = f;
 				return 0;
 			}
@@ -829,6 +1089,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				f->size = 0;
 				f->driver_private = h;
 				h->file_id = 12; /* cpuinfo */
+				procfs_fill_kind7_cache(h, f);
 				*out_file = f;
 				return 0;
 			}
@@ -837,6 +1098,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				f->size = 0;
 				f->driver_private = h;
 				h->file_id = 41; /* pci */
+				procfs_fill_kind7_cache(h, f);
 				*out_file = f;
 				return 0;
 			}
@@ -845,6 +1107,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				f->size = 0;
 				f->driver_private = h;
 				h->file_id = 14; /* loadavg */
+				procfs_fill_kind7_cache(h, f);
 				*out_file = f;
 				return 0;
 			}
@@ -853,6 +1116,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
                 f->size = 0;
                 f->driver_private = h;
                 h->file_id = 16; /* mounts */
+                procfs_fill_kind7_cache(h, f);
                 *out_file = f;
                 return 0;
             }
@@ -861,6 +1125,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
                 f->size = 0;
                 f->driver_private = h;
                 h->file_id = 17; /* filesystems */
+                procfs_fill_kind7_cache(h, f);
                 *out_file = f;
                 return 0;
             }
@@ -869,6 +1134,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				f->size = 0;
 				f->driver_private = h;
 				h->file_id = 15; /* kernel stat (cpu lines) */
+				procfs_fill_kind7_cache(h, f);
 				*out_file = f;
 				return 0;
 			}
@@ -1032,24 +1298,30 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 						else { kfree(h); kfree(pp); kfree(f); return -1; }
 						h->kind = 3;
 						h->pid = tid;
+						h->is_task = 1;
 						f->type = FS_TYPE_REG;
 					}
 				}
 				if (h->kind == 3 && f->type == FS_TYPE_REG) {
 					size_t cap = 4096;
-					char *tmpbuf = (char *)kmalloc(cap);
-					if (tmpbuf) {
+					h->cache = (char *)kmalloc(cap);
+					if (h->cache) {
 						ssize_t full = 0;
 						if (h->file_id == 0)
-							full = procfs_show_cmdline(tmpbuf, cap, (void *)(uintptr_t)h->pid);
+							full = procfs_show_cmdline(h->cache, cap, (void *)(uintptr_t)h->pid);
 						else if (h->file_id == 1)
-							full = procfs_show_stat(tmpbuf, cap, (void *)(uintptr_t)h->pid);
+							full = procfs_show_stat(h->cache, cap, h);
 						else if (h->file_id == 2)
-							full = procfs_show_status(tmpbuf, cap, (void *)(uintptr_t)h->pid);
+							full = procfs_show_status(h->cache, cap, (void *)(uintptr_t)h->pid);
 						else if (h->file_id == 3)
-							full = procfs_show_statm(tmpbuf, cap, (void *)(uintptr_t)h->pid);
-						if (full > 0) f->size = (size_t)full;
-						kfree(tmpbuf);
+							full = procfs_show_statm(h->cache, cap, (void *)(uintptr_t)h->pid);
+						if (full > 0) {
+							f->size = (size_t)full;
+							h->cache_len = f->size;
+						} else {
+							kfree(h->cache);
+							h->cache = NULL;
+						}
 					}
 				}
 			} else if (strncmp(rest, "fd", 2) == 0 && (rest[2] == '\0' || rest[2] == '/')) {
@@ -1107,6 +1379,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					/* /proc/self/mounts == /proc/mounts (Linux) */
 					h->kind = 7; h->file_id = 16; f->type = FS_TYPE_REG; f->size = 0;
 					f->driver_private = h;
+					procfs_fill_kind7_cache(h, f);
 					*out_file = f;
 					return 0;
 				} else {
@@ -1114,19 +1387,28 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				}
 				/* compute size */
 				size_t cap = 4096;
-				char *tmpbuf = (char*)kmalloc(cap);
-				if (tmpbuf) {
+				h->cache = (char*)kmalloc(cap);
+				if (h->cache) {
 					ssize_t full = 0;
-					if (h->file_id == 0) full = procfs_show_cmdline(tmpbuf, cap, (void*)(uintptr_t)h->pid);
-					else if (h->file_id == 1) full = procfs_show_stat(tmpbuf, cap, (void*)(uintptr_t)h->pid);
-					else if (h->file_id == 2) full = procfs_show_status(tmpbuf, cap, (void*)(uintptr_t)h->pid);
-					else if (h->file_id == 3) full = procfs_show_statm(tmpbuf, cap, (void*)(uintptr_t)h->pid);
-					if (full > 0) f->size = (size_t)full;
-					kfree(tmpbuf);
+					if (h->file_id == 0) full = procfs_show_cmdline(h->cache, cap, (void*)(uintptr_t)h->pid);
+					else if (h->file_id == 1) full = procfs_show_stat(h->cache, cap, h);
+					else if (h->file_id == 2) full = procfs_show_status(h->cache, cap, (void*)(uintptr_t)h->pid);
+					else if (h->file_id == 3) full = procfs_show_statm(h->cache, cap, (void*)(uintptr_t)h->pid);
+					if (full > 0) {
+						f->size = (size_t)full;
+						h->cache_len = f->size;
+					} else {
+						kfree(h->cache);
+						h->cache = NULL;
+					}
 				}
 			}
 		}
     }
+
+    /* Plain /proc files: snapshot once so multi-read/getdents offsets stay stable. */
+    if (h->kind == 7)
+        procfs_fill_kind7_cache(h, f);
 
     f->driver_private = h;
     *out_file = f;
@@ -1138,94 +1420,17 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
     struct procfs_handle *h = (struct procfs_handle*)file->driver_private;
     if (!h) return -1;
 
-    /* directory reading */
+    /* /proc root — stable snapshot built at open (byte-offset safe for getdents). */
     if (h->kind == 1) {
-        /* /proc root: list numeric pids as directories */
-        /* include some top-level virtual files/directories before PIDs */
-        size_t pos = 0;
-        size_t written = 0;
-        uint8_t *out = (uint8_t*)buf;
-        const char *top[] = { "meminfo", "cpuinfo", "uptime", "loadavg", "mounts", "filesystems", "stat", "partitions", "sys", "bus", "tty", "ttydebug", "net", "scsi" };
-        for (size_t ti = 0; ti < sizeof(top)/sizeof(top[0]); ti++) {
-            const char *name = top[ti];
-            size_t namelen = strlen(name);
-            size_t rec_len = 8 + namelen;
-            rec_len = (rec_len + 3) & ~3u;
-            if (pos + rec_len <= offset) { pos += rec_len; continue; }
-            if (written >= size) break;
-            size_t entry_off = 0;
-            if ((size_t)offset > pos) entry_off = (size_t)offset - pos;
-            uint8_t tmpent[256];
-            if (rec_len <= sizeof(tmpent)) {
-                for (size_t zi = 0; zi < sizeof(tmpent); zi++) tmpent[zi] = 0;
-                struct ext2_dir_entry de;
-                de.inode = (uint32_t)(1000 + (uint32_t)ti); /* pseudo inode */
-                de.rec_len = (uint16_t)rec_len;
-                de.name_len = (uint8_t)namelen;
-                /* sys, bus, tty, net, scsi are directories */
-                de.file_type = (strcmp(name, "sys") == 0 || strcmp(name, "bus") == 0 || strcmp(name, "tty") == 0 || strcmp(name, "net") == 0 || strcmp(name, "scsi") == 0)
-                               ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
-                memcpy(tmpent, &de, 8);
-                memcpy(tmpent + 8, name, namelen);
-                size_t avail = size - written;
-                size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
-                if (tocopy > avail) tocopy = avail;
-                if (tocopy > 0) memcpy(out + written, tmpent + entry_off, tocopy);
-                written += tocopy;
-            }
-            pos += rec_len;
-        }
-        int cnt = thread_get_count();
-        for (int i = 0; i < cnt; i++) {
-            thread_t *t = thread_get_by_index(i);
-            if (!t || t->tid == 0 || t->ring != 3) continue;
-            /*
-             * Linux /proc: one directory per live TGID, plus unreaped zombies.
-             * Advertising THREAD_TERMINATED slots as PIDs made ps show "live"
-             * httpd workers (fake utime from wall clock) that kill(2) could not
-             * signal (ESRCH).
-             */
-            if (t->state == THREAD_TERMINATED) {
-                if (!t->process || t->process->state != PROCESS_ZOMBIE)
-                    continue;
-                if (t->process->leader && t->process->leader != t)
-                    continue;
-            } else if (t->process && t->process->leader &&
-                       t->process->leader != t) {
-                /* CLONE_THREAD peer — only the leader owns /proc/<tgid>. */
-                continue;
-            }
-            int tgid = procfs_tgid(t);
-            if (tgid <= 0) continue;
-            char namebuf[32];
-            int nlen = snprintf(namebuf, sizeof(namebuf), "%d", tgid);
-            if (nlen <= 0) continue;
-            size_t namelen = (size_t)nlen;
-            size_t rec_len = 8 + namelen;
-            rec_len = (rec_len + 3) & ~3u;
-            if (pos + rec_len <= offset) { pos += rec_len; continue; }
-            if (written >= size) break;
-            size_t entry_off = 0;
-            if ((size_t)offset > pos) entry_off = (size_t)offset - pos;
-            uint8_t tmp[512];
-            if (rec_len > sizeof(tmp)) { pos += rec_len; continue; }
-            struct ext2_dir_entry de;
-            /* Ensure non-zero pseudo-inode: some userspace parsers stop at inode==0 */
-            de.inode = (uint32_t)((uint32_t)(tgid + 1) & 0xFFFFFFFFu);
-            de.rec_len = (uint16_t)rec_len;
-            de.name_len = (uint8_t)namelen;
-            de.file_type = EXT2_FT_DIR;
-            for (size_t zi = 0; zi < sizeof(tmp); zi++) tmp[zi] = 0;
-            memcpy(tmp, &de, 8);
-            memcpy(tmp + 8, namebuf, namelen);
-            size_t avail = size - written;
-            size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
-            if (tocopy > avail) tocopy = avail;
-            if (tocopy > 0) memcpy(out + written, tmp + entry_off, tocopy);
-            written += tocopy;
-            pos += rec_len;
-        }
-        return (ssize_t)written;
+        if (!h->cache)
+            return 0;
+        if ((size_t)offset >= h->cache_len)
+            return 0;
+        size_t to_copy = h->cache_len - (size_t)offset;
+        if (to_copy > size)
+            to_copy = size;
+        memcpy(buf, h->cache + offset, to_copy);
+        return (ssize_t)to_copy;
     }
 
     if (h->kind == 2) {
@@ -1528,49 +1733,52 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 
     /* regular file */
     if (h->kind == 3) {
-        ssize_t full = 0;
-        size_t cap = 4096;
-        if (cap < size + offset) cap = size + offset;
-        if (cap > 65536) cap = 65536;
-        char *tmp = (char*)kmalloc(cap);
-        if (!tmp) return -1;
-        if (h->file_id == 0) full = procfs_show_cmdline(tmp, cap, (void*)(uintptr_t)h->pid);
-        else if (h->file_id == 1) full = procfs_show_stat(tmp, cap, (void*)(uintptr_t)h->pid);
-        else if (h->file_id == 2) full = procfs_show_status(tmp, cap, (void*)(uintptr_t)h->pid);
-        else if (h->file_id == 3) full = procfs_show_statm(tmp, cap, (void*)(uintptr_t)h->pid);
-        else full = -1;
-        if (full < 0) { kfree(tmp); return -1; }
-        size_t len = (size_t)full;
-        if ((size_t)offset >= len) { kfree(tmp); return 0; }
-        size_t to_copy = len - (size_t)offset;
+        if (!h->cache) return 0;
+        if ((size_t)offset >= h->cache_len) return 0;
+        size_t to_copy = h->cache_len - (size_t)offset;
         if (to_copy > size) to_copy = size;
-        memcpy(buf, tmp + offset, to_copy);
-        kfree(tmp);
+        memcpy(buf, h->cache + offset, to_copy);
         return (ssize_t)to_copy;
     }
 
-	/* /proc/<pid>/task — list thread ids (minimal: main thread only) */
+	/* /proc/<pid>/task — list thread ids */
 	if (h->kind == 15) {
-		thread_t *t = procfs_thread_by_id(h->pid);
-		if (!t) return -1;
-		char namebuf[32];
-		int nlen = snprintf(namebuf, sizeof(namebuf), "%d", (int)t->tid);
-		if (nlen <= 0) return 0;
-		size_t namelen = (size_t)nlen;
-		size_t rec_len = 8 + namelen;
-		rec_len = (rec_len + 3) & ~3u;
-		if (offset > 0) return 0;
-		if (rec_len > size) rec_len = size;
-		struct ext2_dir_entry de;
-		de.inode = (uint32_t)t->tid;
-		de.rec_len = (uint16_t)rec_len;
-		de.name_len = (uint8_t)namelen;
-		de.file_type = EXT2_FT_DIR;
-		memcpy(buf, &de, 8);
-		memcpy((uint8_t*)buf + 8, namebuf, namelen);
-		return (ssize_t)rec_len;
+        if (offset == 0) h->file_id = 0;
+        size_t written = 0;
+        uint8_t *out = (uint8_t*)buf;
+        
+        int cnt = thread_get_count();
+        for (int i = h->file_id; i < cnt; i++) {
+            thread_t *t = thread_get_by_index(i);
+            if (!t || t->process == NULL || t->process->pid != (uint64_t)(unsigned)h->pid) {
+                h->file_id = i + 1;
+                continue;
+            }
+            char namebuf[32];
+            int nlen = snprintf(namebuf, sizeof(namebuf), "%d", (int)t->tid);
+            if (nlen <= 0) {
+                h->file_id = i + 1;
+                continue;
+            }
+            size_t namelen = (size_t)nlen;
+            size_t rec_len = 8 + namelen;
+            rec_len = (rec_len + 3) & ~3u;
+            if (written + rec_len > size) break;
+            
+            struct ext2_dir_entry de;
+            de.inode = (uint32_t)t->tid;
+            de.rec_len = (uint16_t)rec_len;
+            de.name_len = (uint8_t)namelen;
+            de.file_type = EXT2_FT_DIR;
+            memcpy(out + written, &de, 8);
+            memcpy(out + written + 8, namebuf, namelen);
+            for (size_t z = 8 + namelen; z < rec_len; z++) out[written + z] = 0;
+            
+            written += rec_len;
+            h->file_id = i + 1;
+        }
+        return (ssize_t)written;
 	}
-
 	/* /proc/<pid>/task/<tid> — same files as pid dir */
 	if (h->kind == 16) {
 		const char *tnames[4] = { "cmdline", "stat", "status", "statm" };
@@ -1604,42 +1812,35 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 
 	/* pid fd directory listing */
 	if (h->kind == 5) {
+        if (offset == 0) h->file_id = 0;
 		thread_t *t = procfs_thread_by_id(h->pid);
 		if (!t) return -1;
-		size_t pos = 0;
 		size_t written = 0;
 		uint8_t *out = (uint8_t*)buf;
-		for (int i = 0; i < THREAD_MAX_FD; i++) {
+		for (int i = h->file_id; i < THREAD_MAX_FD; i++) {
 			char namebuf[16];
 			int nlen = snprintf(namebuf, sizeof(namebuf), "%d", i);
-			if (nlen <= 0) continue;
+			if (nlen <= 0) { h->file_id = i + 1; continue; }
 			size_t namelen = (size_t)nlen;
 			size_t rec_len = 8 + namelen;
 			rec_len = (rec_len + 3) & ~3u;
-			if (pos + rec_len <= offset) { pos += rec_len; continue; }
-			if (written >= size) break;
-			size_t entry_off = 0;
-			if ((size_t)offset > pos) entry_off = (size_t)offset - pos;
+            if (written + rec_len > size) break;
+            
 			uint8_t tmp[256];
-			if (rec_len > sizeof(tmp)) { pos += rec_len; continue; }
+            memset(tmp, 0, sizeof(tmp));
 			struct ext2_dir_entry de;
 			de.inode = (uint32_t)(i + 1);
 			de.rec_len = (uint16_t)rec_len;
 			de.name_len = (uint8_t)namelen;
 			de.file_type = (t->fds[i] ? EXT2_FT_REG_FILE : EXT2_FT_UNKNOWN);
-			for (size_t zi = 0; zi < sizeof(tmp); zi++) tmp[zi] = 0;
 			memcpy(tmp, &de, 8);
 			memcpy(tmp + 8, namebuf, namelen);
-			size_t avail = size - written;
-			size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
-			if (tocopy > avail) tocopy = avail;
-			if (tocopy > 0) memcpy(out + written, tmp + entry_off, tocopy);
-			written += tocopy;
-			pos += rec_len;
+            memcpy(out + written, tmp, rec_len);
+			written += rec_len;
+            h->file_id = i + 1;
 		}
 		return (ssize_t)written;
 	}
-
 	/* pid fd symlink target */
 	if (h->kind == 6) {
 		thread_t *t = procfs_thread_by_id(h->pid);
@@ -1658,46 +1859,17 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 		return (ssize_t)tocopy;
 	}
 
-	/* top-level files like meminfo/uptime */
+	/* top-level files like meminfo/uptime/stat/mounts */
 	if (h->kind == 7) {
-		size_t cap = 4096;
-		if (h->file_id >= 50 && h->file_id <= 56) cap = 65536;
-		if (cap < size + offset) cap = size + offset;
-		if (cap > 65536) cap = 65536;
-		char *tmpbuf = (char*)kmalloc(cap);
-		if (!tmpbuf) return -1;
-		ssize_t full = 0;
-		if (h->file_id == 10) full = procfs_show_meminfo(tmpbuf, cap, NULL);
-		else if (h->file_id == 11) full = procfs_show_uptime(tmpbuf, cap, NULL);
-		else if (h->file_id == 12) full = procfs_show_cpuinfo(tmpbuf, cap, NULL);
-		else if (h->file_id == 13) full = procfs_show_partitions(tmpbuf, cap, NULL);
-		else if (h->file_id == 14) full = procfs_show_loadavg(tmpbuf, cap, NULL);
-		else if (h->file_id == 15) full = procfs_show_kernel_stat(tmpbuf, cap, NULL);
-        else if (h->file_id == 16) full = procfs_show_mounts(tmpbuf, cap, NULL);
-        else if (h->file_id == 17) full = procfs_show_filesystems(tmpbuf, cap, NULL);
-		else if (h->file_id == 40) full = procfs_show_scsi(tmpbuf, cap, NULL);
-		else if (h->file_id == 41 || h->file_id == 42) full = procfs_show_pci(tmpbuf, cap, NULL);
-        else if (h->file_id == 30) full = usb_proc_bus_devices_show(tmpbuf, cap, NULL);
-        else if (h->file_id == 31) full = devfs_tty_debug_dump(tmpbuf, cap);
-        else if (h->file_id == 50) full = procfs_net_snap_tcp(tmpbuf, cap);
-        else if (h->file_id == 51) full = procfs_net_snap_udp(tmpbuf, cap);
-        else if (h->file_id == 52) full = procfs_net_snap_tcp6(tmpbuf, cap);
-        else if (h->file_id == 53) full = procfs_net_snap_udp6(tmpbuf, cap);
-        else if (h->file_id == 54) full = procfs_net_snap_raw(tmpbuf, cap);
-        else if (h->file_id == 55) full = procfs_net_snap_raw6(tmpbuf, cap);
-        else if (h->file_id == 56) full = procfs_net_snap_unix(tmpbuf, cap);
-        else if (h->file_id == 57) full = procfs_net_snap_arp(tmpbuf, cap);
-        else if (h->file_id == 58) full = procfs_net_snap_dev(tmpbuf, cap);
-        else if (h->file_id == 59) full = procfs_net_snap_route(tmpbuf, cap);
-        else if (h->file_id == 60) full = procfs_net_snap_dhcp(tmpbuf, cap);
-		if (full < 0) { kfree(tmpbuf); return -1; }
-		size_t len = (size_t)full;
-		if ((size_t)offset >= len) { kfree(tmpbuf); return 0; }
-		size_t tocopy = len - (size_t)offset;
-		if (tocopy > size) tocopy = size;
-		memcpy(buf, tmpbuf + offset, tocopy);
-		kfree(tmpbuf);
-		return (ssize_t)tocopy;
+        /* Open has many early-return paths that skip cache fill — generate now. */
+        if (!h->cache)
+            procfs_fill_kind7_cache(h, file);
+        if (!h->cache) return 0;
+        if ((size_t)offset >= h->cache_len) return 0;
+        size_t to_copy = h->cache_len - (size_t)offset;
+        if (to_copy > size) to_copy = size;
+        memcpy(buf, h->cache + offset, to_copy);
+        return (ssize_t)to_copy;
 	}
 
 	/* proc/sys files (hostname etc) */
@@ -1726,7 +1898,11 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 
 static void procfs_release(struct fs_file *file) {
     if (!file) return;
-    if (file->driver_private) kfree(file->driver_private);
+    if (file->driver_private) {
+        struct procfs_handle *h = (struct procfs_handle*)file->driver_private;
+        if (h->cache) kfree(h->cache);
+        kfree(h);
+    }
     if (file->path) kfree((void*)file->path);
     kfree(file);
 }

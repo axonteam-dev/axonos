@@ -10687,7 +10687,58 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return 0;
                 }
 
-                int step = 10;
+                /* Wake on tty keypress like poll() — do not sleep fixed 10ms slices. */
+                int cur_tid = curth ? (int)curth->tid : -1;
+                int tty_waiting[16];
+                int n_tty_waiting = 0;
+                if (cur_tid >= 0 && rin) {
+                    for (int fd = 0; fd < nfds && n_tty_waiting < (int)(sizeof(tty_waiting)/sizeof(tty_waiting[0])); fd++) {
+                        if (!((rin[fd / 64] >> (fd % 64)) & 1ULL)) continue;
+                        struct fs_file *f = syscall_fd_get(curth, fd);
+                        if (!f || !devfs_is_tty_file(f)) continue;
+                        int tidx = devfs_get_tty_index_from_file(f);
+                        if (tidx < 0) tidx = devfs_get_active();
+                        if (devfs_tty_add_waiter(tidx, cur_tid) == 0)
+                            tty_waiting[n_tty_waiting++] = tidx;
+                    }
+                }
+                if (n_tty_waiting > 0 && !has_net_socket) {
+                    if (timeout_ms < 0) {
+                        thread_block(cur_tid);
+                        thread_yield();
+                        for (int w = 0; w < n_tty_waiting; w++)
+                            devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
+                        goto auto_select_check;
+                    }
+                    uint64_t t0 = pit_get_time_ms();
+                    thread_block_with_timeout(cur_tid, (uint32_t)timeout_ms);
+                    thread_yield();
+                    for (int w = 0; w < n_tty_waiting; w++)
+                        devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
+                    int elapsed = (int)(pit_get_time_ms() - t0);
+                    if (elapsed >= timeout_ms) {
+                        if (readfds_u && rout) (void)copy_to_user_safe(readfds_u, rout, fdset_bytes);
+                        if (writefds_u && wout) (void)copy_to_user_safe(writefds_u, wout, fdset_bytes);
+                        if (rin) kfree(rin); if (rout) kfree(rout);
+                        if (win) kfree(win); if (wout) kfree(wout);
+                        return 0;
+                    }
+                    timeout_ms -= elapsed;
+                    goto auto_select_check;
+                }
+                if (n_tty_waiting > 0) {
+                    int step = 2;
+                    if (timeout_ms > 0 && timeout_ms < step) step = timeout_ms;
+                    net_pump_all_tcp(curth);
+                    thread_block_with_timeout(cur_tid, (uint32_t)step);
+                    thread_yield();
+                    for (int w = 0; w < n_tty_waiting; w++)
+                        devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
+                    if (timeout_ms > 0) timeout_ms -= step;
+                    goto auto_select_check;
+                }
+
+                int step = 2;
                 if (timeout_ms > 0 && timeout_ms < step) step = timeout_ms;
                 if (has_net_socket)
                     net_pump_all_tcp(curth);
@@ -15417,11 +15468,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     has_net_socket = 1;
             }
             if (timeout == 0) {
-                /* Non-blocking poll: service network once so packets get processed. */
+                /* Non-blocking poll: must return immediately (POSIX). Sleeping
+                 * here made ncurses/htop feel laggy — every idle poll cost 10ms. */
                 if (has_net_socket)
                     net_pump_all_tcp(poll_thr);
-                else
-                    thread_sleep(10); /* avoid busy-loop when no network fds */
                 kfree(kbuf);
                 return 0;
             }
@@ -17021,7 +17071,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             uint64_t mr = user_syscall_mmap(cur, a1, a2, a3, a4, a5, a6);
             if ((int64_t)mr < 0 && pid1_dl_trace_thread(cur)) {
-                kprintf("dl-trace mmap syscall errno=%d addr=0x%llx len=0x%llx prot=0x%x "
+                kprintf("dl-race mmap syscall errno=%d addr=0x%llx len=0x%llx prot=0x%x "
                     "flags=0x%x fd=%lld off=0x%llx\n",
                     (int)(-(int64_t)mr),
                     (unsigned long long)a1, (unsigned long long)a2, (int)a3, (int)a4,

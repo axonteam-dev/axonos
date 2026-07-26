@@ -41,6 +41,11 @@ static uint64_t cpu_user_ticks;
 static uint64_t cpu_nice_ticks;
 static uint64_t cpu_system_ticks;
 static uint64_t cpu_idle_ticks;
+/* Per-CPU raw ticks for /proc/stat cpuN lines. */
+static uint64_t cpu_user_ticks_pc[SMP_MAX_CPUS];
+static uint64_t cpu_nice_ticks_pc[SMP_MAX_CPUS];
+static uint64_t cpu_system_ticks_pc[SMP_MAX_CPUS];
+static uint64_t cpu_idle_ticks_pc[SMP_MAX_CPUS];
 int init = 0;
 static int init_user_tid = -1;
 
@@ -92,39 +97,73 @@ static int thread_is_any_idle(const thread_t *t) {
 }
 
 void thread_account_timer_tick(int user_mode) {
+        int cpu = smp_sched_cpu_id();
+        if (cpu < 0 || cpu >= SMP_MAX_CPUS)
+                cpu = 0;
+
         thread_t *cur = thread_current();
         if (!cur || thread_is_any_idle(cur) || cur->ring != 3) {
+                cpu_idle_ticks_pc[cpu]++;
                 cpu_idle_ticks++;
-                return;
-        }
-        if (user_mode) {
+        } else if (user_mode) {
                 cur->utime_ticks++;
-                if (cur->nice > 0)
+                if (cur->nice > 0) {
+                        cpu_nice_ticks_pc[cpu]++;
                         cpu_nice_ticks++;
-                else
+                } else {
+                        cpu_user_ticks_pc[cpu]++;
                         cpu_user_ticks++;
+                }
         } else {
                 cur->stime_ticks++;
+                cpu_system_ticks_pc[cpu]++;
                 cpu_system_ticks++;
         }
+
+        /*
+         * Periodic timer currently fires on BSP only. Topology still reports
+         * N CPUs, and htop scales process CPU% by N / delta(total jiffies).
+         * Charge silent CPUs as idle so totals grow at ncpus*HZ.
+         */
+        if (cpu == 0) {
+                int n = smp_cpu_count();
+                for (int i = 1; i < n && i < SMP_MAX_CPUS; i++) {
+                        cpu_idle_ticks_pc[i]++;
+                        cpu_idle_ticks++;
+                }
+        }
+}
+
+static void thread_ticks_to_user_hz(uint64_t raw, uint64_t *out) {
+        if (!out)
+                return;
+        uint32_t freq = (uint32_t)pit_get_frequency();
+        if (freq == 0)
+                freq = 1000u;
+        *out = (raw * 100ull) / (uint64_t)freq;
 }
 
 void thread_cpu_times_user_hz(uint64_t *user, uint64_t *nice, uint64_t *system,
                               uint64_t *idle) {
-        uint32_t freq = (uint32_t)pit_get_frequency();
-        if (freq == 0)
-                freq = 1000u;
-        /* Convert timer ticks → USER_HZ (100). */
-        uint64_t scale_num = 100ull;
-        uint64_t scale_den = (uint64_t)freq;
-        if (user)
-                *user = (cpu_user_ticks * scale_num) / scale_den;
-        if (nice)
-                *nice = (cpu_nice_ticks * scale_num) / scale_den;
-        if (system)
-                *system = (cpu_system_ticks * scale_num) / scale_den;
-        if (idle)
-                *idle = (cpu_idle_ticks * scale_num) / scale_den;
+        thread_ticks_to_user_hz(cpu_user_ticks, user);
+        thread_ticks_to_user_hz(cpu_nice_ticks, nice);
+        thread_ticks_to_user_hz(cpu_system_ticks, system);
+        thread_ticks_to_user_hz(cpu_idle_ticks, idle);
+}
+
+void thread_cpu_times_user_hz_cpu(int cpu, uint64_t *user, uint64_t *nice,
+                                  uint64_t *system, uint64_t *idle) {
+        if (cpu < 0 || cpu >= SMP_MAX_CPUS) {
+                if (user) *user = 0;
+                if (nice) *nice = 0;
+                if (system) *system = 0;
+                if (idle) *idle = 0;
+                return;
+        }
+        thread_ticks_to_user_hz(cpu_user_ticks_pc[cpu], user);
+        thread_ticks_to_user_hz(cpu_nice_ticks_pc[cpu], nice);
+        thread_ticks_to_user_hz(cpu_system_ticks_pc[cpu], system);
+        thread_ticks_to_user_hz(cpu_idle_ticks_pc[cpu], idle);
 }
 
 /* declared below (needs main_thread, sched_lock, KERNEL_STACK_SIZE, thread_is_any_idle) */

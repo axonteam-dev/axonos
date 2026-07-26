@@ -233,10 +233,15 @@ void apic_timer_handler(cpu_registers_t* regs) {
     int published_fork_child = 0;
     if (regs && ((regs->cs & 3) == 3))
         published_fork_child = syscall_publish_deferred_fork_child();
-    if (init && smp_sched_cpu_id() == 0 && apic_timer_state.frequency > 0 &&
-        apic_timer_ticks > 0 &&
-        (apic_timer_ticks % (uint64_t)apic_timer_state.frequency) == 0)
-        loadavg_second_tick();
+    /* Wall-second loadavg update (modulo ticks skips seconds when IRQs coalesce). */
+    if (init && smp_sched_cpu_id() == 0) {
+        static uint64_t loadavg_last_ms;
+        uint64_t now_ms = pit_get_time_ms();
+        if (now_ms - loadavg_last_ms >= 1000ull) {
+            loadavg_last_ms = now_ms;
+            loadavg_second_tick();
+        }
+    }
 
     /* Ensure ACPI/power requests progress even when system is otherwise idle at a prompt. */
     if (power_is_pending() && (!regs || ((regs->cs & 3) == 0))) {

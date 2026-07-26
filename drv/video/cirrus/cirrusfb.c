@@ -112,6 +112,11 @@ static void cirrusfb_kick_sync_rate_limited(void) {
 	video_display_sync();
 }
 
+/*
+ * Push dirty shadow→VRAM. Large rects are expensive on PCI BAR hosts; callers
+ * that must not stall (tty write batch end) leave g_fb_dirty and let the
+ * timer path (cirrusfb_update_cursor) perform the push.
+ */
 static void cirrusfb_flush_dirty(void) {
 	if (!g_fb_dirty || !g_ready) return;
 	/* Nested tty write batches: keep dirty until outermost end_batch. */
@@ -144,6 +149,20 @@ static void cirrusfb_flush_dirty(void) {
 	g_fb_sync_pending = 1;
 }
 
+/* Immediate push only for small damage (shell ECHO = one glyph). */
+static void cirrusfb_flush_dirty_if_small(void) {
+	if (!g_fb_dirty || !g_ready || g_batch_depth > 0)
+		return;
+	uint32_t w = g_dirty_x1 - g_dirty_x0 + 1;
+	uint32_t h = g_dirty_y1 - g_dirty_y0 + 1;
+	uint32_t fw = FONT_W();
+	uint32_t fh = FONT_H();
+	/* ~2 glyph rows × full width, or a short run — keep echo snappy. */
+	uint32_t small = (fw && fh) ? (g_cols * fw * fh * 2u) : (64u * 32u);
+	if (w * h <= small)
+		cirrusfb_flush_dirty();
+}
+
 void cirrusfb_begin_batch(void) {
 	if (g_batch_depth < 64)
 		g_batch_depth++;
@@ -159,7 +178,12 @@ void cirrusfb_end_batch(void) {
 		hwcursor_set_pos(g_hwcursor_def_x, g_hwcursor_def_y);
 		g_hwcursor_deferred = 0;
 	}
-	cirrusfb_flush_dirty();
+	/*
+	 * Do not memcpy a full-screen dirty rect inside write().
+	 * ncurses/htop redraws mark huge unions; shell ECHO is unbatched and
+	 * still flushes immediately via putch (small rect). Timer pushes the rest.
+	 */
+	cirrusfb_flush_dirty_if_small();
 }
 
 /* ANSI: kputchar() goes straight here when Cirrus is active — devfs may not see all output. */
@@ -610,11 +634,10 @@ static void cirrusfb_putchar_inner(uint8_t ch, uint8_t attr) {
 			draw_glyph_noflush(g_cursor_x, oy, ' ', g_current_attr);
 			g_cursor_x++;
 		}
-	} else if (ch == '\b') {
-		if (g_cursor_x > 0) g_cursor_x--;
-		g_textbuf[g_cursor_y * g_cols + g_cursor_x].ch = ' ';
-		g_textbuf[g_cursor_y * g_cols + g_cursor_x].attr = g_current_attr;
-		draw_glyph_noflush(g_cursor_x, g_cursor_y, ' ', g_current_attr);
+	} else if (ch == '\b' || ch == 0x7F) {
+		/* Non-destructive: cursor left only (Linux vt bs()). */
+		if (g_cursor_x > 0)
+			g_cursor_x--;
 	} else {
 		g_textbuf[oy * g_cols + ox].ch = ch;
 		g_textbuf[oy * g_cols + ox].attr = g_current_attr;
@@ -994,6 +1017,9 @@ void cirrusfb_putchar(uint8_t ch, uint8_t attr) {
 
 void cirrusfb_update_cursor(void) {
 	if (!g_ready) return;
+	/* Push damage deferred from tty write batches (ncurses redraws). */
+	if (g_fb_dirty && g_batch_depth == 0)
+		cirrusfb_flush_dirty();
 	/* Drain a deferred SVGA SYNC from a prior flush (rate-limit gap). */
 	if (g_fb_sync_pending)
 		cirrusfb_kick_sync_rate_limited();

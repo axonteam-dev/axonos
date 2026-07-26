@@ -40,9 +40,14 @@ void pit_handler(cpu_registers_t* regs) {
                 power_poll();
         }
 
-        if (init && smp_sched_cpu_id() == 0 && pit_ticks > 0 &&
-            pit_frequency > 0 && (pit_ticks % pit_frequency) == 0)
-                loadavg_second_tick();
+        if (init && smp_sched_cpu_id() == 0) {
+                static uint64_t loadavg_last_ms;
+                uint64_t now_ms = pit_get_time_ms();
+                if (now_ms - loadavg_last_ms >= 1000ull) {
+                        loadavg_last_ms = now_ms;
+                        loadavg_second_tick();
+                }
+        }
 
         if (!init) return;
         thread_wake_expired_timeouts();

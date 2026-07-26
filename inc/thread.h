@@ -220,6 +220,9 @@ void thread_account_timer_tick(int user_mode);
 /* Aggregate USER_HZ counters for /proc/stat (cpu line). */
 void thread_cpu_times_user_hz(uint64_t *user, uint64_t *nice, uint64_t *system,
                               uint64_t *idle);
+/* Per-CPU USER_HZ counters for /proc/stat cpuN lines. */
+void thread_cpu_times_user_hz_cpu(int cpu, uint64_t *user, uint64_t *nice,
+                                  uint64_t *system, uint64_t *idle);
 void thread_schedule();
 thread_t* thread_current();
 void thread_stop(int pid);

@@ -4,8 +4,8 @@
 #include <spinlock.h>
 #include <string.h>
 
-#define FRAME_META_MAX 32768
-#define FRAME_HASH_SIZE 4096
+#define FRAME_META_MAX 65536
+#define FRAME_HASH_SIZE 8192
 
 typedef struct frame_meta {
     uint64_t pa;
@@ -15,7 +15,9 @@ typedef struct frame_meta {
     int link;
 } frame_meta_t;
 
-static frame_meta_t frames[FRAME_META_MAX];
+/* Heap-allocated: a static frames[] BSS blows past 0x400000 (user ET_EXEC). */
+static frame_meta_t *frames;
+static int frames_cap;
 static int *frame_hash; /* FRAME_HASH_SIZE entries, heap-allocated */
 static int frame_free_head = -1;
 static spinlock_t frame_lock = { 0 };
@@ -27,25 +29,36 @@ static unsigned frame_hash_pa(uint64_t pa) {
 
 void frame_init(void) {
     unsigned long flags;
+    frames_cap = FRAME_META_MAX;
+    frames = (frame_meta_t *)kmalloc(sizeof(frame_meta_t) * (size_t)frames_cap);
+    if (!frames) {
+        frames_cap = 4096;
+        frames = (frame_meta_t *)kmalloc(sizeof(frame_meta_t) * (size_t)frames_cap);
+    }
     acquire_irqsave(&frame_lock, &flags);
-    memset(frames, 0, sizeof(frames));
+    if (frames)
+        memset(frames, 0, sizeof(frame_meta_t) * (size_t)frames_cap);
     frame_hash = (int *)kmalloc(sizeof(int) * FRAME_HASH_SIZE);
     if (frame_hash) {
         for (int i = 0; i < FRAME_HASH_SIZE; i++)
             frame_hash[i] = -1;
     }
     frame_free_head = -1;
-    for (int i = FRAME_META_MAX - 1; i >= 0; --i) {
-        frames[i].link = frame_free_head;
-        frame_free_head = i;
+    if (frames) {
+        for (int i = frames_cap - 1; i >= 0; --i) {
+            frames[i].link = frame_free_head;
+            frame_free_head = i;
+        }
     }
     release_irqrestore(&frame_lock, flags);
 }
 
 static int frame_slot_locked(uint64_t pa) {
     pa &= PG_ADDR_MASK;
+    if (!frames)
+        return -1;
     if (!frame_hash) {
-        for (int i = 0; i < FRAME_META_MAX; ++i)
+        for (int i = 0; i < frames_cap; ++i)
             if (frames[i].refs && frames[i].pa == pa)
                 return i;
         return -1;
@@ -59,6 +72,8 @@ static int frame_slot_locked(uint64_t pa) {
 }
 
 static int frame_take_free_locked(void) {
+    if (!frames)
+        return -1;
     int slot = frame_free_head;
     if (slot < 0)
         return -1;
@@ -103,6 +118,8 @@ static void frame_return_free_locked(int slot) {
 }
 
 void *frame_alloc(void) {
+    if (!frames)
+        return NULL;
     void *raw = kmalloc((size_t)PAGE_SIZE_4K * 2u);
     if (!raw)
         return NULL;
@@ -134,7 +151,7 @@ void *frame_alloc_zero(void) {
 
 int frame_adopt(uint64_t pa) {
     pa &= PG_ADDR_MASK;
-    if (!pa)
+    if (!pa || !frames)
         return -1;
     unsigned long flags;
     acquire_irqsave(&frame_lock, &flags);

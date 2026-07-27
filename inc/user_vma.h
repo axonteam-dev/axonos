@@ -60,6 +60,20 @@ uintptr_t user_vma_min_mmap_like_for_thread(thread_t *tcur, uintptr_t brk_base);
 /* True if [addr,addr+len) intersects any VMA tracked for runner's address space. */
 int user_vma_overlaps_thread_range(thread_t *runner, uintptr_t addr, size_t len);
 int user_vma_mmap_range_overlaps(thread_t *runner, uintptr_t addr, size_t len);
+/*
+ * Linux get_unmapped_area (bottom-up): first free [floor,ceil) gap of len,
+ * aligned to `align` (power of two). Soft `hint` preferred when free.
+ * Returns 0 if no gap fits.
+ */
+uintptr_t user_vma_find_unmapped(thread_t *runner, uintptr_t floor, uintptr_t ceil,
+                                 uint64_t len, uintptr_t hint, uintptr_t align);
+/*
+ * Top-down gap search (Linux arch_get_unmapped_area_topdown style).
+ * Used for large Go PROT_NONE arenas so low VA stays free for glibc brk/mmap.
+ */
+uintptr_t user_vma_find_unmapped_topdown(thread_t *runner, uintptr_t floor,
+                                         uintptr_t ceil, uint64_t len,
+                                         uintptr_t align);
 
 int user_vma_fault_lazy_anon(uint64_t cr2);
 int user_vma_fault_nonpresent(uint64_t cr2, uint64_t err);

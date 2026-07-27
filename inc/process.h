@@ -6,8 +6,12 @@
 #include <fs.h>
 #include <stat.h>
 
-#define PROCESS_MAX_FD 256
+/* Match THREAD_MAX_FD; docker/containerd expect ≥1024 NOFILE soft. */
+#define PROCESS_MAX_FD 1024
 #define PROCESS_SIGNAL_MAX 64
+/* Linux-ish defaults for RLIMIT_NOFILE (getrlimit/setrlimit/prlimit64). */
+#define PROCESS_RLIMIT_NOFILE_SOFT 1024ULL
+#define PROCESS_RLIMIT_NOFILE_HARD 1048576ULL
 #ifndef AXON_NGROUPS_MAX
 #define AXON_NGROUPS_MAX 32
 #endif
@@ -62,6 +66,15 @@ typedef struct process {
     uint32_t itimer_interval_ms;
     /* prctl(PR_SET_DUMPABLE): 0/1/2 — Linux default is 1 (SUID_DUMP_USER). */
     int dumpable;
+    /* Resource limits (Linux rlimit64). Only NOFILE is enforced on open. */
+    uint64_t rlim_nofile_cur;
+    uint64_t rlim_nofile_max;
+    uint64_t rlim_stack_cur;
+    uint64_t rlim_stack_max;
+    uint64_t rlim_nproc_cur;
+    uint64_t rlim_nproc_max;
+    uint64_t rlim_as_cur;
+    uint64_t rlim_as_max;
 } process_t;
 
 void process_init(void);
@@ -94,5 +107,13 @@ void process_arm_itimer_real(process_t *p, uint64_t expire_ms, uint32_t interval
 void process_get_itimer_real(process_t *p, uint32_t *value_ms, uint32_t *interval_ms,
                              uint64_t now_ms);
 void process_itimer_tick(uint64_t now_ms);
+
+/* POSIX timers (timer_create/settime) — Linux SIGEV_SIGNAL / SIGEV_THREAD_ID. */
+int process_posix_timer_create(int clockid, const void *sevp, size_t sev_len, int32_t *out_id);
+int process_posix_timer_settime(int32_t timerid, int flags,
+                                uint64_t value_ms, uint32_t interval_ms,
+                                uint64_t *old_value_ms, uint32_t *old_interval_ms);
+int process_posix_timer_delete(int32_t timerid);
+void process_posix_timer_tick(uint64_t now_ms);
 
 #endif

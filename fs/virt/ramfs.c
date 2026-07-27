@@ -317,30 +317,85 @@ static int ramfs_build_path(struct ramfs_node *node, char *buf, size_t bufsz) {
     return 0;
 }
 
-/* Lookup node by absolute path WITHOUT following symlinks.
-   If a symlink appears in the middle of the path, we treat it as non-directory and fail. */
+/*
+ * Lookup by absolute path for lstat/readlink semantics (Linux):
+ * follow every intermediate symlink; do not follow the final component.
+ * The old implementation refused intermediate symlinks entirely, so
+ * `/var/run/X` failed with ENOENT while getdents on the open(`/var/run`)
+ * (followed) directory still listed X — classic ls "cannot access" spam.
+ */
 static struct ramfs_node *ramfs_lookup_nofollow(const char *path) {
     if (!path) return NULL;
     if (strcmp(path, "/") == 0) return ramfs_root;
     if (path[0] != '/') return NULL;
 
-    struct ramfs_node *cur = ramfs_root;
-    const char *p = path;
-    char comp[256];
-    while (ramfs_next_component(&p, comp, sizeof(comp))) {
-        struct ramfs_node *child = ramfs_find_child(cur, comp);
-        if (!child) return NULL;
-        /* If this is a symlink and there are more components, fail (nofollow). */
-        if ((child->mode & S_IFLNK) == S_IFLNK) {
+    int depth = 0;
+    char *curpath = (char *)kmalloc(strlen(path) + 1);
+    if (!curpath) return NULL;
+    strcpy(curpath, path);
+
+    while (depth < 16) {
+        depth++;
+        struct ramfs_node *cur = ramfs_root;
+        const char *p = curpath;
+        char comp[256];
+        int restarted = 0;
+        while (ramfs_next_component(&p, comp, sizeof(comp)) && cur) {
+            struct ramfs_node *child = ramfs_find_child(cur, comp);
+            if (!child) {
+                kfree(curpath);
+                return NULL;
+            }
             const char *peekp = p;
             char peek[2];
-            if (ramfs_next_component(&peekp, peek, sizeof(peek))) return NULL;
-            return child;
+            int has_more = ramfs_next_component(&peekp, peek, sizeof(peek)) ? 1 : 0;
+
+            if ((child->mode & S_IFLNK) == S_IFLNK) {
+                if (!has_more) {
+                    kfree(curpath);
+                    return child; /* final symlink: leave unfollowed */
+                }
+                while (*p == '/') p++;
+                const char *rest = (*p) ? p : NULL;
+                size_t newlen = strlen(child->data) + 1 + (rest ? strlen(rest) : 0) + 2;
+                char *newpath = (char *)kmalloc(newlen);
+                if (!newpath) {
+                    kfree(curpath);
+                    return NULL;
+                }
+                if (child->data[0] == '/') {
+                    strcpy(newpath, child->data);
+                } else {
+                    char parentbuf[2048];
+                    parentbuf[0] = '\0';
+                    if (ramfs_build_path(child->parent ? child->parent : ramfs_root,
+                                         parentbuf, sizeof(parentbuf)) != 0)
+                        strcpy(parentbuf, "/");
+                    size_t plen = strlen(parentbuf);
+                    if (plen > 1 && parentbuf[plen - 1] == '/')
+                        parentbuf[plen - 1] = '\0';
+                    snprintf(newpath, newlen, "%s/%s", parentbuf, child->data);
+                }
+                if (rest) {
+                    size_t curlen = strlen(newpath);
+                    newpath[curlen] = '/';
+                    newpath[curlen + 1] = '\0';
+                    strncat(newpath, rest, newlen - curlen - 2);
+                }
+                kfree(curpath);
+                curpath = newpath;
+                restarted = 1;
+                break;
+            }
+            cur = child;
         }
-        cur = child;
-        if (!cur) return NULL;
+        if (!restarted) {
+            kfree(curpath);
+            return ramfs_resolve_link(cur);
+        }
     }
-    return cur;
+    kfree(curpath);
+    return NULL;
 }
 
 static struct ramfs_node *ramfs_lookup(const char *path) {

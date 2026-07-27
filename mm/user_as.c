@@ -60,34 +60,17 @@ uintptr_t user_as_stack_top_for_tid(uint64_t tid) {
 }
 
 uintptr_t user_as_mmap_brk_top_limit(thread_t *tcur) {
+    /*
+     * Linux get_unmapped_area is process-wide. Do NOT clamp to the calling
+     * thread's pthread stack_base (Go workers sit mid-VA around 0x31xxxxxx):
+     * that made mmap for the next ~8MiB stack see top≈0x318a0000 after arenas
+     * filled [MMAP_BASE..pthread_stack) and fail with ENOMEM / EAGAIN.
+     * Pthread stacks are normal mmap VMAs — find_unmapped skips them.
+     */
     uintptr_t top_limit = (uintptr_t)USER_TLS_BASE;
-    if (!tcur)
-        return top_limit;
-    uintptr_t tls_slot = user_as_stack_top_for_tid(tcur->tid ? tcur->tid : 1);
-    tls_slot = tls_slot - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
-    if (tls_slot > 0x200000 && tls_slot < (uintptr_t)MMIO_IDENTITY_LIMIT && tls_slot < top_limit)
-        top_limit = tls_slot;
-    if (tcur->user_stack_base != 0u && tcur->user_stack_limit > tcur->user_stack_base) {
-        uintptr_t sb = (uintptr_t)tcur->user_stack_base;
-        if (sb > 0x200000u && sb < top_limit)
-            top_limit = sb;
-        uintptr_t st = (uintptr_t)tcur->user_stack_limit;
-        if (st > (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + 0x200000u) {
-            uintptr_t tls_exec = st - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
-            if (tls_exec > 0x200000 && tls_exec < (uintptr_t)MMIO_IDENTITY_LIMIT && tls_exec < top_limit)
-                top_limit = tls_exec;
-        }
-    }
-    {
-        uintptr_t rsp = (uintptr_t)syscall_user_rsp_saved;
-        if (rsp >= 0x200000u && rsp < (uintptr_t)USER_STACK_TOP) {
-            uintptr_t live_cap = rsp & ~0xFFFULL;
-            if (live_cap > 0x200000u && live_cap < top_limit)
-                top_limit = live_cap;
-        }
-    }
-    if (top_limit > (uintptr_t)USER_TLS_BASE)
-        top_limit = (uintptr_t)USER_TLS_BASE;
+    (void)tcur;
+    if (top_limit > (uintptr_t)USER_STACK_TOP)
+        top_limit = (uintptr_t)USER_STACK_TOP;
     {
         uintptr_t hlo = (uintptr_t)heap_base_addr();
         if (hlo > 0x200000u && hlo < (uintptr_t)MMIO_IDENTITY_LIMIT) {
@@ -189,27 +172,18 @@ int user_as_mmap_overlaps_user_stack(thread_t *t, uintptr_t addr, uintptr_t len,
     if (len && map_end < addr)
         return 1;
 
+    /*
+     * Only the high primary stack (near USER_STACK_TOP) is a hard reserved
+     * band. Mid-VA pthread stacks are mmap VMAs and must not be treated as a
+     * process-wide ceiling here.
+     */
     uintptr_t lo = 0;
     uintptr_t hi = 0;
-    uintptr_t rsp = (uintptr_t)syscall_user_rsp_saved;
-    if (rsp >= 0x200000u && rsp < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-        lo = (rsp > (uintptr_t)USER_STACK_SIZE) ? (rsp - (uintptr_t)USER_STACK_SIZE) : 0x200000u;
-        hi = rsp + 0x10000u;
-    }
-    if (t && t->user_stack_limit > t->user_stack_base) {
-        uintptr_t sb = (uintptr_t)t->user_stack_base;
-        uintptr_t se = (uintptr_t)t->user_stack_limit;
-        if (lo == 0 || sb < lo)
-            lo = sb;
-        if (hi < se)
-            hi = se;
-    }
-    if (t && t->user_stack && lo == 0) {
-        uintptr_t us = (uintptr_t)t->user_stack;
-        if (us >= 0x200000u) {
-            lo = (us > (uintptr_t)USER_STACK_SIZE) ? (us - (uintptr_t)USER_STACK_SIZE) : 0x200000u;
-            hi = us + 0x10000u;
-        }
+    const uintptr_t primary_floor = (uintptr_t)USER_STACK_TOP / 2u;
+    if (t && t->user_stack_limit > t->user_stack_base &&
+        t->user_stack_base >= primary_floor) {
+        lo = (uintptr_t)t->user_stack_base;
+        hi = (uintptr_t)t->user_stack_limit;
     }
     if (lo == 0 || hi <= lo)
         return 0;

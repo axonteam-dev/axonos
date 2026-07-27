@@ -16,7 +16,7 @@ typedef enum {
         THREAD_SLEEPING
 } thread_state_t;
 
-#define THREAD_MAX_FD 256
+#define THREAD_MAX_FD 1024
 
 typedef struct thread {
         context_t context;

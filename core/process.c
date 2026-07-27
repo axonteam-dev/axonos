@@ -9,6 +9,7 @@
 #include <paging.h>
 #include <exec.h>
 #include <mmio.h>
+#include <pit.h>
 
 extern void kprintf(const char *fmt, ...);
 
@@ -54,6 +55,14 @@ static process_t *process_alloc_locked(process_t *parent) {
     p->ngroups = 1;
     p->groups[0] = 0;
     p->dumpable = 1; /* Linux SUID_DUMP_USER */
+    p->rlim_nofile_cur = PROCESS_RLIMIT_NOFILE_SOFT;
+    p->rlim_nofile_max = PROCESS_RLIMIT_NOFILE_HARD;
+    p->rlim_stack_cur = 8ULL * 1024ULL * 1024ULL;
+    p->rlim_stack_max = 8ULL * 1024ULL * 1024ULL;
+    p->rlim_nproc_cur = 4096ULL;
+    p->rlim_nproc_max = 4096ULL;
+    p->rlim_as_cur = ~0ULL;
+    p->rlim_as_max = ~0ULL;
 
     if (parent) {
         p->next_sibling = parent->first_child;
@@ -75,6 +84,14 @@ static process_t *process_alloc_locked(process_t *parent) {
         p->umask = parent->umask;
         p->pgid = parent->pgid;
         p->sid = parent->sid;
+        p->rlim_nofile_cur = parent->rlim_nofile_cur;
+        p->rlim_nofile_max = parent->rlim_nofile_max;
+        p->rlim_stack_cur = parent->rlim_stack_cur;
+        p->rlim_stack_max = parent->rlim_stack_max;
+        p->rlim_nproc_cur = parent->rlim_nproc_cur;
+        p->rlim_nproc_max = parent->rlim_nproc_max;
+        p->rlim_as_cur = parent->rlim_as_cur;
+        p->rlim_as_max = parent->rlim_as_max;
         memcpy(p->cwd, parent->cwd, sizeof(p->cwd));
         memcpy(p->signal_handlers, parent->signal_handlers,
                sizeof(p->signal_handlers));
@@ -619,4 +636,209 @@ void process_itimer_tick(uint64_t now_ms) {
         acquire_irqsave(&process_lock, &flags);
     }
     release_irqrestore(&process_lock, flags);
+    process_posix_timer_tick(now_ms);
+}
+
+/* ---- POSIX interval timers (timer_create / timer_settime) ---- */
+
+#ifndef EINVAL
+#define EINVAL 22
+#endif
+#ifndef EFAULT
+#define EFAULT 14
+#endif
+#ifndef ENOMEM
+#define ENOMEM 12
+#endif
+#ifndef EAGAIN
+#define EAGAIN 11
+#endif
+#ifndef ESRCH
+#define ESRCH 3
+#endif
+
+enum {
+    AXON_SIGEV_SIGNAL = 0,
+    AXON_SIGEV_NONE = 1,
+    AXON_SIGEV_THREAD = 2,
+    AXON_SIGEV_THREAD_ID = 4,
+};
+
+#define AXON_POSIX_TIMER_MAX 128
+
+typedef struct {
+    int used;
+    int32_t id;
+    int clockid;
+    int notify;
+    int signo;
+    int32_t notify_tid; /* SIGEV_THREAD_ID target (musl timer helper) */
+    uint64_t owner_pid;
+    uint64_t expire_ms; /* 0 = disarmed */
+    uint32_t interval_ms;
+} axon_posix_timer_t;
+
+static axon_posix_timer_t g_posix_timers[AXON_POSIX_TIMER_MAX];
+static int32_t g_posix_timer_next_id = 1;
+static spinlock_t g_posix_timer_lock = { 0 };
+
+int process_posix_timer_create(int clockid, const void *sevp, size_t sev_len,
+                               int32_t *out_id) {
+    if (!out_id)
+        return -EFAULT;
+    /* Linux: CLOCK_REALTIME=0, CLOCK_MONOTONIC=1, CLOCK_BOOTTIME=7, … */
+    if (clockid < 0)
+        return -EINVAL;
+
+    int notify = AXON_SIGEV_SIGNAL;
+    int signo = SIGALRM;
+    int32_t notify_tid = 0;
+    if (sevp && sev_len >= 20) {
+        const uint8_t *b = (const uint8_t *)sevp;
+        int32_t n_signo = 0, n_notify = 0, n_tid = 0;
+        memcpy(&n_signo, b + 8, 4);
+        memcpy(&n_notify, b + 12, 4);
+        memcpy(&n_tid, b + 16, 4);
+        notify = n_notify;
+        if (n_signo > 0 && n_signo < 64)
+            signo = n_signo;
+        if (notify == AXON_SIGEV_THREAD_ID)
+            notify_tid = n_tid;
+        if (notify == AXON_SIGEV_THREAD) {
+            /* Kernel never sees raw SIGEV_THREAD (musl converts). Reject. */
+            return -EINVAL;
+        }
+        if (notify != AXON_SIGEV_SIGNAL && notify != AXON_SIGEV_NONE &&
+            notify != AXON_SIGEV_THREAD_ID)
+            return -EINVAL;
+    }
+
+    thread_t *cur = thread_current();
+    if (!cur || cur->ring != 3)
+        cur = thread_get_current_user();
+    uint64_t owner_pid = cur && cur->process ? cur->process->pid : 0;
+
+    unsigned long flags;
+    acquire_irqsave(&g_posix_timer_lock, &flags);
+    int slot = -1;
+    for (int i = 0; i < AXON_POSIX_TIMER_MAX; i++) {
+        if (!g_posix_timers[i].used) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        release_irqrestore(&g_posix_timer_lock, flags);
+        return -EAGAIN; /* Linux: too many timers */
+    }
+    int32_t id = g_posix_timer_next_id++;
+    if (g_posix_timer_next_id <= 0)
+        g_posix_timer_next_id = 1;
+    axon_posix_timer_t *t = &g_posix_timers[slot];
+    memset(t, 0, sizeof(*t));
+    t->used = 1;
+    t->id = id;
+    t->clockid = clockid;
+    t->notify = notify;
+    t->signo = signo;
+    t->notify_tid = notify_tid;
+    t->owner_pid = owner_pid;
+    release_irqrestore(&g_posix_timer_lock, flags);
+    *out_id = id;
+    return 0;
+}
+
+int process_posix_timer_settime(int32_t timerid, int flags,
+                                uint64_t value_ms, uint32_t interval_ms,
+                                uint64_t *old_value_ms, uint32_t *old_interval_ms) {
+    (void)flags; /* TIMER_ABSTIME: treat as relative for now (monotonic ms). */
+    uint64_t now = pit_get_time_ms();
+    unsigned long fl;
+    acquire_irqsave(&g_posix_timer_lock, &fl);
+    axon_posix_timer_t *t = NULL;
+    for (int i = 0; i < AXON_POSIX_TIMER_MAX; i++) {
+        if (g_posix_timers[i].used && g_posix_timers[i].id == timerid) {
+            t = &g_posix_timers[i];
+            break;
+        }
+    }
+    if (!t) {
+        release_irqrestore(&g_posix_timer_lock, fl);
+        return -EINVAL;
+    }
+    if (old_interval_ms)
+        *old_interval_ms = t->interval_ms;
+    if (old_value_ms) {
+        if (t->expire_ms == 0 || now >= t->expire_ms)
+            *old_value_ms = 0;
+        else
+            *old_value_ms = t->expire_ms - now;
+    }
+    t->interval_ms = interval_ms;
+    if (value_ms == 0)
+        t->expire_ms = 0;
+    else
+        t->expire_ms = now + value_ms;
+    release_irqrestore(&g_posix_timer_lock, fl);
+    return 0;
+}
+
+int process_posix_timer_delete(int32_t timerid) {
+    unsigned long fl;
+    acquire_irqsave(&g_posix_timer_lock, &fl);
+    for (int i = 0; i < AXON_POSIX_TIMER_MAX; i++) {
+        if (g_posix_timers[i].used && g_posix_timers[i].id == timerid) {
+            memset(&g_posix_timers[i], 0, sizeof(g_posix_timers[i]));
+            release_irqrestore(&g_posix_timer_lock, fl);
+            return 0;
+        }
+    }
+    release_irqrestore(&g_posix_timer_lock, fl);
+    return -EINVAL;
+}
+
+void process_posix_timer_tick(uint64_t now_ms) {
+    unsigned long fl;
+    acquire_irqsave(&g_posix_timer_lock, &fl);
+    for (int i = 0; i < AXON_POSIX_TIMER_MAX; i++) {
+        axon_posix_timer_t *tm = &g_posix_timers[i];
+        if (!tm->used || tm->expire_ms == 0 || now_ms < tm->expire_ms)
+            continue;
+        int notify = tm->notify;
+        int signo = tm->signo;
+        int32_t notify_tid = tm->notify_tid;
+        uint64_t owner_pid = tm->owner_pid;
+        if (tm->interval_ms)
+            tm->expire_ms = now_ms + (uint64_t)tm->interval_ms;
+        else
+            tm->expire_ms = 0;
+        release_irqrestore(&g_posix_timer_lock, fl);
+
+        if (notify != AXON_SIGEV_NONE && signo > 0 && signo < 64) {
+            uint64_t bit = 1ULL << (signo - 1);
+            if (notify == AXON_SIGEV_THREAD_ID && notify_tid > 0) {
+                thread_t *t = thread_get((int)notify_tid);
+                if (t && t->state != THREAD_TERMINATED) {
+                    t->pending_signals |= bit;
+                    if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING)
+                        thread_unblock((int)(t->tid ? t->tid : 1));
+                }
+            } else {
+                for (int ti = 0; ti < thread_get_count(); ++ti) {
+                    thread_t *t = thread_get_by_index(ti);
+                    if (!t || t->state == THREAD_TERMINATED)
+                        continue;
+                    if (owner_pid && t->process && t->process->pid != owner_pid)
+                        continue;
+                    t->pending_signals |= bit;
+                    if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING)
+                        thread_unblock((int)(t->tid ? t->tid : 1));
+                }
+            }
+            thread_request_resched();
+        }
+
+        acquire_irqsave(&g_posix_timer_lock, &fl);
+    }
+    release_irqrestore(&g_posix_timer_lock, fl);
 }

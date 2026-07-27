@@ -206,15 +206,46 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     uintptr_t anon_floor = (uintptr_t)USER_MMAP_BASE;
     if (brk_guard_floor > anon_floor)
         anon_floor = brk_guard_floor;
+    /*
+     * Leave a permanent low band for glibc brk + small mmap arenas.
+     * Go PROT_NONE / large anon are placed TOP-DOWN above this band so they
+     * cannot starve libc malloc (x_cgo_thread_start malloc(24)).
+     */
+    const uintptr_t libc_zone = 128u * 1024u * 1024u;
+    /* pthread MAP_STACK stays in the low libc band (bottom-up). Go arenas don't. */
+    int is_stack = (flags & MAP_STACK) != 0;
+    int large_or_reserve = (flags & MAP_ANONYMOUS) && !shared_mapping &&
+        !fixed_mapping && !is_stack && (prot_none || len_u64 > (1ull << 20));
+    if (large_or_reserve) {
+        uintptr_t prefer = (uintptr_t)USER_MMAP_BASE + libc_zone;
+        if (brk_guard_floor + libc_zone > prefer)
+            prefer = brk_guard_floor + libc_zone;
+        prefer = user_mm_align_up(prefer, (uintptr_t)PAGE_SIZE_2M);
+        if (prefer > anon_floor && prefer < top_limit &&
+            prefer + len_u64 <= top_limit)
+            anon_floor = prefer;
+    }
+    /*
+     * Guard only low TLS (glibc TCB near brk/image). Go keeps FS near the
+     * stack; raising anon_floor to that tip made anon_floor >= top_limit and
+     * the reset below collapsed the search floor to ~brk (0x26xxxxx) — then
+     * 128MiB arenas hit "no free VA" despite a free window under the stack.
+     */
     if (tcur && tcur->user_fs_base >= 0x200000u &&
-        tcur->user_fs_base < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+        tcur->user_fs_base < (uintptr_t)USER_MMAP_BASE) {
         uintptr_t tls_hi = user_mm_align_up(
             (uintptr_t)tcur->user_fs_base + 0x10000u, (uintptr_t)PAGE_SIZE_2M);
-        if (tls_hi > anon_floor)
+        if (tls_hi > anon_floor && tls_hi < top_limit)
             anon_floor = tls_hi;
     }
-    if (anon_floor >= top_limit)
+    if (anon_floor >= top_limit) {
         anon_floor = brk_guard_floor;
+        if (anon_floor < (uintptr_t)USER_MMAP_BASE &&
+            (uintptr_t)USER_MMAP_BASE < top_limit)
+            anon_floor = (uintptr_t)USER_MMAP_BASE;
+        if (anon_floor >= top_limit)
+            anon_floor = brk_guard_floor < top_limit ? brk_guard_floor : 0;
+    }
 
     if (len_u64 > (uint64_t)top_limit) {
         kprintf("mmap: ENOMEM len 0x%llx > top_limit 0x%llx\n",
@@ -237,48 +268,145 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     if (*p_mmap_next < anon_floor) *p_mmap_next = anon_floor;
     if (*p_mmap_next < brk_guard_floor) *p_mmap_next = brk_guard_floor;
 
-    if (tcur && tcur->user_stack_base != 0 && tcur->user_stack_limit > tcur->user_stack_base) {
-        uintptr_t se = (uintptr_t)tcur->user_stack_limit;
-        uintptr_t min_alloc = user_mm_align_up(se, PAGE_SIZE_2M);
-        if (tcur->user_fs_base > se && tcur->user_fs_base < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-            uintptr_t tls_min = user_mm_align_up((uintptr_t)tcur->user_fs_base + 0x3000u, PAGE_SIZE_2M);
-            if (tls_min > min_alloc) min_alloc = tls_min;
-        }
-        if (min_alloc < top_limit && *p_mmap_next < min_alloc)
-            *p_mmap_next = min_alloc;
-        else if (*p_mmap_next >= top_limit)
-            *p_mmap_next = anon_floor < top_limit ? anon_floor : brk_guard_floor;
+    /*
+     * Stack occupies [base, limit). top_limit already stops below that VMA —
+     * do not bump mmap_next above the stack tip (that left no room for Go).
+     */
+    if (tcur && tcur->user_stack_base != 0 &&
+        tcur->user_stack_limit > tcur->user_stack_base &&
+        *p_mmap_next >= top_limit) {
+        *p_mmap_next = anon_floor < top_limit ? anon_floor : brk_guard_floor;
     }
 
-    uintptr_t addr = fixed_mapping ? req_addr : user_mm_align_up(*p_mmap_next, 4096);
+    /*
+     * Large Go arenas (dockerd) are 2MiB-aligned PROT_NONE reserves. Keep the
+     * chosen VA 2MiB-aligned so reserve_only applies and we do not eagerly
+     * commit 128MiB of frames.
+     */
+    uintptr_t map_align = 4096u;
+    if ((flags & MAP_ANONYMOUS) && !shared_mapping &&
+        len_u64 > (96ull << 20) &&
+        (len_u64 & ((uint64_t)PAGE_SIZE_2M - 1)) == 0)
+        map_align = (uintptr_t)PAGE_SIZE_2M;
+
+    uintptr_t addr = fixed_mapping ? req_addr : user_mm_align_up(*p_mmap_next, map_align);
     if (fixed_mapping && (addr & 0xFFFu) != 0) return user_mm_ret_err(USER_MM_EINVAL);
     if (fixed_mapping && user_as_mmap_overlaps_kernel_heap(addr, len))
         return user_mm_ret_err(USER_MM_EINVAL);
 
-    if (!fixed_mapping && tcur && user_as_mmap_overlaps_user_stack(tcur, addr, (uintptr_t)len_u64, NULL)) {
-        uintptr_t above_stack = 0;
-        (void)user_as_mmap_overlaps_user_stack(tcur, addr, (uintptr_t)len_u64, &above_stack);
-        if (above_stack > addr && user_mm_range_fits(above_stack, len_u64, top_limit)) {
-            addr = above_stack;
-            *p_mmap_next = addr;
-        } else {
-            kprintf("mmap: ENOMEM overlaps user stack rsp=0x%llx stk=[0x%llx..0x%llx] addr=0x%llx len=0x%llx\n",
-                (unsigned long long)(uint64_t)syscall_user_rsp_saved,
-                (unsigned long long)tcur->user_stack_base,
-                (unsigned long long)tcur->user_stack_limit,
-                (unsigned long long)addr, (unsigned long long)len_u64);
+    if (!fixed_mapping) {
+        uintptr_t floor = anon_floor;
+        if (brk_guard_floor > floor)
+            floor = brk_guard_floor;
+        if (addr < floor)
+            addr = floor;
+        /*
+         * Linux do_mmap / get_unmapped_area: without MAP_FIXED a busy hint or a
+         * stale mmap cursor that sits under an existing VMA (holes after
+         * munmap / MAP_FIXED arenas) must not ENOMEM — search for a free gap.
+         */
+        uintptr_t search = user_mm_align_up(addr, map_align);
+        uintptr_t soft_hint = 0;
+        if (req_addr != 0) {
+            uintptr_t h = user_mm_align_up(req_addr, map_align);
+            if (h >= floor && user_mm_range_fits(h, len_u64, top_limit) &&
+                h < (uintptr_t)USER_TLS_BASE &&
+                (uint64_t)h + len_u64 <= (uint64_t)USER_TLS_BASE)
+                soft_hint = h;
+        }
+        /* Large Go arenas: top-down so the libc zone below anon_floor stays free. */
+        int use_topdown = large_or_reserve && tcur &&
+            (prot_none || len_u64 > (32ull << 20));
+        addr = 0;
+        if (use_topdown) {
+            uintptr_t cand = user_vma_find_unmapped_topdown(tcur, floor, top_limit,
+                                                           len_u64, map_align);
+            if (cand != 0 && !user_as_mmap_overlaps_kernel_heap(cand, len) &&
+                !(tcur && user_as_mmap_overlaps_user_stack(tcur, cand,
+                                                          (uintptr_t)len_u64, NULL)) &&
+                user_mm_range_fits(cand, len_u64, top_limit) &&
+                cand >= brk_guard_floor) {
+                addr = cand;
+            }
+        }
+        if (addr == 0) {
+        int retried_from_floor = 0;
+        for (int attempt = 0; attempt < 64; attempt++) {
+            if (search < floor)
+                search = floor;
+            search = user_mm_align_up(search, map_align);
+            uintptr_t cand = tcur ?
+                user_vma_find_unmapped(tcur, search, top_limit, len_u64,
+                                       attempt == 0 ? soft_hint : 0, map_align) :
+                search;
+            if (!tcur) {
+                /* No VMA owner: accept cursor if it fits. */
+                if (!user_mm_range_fits(search, len_u64, top_limit))
+                    cand = 0;
+                else
+                    cand = search;
+            }
+            if (cand == 0) {
+                /*
+                 * Cursor may sit near top_limit so (ceil-search) < len even
+                 * though a free gap exists at anon_floor (Linux bottom-up
+                 * fallback after vm_unmapped_area fails the hint/cursor).
+                 */
+                if (!retried_from_floor && search > floor) {
+                    search = floor;
+                    retried_from_floor = 1;
+                    continue;
+                }
+                break;
+            }
+            if (user_as_mmap_overlaps_kernel_heap(cand, len)) {
+                const uintptr_t hgap = 0x10000u;
+                uintptr_t hhi = heap_region_end_exclusive();
+                uintptr_t skip = user_mm_align_up(hhi + hgap, map_align);
+                if (skip <= search || skip >= top_limit) {
+                    if (!retried_from_floor && search > floor) {
+                        search = floor;
+                        retried_from_floor = 1;
+                        continue;
+                    }
+                    break;
+                }
+                search = skip;
+                continue;
+            }
+            if (tcur && user_as_mmap_overlaps_user_stack(tcur, cand, (uintptr_t)len_u64, NULL)) {
+                uintptr_t above_stack = 0;
+                (void)user_as_mmap_overlaps_user_stack(tcur, cand, (uintptr_t)len_u64, &above_stack);
+                if (above_stack > cand && above_stack < top_limit) {
+                    search = user_mm_align_up(above_stack, map_align);
+                    continue;
+                }
+                if (!retried_from_floor && search > floor) {
+                    search = floor;
+                    retried_from_floor = 1;
+                    continue;
+                }
+                break;
+            }
+            if (!user_mm_range_fits(cand, len_u64, top_limit) ||
+                cand >= (uintptr_t)USER_TLS_BASE ||
+                (uint64_t)cand + len_u64 > (uint64_t)USER_TLS_BASE ||
+                cand < brk_guard_floor) {
+                search = cand + map_align;
+                continue;
+            }
+            addr = cand;
+            break;
+        }
+        } /* bottom-up (or topdown miss) */
+        if (addr == 0) {
+            kprintf("mmap: ENOMEM no free VA len=0x%llx floor=0x%llx top=0x%llx\n",
+                (unsigned long long)len_u64,
+                (unsigned long long)floor,
+                (unsigned long long)top_limit);
             return user_mm_ret_err(USER_MM_ENOMEM);
         }
-    }
-    if (!fixed_mapping) {
-        if (addr < anon_floor) {
-            addr = anon_floor;
-            *p_mmap_next = anon_floor;
-        }
-        if (addr < brk_guard_floor) {
-            addr = brk_guard_floor;
-            *p_mmap_next = brk_guard_floor;
-        }
+        *p_mmap_next = addr;
     }
     if (addr < brk_guard_floor) return user_mm_ret_err(USER_MM_EINVAL);
     /* MAP_FIXED must not punch through TLS/brk/image below the anon floor. */
@@ -294,33 +422,6 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
             (unsigned long long)(uint64_t)USER_TLS_BASE,
             fixed_mapping);
         return user_mm_ret_err(USER_MM_ENOMEM);
-    }
-    if (!fixed_mapping && user_as_mmap_overlaps_kernel_heap(addr, len)) {
-        const uintptr_t hgap = 0x10000u;
-        uintptr_t hhi = heap_region_end_exclusive();
-        uintptr_t skip = user_mm_align_up(hhi + hgap, 4096);
-        if (skip >= top_limit || skip >= (uintptr_t)USER_TLS_BASE) {
-            kprintf("mmap: ENOMEM overlap kernel heap (heap above user VA cap)\n");
-            return user_mm_ret_err(USER_MM_ENOMEM);
-        }
-        addr = skip;
-        *p_mmap_next = addr;
-        if ((uint64_t)addr + len_u64 < (uint64_t)addr) return user_mm_ret_err(USER_MM_ENOMEM);
-        if (tcur && user_as_mmap_overlaps_user_stack(tcur, addr, (uintptr_t)len_u64, NULL)) {
-            uintptr_t above_stack = 0;
-            (void)user_as_mmap_overlaps_user_stack(tcur, addr, (uintptr_t)len_u64, &above_stack);
-            if (above_stack > addr && user_mm_range_fits(above_stack, len_u64, top_limit)) {
-                addr = above_stack;
-                *p_mmap_next = addr;
-            } else {
-                return user_mm_ret_err(USER_MM_ENOMEM);
-            }
-        }
-        if (addr < brk_guard_floor) return user_mm_ret_err(USER_MM_EINVAL);
-        if (user_as_mmap_overlaps_kernel_heap(addr, len)) {
-            kprintf("mmap: ENOMEM mmap still overlaps kernel heap after skip\n");
-            return user_mm_ret_err(USER_MM_ENOMEM);
-        }
     }
 
     if (!user_mm_range_fits(addr, len_u64, top_limit)) {
@@ -366,10 +467,14 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     struct fs_file *file_lazy_f = NULL;
     uint64_t file_lazy_off = 0;
     if ((flags & MAP_ANONYMOUS) && !shared_mapping) {
-        const int large_aligned = (len_u64 > (96ull << 20)) &&
-            ((addr & ((uintptr_t)PAGE_SIZE_2M - 1)) == 0) &&
-            ((len_u64 & ((uint64_t)PAGE_SIZE_2M - 1)) == 0);
-        if (prot_none || large_aligned)
+        /*
+         * Linux demand-pages anonymous memory unless MAP_POPULATE.
+         * Eager install of every RW page (pthread 8MiB stacks, glibc arenas)
+         * burned kmalloc via frame_alloc(8KiB/page) until libc malloc(24) in
+         * x_cgo_thread_start failed → "runtime/cgo: out of memory in thread_start".
+         * PROT_NONE / large 2MiB-aligned arenas stay lazy as before.
+         */
+        if (prot_none || !(flags & MAP_POPULATE))
             reserve_only = 1;
     } else if (!(flags & MAP_ANONYMOUS) && !shared_mapping &&
                !(flags & MAP_POPULATE)) {
@@ -476,11 +581,7 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         }
     }
 
-    if (!fixed_mapping && user_vma_mmap_range_overlaps(tcur, addr, len)) {
-        kprintf("mmap: ENOMEM overlap addr=0x%llx len=0x%llx\n",
-            (unsigned long long)addr, (unsigned long long)len_u64);
-        return user_mm_ret_err(USER_MM_ENOMEM);
-    }
+    /* Non-FIXED: address was chosen free via user_vma_find_unmapped. */
     if (file_lazy) {
         if (user_vma_add_file(vtid, addr, len, prot & 7, USER_VMA_KIND_MMAP_LAZY,
                               file_lazy_f, file_lazy_off) != 0)

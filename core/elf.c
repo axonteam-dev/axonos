@@ -1160,9 +1160,12 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
                 mm_t *share = mm_kernel();
                 /* copy_old=0 + has_private skip: never wipe a prior PT_LOAD. */
                 if (mm_make_private_range(tc->mm, map_lo, map_hi, 0, share) != 0) {
+                    kprintf("elf: OOM private PT_LOAD %s [0x%llx..0x%llx)\n",
+                            path ? path : "(null)",
+                            (unsigned long long)map_lo, (unsigned long long)map_hi);
                     kfree(phdrs);
                     fs_file_free(f);
-                    return -1;
+                    return -12; /* ENOMEM */
                 }
                 /* Do NOT mark_user_identity here: holes become pa==va and the
                  * following elf_copy_into_mm smashes the vfork parent's image. */
@@ -1184,20 +1187,43 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
             if (!tc || tc->ring != 3)
                 tc = thread_get_current_user();
             if (tc && elf_needs_private_user_pages(tc) && tc->mm) {
-                void *kbuf = kmalloc((size_t)ph->p_filesz);
+                /*
+                 * Stream PT_LOAD into private pages. A single kmalloc(p_filesz)
+                 * for static Go binaries (docker-containerd ~7MiB, dockerd ~30MiB)
+                 * OOMs the kernel heap after the parent has already run — exec
+                 * then returns -1 which syscall maps to ENOENT ("no such file").
+                 * Linux load_elf reads into the destination VMA; we chunk via a
+                 * small bounce buffer into leaf PAs.
+                 */
+                const size_t chunk_cap = 256u * 1024u;
+                void *kbuf = kmalloc(chunk_cap);
                 if (!kbuf) {
+                    kprintf("elf: OOM bounce buffer for %s filesz=0x%llx\n",
+                            path ? path : "(null)",
+                            (unsigned long long)ph->p_filesz);
                     kfree(phdrs);
                     fs_file_free(f);
-                    return -1;
+                    return -12; /* ENOMEM */
                 }
-                ssize_t rr = fs_read(f, kbuf, (size_t)ph->p_filesz, (size_t)ph->p_offset);
-                if (rr != (ssize_t)ph->p_filesz ||
-                    elf_copy_into_mm(tc->mm, (uint64_t)(uintptr_t)dst, kbuf,
-                                    (size_t)ph->p_filesz) != 0) {
-                    kfree(kbuf);
-                    kfree(phdrs);
-                    fs_file_free(f);
-                    return -1;
+                size_t left = (size_t)ph->p_filesz;
+                size_t foff = (size_t)ph->p_offset;
+                uint64_t va = (uint64_t)(uintptr_t)dst;
+                while (left > 0) {
+                    size_t n = left < chunk_cap ? left : chunk_cap;
+                    ssize_t rr = fs_read(f, kbuf, n, foff);
+                    if (rr != (ssize_t)n ||
+                        elf_copy_into_mm(tc->mm, va, kbuf, n) != 0) {
+                        kprintf("elf: private PT_LOAD copy failed %s va=0x%llx n=0x%zx rr=%zd\n",
+                                path ? path : "(null)",
+                                (unsigned long long)va, n, rr);
+                        kfree(kbuf);
+                        kfree(phdrs);
+                        fs_file_free(f);
+                        return -1;
+                    }
+                    left -= n;
+                    foff += n;
+                    va += (uint64_t)n;
                 }
                 kfree(kbuf);
             } else {
@@ -1633,13 +1659,17 @@ int kernel_execve_from_path(const char *path, const char *const argv[],
             cur->mm_ptemplate = NULL;
         }
         if (cur->exec_discard_mm) {
+            /* open_exec-style failure: old Soft_COW mm still restorable. */
             mm_t *dead = new_mm;
             cur->mm = cur->exec_discard_mm;
             cur->exec_discard_mm = NULL;
             mm_switch(cur->mm);
             mm_release(dead);
         } else {
-            mm_release(new_mm);
+            /*
+             * Past Linux exec_mmap: oldmm already mmput. Keep nascent mm so the
+             * child can still return the errno to userspace (Go ForkExec).
+             */
         }
         return rc;
     }
@@ -1700,6 +1730,36 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
                 (unsigned long long)(tr->tid ? tr->tid : 1),
                 curpath ? curpath : "?");
     }
+
+    /*
+     * Linux open_exec before exec_mmap: fail missing paths while oldmm can
+     * still be restored. Then mmput(old) before load_elf — holding Soft_COW
+     * dockerd image through a multi-MiB PT_LOAD OOMed frames and surfaced as
+     * ENOENT from fork/exec of docker-containerd.
+     */
+    {
+        struct fs_file *probe = fs_open(curpath);
+        if (!probe)
+            return -1;
+        fs_file_free(probe);
+    }
+    {
+        thread_t *tc = thread_current();
+        if (!tc || tc->ring != 3)
+            tc = thread_get_current_user();
+        if (tc) {
+            if (tc->mm_ptemplate) {
+                mm_release(tc->mm_ptemplate);
+                tc->mm_ptemplate = NULL;
+            }
+            if (tc->exec_discard_mm) {
+                mm_t *dead = tc->exec_discard_mm;
+                tc->exec_discard_mm = NULL;
+                mm_release(dead);
+            }
+        }
+    }
+
     int r = elf_load_from_path_info(curpath, 0, &main_info, &main_tls);
     if (r == -2) {
         /* unsupported ELF format */

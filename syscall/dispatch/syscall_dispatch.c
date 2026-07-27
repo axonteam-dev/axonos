@@ -47,6 +47,7 @@
 #endif
 #include <user_map.h>
 #include <process.h>
+#include <sysinfo.h>
 #include <user_mmap.h>
 #include <user_brk.h>
 #include <user_mm.h>
@@ -1182,6 +1183,56 @@ static uint64_t fork_child_ret_rip(thread_t *cur) {
     return 0;
 }
 
+static int clone_ensure_user_va(mm_t *mm, uint64_t va, int write) {
+    uint64_t pa = 0;
+    if (!mm || va < 0x1000ull || va >= (uint64_t)MMIO_IDENTITY_LIMIT)
+        return -1;
+    if (mm_user_leaf_pa(mm, va, write, &pa) == 0)
+        return 0;
+    /*
+     * Linux copy_thread: stack/TLS VMAs may be demand-paged. Forcing present
+     * here matches populate-on-clone expectations without requiring MAP_POPULATE.
+     * musl timer helper pthread_create failed with EFAULT → timer_create EAGAIN
+     * → vim E1286 flood when opening kernel logs.
+     */
+    (void)user_vma_fault_lazy_anon(va);
+    if (mm_user_leaf_pa(mm, va, write, &pa) == 0)
+        return 0;
+    /* Exclusive stack top: try the last byte of the page below. */
+    if ((va & 0xfffu) == 0 && va >= 0x1000ull) {
+        (void)user_vma_fault_lazy_anon(va - 1u);
+        if (mm_user_leaf_pa(mm, va - 1u, write, &pa) == 0)
+            return 0;
+    }
+    {
+        uint64_t lo = va & ~0xFFFULL;
+        uint64_t hi = lo + 0x1000ULL;
+        /* If VA is the exclusive end of a mapping, commit the previous page. */
+        if ((va & 0xfffu) == 0 && va >= 0x1000ull) {
+            lo = (va - 1u) & ~0xFFFULL;
+            hi = lo + 0x1000ULL;
+        }
+        mm_t *k = mm_kernel();
+        if (mm->pml4 && k && k->pml4 && mm->pml4 != k->pml4) {
+            mm_t *share = k;
+            if (mm_privatize_identity_range_blank(mm, lo, hi) == 0 &&
+                mm_make_private_range_noyield(mm, lo, hi, 0, share) == 0 &&
+                (mm_user_leaf_pa(mm, va, write, &pa) == 0 ||
+                 ((va & 0xfffu) == 0 && va >= 0x1000ull &&
+                  mm_user_leaf_pa(mm, va - 1u, write, &pa) == 0)))
+                return 0;
+        } else {
+            uint64_t va2m = lo & ~((uint64_t)PAGE_SIZE_2M - 1ull);
+            if (map_page_2m(va2m, va2m, PG_PRESENT | PG_RW | PG_US) == 0 &&
+                (mm_user_leaf_pa(mm, va, write, &pa) == 0 ||
+                 ((va & 0xfffu) == 0 && va >= 0x1000ull &&
+                  mm_user_leaf_pa(mm, va - 1u, write, &pa) == 0)))
+                return 0;
+        }
+    }
+    return -1;
+}
+
 static uint64_t fork_caller_user_rip(thread_t *cur) {
     if (!cur) return 0;
     uint64_t rip = 0;
@@ -2006,6 +2057,7 @@ static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t
 #define SYSCALL_FTYPE_SOCKET  0x534F434Bu
 #define SYSCALL_FTYPE_EPOLL   0x45504F4Cu  /* 'EPOL' */
 
+#define AF_UNIX_LOCAL         1
 #define AF_INET_LOCAL         2
 #define AF_UNSPEC             0   /* treat as AF_INET for getaddrinfo fallback */
 #define AF_INET6              10  /* Linux value; we stub to AF_INET */
@@ -2014,6 +2066,8 @@ static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t
 #define SOCK_STREAM_LOCAL     1
 #define SOCK_DGRAM_LOCAL      2
 #define SOCK_RAW_LOCAL        3
+#define SOCK_SEQPACKET_LOCAL  5
+#define SOCK_CLOEXEC_LINUX    02000000
 /* Linux: SOCK_NONBLOCK == O_NONBLOCK (glibc sets this in socket type / fcntl). */
 #define O_NONBLOCK_LINUX      0x800
 /* F_GETFL must include accmode; 0 breaks glibc fdopen/wget (bogus "out of memory"). */
@@ -2098,10 +2152,13 @@ typedef struct {
     int ipv6_stub;
     /* Linux IPV6_V6ONLY (default 0 = /proc/sys/net/ipv6/bindv6only). */
     int ipv6_only;
-    /* socket(AF_UNIX) is created as IPv4 internally; nscd uses connect(sockaddr_un). */
+    /* AF_UNIX: Linux PF_UNIX stream/seqpacket (pathname + abstract). */
     int unix_domain_stub;
     int unix_bound;
     int unix_listening;
+    int unix_abstract;          /* sun_path[0]=='\0' abstract namespace */
+    int unix_path_len;          /* bytes in unix_path (abstract may embed NULs) */
+    int unix_backlog;           /* sk_max_ack_backlog after listen() */
     char unix_path[108];
     /* AF_UNIX stream endpoint/listener state */
     struct unix_stream_conn *unix_conn;
@@ -2213,42 +2270,80 @@ static ksock_net_t *net_tcp_find_listener(uint16_t port);
 static int lo_tcp_stream_connect(ksock_net_t *client, uint32_t dst_ip_be, uint16_t dport, thread_t *t);
 
 /* Parse sockaddr_un from user memory into a kernel path buffer.
-   Returns 0 on success, or Linux errno value on failure. */
-static int unix_sockaddr_path_from_user(const void *addr_u, size_t addrlen, char *out, size_t out_cap, int *is_abstract) {
+   Returns 0 on success, or Linux errno value on failure.
+   out_len receives sun_path byte count (abstract names may embed NULs). */
+static int unix_sockaddr_path_from_user(const void *addr_u, size_t addrlen, char *out, size_t out_cap,
+                                        int *out_len, int *is_abstract) {
     if (!out || out_cap == 0) return EFAULT;
-    out[0] = '\0';
+    memset(out, 0, out_cap);
+    if (out_len) *out_len = 0;
     if (is_abstract) *is_abstract = 0;
-    if (!addr_u || addrlen < 3) return EINVAL; /* family + at least one path byte */
+    /* Linux unix_validate_addr: family + optional path. */
+    if (!addr_u || addrlen < sizeof(uint16_t)) return EINVAL;
     if (!user_range_ok(addr_u, addrlen)) return EFAULT;
     uint16_t fam = 0;
     if (copy_from_user_raw(&fam, addr_u, sizeof(fam)) != 0) return EFAULT;
-    if (fam != 1u) return EAFNOSUPPORT; /* AF_UNIX */
+    if (fam != AF_UNIX_LOCAL) return EAFNOSUPPORT;
 
     size_t path_len = addrlen - sizeof(uint16_t);
-    if (path_len >= out_cap) path_len = out_cap - 1;
-    if (path_len == 0) return EINVAL;
-    if (copy_from_user_raw(out, (const uint8_t *)addr_u + sizeof(uint16_t), path_len) != 0) return EFAULT;
-    out[path_len] = '\0';
-
+    if (path_len > out_cap) path_len = out_cap;
+    if (path_len == 0) {
+        /* addrlen == sizeof(short) → autobind; not implemented → EINVAL like unbound. */
+        return EINVAL;
+    }
+    if (copy_from_user_raw(out, (const uint8_t *)addr_u + sizeof(uint16_t), path_len) != 0)
+        return EFAULT;
+    if (out_len) *out_len = (int)path_len;
     if (out[0] == '\0') {
-        if (is_abstract) *is_abstract = 1; /* Linux abstract AF_UNIX */
+        if (is_abstract) *is_abstract = 1;
         return 0;
     }
-    /* Linux accepts addrlen without trailing NUL in sun_path.
-       We already terminate in-kernel buffer above, so treat it as valid. */
+    /* Pathname: ensure C string for VFS helpers (Linux accepts non-NUL-terminated sun_path). */
+    if (path_len < out_cap)
+        out[path_len] = '\0';
+    else
+        out[out_cap - 1] = '\0';
     return 0;
+}
+
+static int unix_path_equal(const ksock_net_t *s, const char *path, int path_len, int is_abs) {
+    if (!s || !path || path_len <= 0) return 0;
+    if (s->unix_abstract != (is_abs ? 1 : 0)) return 0;
+    if (s->unix_path_len != path_len) return 0;
+    return memcmp(s->unix_path, path, (size_t)path_len) == 0;
+}
+
+static void unix_ensure_parent_dirs(const char *path) {
+    if (!path || path[0] != '/') return;
+    char tmp[108];
+    size_t n = strlen(path);
+    if (n == 0 || n >= sizeof(tmp)) return;
+    memcpy(tmp, path, n + 1);
+    char *slash = strrchr(tmp, '/');
+    if (!slash || slash == tmp) return;
+    *slash = '\0';
+    for (size_t i = 1; tmp[i]; i++) {
+        if (tmp[i] != '/') continue;
+        tmp[i] = '\0';
+        (void)fs_mkdir(tmp);
+        tmp[i] = '/';
+    }
+    (void)fs_mkdir(tmp);
 }
 
 static int unix_acceptq_push(ksock_net_t *listener, struct fs_file *pending_f) {
     if (!listener || !pending_f) return -1;
     unsigned long fl = 0;
     acquire_irqsave(&listener->unix_accept_lock, &fl);
-    if (listener->unix_accept_count >= (int)(sizeof(listener->unix_accept_q) / sizeof(listener->unix_accept_q[0]))) {
+    int cap = (int)(sizeof(listener->unix_accept_q) / sizeof(listener->unix_accept_q[0]));
+    int maxq = listener->unix_backlog > 0 ? listener->unix_backlog : cap;
+    if (maxq > cap) maxq = cap;
+    if (listener->unix_accept_count >= maxq) {
         release_irqrestore(&listener->unix_accept_lock, fl);
         return -1;
     }
     listener->unix_accept_q[listener->unix_accept_tail] = pending_f;
-    listener->unix_accept_tail = (listener->unix_accept_tail + 1) % (int)(sizeof(listener->unix_accept_q) / sizeof(listener->unix_accept_q[0]));
+    listener->unix_accept_tail = (listener->unix_accept_tail + 1) % cap;
     listener->unix_accept_count++;
     release_irqrestore(&listener->unix_accept_lock, fl);
     return 0;
@@ -2273,18 +2368,32 @@ static inline int ip_is_loopback_be(uint32_t ip_be) {
     return (ip_be & 0xFF000000u) == 0x7F000000u;
 }
 
-static ksock_net_t *unix_find_listener_by_path(const char *path) {
-    if (!path || !path[0]) return NULL;
+static ksock_net_t *unix_find_listener_by_path(const char *path, int path_len, int is_abs) {
+    if (!path || path_len <= 0) return NULL;
+    unsigned long flags;
+    acquire_irqsave(&g_ksock_registry_lock, &flags);
+    for (int i = 0; i < KSOCK_REGISTRY_MAX; i++) {
+        ksock_net_t *s = g_ksock_registry[i];
+        if (!s || !s->unix_domain_stub || !s->unix_listening || !s->unix_bound)
+            continue;
+        if (unix_path_equal(s, path, path_len, is_abs)) {
+            release_irqrestore(&g_ksock_registry_lock, flags);
+            return s;
+        }
+    }
+    release_irqrestore(&g_ksock_registry_lock, flags);
+    /* Fallback: scan process/thread fds (pre-registry listeners / races). */
     int tcnt = thread_get_count();
     for (int ti = 0; ti < tcnt; ti++) {
         thread_t *th = thread_get_by_index(ti);
         if (!th) continue;
         for (int fd = 0; fd < THREAD_MAX_FD; fd++) {
-            struct fs_file *f = th->fds[fd];
+            struct fs_file *f = th->process && th->process->fds[fd] ?
+                th->process->fds[fd] : th->fds[fd];
             if (!f || f->type != SYSCALL_FTYPE_SOCKET || !f->driver_private) continue;
             ksock_net_t *s = (ksock_net_t *)f->driver_private;
             if (!s->unix_domain_stub || !s->unix_listening || !s->unix_bound) continue;
-            if (strncmp(s->unix_path, path, sizeof(s->unix_path)) == 0) return s;
+            if (unix_path_equal(s, path, path_len, is_abs)) return s;
         }
     }
     return NULL;
@@ -8163,6 +8272,101 @@ static uint64_t kernel_clone(thread_t *parent,
 	return nr;
 }
 
+/* Linux resource numbers used by getrlimit/setrlimit/prlimit64. */
+enum {
+    RLIMIT_CPU_K = 0,
+    RLIMIT_FSIZE_K = 1,
+    RLIMIT_DATA_K = 2,
+    RLIMIT_STACK_K = 3,
+    RLIMIT_CORE_K = 4,
+    RLIMIT_RSS_K = 5,
+    RLIMIT_NPROC_K = 6,
+    RLIMIT_NOFILE_K = 7,
+    RLIMIT_MEMLOCK_K = 8,
+    RLIMIT_AS_K = 9,
+};
+
+static int rlimit_get(thread_t *cur, int resource, uint64_t *soft, uint64_t *hard) {
+    process_t *p = cur ? cur->process : NULL;
+    uint64_t s = ~0ULL, h = ~0ULL;
+    switch (resource) {
+        case RLIMIT_STACK_K:
+            s = p ? p->rlim_stack_cur : (8ULL * 1024ULL * 1024ULL);
+            h = p ? p->rlim_stack_max : s;
+            break;
+        case RLIMIT_CORE_K:
+            s = 0;
+            h = ~0ULL;
+            break;
+        case RLIMIT_NPROC_K:
+            s = p ? p->rlim_nproc_cur : 4096ULL;
+            h = p ? p->rlim_nproc_max : 4096ULL;
+            break;
+        case RLIMIT_NOFILE_K:
+            s = p ? p->rlim_nofile_cur : PROCESS_RLIMIT_NOFILE_SOFT;
+            h = p ? p->rlim_nofile_max : PROCESS_RLIMIT_NOFILE_HARD;
+            break;
+        case RLIMIT_AS_K:
+        case RLIMIT_DATA_K:
+        case RLIMIT_RSS_K:
+            s = p ? p->rlim_as_cur : ~0ULL;
+            h = p ? p->rlim_as_max : ~0ULL;
+            break;
+        case RLIMIT_CPU_K:
+        case RLIMIT_FSIZE_K:
+        case RLIMIT_MEMLOCK_K:
+            s = h = ~0ULL;
+            break;
+        default:
+            /* Unknown resource: Linux returns EINVAL for get; accept infinity. */
+            s = h = ~0ULL;
+            break;
+    }
+    if (soft) *soft = s;
+    if (hard) *hard = h;
+    return 0;
+}
+
+static int rlimit_set(thread_t *cur, int resource, uint64_t soft, uint64_t hard) {
+    if (!cur) return EINVAL;
+    /* RLIM_INFINITY is ~0ULL; soft must be <= hard when both finite. */
+    if (soft != ~0ULL && hard != ~0ULL && soft > hard)
+        return EINVAL;
+    process_t *p = cur->process;
+    if (!p) {
+        /* No process struct yet — accept and ignore (early threads). */
+        return 0;
+    }
+    switch (resource) {
+        case RLIMIT_STACK_K:
+            p->rlim_stack_cur = soft;
+            p->rlim_stack_max = hard;
+            return 0;
+        case RLIMIT_NPROC_K:
+            p->rlim_nproc_cur = soft;
+            p->rlim_nproc_max = hard;
+            return 0;
+        case RLIMIT_NOFILE_K:
+            /* Store requested limits; open paths still cannot exceed THREAD_MAX_FD. */
+            p->rlim_nofile_cur = soft;
+            p->rlim_nofile_max = hard;
+            return 0;
+        case RLIMIT_AS_K:
+        case RLIMIT_DATA_K:
+        case RLIMIT_RSS_K:
+            p->rlim_as_cur = soft;
+            p->rlim_as_max = hard;
+            return 0;
+        case RLIMIT_CORE_K:
+        case RLIMIT_CPU_K:
+        case RLIMIT_FSIZE_K:
+        case RLIMIT_MEMLOCK_K:
+            return 0; /* accept, not enforced */
+        default:
+            return EINVAL;
+    }
+}
+
 static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
     /* IMPORTANT:
        current_user can be stale if some subsystem (e.g. tty switching) overwrote it.
@@ -8271,12 +8475,23 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                  * so RSP is 8 mod 16 on entry; the child pops the start arg
                  * then call. Rounding RSP down to 16 bytes drops that slot
                  * and SIGSEGVs in the pthread child (curl DNS worker).
+                 *
+                 * glibc often passes the exclusive end of the mmap (stack+size).
+                 * Prefault that VA can hit the next VMA (Go PROT_NONE) → EFAULT
+                 * "pthread_create failed: Bad address". Touch the first slot
+                 * below SP, same as SYS_clone3 below.
                  */
                 {
-                    uint64_t pa = 0;
+                    uint64_t stack_touch = (uint64_t)child_rsp;
+                    if (stack_touch >= 8u)
+                        stack_touch -= 8u;
                     if (!cur->mm ||
-                        mm_user_leaf_pa(cur->mm, saved_rcx, 0, &pa) != 0 ||
-                        mm_user_leaf_pa(cur->mm, child_rsp, 1, &pa) != 0)
+                        clone_ensure_user_va(cur->mm, saved_rcx, 0) != 0 ||
+                        clone_ensure_user_va(cur->mm, stack_touch, 1) != 0)
+                        return ret_err(EFAULT);
+                    if ((flags & CLONE_SETTLS_OLD) && tls >= 0x1000 &&
+                        tls < (uint64_t)MMIO_IDENTITY_LIMIT &&
+                        clone_ensure_user_va(cur->mm, tls, 1) != 0)
                         return ret_err(EFAULT);
                 }
 
@@ -8535,14 +8750,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return ret_err(EINVAL);
 
                 {
-                    uint64_t pa = 0;
                     if (!cur->mm ||
-                        mm_user_leaf_pa(cur->mm, saved_rcx, 0, &pa) != 0 ||
-                        mm_user_leaf_pa(cur->mm, child_rsp - 8u, 1, &pa) != 0)
+                        clone_ensure_user_va(cur->mm, saved_rcx, 0) != 0 ||
+                        clone_ensure_user_va(cur->mm, (uint64_t)child_rsp - 8u, 1) != 0)
                         return ret_err(EFAULT);
                     if ((flags & CLONE3_CLONE_SETTLS) &&
                         (tls < 0x1000u ||
-                         mm_user_leaf_pa(cur->mm, tls, 0, &pa) != 0))
+                         clone_ensure_user_va(cur->mm, tls, 0) != 0))
                         return ret_err(EFAULT);
                 }
                 char child_name[32];
@@ -9124,37 +9338,40 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return 0;
             }
         case SYS_prlimit64: {
-            /* prlimit64(pid, resource, new_limit, old_limit)
-               Minimal: return conservative limits for current process only (pid==0 or self).
-               We ignore new_limit for now. */
+            /* prlimit64(pid, resource, new_limit, old_limit) — current process only. */
             uint64_t pid = a1;
             int resource = (int)a2;
             const void *new_u = (const void*)(uintptr_t)a3;
             void *old_u = (void*)(uintptr_t)a4;
-            (void)new_u;
             uint64_t self = (uint64_t)(cur->tid ? cur->tid : 1);
+            if (cur->process && cur->process->pid)
+                self = cur->process->pid;
             if (!(pid == 0 || pid == self)) return ret_err(ESRCH);
 
-            /* Linux rlimit64 */
             struct rlimit64_k { uint64_t rlim_cur; uint64_t rlim_max; } rl;
-            enum {
-                RLIMIT_STACK = 3,
-                RLIMIT_NOFILE = 7,
-            };
-            if (resource == RLIMIT_STACK) {
-                rl.rlim_cur = 8ULL * 1024ULL * 1024ULL;
-                rl.rlim_max = 8ULL * 1024ULL * 1024ULL;
-            } else if (resource == RLIMIT_NOFILE) {
-                rl.rlim_cur = (uint64_t)THREAD_MAX_FD;
-                rl.rlim_max = (uint64_t)THREAD_MAX_FD;
-            } else {
-                /* unknown resource: report "infinite" */
-                rl.rlim_cur = ~0ULL;
-                rl.rlim_max = ~0ULL;
-            }
+            int gr = rlimit_get(cur, resource, &rl.rlim_cur, &rl.rlim_max);
+            if (gr != 0) return ret_err(gr);
             if (old_u) {
                 if (copy_to_user_safe(old_u, &rl, sizeof(rl)) != 0) return ret_err(EFAULT);
             }
+            if (new_u) {
+                struct rlimit64_k nr;
+                if (copy_from_user_raw(&nr, new_u, sizeof(nr)) != 0) return ret_err(EFAULT);
+                int sr = rlimit_set(cur, resource, nr.rlim_cur, nr.rlim_max);
+                if (sr != 0) return ret_err(sr);
+            }
+            return 0;
+        }
+        case SYS_setrlimit: {
+            /* setrlimit(resource, rlim) — Linux x86_64 #160; Go 1.7 docker uses this. */
+            int resource = (int)a1;
+            const void *rlim_u = (const void *)(uintptr_t)a2;
+            if (!rlim_u || !user_range_ok(rlim_u, 16)) return ret_err(EFAULT);
+            uint64_t soft = 0, hard = 0;
+            if (copy_from_user_raw(&soft, rlim_u, 8) != 0) return ret_err(EFAULT);
+            if (copy_from_user_raw(&hard, (const char *)rlim_u + 8, 8) != 0) return ret_err(EFAULT);
+            int sr = rlimit_set(cur, resource, soft, hard);
+            if (sr != 0) return ret_err(sr);
             return 0;
         }
         case SYS_readlink: {
@@ -10769,17 +10986,82 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             return 0;
         }
-        case 222: { /* timer_create(clockid, sevp, timerid) - stub for vim E1286 */
-            void *tid_u = (void*)(uintptr_t)a3;
+        case 222: { /* timer_create(clockid, sevp, timerid) */
+            int clockid = (int)a1;
+            const void *sev_u = (const void *)(uintptr_t)a2;
+            void *tid_u = (void *)(uintptr_t)a3;
             if (!tid_u) return ret_err(EFAULT);
-            static int32_t stub_timer_id = 1;
-            if (copy_to_user_safe(tid_u, &stub_timer_id, sizeof(stub_timer_id)) != 0) return ret_err(EFAULT);
+            uint8_t sev_buf[64];
+            memset(sev_buf, 0, sizeof(sev_buf));
+            size_t sev_len = 0;
+            if (sev_u) {
+                if (!user_range_ok(sev_u, 64)) return ret_err(EFAULT);
+                if (copy_from_user_raw(sev_buf, sev_u, 64) != 0) return ret_err(EFAULT);
+                sev_len = 64;
+            }
+            int32_t kid = 0;
+            int rc = process_posix_timer_create(clockid, sev_len ? sev_buf : NULL, sev_len, &kid);
+            if (rc < 0) return ret_err(-rc);
+            if (copy_to_user_safe(tid_u, &kid, sizeof(kid)) != 0) {
+                (void)process_posix_timer_delete(kid);
+                return ret_err(EFAULT);
+            }
             return 0;
         }
-        case 223: { /* timer_settime(timerid, flags, new_value, old_value) - no-op */
+        case 223: { /* timer_settime(timerid, flags, new_value, old_value) */
+            int32_t timerid = (int32_t)a1;
+            int flags = (int)a2;
+            const void *new_u = (const void *)(uintptr_t)a3;
+            void *old_u = (void *)(uintptr_t)a4;
+            struct timespec_k { int64_t tv_sec; int64_t tv_nsec; };
+            struct itimerspec_k {
+                struct timespec_k it_interval;
+                struct timespec_k it_value;
+            } nv, ov;
+            memset(&ov, 0, sizeof(ov));
+            uint64_t old_v = 0;
+            uint32_t old_i = 0;
+            if (!new_u) {
+                int rc = process_posix_timer_settime(timerid, flags, 0, 0, &old_v, &old_i);
+                if (rc < 0) return ret_err(-rc);
+            } else {
+                if (!user_range_ok(new_u, sizeof(nv))) return ret_err(EFAULT);
+                if (copy_from_user_raw(&nv, new_u, sizeof(nv)) != 0) return ret_err(EFAULT);
+                if (nv.it_interval.tv_sec < 0 || nv.it_interval.tv_nsec < 0 ||
+                    nv.it_value.tv_sec < 0 || nv.it_value.tv_nsec < 0 ||
+                    nv.it_interval.tv_nsec >= 1000000000LL ||
+                    nv.it_value.tv_nsec >= 1000000000LL)
+                    return ret_err(EINVAL);
+                uint64_t interval_ms = (uint64_t)nv.it_interval.tv_sec * 1000ULL +
+                                      (uint64_t)(nv.it_interval.tv_nsec / 1000000LL);
+                uint64_t value_ms = (uint64_t)nv.it_value.tv_sec * 1000ULL +
+                                   (uint64_t)(nv.it_value.tv_nsec / 1000000LL);
+                if (nv.it_interval.tv_nsec > 0 && interval_ms == (uint64_t)nv.it_interval.tv_sec * 1000ULL &&
+                    (nv.it_interval.tv_nsec % 1000000LL))
+                    interval_ms++;
+                if (nv.it_value.tv_nsec > 0 && value_ms == (uint64_t)nv.it_value.tv_sec * 1000ULL &&
+                    (nv.it_value.tv_nsec % 1000000LL))
+                    value_ms++;
+                if (interval_ms > 0xFFFFFFFFULL) interval_ms = 0xFFFFFFFFULL;
+                if (value_ms > 0xFFFFFFFFULL) value_ms = 0xFFFFFFFFULL;
+                int rc = process_posix_timer_settime(timerid, flags, value_ms,
+                                                    (uint32_t)interval_ms, &old_v, &old_i);
+                if (rc < 0) return ret_err(-rc);
+            }
+            if (old_u) {
+                ov.it_interval.tv_sec = (int64_t)(old_i / 1000u);
+                ov.it_interval.tv_nsec = (int64_t)((old_i % 1000u) * 1000000u);
+                ov.it_value.tv_sec = (int64_t)(old_v / 1000u);
+                ov.it_value.tv_nsec = (int64_t)((old_v % 1000u) * 1000000u);
+                if (!user_range_ok(old_u, sizeof(ov))) return ret_err(EFAULT);
+                if (copy_to_user_safe(old_u, &ov, sizeof(ov)) != 0) return ret_err(EFAULT);
+            }
             return 0;
         }
-        case 226: { /* timer_delete(timerid) - no-op */
+        case 226: { /* timer_delete(timerid) */
+            int32_t timerid = (int32_t)a1;
+            int rc = process_posix_timer_delete(timerid);
+            if (rc < 0) return ret_err(-rc);
             return 0;
         }
         case 38: { /* setitimer(which, new_value, old_value) */
@@ -10843,7 +11125,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             int protocol = (int)a3;
             int unix_stub = 0;
             int ipv6_stub = (domain == AF_INET6);
-            int type_base = type & 0x0F; /* mask SOCK_NONBLOCK/CLOEXEC flags */
+            /* Linux: type may include SOCK_NONBLOCK|SOCK_CLOEXEC in high bits. */
+            int type_base = type & ~(O_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
             if (domain == AF_INET_LOCAL) {
                 if (!(type_base == SOCK_RAW_LOCAL || type_base == SOCK_DGRAM_LOCAL || type_base == SOCK_STREAM_LOCAL)) return ret_err(ESOCKTNOSUPPORT);
                 if (type_base == SOCK_RAW_LOCAL) {
@@ -10868,11 +11151,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             } else if (domain == AF_UNSPEC) {
                 /* getaddrinfo/glibc may pass AF_UNSPEC; treat as IPv4 */
                 domain = AF_INET_LOCAL;
-            } else if (domain == 1) {
-                /* AF_UNIX: stub as AF_INET in the kernel, but emulate connect/send/recv so nss/glibc
-                   does not see ECONNREFUSED on nscd-style unix sockets (that breaks getaddrinfo). */
+            } else if (domain == AF_UNIX_LOCAL) {
+                /* Linux PF_UNIX — keep sock_domain=AF_UNIX (not remapped to AF_INET). */
+                if (!(type_base == SOCK_STREAM_LOCAL || type_base == SOCK_DGRAM_LOCAL ||
+                      type_base == SOCK_SEQPACKET_LOCAL))
+                    return ret_err(ESOCKTNOSUPPORT);
+                if (protocol != 0)
+                    return ret_err(EPROTONOSUPPORT);
                 unix_stub = 1;
-                domain = AF_INET_LOCAL;
             } else {
                 /* Compatibility: map odd domains to IPv4 (getaddrinfo quirks).
                    Avoids EAFNOSUPPORT causing wget to fail with "out of memory" (fdopen path). */
@@ -10891,6 +11177,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             memset(f, 0, sizeof(*f));
             if (domain == AF_NETLINK_LOCAL) snprintf(p, 24, "socket:[netlink]");
             else if (domain == AF_PACKET_LOCAL) snprintf(p, 24, "socket:[packet]");
+            else if (unix_stub) snprintf(p, 24, "socket:[unix]");
             else snprintf(p, 24, "socket:[icmp]");
             s->sock_domain = domain;
             s->ipv6_stub = ipv6_stub;
@@ -10903,6 +11190,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 s->protocol = protocol;
                 s->packet_proto_host = protocol ? be16((uint16_t)protocol) : ETH_P_ALL_HOST;
                 s->packet_ifindex = 0;
+            } else if (unix_stub) {
+                s->protocol = 0;
             } else if (type_base == SOCK_RAW_LOCAL) {
                 s->protocol = (protocol == 0) ? IPPROTO_ICMP_LOCAL : protocol;
             } else if (type_base == SOCK_DGRAM_LOCAL) {
@@ -10935,7 +11224,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 packet_sock_register(s);
             return (uint64_t)fd;
         }
-        case 49: { /* bind */
+        case SYS_bind: { /* bind */
             int fd = (int)a1;
             const void *addr_u = (const void *)(uintptr_t)a2;
             size_t addrlen = (size_t)a3;
@@ -10967,16 +11256,40 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (s->unix_domain_stub) {
                 char upath[108];
                 int is_abs = 0;
-                int pr = unix_sockaddr_path_from_user(addr_u, addrlen, upath, sizeof(upath), &is_abs);
+                int plen = 0;
+                int pr = unix_sockaddr_path_from_user(addr_u, addrlen, upath, sizeof(upath),
+                                                      &plen, &is_abs);
                 if (pr != 0) return ret_err(pr);
+                if (s->unix_bound) return ret_err(EINVAL);
+                /* Linux: EADDRINUSE if another sock already owns this name. */
+                if (unix_find_listener_by_path(upath, plen, is_abs))
+                    return ret_err(EADDRINUSE);
+                {
+                    unsigned long flags;
+                    acquire_irqsave(&g_ksock_registry_lock, &flags);
+                    for (int i = 0; i < KSOCK_REGISTRY_MAX; i++) {
+                        ksock_net_t *o = g_ksock_registry[i];
+                        if (!o || o == s || !o->unix_domain_stub || !o->unix_bound) continue;
+                        if (unix_path_equal(o, upath, plen, is_abs)) {
+                            release_irqrestore(&g_ksock_registry_lock, flags);
+                            return ret_err(EADDRINUSE);
+                        }
+                    }
+                    release_irqrestore(&g_ksock_registry_lock, flags);
+                }
                 if (!is_abs) {
-                    /* Maintain a visible socket pathname for userland checks. */
+                    /* unix_bind_bsd: create S_IFSOCK inode on the pathname. */
+                    unix_ensure_parent_dirs(upath);
                     (void)fs_unlink(upath);
-                    (void)fs_create_file(upath);
-                    (void)fs_chmod(upath, S_IFSOCK | 0600);
+                    if (!fs_create_file(upath))
+                        return ret_err(ENOENT);
+                    (void)fs_chmod(upath, S_IFSOCK | 0666);
                 }
                 memset(s->unix_path, 0, sizeof(s->unix_path));
-                strncpy(s->unix_path, upath, sizeof(s->unix_path) - 1);
+                if (plen > (int)sizeof(s->unix_path)) plen = (int)sizeof(s->unix_path);
+                memcpy(s->unix_path, upath, (size_t)plen);
+                s->unix_path_len = plen;
+                s->unix_abstract = is_abs ? 1 : 0;
                 s->unix_bound = 1;
                 return 0;
             }
@@ -11014,17 +11327,33 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             return 0;
         }
-        case 50: { /* listen */
+        case SYS_listen: { /* listen — Linux unix_listen / inet_listen */
             int fd = (int)a1;
-            (void)a2; /* backlog */
+            int backlog = (int)a2;
             thread_t *t = thread_get_current_user();
             if (!t) t = thread_current();
             ksock_net_t *s = NULL;
             if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
             if (s->unix_domain_stub) {
-                if (s->type_base != SOCK_STREAM_LOCAL) return ret_err(EOPNOTSUPP);
+                /* Only stream/seqpacket; must be bound (u->addr). */
+                if (s->type_base != SOCK_STREAM_LOCAL && s->type_base != SOCK_SEQPACKET_LOCAL)
+                    return ret_err(EOPNOTSUPP);
                 if (!s->unix_bound) return ret_err(EINVAL);
+                if (s->connected && s->unix_conn) return ret_err(EINVAL);
+                if (backlog < 0) backlog = 0;
+                if (backlog > 128) backlog = 128;
+                if (backlog == 0) backlog = 1;
+                s->unix_backlog = backlog;
                 s->unix_listening = 1;
+                {
+                    static int unix_listen_log = 8;
+                    if (unix_listen_log-- > 0)
+                        kprintf("unix: listen ok path=%s abs=%d backlog=%d tid=%d\n",
+                                s->unix_abstract ? "(abstract)" :
+                                    (s->unix_path[0] ? s->unix_path : "?"),
+                                s->unix_abstract, backlog,
+                                t ? (int)t->tid : -1);
+                }
                 return 0;
             }
             if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
@@ -11071,10 +11400,22 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 if (addr_u && addrlen_u && user_range_ok(addrlen_u, 4)) {
                     uint32_t ulen = 0;
-                    if (copy_from_user_raw(&ulen, addrlen_u, 4) == 0 && ulen >= 2 && user_range_ok(addr_u, 2)) {
-                        uint16_t fam = 1; /* AF_UNIX */
-                        (void)copy_to_user_safe(addr_u, &fam, sizeof(fam));
-                        ulen = 2;
+                    ksock_net_t *as = (ksock_net_t *)af->driver_private;
+                    if (copy_from_user_raw(&ulen, addrlen_u, 4) == 0 && ulen >= 2) {
+                        uint8_t sa[2 + 108];
+                        memset(sa, 0, sizeof(sa));
+                        uint16_t fam = AF_UNIX_LOCAL;
+                        memcpy(sa, &fam, sizeof(fam));
+                        int plen = as ? as->unix_path_len : 0;
+                        if (plen < 0) plen = 0;
+                        if (plen > 108) plen = 108;
+                        if (as && plen > 0)
+                            memcpy(sa + 2, as->unix_path, (size_t)plen);
+                        uint32_t want = (uint32_t)(2 + plen);
+                        uint32_t copy_len = (ulen < want) ? ulen : want;
+                        if (copy_len > 0 && user_range_ok(addr_u, copy_len))
+                            (void)copy_to_user_safe(addr_u, sa, copy_len);
+                        ulen = want;
                         (void)copy_to_user_safe(addrlen_u, &ulen, 4);
                     }
                 }
@@ -11136,14 +11477,15 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (s->unix_domain_stub) {
                 char upath[108];
                 int is_abs = 0;
-                int pr = unix_sockaddr_path_from_user(addr_u, addrlen, upath, sizeof(upath), &is_abs);
+                int plen = 0;
+                int pr = unix_sockaddr_path_from_user(addr_u, addrlen, upath, sizeof(upath),
+                                                      &plen, &is_abs);
                 if (pr != 0) return ret_err(pr);
-                if (s->type_base != SOCK_STREAM_LOCAL) {
+                if (s->type_base != SOCK_STREAM_LOCAL && s->type_base != SOCK_SEQPACKET_LOCAL) {
                     s->connected = 1;
                     return 0;
                 }
-                if (is_abs) return ret_err(ECONNREFUSED);
-                ksock_net_t *listener = unix_find_listener_by_path(upath);
+                ksock_net_t *listener = unix_find_listener_by_path(upath, plen, is_abs);
                 if (!listener || !listener->unix_listening) return ret_err(ECONNREFUSED);
                 if (s->connected && s->unix_conn) return ret_err(EISCONN);
 
@@ -11163,7 +11505,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 memset(srv, 0, sizeof(*srv));
                 memset(srv_f, 0, sizeof(*srv_f));
                 snprintf(srv_p, 24, "socket:[unix]");
-                srv->sock_domain = AF_INET_LOCAL;
+                srv->sock_domain = AF_UNIX_LOCAL;
                 srv->unix_domain_stub = 1;
                 srv->type_base = SOCK_STREAM_LOCAL;
                 srv->protocol = 0;
@@ -11172,7 +11514,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 srv->unix_end = 1;
                 srv->kref = 1;
                 memset(srv->unix_path, 0, sizeof(srv->unix_path));
-                strncpy(srv->unix_path, upath, sizeof(srv->unix_path) - 1);
+                if (plen > (int)sizeof(srv->unix_path)) plen = (int)sizeof(srv->unix_path);
+                memcpy(srv->unix_path, upath, (size_t)plen);
+                srv->unix_path_len = plen;
+                srv->unix_abstract = is_abs ? 1 : 0;
                 srv_f->path = srv_p;
                 srv_f->type = SYSCALL_FTYPE_SOCKET;
                 srv_f->driver_private = srv;
@@ -11199,7 +11544,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 s->unix_conn = conn;
                 s->unix_end = 0;
                 memset(s->unix_path, 0, sizeof(s->unix_path));
-                strncpy(s->unix_path, upath, sizeof(s->unix_path) - 1);
+                memcpy(s->unix_path, upath, (size_t)plen);
+                s->unix_path_len = plen;
+                s->unix_abstract = is_abs ? 1 : 0;
                 return 0;
             }
             sockaddr_in_k to;
@@ -11377,13 +11724,23 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             uint32_t ulen = 0;
             if (copy_from_user_raw(&ulen, addrlen_u, 4) != 0) return ret_err(EFAULT);
             if (s->unix_domain_stub) {
-                uint16_t fam = 1;
-                uint32_t copy_len = (ulen < (uint32_t)sizeof(fam)) ? ulen : (uint32_t)sizeof(fam);
+                /* Linux unix_getname: family + sun_path (pathname or abstract). */
+                uint8_t sa[2 + 108];
+                memset(sa, 0, sizeof(sa));
+                uint16_t fam = AF_UNIX_LOCAL;
+                memcpy(sa, &fam, sizeof(fam));
+                int plen = s->unix_path_len;
+                if (plen < 0) plen = 0;
+                if (plen > 108) plen = 108;
+                if (plen > 0)
+                    memcpy(sa + 2, s->unix_path, (size_t)plen);
+                uint32_t want = (uint32_t)(2 + plen);
+                uint32_t copy_len = (ulen < want) ? ulen : want;
                 if (copy_len > 0) {
                     if (!user_range_ok(addr_u, copy_len)) return ret_err(EFAULT);
-                    if (copy_to_user_safe(addr_u, &fam, copy_len) != 0) return ret_err(EFAULT);
+                    if (copy_to_user_safe(addr_u, sa, copy_len) != 0) return ret_err(EFAULT);
                 }
-                ulen = (uint32_t)sizeof(fam);
+                ulen = want;
                 if (copy_to_user_safe(addrlen_u, &ulen, 4) != 0) return ret_err(EFAULT);
                 return 0;
             }
@@ -11449,13 +11806,23 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             uint32_t ulen = 0;
             if (copy_from_user_raw(&ulen, addrlen_u, 4) != 0) return ret_err(EFAULT);
             if (s->unix_domain_stub) {
-                uint16_t fam = 1;
-                uint32_t copy_len = (ulen < (uint32_t)sizeof(fam)) ? ulen : (uint32_t)sizeof(fam);
+                /* Linux unix_getname: family + sun_path (pathname or abstract). */
+                uint8_t sa[2 + 108];
+                memset(sa, 0, sizeof(sa));
+                uint16_t fam = AF_UNIX_LOCAL;
+                memcpy(sa, &fam, sizeof(fam));
+                int plen = s->unix_path_len;
+                if (plen < 0) plen = 0;
+                if (plen > 108) plen = 108;
+                if (plen > 0)
+                    memcpy(sa + 2, s->unix_path, (size_t)plen);
+                uint32_t want = (uint32_t)(2 + plen);
+                uint32_t copy_len = (ulen < want) ? ulen : want;
                 if (copy_len > 0) {
                     if (!user_range_ok(addr_u, copy_len)) return ret_err(EFAULT);
-                    if (copy_to_user_safe(addr_u, &fam, copy_len) != 0) return ret_err(EFAULT);
+                    if (copy_to_user_safe(addr_u, sa, copy_len) != 0) return ret_err(EFAULT);
                 }
-                ulen = (uint32_t)sizeof(fam);
+                ulen = want;
                 if (copy_to_user_safe(addrlen_u, &ulen, 4) != 0) return ret_err(EFAULT);
                 return 0;
             }
@@ -12496,8 +12863,22 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             unsigned long loads[3];
             loadavg_get_user(loads);
             memcpy(buf + 8, loads, 24);
-            uint64_t totalram = 128 * 1024 * 1024;  /* 128MB */
-            uint64_t freeram = 64 * 1024 * 1024;   /* 64MB - enough for stack allocation */
+            int ram_mb = sysinfo_ram_mb();
+            uint64_t totalram;
+            if (ram_mb > 0)
+                totalram = (uint64_t)ram_mb * 1024ULL * 1024ULL;
+            else
+                totalram = heap_total_bytes() ? (uint64_t)heap_total_bytes() : (256ULL * 1024ULL * 1024ULL);
+            uint64_t used = (uint64_t)heap_used_bytes();
+            /* Rough free: physical minus kernel heap used; never claim less than
+             * 64MiB free or pthread/cgo stack allocation aborts. */
+            uint64_t freeram = totalram > used + (64ULL * 1024ULL * 1024ULL)
+                ? totalram - used
+                : (totalram > (64ULL * 1024ULL * 1024ULL)
+                   ? totalram / 2
+                   : (64ULL * 1024ULL * 1024ULL));
+            if (freeram > totalram)
+                freeram = totalram;
             memcpy(buf + 32, &totalram, 8);
             memcpy(buf + 40, &freeram, 8);
             /* sharedram, bufferram at 48,56 = 0 */
@@ -12514,16 +12895,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             int resource = (int)a1;
             void *rlim_u = (void*)(uintptr_t)a2;
             if (!rlim_u || (uintptr_t)rlim_u + 16 > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            /* struct rlimit { rlim_t rlim_cur; rlim_t rlim_max; }; rlim_t = 64-bit */
-            uint64_t cur_val = 0xFFFFFFFFFFFFFFFFULL, max_val = 0xFFFFFFFFFFFFFFFFULL;
-            switch (resource) {
-                case 3: /* RLIMIT_STACK */ cur_val = 8 * 1024 * 1024; max_val = cur_val; break;
-                case 4: /* RLIMIT_CORE */ cur_val = 0; max_val = 0xFFFFFFFFFFFFFFFFULL; break;
-                case 6: /* RLIMIT_NPROC */ cur_val = 4096; max_val = 4096; break;
-                case 7: /* RLIMIT_NOFILE */ cur_val = (uint64_t)THREAD_MAX_FD; max_val = cur_val; break;
-                case 9: /* RLIMIT_AS */ cur_val = max_val = 0xFFFFFFFFFFFFFFFFULL; break;
-                default: cur_val = max_val = 0xFFFFFFFFFFFFFFFFULL; break;
-            }
+            uint64_t cur_val = 0, max_val = 0;
+            if (rlimit_get(cur, resource, &cur_val, &max_val) != 0)
+                return ret_err(EINVAL);
             if (copy_to_user_safe(rlim_u, &cur_val, sizeof(cur_val)) != 0) return ret_err(EFAULT);
             if (copy_to_user_safe((char*)rlim_u + 8, &max_val, sizeof(max_val)) != 0) return ret_err(EFAULT);
             return 0;
@@ -15823,8 +16197,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             int type = (int)a2;
             int protocol = (int)a3;
             void *sv_u = (void*)(uintptr_t)a4;
-            int type_base = type & ~(O_NONBLOCK_LINUX | 02000000);
-            if (domain != 1 || !sv_u || (uintptr_t)sv_u + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT)
+            int type_base = type & ~(O_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
+            if (domain != AF_UNIX_LOCAL || !sv_u || (uintptr_t)sv_u + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT)
                 return ret_err(EAFNOSUPPORT);
             if (type_base != SOCK_STREAM_LOCAL || protocol != 0)
                 return ret_err(EOPNOTSUPP);
@@ -15854,8 +16228,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             memset(f1, 0, sizeof(*f1));
             snprintf(p0, 24, "socket:[unix]");
             snprintf(p1, 24, "socket:[unix]");
-            s0->sock_domain = AF_INET_LOCAL;
-            s1->sock_domain = AF_INET_LOCAL;
+            s0->sock_domain = AF_UNIX_LOCAL;
+            s1->sock_domain = AF_UNIX_LOCAL;
             s0->unix_domain_stub = 1;
             s1->unix_domain_stub = 1;
             s0->type_base = SOCK_STREAM_LOCAL;
@@ -16273,6 +16647,117 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 memset(tmp + sizeof(cs), 0, STAT_COPY_SIZE - sizeof(cs));
                 if (copy_to_user_safe(st_u, tmp, STAT_COPY_SIZE) != 0) return ret_err(EFAULT);
             }
+            return 0;
+        }
+        case SYS_statx: {
+            /* statx(dirfd, pathname, flags, mask, statxbuf) — Linux x86_64 #332.
+             * coreutils ls uses this; ENOSYS became "Function not implemented". */
+            int dirfd = (int)a1;
+            const char *path_u = (const char *)(uintptr_t)a2;
+            int flags = (int)a3;
+            unsigned int req_mask = (unsigned int)a4;
+            void *buf_u = (void *)(uintptr_t)a5;
+            (void)req_mask;
+            if (!buf_u) return ret_err(EFAULT);
+            enum { AT_FDCWD_X = -100, AT_SYMLINK_NOFOLLOW_X = 0x100, AT_EMPTY_PATH_X = 0x1000 };
+            struct stat st;
+            int st_ready = 0;
+            char first = '\0';
+            int empty_path = 0;
+            if ((flags & AT_EMPTY_PATH_X) != 0) {
+                if (!path_u) empty_path = 1;
+                else {
+                    if (copy_from_user_raw(&first, path_u, 1) != 0) return ret_err(EFAULT);
+                    if (first == '\0') empty_path = 1;
+                }
+            }
+            if (empty_path) {
+                if (dirfd < 0 || dirfd >= THREAD_MAX_FD) return ret_err(EBADF);
+                struct fs_file *f = cur->fds[dirfd];
+                if (!f) return ret_err(EBADF);
+                if (vfs_fstat(f, &st) != 0) return ret_err(EINVAL);
+                st_ready = 1;
+            } else {
+                if (!path_u) return ret_err(EFAULT);
+                char *kpath = copy_user_cstr(path_u, 256);
+                if (!kpath) return ret_err(EFAULT);
+                char path[256];
+                int rc_resolve = 0;
+                if (kpath[0] == '/' || dirfd == AT_FDCWD_X) {
+                    resolve_kernel_path(cur, kpath, path, sizeof(path));
+                } else if (dirfd < 0 || dirfd >= THREAD_MAX_FD) {
+                    rc_resolve = -EBADF;
+                } else {
+                    struct fs_file *df = cur->fds[dirfd];
+                    if (!df) rc_resolve = -EBADF;
+                    else if (df->type != FS_TYPE_DIR) rc_resolve = -ENOTDIR;
+                    else {
+                        const char *base = df->path ? df->path : "/";
+                        if (strcmp(base, "/") == 0) snprintf(path, sizeof(path), "/%s", kpath);
+                        else snprintf(path, sizeof(path), "%s/%s", base, kpath);
+                        path[sizeof(path) - 1] = '\0';
+                        if (path_needs_normalize(path)) normalize_path(path, sizeof(path));
+                    }
+                }
+                kfree(kpath);
+                if (rc_resolve == -EBADF) return ret_err(EBADF);
+                if (rc_resolve == -ENOTDIR) return ret_err(ENOTDIR);
+                if (rc_resolve != 0) return ret_err(EFAULT);
+                int sr = (flags & AT_SYMLINK_NOFOLLOW_X) ? vfs_lstat(path, &st) : vfs_stat(path, &st);
+                if (sr != 0) return ret_err(ENOENT);
+                st_ready = 1;
+            }
+            if (!st_ready) return ret_err(EFAULT);
+
+            struct statx_ts { int64_t tv_sec; uint32_t tv_nsec; int32_t __reserved; };
+            struct statx_k {
+                uint32_t stx_mask;
+                uint32_t stx_blksize;
+                uint64_t stx_attributes;
+                uint32_t stx_nlink;
+                uint32_t stx_uid;
+                uint32_t stx_gid;
+                uint16_t stx_mode;
+                uint16_t __spare0[1];
+                uint64_t stx_ino;
+                uint64_t stx_size;
+                uint64_t stx_blocks;
+                uint64_t stx_attributes_mask;
+                struct statx_ts stx_atime;
+                struct statx_ts stx_btime;
+                struct statx_ts stx_ctime;
+                struct statx_ts stx_mtime;
+                uint32_t stx_rdev_major;
+                uint32_t stx_rdev_minor;
+                uint32_t stx_dev_major;
+                uint32_t stx_dev_minor;
+                uint64_t stx_mnt_id;
+                uint64_t __spare2[13];
+            } sx;
+            memset(&sx, 0, sizeof(sx));
+            /* STATX_BASIC_STATS */
+            sx.stx_mask = 0x000007ffu;
+            sx.stx_blksize = 4096;
+            sx.stx_nlink = (uint32_t)st.st_nlink;
+            sx.stx_uid = (uint32_t)st.st_uid;
+            sx.stx_gid = (uint32_t)st.st_gid;
+            sx.stx_mode = (uint16_t)st.st_mode;
+            sx.stx_ino = (uint64_t)st.st_ino;
+            sx.stx_size = (uint64_t)st.st_size;
+            sx.stx_blocks = (uint64_t)((st.st_size + 511) / 512);
+            sx.stx_atime.tv_sec = (int64_t)st.st_atime;
+            sx.stx_mtime.tv_sec = (int64_t)st.st_mtime;
+            sx.stx_ctime.tv_sec = (int64_t)st.st_ctime;
+            sx.stx_dev_major = (uint32_t)(((uint64_t)st.st_dev >> 8) & 0xfffu);
+            sx.stx_dev_minor = (uint32_t)((uint64_t)st.st_dev & 0xffu);
+            sx.stx_rdev_major = (uint32_t)(((uint64_t)st.st_rdev >> 8) & 0xfffu);
+            sx.stx_rdev_minor = (uint32_t)((uint64_t)st.st_rdev & 0xffu);
+            /* Linux userspace expects a 256-byte statx buffer. */
+            uint8_t out[256];
+            memset(out, 0, sizeof(out));
+            size_t n = sizeof(sx) < sizeof(out) ? sizeof(sx) : sizeof(out);
+            memcpy(out, &sx, n);
+            if (copy_to_user_safe(buf_u, out, sizeof(out)) != 0) return ret_err(EFAULT);
             return 0;
         }
         case SYS_lseek: {
@@ -16777,8 +17262,16 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             /* umount2(target, flags) */
             const char *tgt_u = (const char*)(uintptr_t)a1;
             int flags = (int)a2;
-            /* Support only the common case flags==0; ignore MNT_DETACH etc for now. */
-            if (flags != 0) return ret_err(ENOSYS);
+            /* Linux: MNT_FORCE=1, MNT_DETACH=2, MNT_EXPIRE=4, UMOUNT_NOFOLLOW=8.
+             * Accept and ignore these — we have no busy mounts to force. */
+            enum {
+                MNT_FORCE_K = 1,
+                MNT_DETACH_K = 2,
+                MNT_EXPIRE_K = 4,
+                UMOUNT_NOFOLLOW_K = 8
+            };
+            if (flags & ~(MNT_FORCE_K | MNT_DETACH_K | MNT_EXPIRE_K | UMOUNT_NOFOLLOW_K))
+                return ret_err(EINVAL);
             if (!tgt_u) return ret_err(EINVAL);
             char *k_tgt_raw = copy_user_cstr(tgt_u, 256);
             if (!k_tgt_raw) return ret_err(EFAULT);
@@ -17080,6 +17573,68 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         }
         case SYS_munmap:
             return user_syscall_munmap(a1, a2);
+        case SYS_mincore: {
+            /*
+             * mincore(addr, length, vec) — Linux x86_64 #27.
+             * Go runtime addrspace_free() probes candidate arenas one page at a
+             * time: ENOMEM ⇒ unmapped (free), anything else ⇒ treated as mapped.
+             * Returning ENOSYS made Go believe the whole 64-bit hint space was
+             * occupied → mmap conflicts → runtime/cgo OOM in thread_start.
+             */
+            uint64_t addr = a1;
+            size_t length = (size_t)a2;
+            void *vec_u = (void *)(uintptr_t)a3;
+            const uint64_t pgsz = PAGE_SIZE_4K;
+            if (length == 0)
+                return 0;
+            if ((addr & (pgsz - 1u)) != 0)
+                return ret_err(EINVAL);
+            if (!vec_u)
+                return ret_err(EFAULT);
+            uint64_t end = addr + (uint64_t)length;
+            if (end < addr)
+                return ret_err(ENOMEM);
+            size_t npages = (size_t)((length + (size_t)pgsz - 1u) / (size_t)pgsz);
+            if (npages == 0 || npages > (16u * 1024u * 1024u))
+                return ret_err(EINVAL);
+            if (!user_range_ok(vec_u, npages))
+                return ret_err(EFAULT);
+
+            /* Linux: ENOMEM if any page in the range lacks a VMA mapping.
+             * Go addrspace_free treats only -ENOMEM as "free to claim". */
+            for (size_t i = 0; i < npages; i++) {
+                uint64_t page = addr + (uint64_t)i * pgsz;
+                if (!user_vma_overlaps_thread_range(cur, (uintptr_t)page, (size_t)pgsz))
+                    return ret_err(ENOMEM);
+            }
+
+            /* All pages covered by VMAs — fill residency vector. */
+            uint8_t *kvec = (uint8_t *)kmalloc(npages);
+            if (!kvec) {
+                /* npages is usually 1 (Go); stack buffer fallback */
+                if (npages > 4096)
+                    return ret_err(ENOMEM);
+                uint8_t small[4096];
+                for (size_t i = 0; i < npages; i++) {
+                    uint64_t page = addr + (uint64_t)i * pgsz;
+                    uint64_t pa = virt_to_phys(page);
+                    small[i] = (pa != 0) ? 1u : 0u;
+                }
+                if (copy_to_user_safe(vec_u, small, npages) != 0)
+                    return ret_err(EFAULT);
+                return 0;
+            }
+            for (size_t i = 0; i < npages; i++) {
+                uint64_t page = addr + (uint64_t)i * pgsz;
+                uint64_t pa = virt_to_phys(page);
+                kvec[i] = (pa != 0) ? 1u : 0u;
+            }
+            int cprc = copy_to_user_safe(vec_u, kvec, npages);
+            kfree(kvec);
+            if (cprc != 0)
+                return ret_err(EFAULT);
+            return 0;
+        }
         case SYS_madvise: {
             /* madvise(addr, length, advice) - syscall 28; glibc/apm uses MADV_DONTNEED etc.; stub success */
             (void)a1; (void)a2; (void)a3;
@@ -17496,7 +18051,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 cur->process->fd_cloexec[fd] = 1;
             return (uint64_t)fd;
         }
-        case 214: { /* epoll_ctl(epfd, op, fd, event) */
+        case 214: /* epoll_ctl_old (legacy number; rarely used) */
+        case 233: { /* epoll_ctl — Linux x86_64 / Go runtime netpoll */
             int epfd = (int)a1;
             int op = (int)a2;
             int fd = (int)a3;
@@ -17612,8 +18168,21 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
         }
         default:
-            /* Keep unknown syscalls silent to avoid console stalls under heavy userland probing. */
+            /* Keep unknown syscalls mostly silent; log a few for docker/containerd. */
             (void)a4; (void)a5; (void)a6;
+            {
+                static int enosys_log_left = 48;
+                if (enosys_log_left > 0 && cur && cur->name[0] &&
+                    (strstr(cur->name, "docker") || strstr(cur->name, "containerd") ||
+                     strstr(cur->name, "runc"))) {
+                    enosys_log_left--;
+                    kprintf("ENOSYS: nr=%llu tid=%d name=%s a1=0x%llx\n",
+                        (unsigned long long)num,
+                        (int)(cur->tid ? cur->tid : 1),
+                        cur->name,
+                        (unsigned long long)a1);
+                }
+            }
             return ret_err(ENOSYS);
     }
 }

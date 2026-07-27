@@ -551,6 +551,146 @@ int user_vma_mmap_range_overlaps(thread_t *runner, uintptr_t addr, size_t len) {
     return rc;
 }
 
+/* Lowest exclusive end of any runner VMA intersecting [addr, addr+len), or 0. */
+static uintptr_t user_vma_overlap_end_nolock(thread_t *runner, uintptr_t addr, uint64_t len) {
+    uint64_t a0 = (uint64_t)addr;
+    uint64_t a1 = a0 + len;
+    uintptr_t end = 0;
+    if (a1 < a0) return (uintptr_t)-1;
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (!g_user_vmas[i].used) continue;
+        if (!user_vma_tid_matches_runner_mm_nolock(runner, (uint64_t)g_user_vmas[i].tid))
+            continue;
+        uint64_t b0 = (uint64_t)g_user_vmas[i].addr;
+        uint64_t b1 = b0 + (uint64_t)g_user_vmas[i].len;
+        if (b1 < b0) continue;
+        if (a1 <= b0 || a0 >= b1) continue;
+        if ((uintptr_t)b1 > end) end = (uintptr_t)b1;
+    }
+    return end;
+}
+
+uintptr_t user_vma_find_unmapped(thread_t *runner, uintptr_t floor, uintptr_t ceil,
+                                 uint64_t len, uintptr_t hint, uintptr_t align) {
+    if (!runner || len == 0 || floor >= ceil)
+        return 0;
+    if (align < 4096u)
+        align = 4096u;
+    /* Require power-of-two align. */
+    if ((align & (align - 1u)) != 0)
+        align = 4096u;
+    if (len > (uint64_t)(ceil - floor))
+        return 0;
+
+    unsigned long fl = 0;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+
+    if (hint != 0) {
+        uintptr_t h = user_mm_align_up(hint, align);
+        if (h >= floor && (uint64_t)h + len <= (uint64_t)ceil &&
+            (uint64_t)h + len >= (uint64_t)h &&
+            user_vma_overlap_end_nolock(runner, h, len) == 0) {
+            release_irqrestore(&g_user_vma_lock, fl);
+            return h;
+        }
+    }
+
+    uintptr_t cand = user_mm_align_up(floor, align);
+    for (int iter = 0; iter < USER_VMA_MAX + 16; iter++) {
+        if (cand >= ceil || (uint64_t)cand + len > (uint64_t)ceil ||
+            (uint64_t)cand + len < (uint64_t)cand)
+            break;
+        uintptr_t block = user_vma_overlap_end_nolock(runner, cand, len);
+        if (block == 0) {
+            release_irqrestore(&g_user_vma_lock, fl);
+            return cand;
+        }
+        if (block == (uintptr_t)-1)
+            break;
+        uintptr_t next = user_mm_align_up(block, align);
+        if (next <= cand)
+            next = cand + align;
+        cand = next;
+    }
+
+    release_irqrestore(&g_user_vma_lock, fl);
+    return 0;
+}
+
+/* Lowest start of any VMA overlapping [addr, addr+len), or 0 if none. */
+static uintptr_t user_vma_overlap_start_nolock(thread_t *runner, uintptr_t addr, uint64_t len) {
+    uint64_t a0 = (uint64_t)addr;
+    uint64_t a1 = a0 + len;
+    uintptr_t start = 0;
+    int hit = 0;
+    if (a1 < a0) return (uintptr_t)-1;
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (!g_user_vmas[i].used) continue;
+        if (!user_vma_tid_matches_runner_mm_nolock(runner, (uint64_t)g_user_vmas[i].tid))
+            continue;
+        uint64_t b0 = (uint64_t)g_user_vmas[i].addr;
+        uint64_t b1 = b0 + (uint64_t)g_user_vmas[i].len;
+        if (b1 < b0) continue;
+        if (a1 <= b0 || a0 >= b1) continue;
+        if (!hit || (uintptr_t)b0 < start) {
+            start = (uintptr_t)b0;
+            hit = 1;
+        }
+    }
+    return hit ? start : 0;
+}
+
+uintptr_t user_vma_find_unmapped_topdown(thread_t *runner, uintptr_t floor,
+                                         uintptr_t ceil, uint64_t len,
+                                         uintptr_t align) {
+    if (!runner || len == 0 || floor >= ceil)
+        return 0;
+    if (align < 4096u)
+        align = 4096u;
+    if ((align & (align - 1u)) != 0)
+        align = 4096u;
+    if (len > (uint64_t)(ceil - floor))
+        return 0;
+
+    unsigned long fl = 0;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+
+    /* Highest aligned start where start+len <= ceil. */
+    uintptr_t cand = user_mm_align_down(ceil - (uintptr_t)len, align);
+    if (cand + (uintptr_t)len > ceil) {
+        if (cand < align) {
+            release_irqrestore(&g_user_vma_lock, fl);
+            return 0;
+        }
+        cand -= align;
+    }
+
+    for (int iter = 0; iter < USER_VMA_MAX + 16; iter++) {
+        if (cand < floor || (uint64_t)cand + len > (uint64_t)ceil)
+            break;
+        uintptr_t ov_start = user_vma_overlap_start_nolock(runner, cand, len);
+        if (ov_start == 0) {
+            release_irqrestore(&g_user_vma_lock, fl);
+            return cand;
+        }
+        if (ov_start == (uintptr_t)-1)
+            break;
+        /* Sit just below the blocking VMA. */
+        if (ov_start < floor + (uintptr_t)len)
+            break;
+        uintptr_t next = user_mm_align_down(ov_start - (uintptr_t)len, align);
+        if (next >= cand) {
+            if (cand < align + floor)
+                break;
+            next = cand - align;
+        }
+        cand = next;
+    }
+
+    release_irqrestore(&g_user_vma_lock, fl);
+    return 0;
+}
+
 void user_vma_remove_all_for_tid(uint64_t tid) {
     unsigned long fl = 0;
     acquire_irqsave(&g_user_vma_lock, &fl);

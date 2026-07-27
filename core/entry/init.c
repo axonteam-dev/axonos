@@ -393,11 +393,12 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             }
 
             uint64_t ram_bytes = (uint64_t)sysinfo_ram_mb() * 1024ULL * 1024ULL;
+            /* Keep initrd/reloc candidates ABOVE the user mmap window. */
             const uintptr_t candidates[] = {
-                (uintptr_t)0x42000000u,
                 (uintptr_t)USER_STACK_TOP + (32u * 1024u * 1024u),
-                (uintptr_t)0x48000000u,
-                (uintptr_t)0x50000000u,
+                (uintptr_t)USER_STACK_TOP + (64u * 1024u * 1024u),
+                (uintptr_t)0x78000000u,
+                (uintptr_t)0x7A000000u,
             };
             uintptr_t safe_start = 0;
             for (unsigned ci = 0; ci < sizeof(candidates) / sizeof(candidates[0]); ci++) {
@@ -535,7 +536,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             int raise_ok = 1;
             if (ram_mb > 0) {
                 uint64_t ram_bytes = (uint64_t)ram_mb * 1024ULL * 1024ULL;
-                if (ram_bytes < (uint64_t)HEAP_ABOVE_USER + (64ULL * 1024ULL * 1024ULL))
+                if (ram_bytes < (uint64_t)HEAP_ABOVE_USER + (256ULL * 1024ULL * 1024ULL))
                     raise_ok = 0;
             }
             if (raise_ok) {
@@ -564,12 +565,21 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         {
             uint64_t hs = (uint64_t)heap_start;
             uint64_t max_heap_end = (uint64_t)MMIO_IDENTITY_LIMIT;
-            /* The simple heap is a contiguous identity arena and does not yet
-             * split around E820/MMIO holes. Keep it below 2 GiB so VMware PCI
-             * BARs cannot become allocator memory after the large initfs is
-             * relocated out of the high GRUB module range. */
-            if (max_heap_end > 0x80000000ULL)
-                max_heap_end = 0x80000000ULL;
+            if (hs >= (uint64_t)USER_STACK_TOP) {
+                /*
+                 * Heap lives above the user mmap window. The old hard 2GiB
+                 * ceiling left only ~240MiB when STACK_TOP=0x70000000 — then
+                 * frame_alloc's kmalloc(8KiB) OOMed mid dockerd→containerd
+                 * exec (largest_free≈4KiB). Allow high identity RAM; leave a
+                 * cushion under 4GiB for MMIO/PCI BARs.
+                 */
+                if (max_heap_end > 0xE0000000ULL)
+                    max_heap_end = 0xE0000000ULL;
+            } else {
+                /* Low placement: stay below 2GiB (VMware PCI-safe). */
+                if (max_heap_end > 0x80000000ULL)
+                    max_heap_end = 0x80000000ULL;
+            }
             if (max_heap_end > 4ULL * 1024ULL * 1024ULL)
                 max_heap_end -= 4ULL * 1024ULL * 1024ULL;
             if (hs < (uint64_t)USER_STACK_TOP) {
@@ -582,8 +592,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             if (max_heap_end > hs && hs + (uint64_t)heap_size > max_heap_end)
                 heap_size = (size_t)(max_heap_end - hs);
         }
-        if (heap_size < (16ULL * 1024ULL * 1024ULL))
-            kprintf("warning: kernel heap only %llu MiB after user-VA split — increase VM RAM\n",
+        if (heap_size < (128ULL * 1024ULL * 1024ULL))
+            kprintf("warning: kernel heap only %llu MiB after user-VA split — increase VM RAM (docker needs ≥2GiB)\n",
                     (unsigned long long)(heap_size / (1024ULL * 1024ULL)));
         heap_init(heap_start, heap_size);
         kprintf("Kernel starting... heap_start: %p heap_size=%llu heap_total=%llu heap_base=%p ram_mb=%d kernel_end: %p mods_end: %p\n",

@@ -1961,6 +1961,7 @@ int devfs_register(void) {
         devfs_tty_init_scroll(&dev_ttys[i]);
         dev_ttys[i].in_head = dev_ttys[i].in_tail = dev_ttys[i].in_count = 0;
         dev_ttys[i].in_lock.lock = 0;
+        dev_ttys[i].out_lock.lock = 0;
         dev_ttys[i].waiters_count = 0;
         dev_ttys[i].fg_pgrp = -1;
         size_t scr_sz = devfs_tty_screen_bytes();

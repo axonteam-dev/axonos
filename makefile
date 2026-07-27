@@ -44,7 +44,7 @@ OPTFLAGS ?= -g
 CFLAGS := $(OPTFLAGS) -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel \
 	-Iinc -I$(AUTOCONF_DIR) -include kconfig.h -MMD -MP $(CFLAGS_EXTRA)
 
-CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -path './userland' -prune -o -path './core/nss_dns_shim' -prune -o -path './core/nss_files_shim' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
+CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -path './third_party' -prune -o -path './tools' -prune -o -path './userland' -prune -o -path './core/nss_dns_shim' -prune -o -path './core/nss_files_shim' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
 COBJS := $(patsubst %.c,$(BUILD_DIR)/%.c.o,$(CSRCS))
 DEPS := $(COBJS:.o=.d)
 
@@ -259,12 +259,27 @@ disk:
 	@dd if=/dev/zero of=../disk.img bs=1M count=10
 	@mkfs.fat -F 32 ../disk.img
 
+# Host helper for converting a legacy initfs.cpio into SquashFS.
+MKINITFS_SQUASH := tools/mkinitfs-squashfs.sh
+
 archive:
-	@if [ ! -f iso/boot/initfs.cpio ]; then \
-		wget -P build apm.axont.ru/Packages/initfs.tar.xz; \
-		tar -xf build/initfs.tar.xz -C iso/boot/; \
-		rm build/initfs.tar.xz; \
+	@if [ ! -f iso/boot/initfs.squashfs ]; then \
+		if [ -f initfs.squashfs ]; then \
+			cp -f initfs.squashfs iso/boot/initfs.squashfs; \
+		elif [ -f initfs.cpio ]; then \
+			$(MKINITFS_SQUASH) initfs.cpio iso/boot/initfs.squashfs; \
+		elif [ -f iso/boot/initfs.cpio ]; then \
+			$(MKINITFS_SQUASH) iso/boot/initfs.cpio iso/boot/initfs.squashfs; \
+		else \
+			wget -P build apm.axont.ru/Packages/initfs.tar.xz; \
+			tar -xf build/initfs.tar.xz -C iso/boot/; \
+			rm -f build/initfs.tar.xz; \
+			if [ -f iso/boot/initfs.cpio ]; then \
+				$(MKINITFS_SQUASH) iso/boot/initfs.cpio iso/boot/initfs.squashfs; \
+			fi; \
+		fi; \
 	fi
+	@test -f iso/boot/initfs.squashfs
 
 clean:
 	@rm -rf $(BUILD_DIR)

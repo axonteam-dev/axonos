@@ -30,6 +30,8 @@
 #include <console.h>
 #include <font.h>
 #include <ramfs.h>
+#include <squashfs.h>
+#include <overlayfs.h>
 #include <dhcp.h>
 #include <debug.h>
 #include <klog.h>
@@ -17238,6 +17240,33 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 ramfs_mkdir(target);
                 rc = devfs_mount(target);
                 if (rc != 0) errno_out = EBUSY;
+            } else if (strcmp(k_type, "squashfs") == 0) {
+                struct fs_driver *md = fs_get_mount_driver(target);
+                if (md && md->ops && md->ops->name &&
+                    strcmp(md->ops->name, "squashfs") == 0) {
+                    rc = 0;
+                } else if (!squashfs_is_ready()) {
+                    errno_out = ENODEV;
+                } else {
+                    ramfs_mkdir(target);
+                    rc = squashfs_mount(target);
+                    if (rc != 0)
+                        errno_out = EBUSY;
+                }
+            } else if (strcmp(k_type, "overlay") == 0 ||
+                       strcmp(k_type, "overlayfs") == 0) {
+                struct fs_driver *md = fs_get_mount_driver(target);
+                if (md && md->ops && md->ops->name &&
+                    (strcmp(md->ops->name, "overlay") == 0 ||
+                     strcmp(md->ops->name, "overlayfs") == 0)) {
+                    rc = 0;
+                } else if (strcmp(target, "/") != 0 || !squashfs_is_ready()) {
+                    errno_out = ENODEV;
+                } else {
+                    rc = overlayfs_mount_root();
+                    if (rc != 0)
+                        errno_out = EBUSY;
+                }
             } else if (strcmp(k_type, "fat32") == 0 || strcmp(k_type, "vfat") == 0 || strcmp(k_type, "msdos") == 0 || strcmp(k_type, "auto") == 0) {
                 if (!src_u) { kfree(k_type); return ret_err(EINVAL); }
                 char *k_src_raw = copy_user_cstr(src_u, 256);

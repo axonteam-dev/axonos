@@ -33,6 +33,8 @@
 #include <fbdev.h>
 #include <procfs.h>
 #include <initfs.h>
+#include <squashfs.h>
+#include <overlayfs.h>
 #include <bootparam.h>
 #include <mb2_linux_shim.h>
 #include <ramfs.h>
@@ -664,6 +666,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 #ifdef EXT2_SUPPORT
     ext2_register();
 #endif
+    squashfs_register();
+    overlayfs_register();
 
     /* sysfs, procfs, devfs mount — only via SYS_mount from userspace (e.g. init) */
 

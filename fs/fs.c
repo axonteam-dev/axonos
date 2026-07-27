@@ -12,6 +12,8 @@
 #include <procfs.h>
 #include <devfs.h>
 #include <fat32.h>
+#include <squashfs.h>
+#include <overlayfs.h>
 
 #ifndef EIO
 #define EIO 5
@@ -852,6 +854,10 @@ int vfs_fstat(struct fs_file *file, struct stat *st) {
             if (procfs_fill_stat(file, st) == 0) goto fix_mode;
         } else if (name && strcmp(name, "devfs") == 0) {
             if (devfs_fill_stat(file, st) == 0) goto fix_mode;
+        } else if (name && strcmp(name, "squashfs") == 0) {
+            if (squashfs_fill_stat(file, st) == 0) goto fix_mode;
+        } else if (name && (strcmp(name, "overlay") == 0 || strcmp(name, "overlayfs") == 0)) {
+            if (overlayfs_fill_stat(file, st) == 0) goto fix_mode;
         }
         break;
     }
@@ -891,6 +897,8 @@ int vfs_ftruncate(struct fs_file *file, off_t length) {
             return ramfs_ftruncate(file, length);
         if (name && strcmp(name, "fat32") == 0)
             return fat32_ftruncate(file, length);
+        if (name && (strcmp(name, "overlay") == 0 || strcmp(name, "overlayfs") == 0))
+            return overlayfs_ftruncate(file, length);
         /* Open file belongs to a driver we do not truncate yet */
         return -95; /* EOPNOTSUPP */
     }

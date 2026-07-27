@@ -1097,6 +1097,40 @@ int ramfs_remove(const char *path) {
     return 0;
 }
 
+#define RAMFS_WHITEOUT_UID 0xffffu
+
+int ramfs_make_whiteout(const char *path) {
+    struct fs_file *file = NULL;
+    if (!path || path[0] != '/')
+        return -1;
+    (void)ramfs_remove(path);
+    if (ramfs_create(path, &file) != 0 || !file || !file->driver_private) {
+        if (file)
+            ramfs_release(file);
+        return -1;
+    }
+    struct ramfs_file_handle *handle =
+        (struct ramfs_file_handle *)file->driver_private;
+    struct ramfs_node *node = handle->node;
+    node->mode = S_IFCHR;
+    node->uid = RAMFS_WHITEOUT_UID;
+    node->gid = 0;
+    node->size = 0;
+    ramfs_free_data_owned(node);
+    ramfs_release(file);
+    return 0;
+}
+
+int ramfs_path_is_whiteout(const char *path) {
+    struct ramfs_node *node = path ? ramfs_lookup_nofollow(path) : NULL;
+    return node && (node->mode & 0170000) == S_IFCHR &&
+           node->uid == RAMFS_WHITEOUT_UID;
+}
+
+struct fs_driver *ramfs_get_driver(void) {
+    return &ramfs_driver;
+}
+
 int ramfs_register(void) {
     /* init root */
     ramfs_root = ramfs_alloc_node("", 1);

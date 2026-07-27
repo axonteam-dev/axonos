@@ -17,6 +17,8 @@
 #include <debug.h>
 #include <sysinfo.h>
 #include <ext2.h>
+#include <squashfs.h>
+#include <overlayfs.h>
 
 void initfs_normalize_target(char *out, size_t out_sz, const char *name);
 
@@ -990,6 +992,23 @@ void initfs_debug_list_vfs(void) {
     qemu_debug_printf("initfs: --- VFS total %d entries ---\n", count);
 }
 
+/* Keep the compressed image in place and expose a writable ramfs upper. */
+static int initfs_mount_squashfs_region(const void *mod_ptr, size_t mod_size) {
+    if (!squashfs_image_looks_valid(mod_ptr, mod_size))
+        return -1;
+    if (squashfs_prepare_image(mod_ptr, mod_size) != 0) {
+        klogprintf("initfs: squashfs_prepare_image failed\n");
+        return -1;
+    }
+    if (overlayfs_mount_root() != 0) {
+        klogprintf("initfs: overlayfs_mount_root failed\n");
+        return -1;
+    }
+    klogprintf("initfs: squashfs mounted at / via ramfs overlay (%u bytes)\n",
+               (unsigned)mod_size);
+    return 0;
+}
+
 uintptr_t initfs_linux_ramdisk_exclusive_end(uint64_t boot_params_phys) {
     uintptr_t st = 0;
     size_t sz = 0;
@@ -1062,9 +1081,17 @@ int initfs_process_linux_bootparams(uint64_t boot_params_phys) {
     }
     if (rd_sz >= 6) {
         const uint8_t *h = (const uint8_t *)rd_pa;
-        klogprintf("initfs: ramdisk head %02x %02x %02x %02x %02x %02x (newc ASCII 070701 = 30 37 30 37 30 31)\n",
+        klogprintf("initfs: ramdisk head %02x %02x %02x %02x %02x %02x (hsqs or newc)\n",
                    h[0], h[1], h[2], h[3], h[4], h[5]);
     }
     const void *mod_ptr = (const void *)rd_pa;
+    if (squashfs_image_looks_valid(mod_ptr, rd_sz)) {
+        int rc = initfs_mount_squashfs_region(mod_ptr, rd_sz);
+        if (rc == 0)
+            return 0;
+        klogprintf("initfs: SquashFS mount failed (%d)\n", rc);
+        return rc;
+    }
+    klogprintf("initfs: legacy cpio newc unpack into ramfs\n");
     return initfs_unpack_ramdisk_region(mod_ptr, rd_sz);
 }

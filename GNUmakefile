@@ -5,6 +5,8 @@ override CFLAGS += -Isyscall/internal
 
 FIND_PRUNE := -path './build' -prune -o \
 	-path './iso' -prune -o \
+	-path './third_party' -prune -o \
+	-path './tools' -prune -o \
 	-path './userland' -prune -o \
 	-path './core/nss_dns_shim' -prune -o \
 	-path './core/nss_files_shim' -prune -o \

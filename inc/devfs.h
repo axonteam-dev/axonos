@@ -41,6 +41,8 @@ struct devfs_tty {
     int in_tail;
     int in_count;
     spinlock_t in_lock;
+    /* Serialize console output and cursor state across concurrent writers. */
+    spinlock_t out_lock;
     /* waiting threads (tids) */
     int waiters[8];
     int waiters_count;

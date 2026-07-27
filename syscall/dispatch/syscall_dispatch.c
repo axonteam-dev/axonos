@@ -14594,8 +14594,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (!devfs_is_tty_file(f)) return ret_err(ENOTTY);
                 int tty_idx = devfs_get_tty_index_from_file(f);
                 if (tty_idx < 0) return ret_err(ENOTTY);
-                (void)tty_idx;
-                (void)argp;
+                int queue = (int)(uintptr_t)argp;
+                if (queue != 0 /* TCIFLUSH */ &&
+                    queue != 1 /* TCOFLUSH */ &&
+                    queue != 2 /* TCIOFLUSH */)
+                    return ret_err(EINVAL);
+                if (queue == 0 || queue == 2)
+                    devfs_tty_flush_input(tty_idx);
+                /* Output is synchronous, so there is no output queue to drop. */
                 return 0;
             }
             if (req == TIOCNOTTY) {
@@ -15222,6 +15228,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 tty->term_lflag = tio.c_lflag;
                 tty->term_vtime = tio.c_cc[5];
                 tty->term_vmin = tio.c_cc[6];
+                if (req == TCSETSF)
+                    devfs_tty_flush_input(tty_idx);
                 return 0;
             }
             if (req == TIOCSTI) {

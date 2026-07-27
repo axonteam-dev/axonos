@@ -166,9 +166,7 @@ void keyboard_handler(cpu_registers_t* regs) {
 
 static void kbd_push_sequence(int tty, const char *seq) {
     if (!seq) return;
-    for (const char *p = seq; *p; ++p) {
-        devfs_tty_push_input_noblock(tty, *p);
-    }
+    devfs_tty_push_input_sequence(tty, seq, strlen(seq));
 }
 
 void keyboard_process_scancode(uint8_t scancode) {

@@ -1076,18 +1076,13 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
     syscall_net_ensure_resolv();
     ramfs_install_libnss_dns();
+
     /* Programs (mount, sh) open /etc/localtime; create so open doesn't fail. */
     {
         struct fs_file *lt = fs_create_file("/etc/localtime");
         if (lt) fs_file_free(lt);
     }
-    /*
-     * /etc/profile: login shells (getty→login→sh -l).
-     * GNU ls colors like Debian: TERM must match DIR_COLORS (linux), then
-     * eval "$(dircolors -b …)" sets LS_COLORS, alias enables --color=auto.
-     * Do not hardcode LS_COLORS; do not use TERM=builtin_ansi (dircolors
-     * emits an empty LS_COLORS for unknown TERM → ls stays monochrome).
-     */
+    /* /etc/profile: login shells (getty→login→sh -l). */
     {
         static const char profile[] =
             "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
@@ -1098,62 +1093,13 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             "export PS1='\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[1;37m\\w\\033[0m \\$ '\n"
             "export OPENSSL_CONF=/etc/ssl/openssl.cnf\n"
             "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n"
-            "export SSL_CERT_DIR=/etc/ssl/certs\n"
-            "if [ -x /usr/bin/dircolors ]; then\n"
-            "  if [ -r /etc/DIR_COLORS ]; then\n"
-            "    eval \"$(dircolors -b /etc/DIR_COLORS)\"\n"
-            "  else\n"
-            "    eval \"$(dircolors -b)\"\n"
-            "  fi\n"
-            "  alias ls='ls --color=auto'\n"
-            "  alias grep='grep --color=auto'\n"
-            "fi\n";
+            "export SSL_CERT_DIR=/etc/ssl/certs\n";
         struct fs_file *pf = fs_create_file("/etc/profile");
         if (!pf) pf = fs_open("/etc/profile");
         if (pf) {
             (void)vfs_ftruncate(pf, 0);
             fs_write(pf, profile, sizeof(profile) - 1, 0);
             fs_file_free(pf);
-        }
-    }
-    /*
-     * Interactive non-login bash (typing `bash`) reads this. Musl-static bash
-     * caches getpwuid at startup; if that fails the prompt stays
-     * "I have no name!" unless PS1 is overridden without \\u.
-     * Color setup mirrors Debian /etc/skel/.bashrc (dircolors + ls alias).
-     */
-    {
-        static const char bashrc[] =
-            "export TERM=${TERM:-linux}\n"
-            "export USER=${USER:-root}\n"
-            "export LOGNAME=${LOGNAME:-root}\n"
-            "export HOME=${HOME:-/root}\n"
-            "if [ -x /usr/bin/dircolors ]; then\n"
-            "  if [ -r /etc/DIR_COLORS ]; then\n"
-            "    eval \"$(dircolors -b /etc/DIR_COLORS)\"\n"
-            "  else\n"
-            "    eval \"$(dircolors -b)\"\n"
-            "  fi\n"
-            "  alias ls='ls --color=auto'\n"
-            "  alias grep='grep --color=auto'\n"
-            "fi\n"
-            "if [ \"${UID:-0}\" = 0 ] || [ \"$(id -u 2>/dev/null)\" = 0 ]; then\n"
-            "  PS1='\\[\\033[1;31m\\]root\\[\\033[0m\\]@\\h \\[\\033[0;37m\\]\\w\\[\\033[0m\\]\\$ '\n"
-            "fi\n";
-        struct fs_file *bf = fs_create_file("/etc/bash.bashrc");
-        if (!bf) bf = fs_open("/etc/bash.bashrc");
-        if (bf) {
-            (void)vfs_ftruncate(bf, 0);
-            fs_write(bf, bashrc, sizeof(bashrc) - 1, 0);
-            fs_file_free(bf);
-        }
-        struct fs_file *rbf = fs_create_file("/root/.bashrc");
-        if (!rbf) rbf = fs_open("/root/.bashrc");
-        if (rbf) {
-            static const char rbashrc[] = "[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n";
-            (void)vfs_ftruncate(rbf, 0);
-            fs_write(rbf, rbashrc, sizeof(rbashrc) - 1, 0);
-            fs_file_free(rbf);
         }
     }
     /* /etc/issue: getty prints this before login prompt. \l = tty name (tty1, tty2, ...) */

@@ -108,12 +108,16 @@ int devfs_get_active(void);
 void devfs_tty_push_input(int tty, char c);
 /* Non-blocking push from ISR (tries to acquire lock, drops on failure) */
 void devfs_tty_push_input_noblock(int tty, char c);
+/* Atomically enqueue one key's complete escape sequence from keyboard IRQ. */
+void devfs_tty_push_input_sequence(int tty, const char *seq, size_t len);
 /* Non-blocking pop: returns -1 if none, or char (0-255) */
 int devfs_tty_pop_nb(int tty);
 /* Push one byte back; will be returned by next pop. Returns 0 on success, -1 if already pushed. */
 int devfs_tty_unget(int tty, int c);
 /* Return number of available chars in input buffer */
 int devfs_tty_available(int tty);
+/* Discard pending input as Linux TCIFLUSH/TCSETSF require. */
+void devfs_tty_flush_input(int tty);
 /* Add thread as waiter (for poll); returns 0 on success, -1 if full or already present */
 int devfs_tty_add_waiter(int tty, int tid);
 /* Remove thread from waiters (call when poll wakes so we are not woken again by other ttys) */

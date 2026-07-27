@@ -18,7 +18,6 @@
 #include <string.h>
 #include <apic_timer.h>
 #include <pit.h>
-#include <console.h>
 #include <devfs.h>
 
 static spinlock_t klog_lock;
@@ -39,24 +38,11 @@ uint64_t klog_tsc_per_us = 0;
 uint64_t klog_tsc_hz = 0;
 
 static void klog_console_write_sync_tty(const char *s, size_t n) {
-	/* Keep devfs tty cursor in sync for kernel log output so that interactive
-	   tty programs don't overwrite logs (klogprintf bypasses /dev/tty writes). */
 	if (!s || n == 0) return;
-	struct devfs_tty *tty = devfs_get_tty_by_index(devfs_get_active());
-	if (!tty) {
-		/* Fall back to VGA printf path. */
+	if (devfs_is_ready())
+		devfs_tty_console_write(s, n);
+	else
 		kprintf("%.*s", (int)n, s);
-		return;
-	}
-	for (size_t i = 0; i < n; i++) {
-		console_set_cursor(tty->cursor_x, tty->cursor_y);
-		/* Literal cells only: klog timestamps start with '['.  Feeding them
-		 * through kputchar's ANSI FSM after a stale ESC leaves "[H" glued onto
-		 * boot lines (looks like a broken login clear). */
-		console_putc_tty_literal((uint8_t)s[i],
-			tty->current_attr ? tty->current_attr : 0x07);
-		console_get_cursor(&tty->cursor_x, &tty->cursor_y);
-	}
 }
 
 static uint64_t klog_rdtsc(void) {

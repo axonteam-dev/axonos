@@ -14,6 +14,9 @@
 
 void kprint(uint8_t *str);
 void kputchar(uint8_t character, uint8_t attribute_byte);
+
+/* Glyph path only — no ANSI CSI FSM (for klog timestamps starting with '['). */
+void vga_putchar_literal(uint8_t character, uint8_t attribute_byte);
 void kprint_colorized(const char* str);
 void kclear();
 void kclear_col(uint8_t attribute_byte);

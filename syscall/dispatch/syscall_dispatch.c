@@ -14594,8 +14594,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (!devfs_is_tty_file(f)) return ret_err(ENOTTY);
                 int tty_idx = devfs_get_tty_index_from_file(f);
                 if (tty_idx < 0) return ret_err(ENOTTY);
-                (void)tty_idx;
-                (void)argp;
+                /* Linux: arg is TCIFLUSH=0, TCOFLUSH=1, TCIOFLUSH=2.
+                 * We only buffer input; output flush is a no-op. */
+                unsigned long which = (unsigned long)argp;
+                if (which == 0 || which == 2) /* TCIFLUSH | TCIOFLUSH */
+                    devfs_tty_flush_input(tty_idx);
                 return 0;
             }
             if (req == TIOCNOTTY) {
@@ -15222,6 +15225,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 tty->term_lflag = tio.c_lflag;
                 tty->term_vtime = tio.c_cc[5];
                 tty->term_vmin = tio.c_cc[6];
+                /* TCSETSF: set attrs then flush pending input (Linux termios). */
+                if (req == TCSETSF)
+                    devfs_tty_flush_input(tty_idx);
                 return 0;
             }
             if (req == TIOCSTI) {

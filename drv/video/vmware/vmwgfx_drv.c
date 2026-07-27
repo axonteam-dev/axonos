@@ -78,6 +78,9 @@ enum svga_fifo {
 /* Fixed ISA-style index port (value port is usually index+4 or index+8). */
 #define SVGA_LEGACY_IO_INDEX 0x4560u
 
+static int g_upd_pending;
+static uint32_t g_upd_x0, g_upd_y0, g_upd_x1, g_upd_y1;
+
 typedef struct {
 	uint8_t bus;
 	uint8_t device;
@@ -701,6 +704,7 @@ static void svga_fifo_reset(vmwgfx_ctx_t *ctx) {
 	fifo[SVGA_FIFO_MAX] = max;
 	fifo[SVGA_FIFO_NEXT] = min;
 	fifo[SVGA_FIFO_STOP] = min;
+	g_upd_pending = 0;
 }
 
 static int vmwgfx_fifo_free_bytes(vmwgfx_ctx_t *ctx) {
@@ -753,14 +757,9 @@ static int vmwgfx_fifo_append_u32(vmwgfx_ctx_t *ctx, uint32_t value) {
 	return 0;
 }
 
-static void vmwgfx_fifo_submit_update(vmwgfx_ctx_t *ctx, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+static void vmwgfx_fifo_emit_update(vmwgfx_ctx_t *ctx, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 	if (!ctx->fifo_va || w == 0 || h == 0)
 		return;
-	/*
-	 * Backpressure only. Never SVGA_REG_SYNC here — QEMU/VMware turn it into
-	 * a long VM-exit on the tty write path. Drop the UPDATE if the ring is
-	 * full; the timer-driven dirty push + rate-limited sync will catch up.
-	 */
 	if (vmwgfx_fifo_free_bytes(ctx) < 20)
 		return;
 	if (vmwgfx_fifo_append_u32(ctx, SVGA_CMD_UPDATE) != 0)
@@ -772,6 +771,39 @@ static void vmwgfx_fifo_submit_update(vmwgfx_ctx_t *ctx, uint32_t x, uint32_t y,
 	if (vmwgfx_fifo_append_u32(ctx, w) != 0)
 		return;
 	(void)vmwgfx_fifo_append_u32(ctx, h);
+}
+
+/*
+ * Coalesce UPDATEs into one AABB until SYNC. Per-glyph UPDATE flood + host
+ * FIFO drain was a major cost on VMware/QEMU; one rect per ~60 Hz sync is enough.
+ */
+static void vmwgfx_fifo_submit_update(vmwgfx_ctx_t *ctx, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+	(void)ctx;
+	if (w == 0 || h == 0)
+		return;
+	uint32_t x1 = x + w - 1;
+	uint32_t y1 = y + h - 1;
+	if (!g_upd_pending) {
+		g_upd_x0 = x;
+		g_upd_y0 = y;
+		g_upd_x1 = x1;
+		g_upd_y1 = y1;
+		g_upd_pending = 1;
+		return;
+	}
+	if (x < g_upd_x0) g_upd_x0 = x;
+	if (y < g_upd_y0) g_upd_y0 = y;
+	if (x1 > g_upd_x1) g_upd_x1 = x1;
+	if (y1 > g_upd_y1) g_upd_y1 = y1;
+}
+
+static void vmwgfx_fifo_flush_pending_update(vmwgfx_ctx_t *ctx) {
+	if (!g_upd_pending)
+		return;
+	uint32_t w = g_upd_x1 - g_upd_x0 + 1;
+	uint32_t h = g_upd_y1 - g_upd_y0 + 1;
+	vmwgfx_fifo_emit_update(ctx, g_upd_x0, g_upd_y0, w, h);
+	g_upd_pending = 0;
 }
 
 /*
@@ -897,6 +929,7 @@ static void vmwgfx_display_sync(video_device_t *dev) {
 	(void)dev;
 	if (!g_vmwgfx.present || !g_vmwgfx.scanout_on)
 		return;
+	vmwgfx_fifo_flush_pending_update(&g_vmwgfx);
 	svga_reg_write32(&g_vmwgfx, SVGA_REG_SYNC, 1);
 	vmwgfx_io_barrier();
 }

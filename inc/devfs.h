@@ -41,6 +41,8 @@ struct devfs_tty {
     int in_tail;
     int in_count;
     spinlock_t in_lock;
+    /* Serialize ANSI parser + screen updates across SMP writers (bash vs child). */
+    spinlock_t out_lock;
     /* waiting threads (tids) */
     int waiters[8];
     int waiters_count;
@@ -59,6 +61,8 @@ struct devfs_tty {
     uint8_t insert_mode;
     /* CSI had '?' (DEC private params) */
     uint8_t ansi_csi_private;
+    /* Saw digit/;/？/> after CSI '[' — distinguishes real ESC[m from sticky ESC[+typed */
+    uint8_t ansi_csi_saw_body;
     /* simple CSI parameter storage (up to 8 parameters) */
     int ansi_param[8];
     int ansi_param_count;
@@ -108,6 +112,10 @@ int devfs_get_active(void);
 void devfs_tty_push_input(int tty, char c);
 /* Non-blocking push from ISR (tries to acquire lock, drops on failure) */
 void devfs_tty_push_input_noblock(int tty, char c);
+/* Non-blocking push of a full CSI/key sequence under one lock (Home=ESC[H). */
+void devfs_tty_push_input_seq_noblock(int tty, const char *seq);
+/* tcflush(TCIFLUSH): discard pending typed input (getty relies on this). */
+void devfs_tty_flush_input(int tty);
 /* Non-blocking pop: returns -1 if none, or char (0-255) */
 int devfs_tty_pop_nb(int tty);
 /* Push one byte back; will be returned by next pop. Returns 0 on success, -1 if already pushed. */

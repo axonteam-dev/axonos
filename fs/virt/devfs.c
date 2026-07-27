@@ -386,6 +386,8 @@ static void devfs_tty_virtual_putc(struct devfs_tty *tty, uint8_t c) {
         }
         return;
     }
+    if (c < 0x20u)
+        return; /* ignore other C0 */
     if (tty->cursor_y >= rows) tty->cursor_y = rows - 1;
     if (tty->cursor_x >= cols) {
         tty->cursor_x = 0;
@@ -428,92 +430,81 @@ static uint8_t devfs_tty_acs_translate(uint8_t ch, int acs_on) {
 
 static void devfs_tty_emit_byte(struct devfs_tty *tty, int tty_on_vga, uint8_t ch);
 
+static void devfs_tty_csi_reset(struct devfs_tty *tty) {
+    tty->ansi_escape_state = 0;
+    tty->ansi_csi_private = 0;
+    tty->ansi_csi_saw_body = 0;
+    tty->ansi_param_count = 0;
+    tty->ansi_current_param = 0;
+}
+
 void devfs_tty_console_write(const char *s, size_t n) {
     if (!s || n == 0)
         return;
     struct devfs_tty *tty = devfs_get_tty_by_index(devfs_get_active());
     if (!tty)
         return;
-    console_begin_tty_batch();
+
     /*
-     * Fast path: coalesce printable runs with the same attr into one
-     * cirrusfb_putch_run() (single dirty rect) — Linux fbcon-style.
+     * printk/kprintf is not a tty userspace writer.  Linux keeps the kernel
+     * console path out of the n_tty/VT escape stream: a kernel log byte must
+     * never finish an ESC/CSI started by bash (or leave one for child stdout).
+     * Paint kernel text literally and update only the shared cursor/backing
+     * store.  Userspace ANSI parsing lives exclusively in devfs_write().
      */
-    for (size_t i = 0; i < n; ) {
-        uint8_t ch = (uint8_t)s[i];
-        ch = devfs_tty_acs_translate(ch, tty->acs_mode);
-        if (ch >= 0x20u && ch != 0x7Fu && !tty->insert_mode &&
-            cirrusfb_is_ready()) {
-            uint32_t cols = devfs_tty_cols();
-            size_t j = i;
-            while (j < n) {
-                uint8_t c = devfs_tty_acs_translate((uint8_t)s[j], tty->acs_mode);
-                if (c < 0x20u || c == 0x7Fu)
-                    break;
-                if (tty->cursor_x + (uint32_t)(j - i) >= cols)
-                    break;
-                j++;
-            }
-            if (j > i) {
-                uint32_t run = (uint32_t)(j - i);
-                uint8_t tmp[256];
-                const uint8_t *p = (const uint8_t *)s + i;
-                if (tty->acs_mode) {
-                    if (run > sizeof(tmp))
-                        run = (uint32_t)sizeof(tmp);
-                    for (uint32_t k = 0; k < run; k++)
-                        tmp[k] = devfs_tty_acs_translate((uint8_t)s[i + k], 1);
-                    p = tmp;
-                }
-                for (uint32_t k = 0; k < run; k++)
-                    devfs_tty_store_xy(tty, tty->cursor_x + k, tty->cursor_y, p[k]);
-                cirrusfb_putch_run(tty->cursor_x, tty->cursor_y, p, run,
-                                   tty->current_attr);
-                tty->cursor_x += run;
-                if (tty->cursor_x >= cols) {
-                    tty->cursor_x = 0;
-                    if (tty->cursor_y + 1 < devfs_tty_rows())
-                        tty->cursor_y++;
-                }
-                i += run;
-                continue;
-            }
-        }
+    console_begin_tty_batch();
+    for (size_t i = 0; i < n; i++)
         devfs_tty_emit_byte(tty, 1, (uint8_t)s[i]);
-        i++;
-    }
     console_set_cursor(tty->cursor_x, tty->cursor_y);
     console_end_tty_batch();
 }
 
 static void devfs_tty_emit_byte(struct devfs_tty *tty, int tty_on_vga, uint8_t ch) {
-    ch = devfs_tty_acs_translate(ch, tty->acs_mode);
-    if (ch == '\n') {
-        devfs_tty_newline(tty, tty_on_vga);
-        return;
-    }
-    if (ch == '\r') {
-        tty->cursor_x = 0;
-        return;
-    }
     /*
-     * BS (0x08): Linux VT moves the cursor left and does NOT erase.
-     * Shells/nano use \b to walk left when editing; erasing here wiped the
-     * tail of the line as the cursor moved (looked like "left arrow clears").
-     * Destructive backspace is the app's job: "\b \b" or CSI sequences.
+     * C0 controls are never font glyphs (Linux VT). Ash rings BEL (0x07) on
+     * ambiguous Tab completion — painting it showed a junk diamond before redraw.
      */
-    if (ch == '\b' || ch == 0x7F) {
+    if (ch < 0x20u) {
+        if (ch == '\n') {
+            devfs_tty_newline(tty, tty_on_vga);
+            return;
+        }
+        if (ch == '\r') {
+            tty->cursor_x = 0;
+            return;
+        }
+        if (ch == '\b') {
+            if (tty->cursor_x > 0)
+                tty->cursor_x--;
+            return;
+        }
+        if (ch == '\t') {
+            uint32_t n = 8u - (tty->cursor_x % 8u);
+            if (n == 0) n = 8;
+            for (uint32_t k = 0; k < n; k++)
+                devfs_tty_emit_byte(tty, tty_on_vga, ' ');
+            return;
+        }
+        if (ch == 0x0Eu) {
+            /* SO — enter G0 (ACS if selected). */
+            tty->acs_mode = tty->g0_is_acs ? 1 : 0;
+            return;
+        }
+        if (ch == 0x0Fu) {
+            /* SI — ASCII. */
+            tty->acs_mode = 0;
+            return;
+        }
+        /* BEL, NUL, VT, FF, CAN, SUB, ESC (if leaked), etc. — ignore. */
+        return;
+    }
+    if (ch == 0x7Fu) {
         if (tty->cursor_x > 0)
             tty->cursor_x--;
         return;
     }
-    if (ch == '\t') {
-        uint32_t n = 8u - (tty->cursor_x % 8u);
-        if (n == 0) n = 8;
-        for (uint32_t k = 0; k < n; k++)
-            devfs_tty_emit_byte(tty, tty_on_vga, ' ');
-        return;
-    }
+
+    ch = devfs_tty_acs_translate(ch, tty->acs_mode);
     /* IRM: shift line right before writing, like Linux vt / xterm. */
     if (tty->insert_mode)
         devfs_tty_insert_cells(tty, tty_on_vga, tty->cursor_x, tty->cursor_y, 1);
@@ -1374,6 +1365,8 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
     int idx = t->id;
     const char *s = (const char*)buf;
     const int tty_on_vga_batch = (idx == devfs_active);
+    unsigned long out_flags = 0;
+    acquire_irqsave(&t->out_lock, &out_flags);
     if (tty_on_vga_batch)
         console_begin_tty_batch();
     for (size_t i = 0; i < size; i++) {
@@ -1432,12 +1425,6 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                 } else if ((unsigned char)ch == 0x0F) {
                     /* SI: shift back to ASCII */
                     tty->acs_mode = 0;
-                } else if (ch == '[' && i + 1 < size && s[i + 1] == 'H') {
-                    tty->cursor_x = 0;
-                    tty->cursor_y = 0;
-                    if (tty_on_vga) console_set_cursor(0, 0);
-                    i += 1;
-                    continue;
                 } else {
                     devfs_tty_emit_byte(tty, tty_on_vga, (uint8_t)ch);
                 }
@@ -1445,13 +1432,14 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                 if ((unsigned char)ch == '[') {
                     tty->ansi_escape_state = 2; /* CSI start */
                     tty->ansi_csi_private = 0;
+                    tty->ansi_csi_saw_body = 0;
                     tty->ansi_param_count = 0;
                     tty->ansi_current_param = 0;
                     if (i + 1 < size && s[i + 1] == 'H') {
                         tty->cursor_x = 0;
                         tty->cursor_y = 0;
                         if (tty_on_vga) console_set_cursor(0, 0);
-                        tty->ansi_escape_state = 0;
+                        devfs_tty_csi_reset(tty);
                         i += 1;
                         continue;
                     }
@@ -1462,10 +1450,12 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                 } else if ((unsigned char)ch == '(') {
                     tty->ansi_escape_state = 5; /* ESC ( <charset> */
                 } else {
-                    /* unknown sequence, reset and output the ESC as literal */
+                    /* Unknown after ESC: do not leave a sticky ESC state that
+                     * swallows the next writer's first glyph (Hello → ello).
+                     * Emit the follow byte if printable; never paint ESC itself. */
                     tty->ansi_escape_state = 0;
-                    devfs_tty_emit_byte(tty, tty_on_vga, (uint8_t)0x1B);
-                    devfs_tty_emit_byte(tty, tty_on_vga, (uint8_t)ch);
+                    if ((unsigned char)ch >= 0x20u && (unsigned char)ch != 0x7Fu)
+                        devfs_tty_emit_byte(tty, tty_on_vga, (uint8_t)ch);
                 }
             } else if (tty->ansi_escape_state == 4) {
                 if ((unsigned char)ch == '0')
@@ -1500,24 +1490,45 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                 }
                 tty->ansi_escape_state = 0;
             } else if (tty->ansi_escape_state == 2) {
-                /* CSI parsing: accumulate parameters until final byte */
-                if (ch >= '0' && ch <= '9') {
+                /*
+                 * ECMA-48 CSI byte classes:
+                 *   parameters    0x30..0x3f
+                 *   intermediates 0x20..0x2f
+                 *   final         0x40..0x7e
+                 * C0 controls execute without terminating CSI; CAN/SUB cancel.
+                 */
+                unsigned char uch = (unsigned char)ch;
+                if (uch == 0x18u || uch == 0x1au) { /* CAN / SUB */
+                    devfs_tty_csi_reset(tty);
+                } else if (uch == 0x1bu) { /* a new ESC restarts parsing */
+                    devfs_tty_csi_reset(tty);
+                    tty->ansi_escape_state = 1;
+                } else if (uch < 0x20u) {
+                    devfs_tty_emit_byte(tty, tty_on_vga, uch);
+                } else if (ch >= '0' && ch <= '9') {
+                    tty->ansi_csi_saw_body = 1;
                     tty->ansi_current_param = tty->ansi_current_param * 10 + (ch - '0');
                 } else if (ch == '?') {
+                    tty->ansi_csi_saw_body = 1;
                     tty->ansi_csi_private = 1;
                 } else if (ch == '>') {
+                    tty->ansi_csi_saw_body = 1;
                     /* DEC/HP private mode marker - skip, continue parsing */
                 } else if (ch == ';') {
+                    tty->ansi_csi_saw_body = 1;
                     if (tty->ansi_param_count < (int)(sizeof(tty->ansi_param)/sizeof(tty->ansi_param[0]))) {
                         tty->ansi_param[tty->ansi_param_count++] = tty->ansi_current_param;
                     }
                     tty->ansi_current_param = 0;
-                } else {
+                } else if (uch >= 0x20u && uch <= 0x3fu) {
+                    /* Unsupported parameter/intermediate: consume through final. */
+                    tty->ansi_csi_saw_body = 1;
+                } else if (uch >= 0x40u && uch <= 0x7eu) {
                     /* final byte of CSI */
+                    unsigned char final_byte = (unsigned char)ch;
                     if (tty->ansi_param_count < (int)(sizeof(tty->ansi_param)/sizeof(tty->ansi_param[0]))) {
                         tty->ansi_param[tty->ansi_param_count++] = tty->ansi_current_param;
                     }
-                    unsigned char final_byte = (unsigned char)ch;
                     if (final_byte == 'm') {
                         /* SGR - color + reverse (ncurses/htop) */
                         if (tty->ansi_param_count == 0) {
@@ -1856,10 +1867,9 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                         }
                     }
                     /* reset CSI parser state after handling final byte */
-                    tty->ansi_escape_state = 0;
-                    tty->ansi_csi_private = 0;
-                    tty->ansi_param_count = 0;
-                    tty->ansi_current_param = 0;
+                    devfs_tty_csi_reset(tty);
+                } else {
+                    /* DEL and non-ECMA bytes are ignored while inside CSI. */
                 }
             }
         }
@@ -1868,6 +1878,7 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
         console_set_cursor(t->cursor_x, t->cursor_y);
         console_end_tty_batch();
     }
+    release_irqrestore(&t->out_lock, out_flags);
     /* Also append written chars to stdout/stderr ring buffers if applicable */
     if (file->path) {
         int which = -1;
@@ -2004,6 +2015,7 @@ int devfs_register(void) {
         devfs_tty_init_scroll(&dev_ttys[i]);
         dev_ttys[i].in_head = dev_ttys[i].in_tail = dev_ttys[i].in_count = 0;
         dev_ttys[i].in_lock.lock = 0;
+        dev_ttys[i].out_lock.lock = 0;
         dev_ttys[i].waiters_count = 0;
         dev_ttys[i].fg_pgrp = -1;
         size_t scr_sz = devfs_tty_screen_bytes();
@@ -2018,6 +2030,7 @@ int devfs_register(void) {
         dev_ttys[i].acs_mode = 0;
         dev_ttys[i].insert_mode = 0;
         dev_ttys[i].ansi_csi_private = 0;
+        dev_ttys[i].ansi_csi_saw_body = 0;
         dev_ttys[i].ansi_param_count = 0;
         dev_ttys[i].ansi_current_param = 0;
         dev_ttys[i].controlling_sid = -1;
@@ -2188,6 +2201,17 @@ void devfs_tty_push_input(int tty, char c) {
 
 int devfs_get_active(void) { return devfs_active; }
 
+void devfs_tty_flush_input(int tty) {
+    if (tty < 0 || tty >= DEVFS_TTY_COUNT) return;
+    struct devfs_tty *t = &dev_ttys[tty];
+    unsigned long flags = 0;
+    acquire_irqsave(&t->in_lock, &flags);
+    t->in_head = t->in_tail = t->in_count = 0;
+    t->unget_char = -1;
+    t->echo_escape_state = 0;
+    release_irqrestore(&t->in_lock, flags);
+}
+
 ssize_t devfs_tty_debug_dump(char *buf, size_t size) {
     if (!buf || size == 0) return 0;
     size_t w = 0;
@@ -2330,6 +2354,48 @@ void devfs_tty_push_input_noblock(int tty, char c) {
     /* IRQ context only marks waiters runnable. Scheduling from IRQ1 can
      * corrupt the active syscall/IRQ frame; timer preemption / syscall-exit
      * cond_resched performs the context switch after the handler returns. */
+    thread_request_resched();
+}
+
+/* Push a full key sequence (e.g. ESC[H) under one lock so getty never sees a
+ * torn CSI — ESC dropped + literal "[H" on the login prompt. */
+void devfs_tty_push_input_seq_noblock(int tty, const char *seq) {
+    if (tty < 0 || tty >= DEVFS_TTY_COUNT || !seq || !seq[0]) return;
+    struct devfs_tty *t = &dev_ttys[tty];
+    if (!try_acquire(&t->in_lock)) {
+        /* Keep the sequence atomic in the single-byte overflow slot when possible. */
+        if (t->unget_char < 0 && !seq[1])
+            t->unget_char = (unsigned char)seq[0];
+        thread_request_resched();
+        return;
+    }
+    int do_echo = (tty == devfs_get_active() && (t->term_lflag & 0x00000008u));
+    for (const char *p = seq; *p; ++p) {
+        unsigned char uc = (unsigned char)*p;
+        if (t->in_count < (int)sizeof(t->inbuf)) {
+            t->inbuf[t->in_tail] = (char)uc;
+            t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
+            t->in_count++;
+        }
+        if (do_echo) {
+            /* Never echo CSI / SS3 — mirrors per-byte echo_escape_state path. */
+            if (uc == 0x1Bu)
+                t->echo_escape_state = 1;
+            else if (t->echo_escape_state == 1 && (uc == '[' || uc == 'O'))
+                t->echo_escape_state = 2;
+            else if (t->echo_escape_state == 2) {
+                if (uc >= 0x40u && uc <= 0x7Eu)
+                    t->echo_escape_state = 0;
+            } else
+                t->echo_escape_state = 0;
+        }
+    }
+    for (int i = 0; i < t->waiters_count; i++) {
+        int tid = t->waiters[i];
+        if (tid >= 0) thread_unblock(tid);
+    }
+    t->waiters_count = 0;
+    release(&t->in_lock);
     thread_request_resched();
 }
 

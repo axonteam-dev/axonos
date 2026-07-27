@@ -156,8 +156,7 @@ static int vga_text_ansi_feed_nolock(uint8_t ch, uint8_t attr) {
 			return 1;
 		}
 		vga_tx_esc = VGA_TX_ESC_NONE;
-		kputchar_vga_text_nolock(0x1B, attr);
-		kputchar_vga_text_nolock(ch, attr);
+		/* Unknown ESC X — discard (do not paint control glyphs). */
 		return 1;
 	}
 	if (vga_tx_esc == VGA_TX_SS3) {
@@ -360,6 +359,11 @@ static void kputchar_vga_text_nolock(uint8_t character, uint8_t attribute_byte)
 			set_cursor_nolock(offset);
 		}
 	}
+	else if (character < 0x20)
+	{
+		/* Ignore other C0 (BEL/NUL/…) — do not paint CP437 control glyphs. */
+		return;
+	}
 	else
 	{
 		/* write char and handle end-of-line / scroll correctly */
@@ -426,6 +430,14 @@ void kputchar(uint8_t character, uint8_t attribute_byte)
 	unsigned long fl;
 	acquire_irqsave(&vga_lock_spin, &fl);
 	console_putc_nolock(character, attribute_byte);
+	release_irqrestore(&vga_lock_spin, fl);
+}
+
+void vga_putchar_literal(uint8_t character, uint8_t attribute_byte)
+{
+	unsigned long fl;
+	acquire_irqsave(&vga_lock_spin, &fl);
+	kputchar_vga_text_nolock(character, attribute_byte);
 	release_irqrestore(&vga_lock_spin, fl);
 }
 
@@ -683,15 +695,23 @@ void kprintf(const char* fmt, ...)
 	va_start(ap, fmt);
 
 	uint8_t color = 0x07; // светло-серый на чёрном
-	unsigned long vga_fl;
-	acquire_irqsave(&vga_lock_spin, &vga_fl);
 	/* Keep devfs active tty cursor in sync with framebuffer/VGA backend.
 	 * Must use console_get/set_cursor (fb-aware), not VGA CRTC ports. */
 	struct devfs_tty *tty = NULL;
 	if (devfs_is_ready()) {
 		tty = devfs_get_tty_by_index(devfs_get_active());
-		if (tty)
-			console_set_cursor(tty->cursor_x, tty->cursor_y);
+	}
+	unsigned long output_fl;
+	if (tty) {
+		/*
+		 * Same lock order as userspace: tty output lock, then backend lock.
+		 * Previously kprintf held vga_lock first and mutated the userspace
+		 * ANSI state without out_lock, allowing printk to eat child byte 0.
+		 */
+		acquire_irqsave(&tty->out_lock, &output_fl);
+		console_set_cursor(tty->cursor_x, tty->cursor_y);
+	} else {
+		acquire_irqsave(&vga_lock_spin, &output_fl);
 	}
 	for (const char *p = fmt; *p; ) {
 		// Color tags are no longer supported; treat them as normal characters.
@@ -852,7 +872,10 @@ PRINT_NUMBER_BASE10:
  		}
  	}
 
-	release_irqrestore(&vga_lock_spin, vga_fl);
+	if (tty)
+		release_irqrestore(&tty->out_lock, output_fl);
+	else
+		release_irqrestore(&vga_lock_spin, output_fl);
 	va_end(ap);
 }
 

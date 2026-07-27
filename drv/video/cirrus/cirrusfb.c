@@ -64,6 +64,8 @@ static int g_logo_visible = 0;
    and erase restores the original cell by redrawing its glyph from g_textbuf. */
 static int g_swcursor_visible = 1;
 static uint64_t g_swcursor_last_phase = 0;
+/* Timer blink must not paint mid-scroll (would leave underscore in scrolled VRAM). */
+static int g_swcursor_frozen = 0;
 
 /* Coalesce: many glyphs -> one dirty rect -> shadow→VRAM copy + UPDATE. */
 static int g_fb_dirty = 0;
@@ -71,6 +73,8 @@ static uint32_t g_dirty_x0 = 0, g_dirty_y0 = 0, g_dirty_x1 = 0, g_dirty_y1 = 0;
 static int g_batch_depth = 0;
 static int g_hwcursor_deferred = 0;
 static uint32_t g_hwcursor_def_x = 0, g_hwcursor_def_y = 0;
+static void swcursor_erase_at(uint32_t cx, uint32_t cy);
+static void swcursor_draw_at(uint32_t cx, uint32_t cy);
 
 extern volatile uint64_t timer_ticks;
 extern volatile uint32_t timer_frequency;
@@ -112,6 +116,52 @@ static void cirrusfb_kick_sync_rate_limited(void) {
 	video_display_sync();
 }
 
+/* Fast 32bpp horizontal fill (2 pixels / uint64). */
+static void fb_fill_rect32(void *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t pix) {
+	if (!fb || w == 0 || h == 0) return;
+	uint64_t pair = ((uint64_t)pix << 32) | pix;
+	for (uint32_t row = 0; row < h; row++) {
+		uint32_t *line = (uint32_t *)((uint8_t *)fb + (size_t)(y + row) * g_pitch + (size_t)x * 4u);
+		uint32_t col = 0;
+		for (; col + 2u <= w; col += 2u)
+			*(uint64_t *)(line + col) = pair;
+		if (col < w)
+			line[col] = pix;
+	}
+}
+
+/* Copy a rect from RAM shadow into VRAM (no FIFO / dirty bookkeeping). */
+static void cirrusfb_shadow_to_vram(uint32_t x0, uint32_t y0, uint32_t w, uint32_t h) {
+	if (!g_shadow || !g_vram || g_fb != g_shadow || w == 0 || h == 0)
+		return;
+	uint32_t bpp = (g_bpp + 7) / 8;
+	size_t row_bytes = (size_t)w * bpp;
+	uint8_t *src0 = (uint8_t *)g_shadow + (size_t)y0 * g_pitch + (size_t)x0 * bpp;
+	uint8_t *dst0 = (uint8_t *)g_vram + (size_t)y0 * g_pitch + (size_t)x0 * bpp;
+	if (x0 == 0 && row_bytes == (size_t)g_pitch) {
+		memcpy(dst0, src0, (size_t)h * g_pitch);
+	} else {
+		for (uint32_t y = 0; y < h; y++) {
+			memcpy(dst0 + (size_t)y * g_pitch,
+			       src0 + (size_t)y * g_pitch,
+			       row_bytes);
+		}
+	}
+}
+
+/*
+ * VRAM is mapped WC.  The SVGA FIFO lives in a different MMIO mapping, so an
+ * UPDATE command may otherwise overtake preceding framebuffer stores.  Linux
+ * uses a write barrier before notifying the host for exactly this reason.
+ */
+static inline void cirrusfb_vram_write_barrier(void) {
+#if defined(__x86_64__) || defined(__i386__)
+	__asm__ volatile("sfence" ::: "memory");
+#else
+	__sync_synchronize();
+#endif
+}
+
 /*
  * Push dirty shadow→VRAM. Large rects are expensive on PCI BAR hosts; callers
  * that must not stall (tty write batch end) leave g_fb_dirty and let the
@@ -130,15 +180,8 @@ static void cirrusfb_flush_dirty(void) {
 	 * glyph blits on a PCI BAR (even WB) are multi-100ms under VMware/QEMU —
 	 * that alone made `ls` feel ~0.8s when the console scrolled.
 	 */
-	if (g_shadow && g_vram && g_fb == g_shadow) {
-		uint32_t bpp = (g_bpp + 7) / 8;
-		size_t row_bytes = (size_t)w * bpp;
-		for (uint32_t y = 0; y < h; y++) {
-			uint8_t *src = (uint8_t *)g_shadow + (size_t)(y0 + y) * g_pitch + (size_t)x0 * bpp;
-			uint8_t *dst = (uint8_t *)g_vram + (size_t)(y0 + y) * g_pitch + (size_t)x0 * bpp;
-			memcpy(dst, src, row_bytes);
-		}
-	}
+	cirrusfb_shadow_to_vram(x0, y0, w, h);
+	cirrusfb_vram_write_barrier();
 	video_flush_region_pixels(x0, y0, w, h);
 	g_fb_dirty = 0;
 	/*
@@ -164,6 +207,19 @@ static void cirrusfb_flush_dirty_if_small(void) {
 }
 
 void cirrusfb_begin_batch(void) {
+	if (g_batch_depth == 0 && g_ready && !g_hwcursor_ok) {
+		/*
+		 * Linux fbcon never lets cursor blink race a text update.  Remove
+		 * the software cursor before touching cells and keep the timer out
+		 * until the complete write has installed its final cursor position.
+		 * Otherwise a blink erase can redraw the old blank cell over byte 0
+		 * of each write; clear() appeared to fix it only by resynchronizing
+		 * cursor pixels and text backing.
+		 */
+		if (g_swcursor_visible)
+			swcursor_erase_at(g_cursor_x, g_cursor_y);
+		g_swcursor_frozen = 1;
+	}
 	if (g_batch_depth < 64)
 		g_batch_depth++;
 }
@@ -178,12 +234,18 @@ void cirrusfb_end_batch(void) {
 		hwcursor_set_pos(g_hwcursor_def_x, g_hwcursor_def_y);
 		g_hwcursor_deferred = 0;
 	}
+	if (g_ready && !g_hwcursor_ok) {
+		g_swcursor_frozen = 0;
+		if (g_swcursor_visible)
+			swcursor_draw_at(g_cursor_x, g_cursor_y);
+	}
 	/*
-	 * Do not memcpy a full-screen dirty rect inside write().
-	 * ncurses/htop redraws mark huge unions; shell ECHO is unbatched and
-	 * still flushes immediately via putch (small rect). Timer pushes the rest.
+	 * One ordered commit for the completed tty transaction.  Deferring large
+	 * batches let later cursor paints overtake text damage in VRAM, so byte 0
+	 * stayed blank until a full redraw (setfont/clear).  The shadow is the
+	 * source of truth; publish its complete dirty union before returning.
 	 */
-	cirrusfb_flush_dirty_if_small();
+	cirrusfb_flush_dirty();
 }
 
 /* ANSI: kputchar() goes straight here when Cirrus is active — devfs may not see all output. */
@@ -262,6 +324,7 @@ static void swcursor_erase_at(uint32_t cx, uint32_t cy) {
 static void swcursor_draw_at(uint32_t cx, uint32_t cy) {
 	if (!g_ready || !g_textbuf || !g_fb) return;
 	if (cx >= g_cols || cy >= g_rows) return;
+	if (g_swcursor_frozen) return;
 
 	uint32_t px = cx * FONT_W();
 	uint32_t py = cy * FONT_H();
@@ -323,35 +386,70 @@ static void scroll_up(void) {
 	if (top >= g_rows - 1)
 		top = 0;
 
+	uint32_t fh = FONT_H();
+	uint32_t y0 = top * fh;
+	uint32_t y1 = (top + 1) * fh;
+	uint32_t clear_y = g_height - fh;
+	uint32_t bg_pix = rgb_to_pixel(attr_to_rgb(g_current_attr, 0));
+	int twin = (g_shadow && g_vram && g_fb == g_shadow && g_bpp == 32) ? 1 : 0;
+
+	g_swcursor_frozen = 1;
+
 	if (top == 0) {
 		memmove(g_textbuf, g_textbuf + g_cols, (size_t)g_cols * (g_rows - 1) * sizeof(cell_t));
-		for (uint32_t x = 0; x < g_cols; x++) {
-			g_textbuf[(g_rows - 1) * g_cols + x].ch = ' ';
-			g_textbuf[(g_rows - 1) * g_cols + x].attr = g_current_attr;
-		}
-		size_t row_bytes = g_pitch;
-		size_t move_bytes = row_bytes * (g_height - FONT_H());
-		memmove(g_fb, (uint8_t *)g_fb + FONT_H() * row_bytes, move_bytes);
-		draw_text_row_noflush(g_rows - 1);
 	} else {
 		size_t row_cells = (size_t)g_cols * sizeof(cell_t);
 		memmove(g_textbuf + top * g_cols,
 		        g_textbuf + (top + 1) * g_cols,
 		        row_cells * (g_rows - 1 - top));
-		for (uint32_t x = 0; x < g_cols; x++) {
-			g_textbuf[(g_rows - 1) * g_cols + x].ch = ' ';
-			g_textbuf[(g_rows - 1) * g_cols + x].attr = g_current_attr;
-		}
-		uint32_t y0 = top * FONT_H();
-		uint32_t y1 = (top + 1) * FONT_H();
-		size_t move_bytes = (size_t)g_pitch * (g_height - y1);
-		memmove((uint8_t *)g_fb + y0 * g_pitch,
-		        (uint8_t *)g_fb + y1 * g_pitch,
+	}
+	for (uint32_t x = 0; x < g_cols; x++) {
+		g_textbuf[(g_rows - 1) * g_cols + x].ch = ' ';
+		g_textbuf[(g_rows - 1) * g_cols + x].attr = g_current_attr;
+	}
+
+	/*
+	 * Apply cursor erase (and any other pending paint) to VRAM *before*
+	 * either buffer scrolls. Pushing after shadow memmove copies the wrong
+	 * pixels and leaves the SW underscore scrolling up as a permanent trail.
+	 */
+	if (twin && g_fb_dirty) {
+		cirrusfb_shadow_to_vram(g_dirty_x0, g_dirty_y0,
+				       g_dirty_x1 - g_dirty_x0 + 1,
+				       g_dirty_y1 - g_dirty_y0 + 1);
+		g_fb_dirty = 0;
+	}
+
+	size_t move_bytes = (size_t)g_pitch * (g_height - y1);
+	memmove((uint8_t *)g_fb + (size_t)y0 * g_pitch,
+	        (uint8_t *)g_fb + (size_t)y1 * g_pitch,
+	        move_bytes);
+	if (twin) {
+		memmove((uint8_t *)g_vram + (size_t)y0 * g_pitch,
+		        (uint8_t *)g_vram + (size_t)y1 * g_pitch,
 		        move_bytes);
+	}
+
+	if (g_bpp == 32) {
+		fb_fill_rect32(g_fb, 0, clear_y, g_width, fh, bg_pix);
+		if (twin)
+			fb_fill_rect32(g_vram, 0, clear_y, g_width, fh, bg_pix);
+	} else {
 		draw_text_row_noflush(g_rows - 1);
 	}
-	fb_dirty_mark(0, 0, g_width, g_height);
-	cirrusfb_flush_dirty();
+
+	if (twin && g_bpp == 32) {
+		/* VRAM already matches; notify host of the scrolled region. */
+		g_fb_dirty = 0;
+		cirrusfb_vram_write_barrier();
+		video_flush_region_pixels(0, y0, g_width, g_height - y0);
+		g_fb_sync_pending = 1;
+	} else {
+		fb_dirty_mark(0, y0, g_width, g_height - y0);
+		cirrusfb_flush_dirty();
+	}
+
+	g_swcursor_frozen = 0;
 }
 
 static void clamp_cursor_to_margin(void) {
@@ -560,7 +658,7 @@ void cirrusfb_putch_run(uint32_t x, uint32_t y, const uint8_t *chars, uint32_t n
 		font_blit_glyph(g_fb, g_pitch, bpp, (x + i) * fw, y * fh, ch, fg_pix, bg_pix);
 	}
 	fb_dirty_mark(x * fw, y * fh, n * fw, fh);
-	cirrusfb_flush_dirty();
+	cirrusfb_flush_dirty_if_small();
 }
 
 int cirrusfb_recompute_geometry(void) {
@@ -620,6 +718,10 @@ static void cirrusfb_putchar_inner(uint8_t ch, uint8_t attr) {
 	uint32_t ox = g_cursor_x;
 	uint32_t oy = g_cursor_y;
 
+	/* Never paint C0 controls as CP437 glyphs (BEL=0x07 looks like a diamond). */
+	if (ch < 0x20u && ch != '\n' && ch != '\r' && ch != '\t' && ch != '\b')
+		return;
+
 	if (ch == '\n') {
 		g_cursor_x = 0;
 		g_cursor_y++;
@@ -646,26 +748,28 @@ static void cirrusfb_putchar_inner(uint8_t ch, uint8_t attr) {
 		if (g_cursor_x >= g_cols) { g_cursor_x = 0; g_cursor_y++; }
 	}
 
+	int did_scroll = 0;
 	if (g_cursor_y >= g_rows) {
-		if (!g_hwcursor_ok && g_swcursor_visible) {
+		/* Always restore the cell — SW cursor pixels may still be in VRAM. */
+		if (!g_hwcursor_ok)
 			swcursor_erase_at(ox, oy);
-		}
 		scroll_up();
 		g_cursor_y = g_rows - 1;
+		did_scroll = 1;
 	}
 	clamp_cursor_to_margin();
 
 	if (g_hwcursor_ok) {
 		hwcursor_set_pos(g_cursor_x, g_cursor_y);
 	} else {
-		if (g_swcursor_visible && (ox != g_cursor_x || oy != g_cursor_y)) {
+		/* After scroll the old (ox,oy) cell has moved — do not redraw it. */
+		if (!did_scroll && (ox != g_cursor_x || oy != g_cursor_y))
 			swcursor_erase_at(ox, oy);
-		}
-		if (g_swcursor_visible) {
+		if (g_swcursor_visible)
 			swcursor_draw_at(g_cursor_x, g_cursor_y);
-		}
 	}
-	cirrusfb_flush_dirty();
+	/* Echo: small rect push. Large damage waits for timer / end_batch. */
+	cirrusfb_flush_dirty_if_small();
 }
 
 void cirrusfb_putchar_literal(uint8_t ch, uint8_t attr) {
@@ -745,11 +849,7 @@ void cirrusfb_clear(uint8_t attr) {
 	uint32_t bg_pix = rgb_to_pixel(attr_to_rgb(attr, 0));
 	uint32_t bpp = (g_bpp + 7) / 8;
 	if (bpp == 4) {
-		for (uint32_t y = 0; y < g_height; y++) {
-			uint32_t *line = (uint32_t *)((uint8_t *)g_fb + y * g_pitch);
-			for (uint32_t x = 0; x < g_width; x++)
-				line[x] = bg_pix;
-		}
+		fb_fill_rect32(g_fb, 0, 0, g_width, g_height, bg_pix);
 	} else {
 		for (uint32_t y = 0; y < g_height; y++) {
 			uint8_t *line = (uint8_t *)g_fb + y * g_pitch;
@@ -820,9 +920,54 @@ void cirrusfb_scroll_region(uint32_t top, uint32_t bottom) {
 		g_textbuf[bottom * g_cols + x].ch = ' ';
 		g_textbuf[bottom * g_cols + x].attr = g_current_attr;
 	}
-	for (uint32_t r = top; r <= bottom; r++)
-		draw_text_row_noflush(r);
-	cirrusfb_flush_dirty();
+
+	uint32_t fh = FONT_H();
+	uint32_t y0 = top * fh;
+	uint32_t y1 = (top + 1) * fh;
+	uint32_t yb = bottom * fh;
+	uint32_t band_h = (bottom - top) * fh;
+	size_t move_bytes = (size_t)g_pitch * band_h;
+	int twin = (g_shadow && g_vram && g_fb == g_shadow && g_bpp == 32) ? 1 : 0;
+
+	g_swcursor_frozen = 1;
+	if (!g_hwcursor_ok)
+		swcursor_erase_at(g_cursor_x, g_cursor_y);
+
+	if (twin && g_fb_dirty) {
+		cirrusfb_shadow_to_vram(g_dirty_x0, g_dirty_y0,
+				       g_dirty_x1 - g_dirty_x0 + 1,
+				       g_dirty_y1 - g_dirty_y0 + 1);
+		g_fb_dirty = 0;
+	}
+
+	memmove((uint8_t *)g_fb + (size_t)y0 * g_pitch,
+	        (uint8_t *)g_fb + (size_t)y1 * g_pitch,
+	        move_bytes);
+	if (twin) {
+		memmove((uint8_t *)g_vram + (size_t)y0 * g_pitch,
+		        (uint8_t *)g_vram + (size_t)y1 * g_pitch,
+		        move_bytes);
+	}
+	uint32_t bg_pix = rgb_to_pixel(attr_to_rgb(g_current_attr, 0));
+	if (g_bpp == 32) {
+		fb_fill_rect32(g_fb, 0, yb, g_width, fh, bg_pix);
+		if (twin)
+			fb_fill_rect32(g_vram, 0, yb, g_width, fh, bg_pix);
+	} else {
+		draw_text_row_noflush(bottom);
+	}
+	if (twin) {
+		g_fb_dirty = 0;
+		cirrusfb_vram_write_barrier();
+		video_flush_region_pixels(0, y0, g_width, (bottom - top + 1) * fh);
+		g_fb_sync_pending = 1;
+	} else {
+		fb_dirty_mark(0, y0, g_width, (bottom - top + 1) * fh);
+		cirrusfb_flush_dirty();
+	}
+	g_swcursor_frozen = 0;
+	if (!g_hwcursor_ok && g_swcursor_visible)
+		swcursor_draw_at(g_cursor_x, g_cursor_y);
 }
 
 void cirrusfb_set_margin_rows(uint32_t rows) {
@@ -848,12 +993,21 @@ static void cirrusfb_erase_cells(uint32_t x0, uint32_t x1, uint32_t y) {
 	if (!g_ready || !g_textbuf || g_rows == 0 || g_cols == 0 || y >= g_rows) return;
 	if (x0 > x1) return;
 	if (x1 >= g_cols) x1 = g_cols - 1;
+	uint32_t fw = FONT_W();
+	uint32_t fh = FONT_H();
+	uint32_t n = x1 - x0 + 1;
+	uint32_t bg_pix = rgb_to_pixel(attr_to_rgb(g_current_attr, 0));
 	for (uint32_t x = x0; x <= x1; x++) {
 		g_textbuf[y * g_cols + x].ch = ' ';
 		g_textbuf[y * g_cols + x].attr = g_current_attr;
-		draw_glyph_noflush(x, y, ' ', g_current_attr);
 	}
-	cirrusfb_flush_dirty();
+	if (g_bpp == 32 && g_fb) {
+		fb_fill_rect32(g_fb, x0 * fw, y * fh, n * fw, fh, bg_pix);
+		fb_dirty_mark(x0 * fw, y * fh, n * fw, fh);
+	} else {
+		for (uint32_t x = x0; x <= x1; x++)
+			draw_glyph_noflush(x, y, ' ', g_current_attr);
+	}
 }
 
 static void cirrusfb_csi_apply_sgr(void) {
@@ -916,6 +1070,7 @@ static void cirrusfb_csi_dispatch(uint8_t fb) {
 			for (uint32_t yy = g_cursor_y + 1; yy < g_rows; yy++) {
 				cirrusfb_erase_cells(0, g_cols - 1, yy);
 			}
+			cirrusfb_flush_dirty_if_small();
 			return;
 		}
 		if (pm == 1) {
@@ -923,6 +1078,7 @@ static void cirrusfb_csi_dispatch(uint8_t fb) {
 				cirrusfb_erase_cells(0, g_cols - 1, yy);
 			}
 			cirrusfb_erase_cells(0, g_cursor_x, g_cursor_y);
+			cirrusfb_flush_dirty_if_small();
 			return;
 		}
 	}
@@ -936,6 +1092,7 @@ static void cirrusfb_csi_dispatch(uint8_t fb) {
 		} else {
 			cirrusfb_erase_cells(0, g_cols - 1, cy);
 		}
+		cirrusfb_flush_dirty_if_small();
 		return;
 	}
 	if (fb == 'A' || fb == 'B' || fb == 'C' || fb == 'D') {
@@ -984,8 +1141,7 @@ void cirrusfb_putchar(uint8_t ch, uint8_t attr) {
 			return;
 		}
 		g_esc_state = CIR_ESC_NONE;
-		cirrusfb_putchar_inner(0x1B, attr);
-		cirrusfb_putchar_inner(ch, attr);
+		/* Unknown ESC X — discard (do not paint ESC as a glyph). */
 		return;
 	}
 	if (g_esc_state == CIR_ESC_SS3) {
@@ -1027,6 +1183,8 @@ void cirrusfb_update_cursor(void) {
 		/* Hardware cursor blinks automatically. */
 		return;
 	}
+	if (g_swcursor_frozen)
+		return;
 	/* Blink based on absolute monotonic time so it remains stable even if
 	   timer IRQs are delayed by load/exception handling (catch-up on next tick). */
 	const uint64_t period_ticks = 500; /* ~500ms when timer_ticks is 1ms */

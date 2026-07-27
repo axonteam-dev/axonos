@@ -1092,6 +1092,17 @@ int initfs_process_linux_bootparams(uint64_t boot_params_phys) {
         klogprintf("initfs: SquashFS mount failed (%d)\n", rc);
         return rc;
     }
+    /* Cpio newc begins with ASCII "070701" / "070702". Do not pretend a
+     * corrupted SquashFS (or ELF/.text garbage) is a cpio archive. */
+    {
+        const uint8_t *h = (const uint8_t *)mod_ptr;
+        int looks_cpio = (rd_sz >= 6 && h[0] == '0' && h[1] == '7' && h[2] == '0' &&
+                          h[3] == '7' && h[4] == '0' && (h[5] == '1' || h[5] == '2'));
+        if (!looks_cpio) {
+            klogprintf("initfs: not SquashFS and not cpio newc - refusing unpack\n");
+            return -1;
+        }
+    }
     klogprintf("initfs: legacy cpio newc unpack into ramfs\n");
     return initfs_unpack_ramdisk_region(mod_ptr, rd_sz);
 }

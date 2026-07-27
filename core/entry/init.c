@@ -345,18 +345,14 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
 
     /*
-     * GRUB allocates very large Multiboot modules top-down. A ~550 MiB initfs
-     * can then straddle PCI/VRAM apertures once firmware BAR decoding is
-     * enabled (VMware failure observed at PA 0x917de830). Relocate it before
-     * PCI/video initialization into ordinary low RAM. The ramfs intentionally
-     * borrows regular-file data from this region, so it must remain reserved
-     * for the lifetime of the system.
+     * GRUB allocates very large Multiboot modules top-down. Relocate before
+     * PCI/video so the image cannot sit in a BAR/aperture or in the mid-RAM
+     * window where the identity heap prefers to live (USER_STACK_TOP+32MiB =
+     * 0x62000000 used to collide with that policy and show up later as
+     * "cpio magic not found" with a .text-looking head).
      *
-     * Prefer PA above USER_STACK_TOP so the identity heap can sit after the
-     * initrd. Never land on the Multiboot/GRUB linear framebuffer — gfxterm
-     * kprintf would then paint glyphs into the cpio (classic "bad magic" a few
-     * hundred bytes in). Linux keeps initrd in memblock-reserved RAM for the
-     * same reason.
+     * Park the initrd under the top of RAM; keep the heap strictly below it.
+     * Never land on the Multiboot/GRUB linear framebuffer.
      */
     if (axon_boot_params_phys) {
         uintptr_t rd_start = 0;
@@ -394,46 +390,64 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 }
             }
 
+            {
+                const uint8_t *h = (const uint8_t *)rd_start;
+                int magic_ok = 0;
+                if (rd_size >= 4 && h[0] == 'h' && h[1] == 's' && h[2] == 'q' && h[3] == 's')
+                    magic_ok = 1;
+                else if (rd_size >= 6 && h[0] == '0' && h[1] == '7' && h[2] == '0' &&
+                         h[3] == '7' && h[4] == '0' && (h[5] == '1' || h[5] == '2'))
+                    magic_ok = 1;
+                kprintf("initfs: GRUB module phys 0x%llx size %llu head %02x %02x %02x %02x %s\n",
+                        (unsigned long long)rd_start, (unsigned long long)rd_size,
+                        rd_size > 0 ? h[0] : 0, rd_size > 1 ? h[1] : 0,
+                        rd_size > 2 ? h[2] : 0, rd_size > 3 ? h[3] : 0,
+                        magic_ok ? "(ok)" : "(BAD magic — image may be corrupted)");
+            }
+
             uint64_t ram_bytes = (uint64_t)sysinfo_ram_mb() * 1024ULL * 1024ULL;
-            /* Keep initrd/reloc candidates ABOVE the user mmap window. */
-            const uintptr_t candidates[] = {
-                (uintptr_t)USER_STACK_TOP + (32u * 1024u * 1024u),
-                (uintptr_t)USER_STACK_TOP + (64u * 1024u * 1024u),
-                (uintptr_t)0x78000000u,
-                (uintptr_t)0x7A000000u,
-            };
             uintptr_t safe_start = 0;
-            for (unsigned ci = 0; ci < sizeof(candidates) / sizeof(candidates[0]); ci++) {
-                uintptr_t cand = candidates[ci];
-                uintptr_t cand_end = 0;
-                if (__builtin_add_overflow(cand, rd_size, &cand_end))
-                    continue;
-                if ((uint64_t)cand_end + (32ull * 1024ull * 1024ull) > ram_bytes)
-                    continue;
-                if (fb_hi > fb_lo) {
-                    uint64_t a0 = (uint64_t)cand, a1 = (uint64_t)cand_end;
-                    if (a0 < fb_hi && fb_lo < a1) {
-                        /* Candidate overlaps GRUB FB — try just after the FB. */
-                        uint64_t after = (fb_hi + 0x1fffffull) & ~0x1fffffull;
-                        if (after < (uint64_t)USER_STACK_TOP + (16ull * 1024ull * 1024ull))
-                            after = (uint64_t)USER_STACK_TOP + (32ull * 1024ull * 1024ull);
-                        if (after > (uint64_t)(uintptr_t)-1)
-                            continue;
-                        cand = (uintptr_t)after;
-                        if (__builtin_add_overflow(cand, rd_size, &cand_end))
-                            continue;
-                        if ((uint64_t)cand_end + (32ull * 1024ull * 1024ull) > ram_bytes)
-                            continue;
-                        a0 = (uint64_t)cand;
-                        a1 = (uint64_t)cand_end;
+            if (ram_bytes > (uint64_t)rd_size + (64ull * 1024ull * 1024ull)) {
+                /* Top of RAM, 2MiB-aligned, leave 16MiB cushion under MMIO/PCI. */
+                uint64_t top = ram_bytes - (16ull * 1024ull * 1024ull);
+                uint64_t cand64 = (top - (uint64_t)rd_size) & ~((uint64_t)(2u * 1024u * 1024u) - 1ull);
+                /* Stay above user mmap window + 64MiB so heap has room below. */
+                uint64_t floor = (uint64_t)USER_STACK_TOP + (64ull * 1024ull * 1024ull);
+                if (cand64 >= floor && cand64 + (uint64_t)rd_size <= top) {
+                    int fb_hit = 0;
+                    if (fb_hi > fb_lo) {
+                        uint64_t a0 = cand64, a1 = cand64 + (uint64_t)rd_size;
+                        if (a0 < fb_hi && fb_lo < a1)
+                            fb_hit = 1;
+                    }
+                    if (!fb_hit)
+                        safe_start = (uintptr_t)cand64;
+                }
+            }
+            /* Fallback: fixed high candidates (never the old STACK_TOP+32MiB slot). */
+            if (!safe_start) {
+                const uintptr_t candidates[] = {
+                    (uintptr_t)0x78000000u,
+                    (uintptr_t)0x70000000u,
+                    (uintptr_t)USER_STACK_TOP + (128u * 1024u * 1024u),
+                };
+                for (unsigned ci = 0; ci < sizeof(candidates) / sizeof(candidates[0]); ci++) {
+                    uintptr_t cand = candidates[ci];
+                    uintptr_t cand_end = 0;
+                    if (__builtin_add_overflow(cand, rd_size, &cand_end))
+                        continue;
+                    if ((uint64_t)cand_end + (16ull * 1024ull * 1024ull) > ram_bytes)
+                        continue;
+                    if (cand < (uintptr_t)USER_STACK_TOP + (64u * 1024u * 1024u))
+                        continue;
+                    if (fb_hi > fb_lo) {
+                        uint64_t a0 = (uint64_t)cand, a1 = (uint64_t)cand_end;
                         if (a0 < fb_hi && fb_lo < a1)
                             continue;
                     }
+                    safe_start = cand;
+                    break;
                 }
-                if ((uintptr_t)rd_start == cand)
-                    break; /* already safe */
-                safe_start = cand;
-                break;
             }
             if (safe_start && (uintptr_t)rd_start != safe_start) {
                 memmove((void *)safe_start, (const void *)rd_start, rd_size);
@@ -442,148 +456,112 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                     (uint32_t)(uint64_t)safe_start;
                 *(uint32_t *)(bp + LINUX_BOOTPARAM_OFF_EXT_RD_IMG) =
                     (uint32_t)((uint64_t)safe_start >> 32);
-                kprintf("initfs: relocated %llu bytes 0x%llx -> 0x%llx before PCI\n",
-                        (unsigned long long)rd_size,
-                        (unsigned long long)rd_start,
-                        (unsigned long long)safe_start);
+                {
+                    const uint8_t *h = (const uint8_t *)safe_start;
+                    kprintf("initfs: relocated %llu bytes 0x%llx -> 0x%llx head %02x %02x %02x %02x\n",
+                            (unsigned long long)rd_size,
+                            (unsigned long long)rd_start,
+                            (unsigned long long)safe_start,
+                            h[0], h[1], h[2], h[3]);
+                }
                 if (fb_hi > fb_lo)
                     kprintf("initfs: avoided GRUB fb [0x%llx..0x%llx)\n",
                             (unsigned long long)fb_lo, (unsigned long long)fb_hi);
             } else if (fb_hi > fb_lo) {
                 uint64_t a0 = (uint64_t)rd_start, a1 = (uint64_t)rd_start + (uint64_t)rd_size;
                 if (a0 < fb_hi && fb_lo < a1)
-                    kprintf("initfs: WARNING ramdisk overlaps GRUB fb — cpio may be corrupted by console\n");
+                    kprintf("initfs: WARNING ramdisk overlaps GRUB fb — image may be corrupted by console\n");
             }
         }
     }
 
-    /* Initialize heap EARLY and place it above kernel + initrd (Linux boot_params). */
+    /* Initialize heap EARLY. Initrd is parked near the top of RAM; the heap
+     * fills [HEAP_ABOVE_USER .. initrd_start). Legacy low initrd still pushes
+     * the heap to mods_end. */
     {
         uintptr_t heap_start = align_up_uintptr((uintptr_t)_end, 0x1000);
-        uintptr_t mods_end = initfs_linux_ramdisk_exclusive_end(axon_boot_params_phys);
-        uintptr_t mods_end_aligned = 0;
-        if (mods_end) {
-            mods_end_aligned = align_up_uintptr(mods_end, 0x1000);
-            if (mods_end_aligned > heap_start) heap_start = mods_end_aligned;
-        }
-        /*
-         * Avoid placing the heap below 64 MiB only when that does not re-enter the
-         * multiboot module/initrd range. Forcing heap_start=64M while a ~160 MiB
-         * module lives at 0x080b9000..0x1234xxxx overlaps the arena with the CPIO:
-         * kmalloc returns addresses inside the module, unpack corrupts heap headers,
-         * krealloc then fails with magic=0.
-         */
-        const uintptr_t HEAP_MIN_START = (uintptr_t)(64u * 1024u * 1024u);
-        if (heap_start < HEAP_MIN_START) {
-            uintptr_t want = HEAP_MIN_START;
-            if (mods_end_aligned != 0 && want < mods_end_aligned)
-                want = mods_end_aligned;
-            if (heap_start < want)
-                heap_start = want;
-        }
-        /* kzip_stub may have filled [AXON_MB2_MODULE_RELOC_BASE, AXON_MB2_MODULE_RELOC_CEIL) even when
-         * synthesized boot_params do not describe a ramdisk (mods_end unknown). Keep heap above that
-         * arena so a late in-place initfs unpack is not clobbered by kmalloc (net/pci/… before initfs). */
-        if (multiboot_magic == 0x36d76289u && mods_end_aligned == 0u) {
-            uintptr_t reloc_ceiling = (uintptr_t)AXON_MB2_MODULE_RELOC_CEIL;
-            if (heap_start < reloc_ceiling)
-                heap_start = reloc_ceiling;
-        }
-        /* Heap size must not exceed installed RAM. The heap implementation is a
-           simple identity-mapped arena; if we size it past RAM we will scribble
-           into non-existent memory and get "random" initfs extraction failures. */
-        size_t heap_size = 0;
+        uintptr_t rd_st = 0;
         size_t initrd_sz = 0;
-        if (axon_boot_params_phys) {
-            uintptr_t rd_st = 0;
-            if (linux_bootparams_ramdisk((const void *)(uintptr_t)axon_boot_params_phys, &rd_st, &initrd_sz) != 0)
-                initrd_sz = 0;
+        uintptr_t mods_end = 0;
+        uintptr_t mods_end_aligned = 0;
+        int initrd_high = 0;
+        if (axon_boot_params_phys &&
+            linux_bootparams_ramdisk((const void *)(uintptr_t)axon_boot_params_phys,
+                                     &rd_st, &initrd_sz) == 0 &&
+            initrd_sz > 0 && rd_st != 0) {
+            mods_end = rd_st + initrd_sz;
+            if (mods_end > rd_st)
+                mods_end_aligned = align_up_uintptr(mods_end, 0x1000);
+            /* High parking: above user window + 64MiB. */
+            if (rd_st >= (uintptr_t)USER_STACK_TOP + (64u * 1024u * 1024u))
+                initrd_high = 1;
         }
+        const uintptr_t HEAP_MIN_START = (uintptr_t)(64u * 1024u * 1024u);
+        const uintptr_t HEAP_ABOVE_USER =
+            (uintptr_t)USER_STACK_TOP + (16u * 1024u * 1024u);
         int ram_mb = sysinfo_ram_mb();
-        if (ram_mb > 0) {
-            uint64_t ram_bytes = (uint64_t)ram_mb * 1024ULL * 1024ULL;
-            uint64_t start = (uint64_t)heap_start;
-            const uint64_t guard = 4ULL * 1024ULL * 1024ULL; /* 4 MiB (was 8) — more heap for VMware/low-RAM */
-            if (ram_bytes > start + guard + (16ULL * 1024ULL * 1024ULL)) {
-                uint64_t max = ram_bytes - start - guard;
-                heap_size = (size_t)max;
+
+        if (!initrd_high) {
+            /* Legacy: heap starts after a low/mid initrd. */
+            if (mods_end_aligned != 0 && mods_end_aligned > heap_start)
+                heap_start = mods_end_aligned;
+            if (heap_start < HEAP_MIN_START) {
+                uintptr_t want = HEAP_MIN_START;
+                if (mods_end_aligned != 0 && want < mods_end_aligned)
+                    want = mods_end_aligned;
+                if (heap_start < want)
+                    heap_start = want;
             }
+            if (multiboot_magic == 0x36d76289u && mods_end_aligned == 0u) {
+                uintptr_t reloc_ceiling = (uintptr_t)AXON_MB2_MODULE_RELOC_CEIL;
+                if (heap_start < reloc_ceiling)
+                    heap_start = reloc_ceiling;
+            }
+        } else {
+            /* High initrd: heap lives below it, above the user mmap window. */
+            heap_start = HEAP_ABOVE_USER;
+            if (heap_start < HEAP_MIN_START)
+                heap_start = HEAP_MIN_START;
         }
-        if (heap_size == 0 && ram_mb > 0) {
-            uint64_t ram_bytes = (uint64_t)ram_mb * 1024ULL * 1024ULL;
-            uint64_t start = (uint64_t)heap_start;
-            if (ram_bytes > start + (4ULL * 1024ULL * 1024ULL))
-                heap_size = (size_t)(ram_bytes - start - (4ULL * 1024ULL * 1024ULL));
-        }
-        if (heap_size == 0)
-            heap_size = 64ULL * 1024ULL * 1024ULL; /* safe default when RAM unknown */
-        if (initrd_sz > 0 && (uint64_t)heap_size < (uint64_t)initrd_sz + (32ULL * 1024ULL * 1024ULL))
-            kprintf("warning: heap %llu MiB may be too small for initfs %llu MiB — increase VM RAM\n",
-                    (unsigned long long)(heap_size / (1024ULL * 1024ULL)),
-                    (unsigned long long)(initrd_sz / (1024ULL * 1024ULL)));
-        /*
-         * Keep the identity-mapped kernel heap OUT of the low user layout
-         * [USER_MMAP_BASE .. USER_STACK_TOP). Go (docker) reserves large anon
-         * arenas there; if kmalloc lives in the same VA window, mmap hits
-         * "overlap kernel heap (heap above user VA cap)" and the runtime dies
-         * before mallocinit completes.
-         *
-         * Prefer heap_start >= USER_STACK_TOP + 16MiB when RAM allows; still
-         * honor mods_end/initrd so we never cover the ramdisk. On tiny VMs
-         * keep the old low placement (docker needs ≥~1.5GiB RAM).
-         */
+
+        size_t heap_size = 0;
         {
-            const uintptr_t HEAP_ABOVE_USER =
-                (uintptr_t)USER_STACK_TOP + (16u * 1024u * 1024u);
             int raise_ok = 1;
             if (ram_mb > 0) {
                 uint64_t ram_bytes = (uint64_t)ram_mb * 1024ULL * 1024ULL;
                 if (ram_bytes < (uint64_t)HEAP_ABOVE_USER + (256ULL * 1024ULL * 1024ULL))
                     raise_ok = 0;
             }
-            if (raise_ok) {
+            if (raise_ok && !initrd_high) {
                 if (heap_start < HEAP_ABOVE_USER)
                     heap_start = HEAP_ABOVE_USER;
                 if (mods_end_aligned != 0 && heap_start < mods_end_aligned)
                     heap_start = mods_end_aligned;
+            } else if (raise_ok && initrd_high) {
+                if (heap_start < HEAP_ABOVE_USER)
+                    heap_start = HEAP_ABOVE_USER;
             }
         }
-        /* Recompute heap_size against the (possibly raised) heap_start. */
-        if (ram_mb > 0) {
-            uint64_t ram_bytes = (uint64_t)ram_mb * 1024ULL * 1024ULL;
-            uint64_t start = (uint64_t)heap_start;
-            const uint64_t guard = 4ULL * 1024ULL * 1024ULL;
-            if (ram_bytes > start + guard + (16ULL * 1024ULL * 1024ULL))
-                heap_size = (size_t)(ram_bytes - start - guard);
-            else if (ram_bytes > start + guard)
-                heap_size = (size_t)(ram_bytes - start - guard);
-            else
-                heap_size = 0;
-        }
-        if (heap_size == 0)
-            heap_size = 64ULL * 1024ULL * 1024ULL;
-        /* Cap: never cross MMIO_IDENTITY_LIMIT; if still below STACK_TOP (tiny
-         * RAM / huge initrd), also stay below TLS as before. */
+
+        /* Size the arena: never enter the initrd or past RAM/MMIO. */
         {
             uint64_t hs = (uint64_t)heap_start;
             uint64_t max_heap_end = (uint64_t)MMIO_IDENTITY_LIMIT;
+            if (ram_mb > 0) {
+                uint64_t ram_bytes = (uint64_t)ram_mb * 1024ULL * 1024ULL;
+                const uint64_t guard = 4ULL * 1024ULL * 1024ULL;
+                if (ram_bytes > guard && ram_bytes - guard < max_heap_end)
+                    max_heap_end = ram_bytes - guard;
+            }
+            if (initrd_high && rd_st > 0 && (uint64_t)rd_st < max_heap_end)
+                max_heap_end = (uint64_t)rd_st;
             if (hs >= (uint64_t)USER_STACK_TOP) {
-                /*
-                 * Heap lives above the user mmap window. The old hard 2GiB
-                 * ceiling left only ~240MiB when STACK_TOP=0x70000000 — then
-                 * frame_alloc's kmalloc(8KiB) OOMed mid dockerd→containerd
-                 * exec (largest_free≈4KiB). Allow high identity RAM; leave a
-                 * cushion under 4GiB for MMIO/PCI BARs.
-                 */
                 if (max_heap_end > 0xE0000000ULL)
                     max_heap_end = 0xE0000000ULL;
             } else {
-                /* Low placement: stay below 2GiB (VMware PCI-safe). */
                 if (max_heap_end > 0x80000000ULL)
                     max_heap_end = 0x80000000ULL;
             }
-            if (max_heap_end > 4ULL * 1024ULL * 1024ULL)
-                max_heap_end -= 4ULL * 1024ULL * 1024ULL;
             if (hs < (uint64_t)USER_STACK_TOP) {
                 uint64_t tls = (uint64_t)USER_TLS_BASE;
                 const uint64_t tls_guard = 1ULL << 20;
@@ -591,20 +569,32 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 if (tls_cap < max_heap_end)
                     max_heap_end = tls_cap;
             }
-            if (max_heap_end > hs && hs + (uint64_t)heap_size > max_heap_end)
+            if (max_heap_end > hs + (16ULL * 1024ULL * 1024ULL))
                 heap_size = (size_t)(max_heap_end - hs);
+            else if (max_heap_end > hs)
+                heap_size = (size_t)(max_heap_end - hs);
+            else
+                heap_size = 0;
         }
+        if (heap_size == 0)
+            heap_size = 64ULL * 1024ULL * 1024ULL;
+        if (initrd_sz > 0 && (uint64_t)heap_size < (128ULL * 1024ULL * 1024ULL))
+            kprintf("warning: heap %llu MiB may be tight with initfs %llu MiB — increase VM RAM\n",
+                    (unsigned long long)(heap_size / (1024ULL * 1024ULL)),
+                    (unsigned long long)(initrd_sz / (1024ULL * 1024ULL)));
         if (heap_size < (128ULL * 1024ULL * 1024ULL))
             kprintf("warning: kernel heap only %llu MiB after user-VA split — increase VM RAM (docker needs ≥2GiB)\n",
                     (unsigned long long)(heap_size / (1024ULL * 1024ULL)));
         heap_init(heap_start, heap_size);
-        kprintf("Kernel starting... heap_start: %p heap_size=%llu heap_total=%llu heap_base=%p ram_mb=%d kernel_end: %p mods_end: %p\n",
+        kprintf("Kernel starting... heap_start: %p heap_size=%llu heap_total=%llu heap_base=%p ram_mb=%d kernel_end: %p initrd: %p..%p\n",
                 (void*)heap_start,
                 (unsigned long long)heap_size,
                 (unsigned long long)heap_total_bytes(),
                 (void*)heap_base_addr(),
                 sysinfo_ram_mb(),
-                (void*)(uintptr_t)_end, (void*)mods_end);
+                (void*)(uintptr_t)_end,
+                (void*)(uintptr_t)rd_st,
+                (void*)(uintptr_t)mods_end);
         /* Default 8x16 until VFS/console.pf2 (or explicit pf2 load). */
         font_init_default();
     }
@@ -750,6 +740,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         }
     }
 
+    kprintf("boot: post-timer (smp/pci/threads/initfs)...\n");
     smp_finalize_topology(multiboot_magic, multiboot_info);
 
     pci_init();
@@ -779,7 +770,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             klogprintf("net: failed to register eth0\n");
     }
 
-    
+    kprintf("boot: mounting initfs...\n");
     /* If an initfs module was provided by the bootloader, unpack it into ramfs */
     int r = initfs_process_linux_bootparams(axon_boot_params_phys);
     if (r == 0) {

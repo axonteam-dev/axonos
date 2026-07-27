@@ -312,6 +312,14 @@ int fs_unmount(const char *path) {
 
 /* Внутренняя функция открытия файла без разрешения симлинков.
    Используется для чтения содержимого симлинков. */
+static void fs_file_mark_opened(struct fs_file *file) {
+    if (!file)
+        return;
+    /* Drivers memset handles to 0; without this fs_file_free skips and leaks. */
+    if (file->refcount < 1)
+        file->refcount = 1;
+}
+
 static struct fs_file *fs_open_no_resolve(const char *path) {
     if (!path) return NULL;
     struct fs_driver *mount_drv = fs_match_mount(path);
@@ -320,6 +328,7 @@ static struct fs_file *fs_open_no_resolve(const char *path) {
         int rr = mount_drv->ops->open(path, &file);
         if (rr == 0 && file) {
             if (!file->fs_private) file->fs_private = (void*)mount_drv;
+            fs_file_mark_opened(file);
             return file;
         }
         /* Path is under a mount; do not fall through to ramfs/etc. so /dev returns devfs, not empty ramfs dir */
@@ -337,11 +346,14 @@ static struct fs_file *fs_open_no_resolve(const char *path) {
                 struct fs_file *mount_file = NULL;
                 if (m->ops->open(path, &mount_file) == 0 && mount_file) {
                     if (!mount_file->fs_private) mount_file->fs_private = (void*)m;
+                    fs_file_mark_opened(file);
                     fs_file_free(file);
+                    fs_file_mark_opened(mount_file);
                     return mount_file;
                 }
             }
             if (!file->fs_private) file->fs_private = (void*)drv;
+            fs_file_mark_opened(file);
             return file;
         }
         if (r < 0 && r != -1) return NULL; /* real error */
@@ -628,6 +640,7 @@ struct fs_file *fs_open(const char *path) {
     }
 
     kfree(resolved_path);
+    fs_file_mark_opened(result);
     return result;
 }
 

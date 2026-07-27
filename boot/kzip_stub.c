@@ -38,12 +38,25 @@ enum {
 };
 
 enum {
-        MB2_COPY_ADDR = 0x10000000u,
+        /* Keep MB2 tags out of the payload load window (~1MiB) and stub (0x08000000). */
+        MB2_COPY_ADDR = 0x01000000u,
         MB2_COPY_MAX  = 2u * 1024u * 1024u
 };
 
-/* Scratch for LZ4 output (~600 KiB kernel); below stub at 0x08000000, above payload load area. */
+/*
+ * Scratch for LZ4 output. Keep this window SMALL: a 128MiB arena at 0x05000000
+ * used to overwrite Multiboot modules that GRUB parked in the same range, so
+ * the later initfs relocate copied ELF/.text garbage instead of SquashFS/cpio
+ * (classic "ramdisk head c8 08 00 48…" / "cpio magic not found").
+ * Payload ELF is ~2MiB; 16MiB is plenty.
+ */
 #define KZIP_DECOMP_PHYS 0x05000000u
+#define KZIP_DECOMP_CAP  (16u * 1024u * 1024u)
+
+static void boot_line(const char *s);
+static uint32_t rd32(const uint8_t *p);
+static uint64_t rd64(const uint8_t *p);
+__attribute__((noreturn)) static void panic_msg(const char *msg);
 
 static void *memcpy_local(void *dst, const void *src, size_t n) {
         uint8_t *d = (uint8_t *)dst;
@@ -52,10 +65,201 @@ static void *memcpy_local(void *dst, const void *src, size_t n) {
         return dst;
 }
 
+static void *memmove_local(void *dst, const void *src, size_t n) {
+        uint8_t *d = (uint8_t *)dst;
+        const uint8_t *s = (const uint8_t *)src;
+        if (d == s || n == 0) return dst;
+        if (d < s) {
+                for (size_t i = 0; i < n; i++) d[i] = s[i];
+        } else {
+                for (size_t i = n; i > 0; i--) d[i - 1] = s[i - 1];
+        }
+        return dst;
+}
+
 static void *memset_local(void *dst, int c, size_t n) {
         uint8_t *d = (uint8_t *)dst;
         for (size_t i = 0; i < n; i++) d[i] = (uint8_t)c;
         return dst;
+}
+
+static void boot_hex32(uint32_t v) {
+        static const char *hex = "0123456789abcdef";
+        char buf[11];
+        buf[0] = '0'; buf[1] = 'x';
+        for (int i = 0; i < 8; i++)
+                buf[2 + i] = hex[(v >> (28 - 4 * i)) & 0xFu];
+        buf[10] = '\0';
+        boot_line(buf);
+}
+
+static int looks_hsqs(const uint8_t *p, size_t n) {
+        return n >= 4 && p[0] == 'h' && p[1] == 's' && p[2] == 'q' && p[3] == 's';
+}
+
+static int looks_cpio_newc(const uint8_t *p, size_t n) {
+        return n >= 6 && p[0] == '0' && p[1] == '7' && p[2] == '0' &&
+               p[3] == '7' && p[4] == '0' && (p[5] == '1' || p[5] == '2');
+}
+
+/* Highest usable RAM byte from MB2 mmap (type=1), or 0 if unknown. */
+static uint64_t mb2_ram_top(const uint8_t *mb, uint32_t total_size) {
+        uint32_t off = 8;
+        uint64_t top = 0;
+        while (off + 8u <= total_size) {
+                uint32_t tag_type = rd32(mb + off);
+                uint32_t tag_size = rd32(mb + off + 4);
+                if (tag_size < 8u) break;
+                if ((uint64_t)off + (uint64_t)tag_size > (uint64_t)total_size) break;
+                if (tag_type == 0u) break;
+                /* mmap: type 6 */
+                if (tag_type == 6u && tag_size >= 16u) {
+                        uint32_t entry_size = rd32(mb + off + 8);
+                        uint32_t entry_ver = rd32(mb + off + 12);
+                        (void)entry_ver;
+                        if (entry_size >= 20u) {
+                                uint32_t eoff = off + 16u;
+                                while (eoff + entry_size <= off + tag_size) {
+                                        uint64_t base = rd64(mb + eoff);
+                                        uint64_t len = rd64(mb + eoff + 8);
+                                        uint32_t typ = rd32(mb + eoff + 16);
+                                        if (typ == 1u && len > 0 && base + len > base) {
+                                                uint64_t end = base + len;
+                                                if (end > top) top = end;
+                                        }
+                                        eoff += entry_size;
+                                }
+                        }
+                }
+                off += (tag_size + 7u) & ~7u;
+        }
+        return top;
+}
+
+/*
+ * Find module cmdline matching "initfs", verify SquashFS/cpio magic, and park
+ * the blob under top-of-RAM before LZ4/ELF load can scribble over GRUB's
+ * module range. Patch the Multiboot2 module tag in-place (on the preserved
+ * MB2 copy) so the payload kernel sees the new physical address.
+ */
+static void salvage_initfs_module(uint8_t *mb) {
+        if (!mb) return;
+        uint32_t total_size = rd32(mb);
+        if (total_size < 16u || total_size > MB2_COPY_MAX) return;
+
+        uint32_t off = 8;
+        while (off + 16u <= total_size) {
+                uint32_t tag_type = rd32(mb + off);
+                uint32_t tag_size = rd32(mb + off + 4);
+                if (tag_size < 8u) break;
+                if ((uint64_t)off + (uint64_t)tag_size > (uint64_t)total_size) break;
+                if (tag_type == 0u) break;
+
+                if (tag_type == 3u && tag_size >= 16u) {
+                        uint32_t ms = rd32(mb + off + 8);
+                        uint32_t me = rd32(mb + off + 12);
+                        if (me <= ms) {
+                                off += (tag_size + 7u) & ~7u;
+                                continue;
+                        }
+                        const char *name = (const char *)(mb + off + 16);
+                        size_t name_max = (size_t)tag_size - 16u;
+                        int match = 0;
+                        /* Accept "initfs" as the first cmdline token / basename. */
+                        {
+                                size_t i = 0;
+                                while (i < name_max && (name[i] == ' ' || name[i] == '\t')) i++;
+                                if (i + 6 <= name_max &&
+                                    name[i] == 'i' && name[i + 1] == 'n' && name[i + 2] == 'i' &&
+                                    name[i + 3] == 't' && name[i + 4] == 'f' && name[i + 5] == 's' &&
+                                    (i + 6 >= name_max || name[i + 6] == '\0' || name[i + 6] == ' ' ||
+                                     name[i + 6] == '.' || name[i + 6] == '-'))
+                                        match = 1;
+                        }
+                        if (!match) {
+                                off += (tag_size + 7u) & ~7u;
+                                continue;
+                        }
+
+                        uint64_t sz = (uint64_t)me - (uint64_t)ms;
+                        const uint8_t *src = (const uint8_t *)(uintptr_t)ms;
+                        boot_line("KZIP: initfs module @");
+                        boot_hex32(ms);
+                        boot_line(" size=");
+                        boot_hex32((uint32_t)sz);
+                        boot_line(" head=");
+                        boot_hex32(rd32(src));
+                        boot_line("\n");
+
+                        if (!looks_hsqs(src, (size_t)sz) && !looks_cpio_newc(src, (size_t)sz)) {
+                                boot_line("KZIP: BAD initfs magic at GRUB address\n");
+                                /* Last-ditch: scan high RAM for hsqs (2MiB steps). */
+                                uint64_t ram_top = mb2_ram_top(mb, total_size);
+                                if (ram_top < (uint64_t)sz + (32ull << 20))
+                                        panic_msg("KZIP: initfs magic missing");
+                                uint64_t scan = (ram_top - (uint64_t)sz) & ~((uint64_t)0x1FFFFFu);
+                                int found = 0;
+                                for (int n = 0; n < 256 && scan >= (64ull << 20); n++) {
+                                        const uint8_t *c = (const uint8_t *)(uintptr_t)scan;
+                                        if (looks_hsqs(c, 4)) {
+                                                boot_line("KZIP: found hsqs @");
+                                                boot_hex32((uint32_t)scan);
+                                                boot_line("\n");
+                                                ms = (uint32_t)scan;
+                                                me = (uint32_t)(scan + sz);
+                                                src = c;
+                                                found = 1;
+                                                /* Rewrite tag start; keep size. */
+                                                mb[off + 8] = (uint8_t)(ms);
+                                                mb[off + 9] = (uint8_t)(ms >> 8);
+                                                mb[off + 10] = (uint8_t)(ms >> 16);
+                                                mb[off + 11] = (uint8_t)(ms >> 24);
+                                                mb[off + 12] = (uint8_t)(me);
+                                                mb[off + 13] = (uint8_t)(me >> 8);
+                                                mb[off + 14] = (uint8_t)(me >> 16);
+                                                mb[off + 15] = (uint8_t)(me >> 24);
+                                                break;
+                                        }
+                                        if (scan < (2ull << 20)) break;
+                                        scan -= (2ull << 20);
+                                }
+                                if (!found)
+                                        panic_msg("KZIP: initfs magic missing");
+                        }
+
+                        /* Park under top of RAM, clear of stub/decomp/MB2. */
+                        uint64_t ram_top = mb2_ram_top(mb, total_size);
+                        if (ram_top < (uint64_t)sz + (64ull << 20))
+                                ram_top = 0x80000000ull; /* assume 2GiB if mmap missing */
+                        uint64_t park = (ram_top - (16ull << 20) - (uint64_t)sz) & ~((uint64_t)0x1FFFFFu);
+                        if (park < 0x10000000ull) {
+                                boot_line("KZIP: park address too low\n");
+                                return;
+                        }
+                        if ((uint64_t)ms != park) {
+                                boot_line("KZIP: parking initfs -> ");
+                                boot_hex32((uint32_t)park);
+                                boot_line("\n");
+                                memmove_local((void *)(uintptr_t)park, src, (size_t)sz);
+                                uint32_t nms = (uint32_t)park;
+                                uint32_t nme = (uint32_t)(park + sz);
+                                mb[off + 8] = (uint8_t)(nms);
+                                mb[off + 9] = (uint8_t)(nms >> 8);
+                                mb[off + 10] = (uint8_t)(nms >> 16);
+                                mb[off + 11] = (uint8_t)(nms >> 24);
+                                mb[off + 12] = (uint8_t)(nme);
+                                mb[off + 13] = (uint8_t)(nme >> 8);
+                                mb[off + 14] = (uint8_t)(nme >> 16);
+                                mb[off + 15] = (uint8_t)(nme >> 24);
+                                src = (const uint8_t *)(uintptr_t)park;
+                        }
+                        if (!looks_hsqs(src, 4) && !looks_cpio_newc(src, 6))
+                                panic_msg("KZIP: initfs corrupt after park");
+                        boot_line("KZIP: initfs OK\n");
+                        return;
+                }
+                off += (tag_size + 7u) & ~7u;
+        }
 }
 
 enum {
@@ -394,12 +598,16 @@ void kernel_main(uint64_t multiboot_magic, uint64_t multiboot_info) {
         size_t payload_lz4_len = (size_t)(_binary_build_payload_lz4_end - _binary_build_payload_lz4_start);
 
         uint8_t *decomp = (uint8_t *)(uintptr_t)KZIP_DECOMP_PHYS;
-        const size_t decomp_cap = 128u * 1024u * 1024u;
+        const size_t decomp_cap = (size_t)KZIP_DECOMP_CAP;
         size_t decomp_len = 0;
         uint64_t entry = 0;
         uint64_t preserved_multiboot_info = preserve_multiboot_info(multiboot_info);
 
         vga_cursor_init();
+
+        /* Relocate/verify initfs BEFORE LZ4+ELF — payload load at 0x100000 must
+         * not leave us reading kernel .text as a fake ramdisk head. */
+        salvage_initfs_module((uint8_t *)(uintptr_t)preserved_multiboot_info);
 
         if (payload_lz4_len == 0) panic_msg("KZIP: empty payload");
         if (rd32(payload_lz4) == LZ4F_MAGIC) {

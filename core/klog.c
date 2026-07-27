@@ -229,7 +229,6 @@ void klogprintf(const char *fmt, ...) {
 			memcpy(line + tslen, msg, len);
 		}
 		line[outlen] = '\0';
-		do_console = 1;
 #else
 		outlen = len;
 		if (outlen + 1 > sizeof line)
@@ -237,6 +236,9 @@ void klogprintf(const char *fmt, ...) {
 		memcpy(line, msg, outlen);
 		line[outlen] = '\0';
 #endif
+		/* Console is independent of KERNEL_LOG_TIME timestamps. Without this,
+		 * post-APIC boot (almost all klogprintf) looks hung on VGA. */
+		do_console = 1;
 
 		inited = klog_inited;
 		if (!inited) {

@@ -18,12 +18,9 @@
 /* Smallest buffer Linux bootloaders use for boot_params; shim uses the same size. */
 #define LINUX_BOOTPARAM_MIN_SIZE 4096u
 
-/* kzip_stub.c copies Multiboot2 modules here before loading the payload at 0x100000.
- * mb2_linux_shim must not extend mod_end to the next module for these: gaps are not copied.
- *
- * 0x02000000 = 32 MiB (note the leading 0 in the constant). Do not substitute 0x20000000
- * (512 MiB): on a 512 MiB RAM machine physical RAM is [0, 0x20000000), so the latter is
- * past RAM and the initrd appears corrupt mid-archive (e.g. cpio bad magic after a large file). */
+/* Historical kzip low reloc window (kept for heap floor when no initrd).
+ * Large SquashFS images are now parked under top-of-RAM by boot/kzip_stub.c
+ * before the payload ELF is loaded — do not assume modules live here. */
 #define AXON_MB2_MODULE_RELOC_BASE 0x02000000u
 #define AXON_MB2_MODULE_RELOC_CEIL 0x05000000u
 

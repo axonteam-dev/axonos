@@ -48,7 +48,7 @@ struct devfs_tty {
     int waiters_count;
     /* current VGA attribute for output on this tty (low nibble FG, high nibble BG) */
     uint8_t current_attr;
-    /* simple ANSI escape state for CSI parsing (0=normal,1=ESC,2=CSI,3=SS3,4=)G0,5=(G0) */
+    /* ECMA-48/VT parser state; private to userspace output on this VC. */
     uint8_t ansi_escape_state;
     /* DEC line-drawing (ACS):
        - ESC ( 0 / ESC ) 0 select special-graphics for G0/G1
@@ -104,6 +104,8 @@ int devfs_tty_count(void);
 /* Kernel console output (kprintf): write through the active tty so cursor and
  * screen backing stay aligned with userspace /dev/console I/O. */
 void devfs_tty_console_write(const char *s, size_t n);
+/* Same kernel-console path with tty->out_lock already held by the caller. */
+void devfs_tty_console_write_locked(const char *s, size_t n);
 /* Return index of currently active tty */
 int devfs_get_active(void);
 /* Process-context input injection; may take the tty lock. */

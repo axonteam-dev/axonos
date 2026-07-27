@@ -431,14 +431,66 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
 static ssize_t devfs_tty_write_stream(struct devfs_tty *tty, const char *s,
                                       size_t size, const char *path);
 
+enum devfs_vt_state {
+    DEVFS_VT_GROUND = 0,
+    DEVFS_VT_ESCAPE,
+    DEVFS_VT_CSI,
+    DEVFS_VT_SS3,
+    DEVFS_VT_G1_SELECT,
+    DEVFS_VT_G0_SELECT,
+    DEVFS_VT_OSC,
+    DEVFS_VT_OSC_ESC,
+    DEVFS_VT_STRING,
+    DEVFS_VT_STRING_ESC,
+};
+
+static void devfs_tty_vt_reset(struct devfs_tty *tty) {
+    tty->ansi_escape_state = DEVFS_VT_GROUND;
+    tty->ansi_csi_private = 0;
+    tty->ansi_param_count = 0;
+    tty->ansi_current_param = 0;
+}
+
+void devfs_tty_console_write_locked(const char *s, size_t n) {
+    if (!s || n == 0)
+        return;
+    struct devfs_tty *tty = devfs_get_tty_by_index(devfs_get_active());
+    if (!tty)
+        return;
+
+    /*
+     * printk is not a userspace VT writer.  Render it without touching the
+     * userspace escape state: otherwise a kernel byte can finish an ESC/CSI
+     * left by an application, or leave one that consumes the next stdout byte.
+     */
+    uint8_t saved_acs = tty->acs_mode;
+    uint8_t saved_insert = tty->insert_mode;
+    tty->acs_mode = 0;
+    tty->insert_mode = 0;
+    console_begin_tty_batch();
+    for (size_t i = 0; i < n; i++) {
+        uint8_t ch = (uint8_t)s[i];
+        if (ch == '\b' || ch == '\t' || ch == '\n' || ch == '\r' ||
+            ch == 0x0B || ch == 0x0C ||
+            (ch >= 0x20 && ch != 0x7F))
+            devfs_tty_emit_byte(tty, 1, ch);
+    }
+    console_set_cursor(tty->cursor_x, tty->cursor_y);
+    console_end_tty_batch();
+    tty->acs_mode = saved_acs;
+    tty->insert_mode = saved_insert;
+}
+
 void devfs_tty_console_write(const char *s, size_t n) {
     if (!s || n == 0)
         return;
     struct devfs_tty *tty = devfs_get_tty_by_index(devfs_get_active());
     if (!tty)
         return;
-    /* Kernel and userspace output share the same per-VC state machine. */
-    (void)devfs_tty_write_stream(tty, s, n, "/dev/console");
+    unsigned long flags = 0;
+    acquire_irqsave(&tty->out_lock, &flags);
+    devfs_tty_console_write_locked(s, n);
+    release_irqrestore(&tty->out_lock, flags);
 }
 
 static void devfs_tty_emit_byte(struct devfs_tty *tty, int tty_on_vga, uint8_t ch) {
@@ -1341,6 +1393,8 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
     if (!t || !s) return -1;
     int idx = t->id;
     const int tty_on_vga_batch = (idx == devfs_active);
+    unsigned long out_flags = 0;
+    acquire_irqsave(&t->out_lock, &out_flags);
     if (tty_on_vga_batch)
         console_begin_tty_batch();
     for (size_t i = 0; i < size; i++) {
@@ -1351,13 +1405,56 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
             struct devfs_tty *tty = t;
             unsigned char uc = (unsigned char)ch;
 
+            /* CAN/SUB cancel any ECMA-48 control sequence. */
+            if (uc == 0x18 || uc == 0x1A) {
+                devfs_tty_vt_reset(tty);
+                continue;
+            }
+
+            /* OSC and DCS/SOS/PM/APC strings end only at BEL or ST (ESC \). */
+            if (uc == 0x07) {
+                if (tty->ansi_escape_state == DEVFS_VT_OSC ||
+                    tty->ansi_escape_state == DEVFS_VT_OSC_ESC)
+                    devfs_tty_vt_reset(tty);
+                continue;
+            }
+            if (tty->ansi_escape_state == DEVFS_VT_OSC) {
+                if (uc == 0x1B)
+                    tty->ansi_escape_state = DEVFS_VT_OSC_ESC;
+                continue;
+            }
+            if (tty->ansi_escape_state == DEVFS_VT_OSC_ESC) {
+                if (ch == '\\')
+                    devfs_tty_vt_reset(tty);
+                else if (uc != 0x1B)
+                    tty->ansi_escape_state = DEVFS_VT_OSC;
+                continue;
+            }
+            if (tty->ansi_escape_state == DEVFS_VT_STRING) {
+                if (uc == 0x1B)
+                    tty->ansi_escape_state = DEVFS_VT_STRING_ESC;
+                continue;
+            }
+            if (tty->ansi_escape_state == DEVFS_VT_STRING_ESC) {
+                if (ch == '\\')
+                    devfs_tty_vt_reset(tty);
+                else if (uc != 0x1B)
+                    tty->ansi_escape_state = DEVFS_VT_STRING;
+                continue;
+            }
+
+            /* ESC restarts parsing even in an incomplete CSI. */
+            if (uc == 0x1B) {
+                tty->ansi_escape_state = DEVFS_VT_ESCAPE;
+                continue;
+            }
+
             /*
-             * Linux VT handles C0 controls before dispatching the current
-             * escape-parser state.  They therefore never become glyphs, and
-             * cursor controls may occur inside a CSI sequence without
-             * destroying that sequence.
+             * Linux VT executes ordinary C0 controls without turning them into
+             * glyphs.  State survives write boundaries, but a complete write
+             * is serialized by out_lock so another writer cannot splice bytes.
              */
-            if (uc == 0x00 || uc == 0x07 || uc == 0x7F)
+            if (uc == 0x00 || uc == 0x7F)
                 continue;
             if (uc == '\b' || uc == '\t' || uc == '\n' || uc == '\r' ||
                 uc == 0x0B || uc == 0x0C) {
@@ -1372,33 +1469,28 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
                 tty->acs_mode = 0;
                 continue;
             }
-            if (uc == 0x18 || uc == 0x1A) {
-                tty->ansi_escape_state = 0;
-                tty->ansi_csi_private = 0;
-                tty->ansi_param_count = 0;
-                tty->ansi_current_param = 0;
+            if (uc < 0x20)
                 continue;
-            }
-            if (uc == 0x1B) {
-                tty->ansi_escape_state = 1;
-                continue;
-            }
-            /* Stateful VT parser; state intentionally survives write boundaries. */
-            if (tty->ansi_escape_state == 0) {
+
+            if (tty->ansi_escape_state == DEVFS_VT_GROUND) {
                 devfs_tty_emit_byte(tty, tty_on_vga, (uint8_t)ch);
-            } else if (tty->ansi_escape_state == 1) {
-                if ((unsigned char)ch == '[') {
-                    tty->ansi_escape_state = 2; /* CSI start */
+            } else if (tty->ansi_escape_state == DEVFS_VT_ESCAPE) {
+                if (ch == '[') {
+                    tty->ansi_escape_state = DEVFS_VT_CSI;
                     tty->ansi_csi_private = 0;
                     tty->ansi_param_count = 0;
                     tty->ansi_current_param = 0;
-                } else if ((unsigned char)ch == 'O') {
-                    tty->ansi_escape_state = 3; /* SS3 (ESC O A/B/C/D) */
-                } else if ((unsigned char)ch == ')') {
-                    tty->ansi_escape_state = 4; /* ESC ) <charset> */
-                } else if ((unsigned char)ch == '(') {
-                    tty->ansi_escape_state = 5; /* ESC ( <charset> */
-                } else if ((unsigned char)ch == 'c') {
+                } else if (ch == 'O') {
+                    tty->ansi_escape_state = DEVFS_VT_SS3;
+                } else if (ch == ')') {
+                    tty->ansi_escape_state = DEVFS_VT_G1_SELECT;
+                } else if (ch == '(') {
+                    tty->ansi_escape_state = DEVFS_VT_G0_SELECT;
+                } else if (ch == ']') {
+                    tty->ansi_escape_state = DEVFS_VT_OSC;
+                } else if (ch == 'P' || ch == 'X' || ch == '^' || ch == '_') {
+                    tty->ansi_escape_state = DEVFS_VT_STRING;
+                } else if (ch == 'c') {
                     /* RIS: reset the virtual console to its initial state. */
                     tty->current_attr = GRAY_ON_BLACK;
                     tty->ansi_bold = 0;
@@ -1413,29 +1505,29 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
                     devfs_tty_clear_backing_fast(tty, tty->current_attr);
                     tty->cursor_x = 0;
                     tty->cursor_y = 0;
-                    tty->ansi_escape_state = 0;
+                    devfs_tty_vt_reset(tty);
                     if (tty_on_vga) {
                         console_clear_screen_attr(tty->current_attr);
                         console_set_cursor(0, 0);
                     }
                 } else {
-                    /* Linux VT ignores unsupported ESC functions. */
-                    tty->ansi_escape_state = 0;
+                    /* A syntactically complete but unsupported ESC function. */
+                    devfs_tty_vt_reset(tty);
                 }
-            } else if (tty->ansi_escape_state == 4) {
-                if ((unsigned char)ch == '0')
+            } else if (tty->ansi_escape_state == DEVFS_VT_G1_SELECT) {
+                if (ch == '0')
                     tty->g0_is_acs = 1;
-                else if ((unsigned char)ch == 'B')
+                else if (ch == 'B')
                     tty->g0_is_acs = 0;
-                tty->ansi_escape_state = 0;
-            } else if (tty->ansi_escape_state == 5) {
+                devfs_tty_vt_reset(tty);
+            } else if (tty->ansi_escape_state == DEVFS_VT_G0_SELECT) {
                 /* G0 select via ESC ( X : treat 0 as ACS table, B as ASCII */
-                if ((unsigned char)ch == '0')
+                if (ch == '0')
                     tty->g0_is_acs = 1;
-                else if ((unsigned char)ch == 'B')
+                else if (ch == 'B')
                     tty->g0_is_acs = 0;
-                tty->ansi_escape_state = 0;
-            } else if (tty->ansi_escape_state == 3) {
+                devfs_tty_vt_reset(tty);
+            } else if (tty->ansi_escape_state == DEVFS_VT_SS3) {
                 /* SS3: single final byte (e.g. A=up, B=down, C=right, D=left) */
                 unsigned char fc = (unsigned char)ch;
                 if (fc == 'A') {
@@ -1453,21 +1545,23 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
                     if (tty->cursor_x > 0) tty->cursor_x--;
                     if (tty_on_vga) console_set_cursor(tty->cursor_x, tty->cursor_y);
                 }
-                tty->ansi_escape_state = 0;
-            } else if (tty->ansi_escape_state == 2) {
-                /* CSI parsing: accumulate parameters until final byte */
+                devfs_tty_vt_reset(tty);
+            } else if (tty->ansi_escape_state == DEVFS_VT_CSI) {
+                /* ECMA-48 CSI: parameters 30-3f, intermediates 20-2f, final 40-7e. */
                 if (ch >= '0' && ch <= '9') {
-                    tty->ansi_current_param = tty->ansi_current_param * 10 + (ch - '0');
-                } else if (ch == '?') {
+                    if (tty->ansi_current_param < 100000)
+                        tty->ansi_current_param =
+                            tty->ansi_current_param * 10 + (ch - '0');
+                } else if (uc >= 0x3C && uc <= 0x3F) {
                     tty->ansi_csi_private = 1;
-                } else if (ch == '>') {
-                    /* DEC/HP private mode marker - skip, continue parsing */
                 } else if (ch == ';') {
                     if (tty->ansi_param_count < (int)(sizeof(tty->ansi_param)/sizeof(tty->ansi_param[0]))) {
                         tty->ansi_param[tty->ansi_param_count++] = tty->ansi_current_param;
                     }
                     tty->ansi_current_param = 0;
-                } else {
+                } else if (ch == ':' || (uc >= 0x20 && uc <= 0x2F)) {
+                    /* Unsupported sub-parameters/intermediates are consumed. */
+                } else if (uc >= 0x40 && uc <= 0x7E) {
                     /* final byte of CSI */
                     if (tty->ansi_param_count < (int)(sizeof(tty->ansi_param)/sizeof(tty->ansi_param[0]))) {
                         tty->ansi_param[tty->ansi_param_count++] = tty->ansi_current_param;
@@ -1812,11 +1906,10 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
                             }
                         }
                     }
-                    /* reset CSI parser state after handling final byte */
-                    tty->ansi_escape_state = 0;
-                    tty->ansi_csi_private = 0;
-                    tty->ansi_param_count = 0;
-                    tty->ansi_current_param = 0;
+                    devfs_tty_vt_reset(tty);
+                } else {
+                    /* Invalid byte: cancel instead of swallowing future text. */
+                    devfs_tty_vt_reset(tty);
                 }
             }
         }
@@ -1825,6 +1918,7 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
         console_set_cursor(t->cursor_x, t->cursor_y);
         console_end_tty_batch();
     }
+    release_irqrestore(&t->out_lock, out_flags);
     /* Also append written chars to stdout/stderr ring buffers if applicable */
     if (path) {
         int which = -1;

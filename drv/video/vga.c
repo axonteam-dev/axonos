@@ -679,7 +679,7 @@ static int utoa_rev(unsigned long long v, unsigned base, int upper, char *out)
  * the next write(1) / ECHO lands at a stale position (often 0,0). */
 static inline void kprintf_putc_locked(struct devfs_tty *tty, uint8_t ch, uint8_t color) {
 	if (tty)
-		devfs_tty_console_write((const char *)&ch, 1);
+		devfs_tty_console_write_locked((const char *)&ch, 1);
 	else
 		console_putc_nolock(ch, color);
 }

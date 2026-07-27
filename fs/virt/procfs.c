@@ -40,19 +40,9 @@ static spinlock_t procfs_lock = { 0 };
 static thread_t *procfs_thread_by_id(int id) {
     if (id <= 0) return NULL;
     process_t *p = process_find((uint64_t)(unsigned)id);
-    if (p && p->leader) {
-        if (p->leader->state != THREAD_TERMINATED)
-            return p->leader;
-        if (p->state == PROCESS_ZOMBIE)
-            return p->leader;
-    }
-    thread_t *t = thread_get(id);
-    if (!t || t->ring != 3) return NULL;
-    if (t->state == THREAD_TERMINATED) {
-        if (!t->process || t->process->state != PROCESS_ZOMBIE)
-            return NULL;
-    }
-    return t;
+    if (p && p->leader && p->leader->state != THREAD_TERMINATED)
+        return p->leader;
+    return thread_get(id);
 }
 
 static int procfs_tgid(const thread_t *t) {
@@ -62,29 +52,11 @@ static int procfs_tgid(const thread_t *t) {
     return (int)(t->tid ? t->tid : 0);
 }
 
-static void procfs_sanitize_comm(char *comm, size_t cap) {
-    if (!comm || cap == 0) return;
-    /* Linux get_task_comm / proc_task_name: '(' ')' never appear raw in (comm). */
-    for (size_t i = 0; i < cap && comm[i]; i++) {
-        if (comm[i] == '(' || comm[i] == ')' || comm[i] == ' ' ||
-            comm[i] == '\n' || comm[i] == '\t')
-            comm[i] = '_';
-    }
-    if (!comm[0]) {
-        comm[0] = '?';
-        if (cap > 1) comm[1] = '\0';
-    }
-}
-
 static ssize_t procfs_show_cmdline(char *buf, size_t size, void *priv) {
     int pid = (int)(uintptr_t)priv;
     if (!buf || size == 0) return 0;
     thread_t *t = procfs_thread_by_id(pid);
-    if (!t) {
-        /* Empty cmdline is OK; never leave parsers with garbage. */
-        if (size > 0) buf[0] = '\0';
-        return (size > 0) ? 1 : 0;
-    }
+    if (!t) return 0;
     char comm[sizeof(t->name)];
     memcpy(comm, t->name, sizeof(comm));
     comm[sizeof(comm) - 1] = '\0';
@@ -200,23 +172,7 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
     int pid = (int)(uintptr_t)priv;
     if (!buf || size == 0) return 0;
     thread_t *t = procfs_thread_by_id(pid);
-    /*
-     * BusyBox ps does strchr(buf, ')') then *p = 0 with no NULL check.
-     * An empty / missing-paren line → #PF at cr2=0. Always emit Linux form.
-     */
-    if (!t) {
-        int written = snprintf(buf, size,
-            "%d (unknown) Z 0 0 0 0 0 "
-            "0 0 0 0 0 0 0 0 0 "
-            "0 0 0 0 0 0 0 "
-            "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 "
-            "0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-            pid);
-        if (written < 0) return 0;
-        size_t w = (size_t)written;
-        if (w > size) w = size;
-        return (ssize_t)w;
-    }
+    if (!t) return 0;
     char comm[sizeof(t->name)];
     memcpy(comm, t->name, sizeof(comm));
     comm[sizeof(comm) - 1] = '\0';
@@ -224,7 +180,6 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
         char *slash = strrchr(comm, '/');
         if (slash && slash[1]) memmove(comm, slash + 1, strlen(slash + 1) + 1);
         if (strlen(comm) > 15) comm[15] = '\0';
-        procfs_sanitize_comm(comm, sizeof(comm));
     }
     int ppid = (t->parent_tid >= 0) ? t->parent_tid : 0;
     int pgrp = (t->pgid >= 0) ? t->pgid : (int)t->tid;
@@ -236,22 +191,12 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
     if (prio > 39) prio = 39;
     uint64_t hz = pit_get_frequency();
     if (hz == 0) hz = 1000;
+    uint64_t now_ms = pit_get_time_ms();
+    uint64_t start_ms = (t->start_ticks * 1000ull) / hz;
+    uint64_t elapsed_ms = (now_ms >= start_ms) ? (now_ms - start_ms) : 0;
     /* /proc/<pid>/stat expects USER_HZ units (typically 100). */
-    uint64_t utime = 0;
+    uint64_t utime = elapsed_ms / 10ull;
     uint64_t stime = 0;
-    if (t->process) {
-        /* Linux: /proc/<tgid>/stat utime/stime are thread-group totals. */
-        int cnt = thread_get_count();
-        for (int i = 0; i < cnt; i++) {
-            thread_t *th = thread_get_by_index(i);
-            if (!th || th->process != t->process) continue;
-            utime += (th->utime_ticks * 100ull) / hz;
-            stime += (th->stime_ticks * 100ull) / hz;
-        }
-    } else {
-        utime = (t->utime_ticks * 100ull) / hz;
-        stime = (t->stime_ticks * 100ull) / hz;
-    }
     uint64_t starttime = (t->start_ticks * 100ull) / hz;
     struct procfs_proc_mem mem;
     procfs_calc_proc_mem(t, &mem);
@@ -281,14 +226,6 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
         0ull, 0ull, 0ull, 0ull, 0
     );
     if (written < 0) return 0;
-    /* Truncation must not drop the closing ')' or BusyBox ps #PF's. */
-    if ((size_t)written >= size || !strchr(buf, ')')) {
-        int stub = snprintf(buf, size, "%d (%s) %c %d 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 "
-            "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-            procfs_tgid(t), comm[0] ? comm : "?", procfs_state_char(t), ppid);
-        if (stub < 0) return 0;
-        written = stub;
-    }
     size_t w = (size_t)written;
     if (w > size) w = size;
     return (ssize_t)w;
@@ -306,7 +243,6 @@ static ssize_t procfs_show_status(char *buf, size_t size, void *priv) {
         char *slash = strrchr(comm, '/');
         if (slash && slash[1]) memmove(comm, slash + 1, strlen(slash + 1) + 1);
         if (strlen(comm) > 15) comm[15] = '\0';
-        procfs_sanitize_comm(comm, sizeof(comm));
     }
     int ppid = (t->parent_tid >= 0) ? t->parent_tid : 0;
     int pgrp = (t->pgid >= 0) ? t->pgid : (int)t->tid;
@@ -468,23 +404,12 @@ static ssize_t procfs_show_kernel_stat(char *buf, size_t size, void *priv) {
 	int n = smp_cpu_count();
 	if (n < 1)
 		n = 1;
-	uint64_t user = 0, nice = 0, system = 0, idle = 0;
-	thread_cpu_times_user_hz(&user, &nice, &system, &idle);
 	size_t w = 0;
 	w += (size_t)snprintf(buf + w, (w < size) ? (size - w) : 0,
-			      "cpu  %llu %llu %llu %llu 0 0 0 0 0 0\n",
-			      (unsigned long long)user,
-			      (unsigned long long)nice,
-			      (unsigned long long)system,
-			      (unsigned long long)idle);
-	/* Per-CPU breakdown is approximate: all charge BSP until SMP accounting. */
+			      "cpu  0 0 0 0 0 0 0 0 0 0\n");
 	for (int i = 0; i < n && w < size; i++) {
 		int wr = snprintf(buf + w, (w < size) ? (size - w) : 0,
-				  "cpu%d %llu %llu %llu %llu 0 0 0 0 0 0\n", i,
-				  (unsigned long long)(i == 0 ? user : 0),
-				  (unsigned long long)(i == 0 ? nice : 0),
-				  (unsigned long long)(i == 0 ? system : 0),
-				  (unsigned long long)(i == 0 ? idle : 0));
+				  "cpu%d 0 0 0 0 0 0 0 0 0 0\n", i);
 		if (wr < 0)
 			break;
 		w += (size_t)wr;
@@ -1178,23 +1103,10 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         int cnt = thread_get_count();
         for (int i = 0; i < cnt; i++) {
             thread_t *t = thread_get_by_index(i);
-            if (!t || t->tid == 0 || t->ring != 3) continue;
-            /*
-             * Linux /proc: one directory per live TGID, plus unreaped zombies.
-             * Advertising THREAD_TERMINATED slots as PIDs made ps show "live"
-             * httpd workers (fake utime from wall clock) that kill(2) could not
-             * signal (ESRCH).
-             */
-            if (t->state == THREAD_TERMINATED) {
-                if (!t->process || t->process->state != PROCESS_ZOMBIE)
-                    continue;
-                if (t->process->leader && t->process->leader != t)
-                    continue;
-            } else if (t->process && t->process->leader &&
-                       t->process->leader != t) {
-                /* CLONE_THREAD peer — only the leader owns /proc/<tgid>. */
+            if (!t || t->tid == 0) continue;
+            /* Linux: one /proc/<tgid> per process (leader). Skip CLONE_THREAD peers. */
+            if (t->process && t->process->leader && t->process->leader != t)
                 continue;
-            }
             int tgid = procfs_tgid(t);
             if (tgid <= 0) continue;
             char namebuf[32];

@@ -13,7 +13,6 @@
 #include <sysinfo.h>
 #include <paging.h>
 #include <syscall.h>
-#include <process.h>
 #include <stdio.h>
 #include <string.h>
 /* common ticks */
@@ -226,9 +225,6 @@ void apic_timer_handler(cpu_registers_t* regs) {
     apic_timer_state.ticks = apic_timer_ticks;
     if (!pit_is_enabled())
         timer_ticks++;
-    /* Charge CPU time before any schedule/publish side effects. */
-    thread_account_timer_tick(regs && ((regs->cs & 3) == 3));
-    process_itimer_tick(pit_get_time_ms());
     /* A ring-3 interrupt proves the parent's fork-return IRETQ completed.
      * It is now safe to make its fully initialized child runnable. Never also
      * context-switch from this same IRQ: first return its complete interrupt
@@ -247,13 +243,6 @@ void apic_timer_handler(cpu_registers_t* regs) {
     }
 
     thread_wake_expired_timeouts();
-    if (apic_timer_state.frequency > 0) {
-        uint32_t resched_quantum = apic_timer_state.frequency / 100u;
-        if (resched_quantum < 1u)
-            resched_quantum = 1u;
-        if ((apic_timer_ticks % resched_quantum) == 0)
-            thread_request_resched();
-    }
 
     /*
      * Bounded post-pipe sampler. Keep this deliberately tiny: it is diagnostic

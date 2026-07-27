@@ -112,20 +112,9 @@ int fs_unlink(const char *path);
 #define FS_TYPE_PIPE    3
 /* Syscall-layer inet/unix socket (see SYSCALL_FTYPE_SOCKET in syscall.c). */
 #define FS_TYPE_SOCKET  0x534F434Bu
-/* epoll file descriptor (SYSCALL_FTYPE_EPOLL). */
-#define FS_TYPE_EPOLL   0x45504F4Cu
-/* Linux eventfd(2) counter fd. */
-#define FS_TYPE_EVENTFD 0x45464446u /* 'EFDF' */
 
 /* Called by fs_file_free on final unref; tears down TCP/unix private state. */
 void net_fs_file_destroy(struct fs_file *f);
-/* Called by fs_file_free on final unref of an epoll fd. */
-void epoll_fs_file_destroy(struct fs_file *f);
-/* Called by fs_file_free on final unref of an eventfd. */
-void eventfd_fs_file_destroy(struct fs_file *f);
-/* Linux: closing fd removes it from every epoll set in that process. */
-struct thread;
-void epoll_notify_fd_closed(struct thread *thr, int fd);
 
 /* Called by thread_fd_close when closing a pipe end; f->type == FS_TYPE_PIPE. */
 void pipe_release_end(struct fs_file *f);

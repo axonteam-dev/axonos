@@ -124,9 +124,8 @@ static int tcp_send_seg_len(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t
     th->doff_res = (uint8_t)((hdr_len / 4u) << 4);
     th->flags = flags;
     size_t free_rx = sizeof(c->rx_buf) - c->rx_len;
-    /* Advertise a true zero window when full — lying with wnd=1 made peers
-     * send bytes we then dropped from the NIC (truncated wget/zip). */
     uint16_t wnd = (free_rx > 65535u) ? 65535u : (uint16_t)free_rx;
+    if (wnd == 0) wnd = 1;
     th->wnd = be16(wnd);
     th->csum = 0;
     th->urg = 0;
@@ -137,7 +136,7 @@ static int tcp_send_seg_len(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t
         uint16_t tc = tcp_checksum(ops->local_ip_be, c->dst_ip_be, seg, seg_len);
         th->csum = be16(tc);
     }
-    if (ops->send_l4(ops->context, c->dst_ip_be, IPPROTO_TCP_LOCAL, seg, seg_len) != 0) return -1;
+    if (ops->send_l4(c->dst_ip_be, IPPROTO_TCP_LOCAL, seg, seg_len) != 0) return -1;
     return 0;
 }
 
@@ -158,51 +157,25 @@ static void tcp_return_frame(const net_tcp_ops_t *ops, const uint8_t *frame, siz
 }
 
 static void tcp_try_merge_ooo(net_tcp_conn_t *c, const net_tcp_ops_t *ops) {
-    for (;;) {
-        int best = -1;
-        uint32_t best_seq = 0;
-        for (int i = 0; i < NET_TCP_OOO_SLOTS; ++i) {
-            if (!c->ooo_slot_valid[i] || c->ooo_len[i] == 0)
-                continue;
-            uint32_t end = c->ooo_seq[i] + (uint32_t)c->ooo_len[i];
-            if (!tcp_seq_after(end, c->rcv_nxt)) {
-                c->ooo_slot_valid[i] = 0;
-                c->ooo_len[i] = 0;
-                if (c->ooo_valid > 0) c->ooo_valid--;
-                continue;
-            }
-            if (tcp_seq_after(c->ooo_seq[i], c->rcv_nxt))
-                continue;
-            if (best < 0 || tcp_seq_after(best_seq, c->ooo_seq[i])) {
-                best = i;
-                best_seq = c->ooo_seq[i];
-            }
-        }
-        if (best < 0)
-            break;
-        size_t skip = (size_t)(c->rcv_nxt - c->ooo_seq[best]);
-        size_t available = c->ooo_len[best] - skip;
+    while (c->ooo_valid && c->ooo_seq == c->rcv_nxt && c->ooo_len > 0) {
         size_t room = sizeof(c->rx_buf) - c->rx_len;
-        size_t cp = available > room ? room : available;
+        size_t cp = (c->ooo_len > room) ? room : c->ooo_len;
         if (cp == 0)
             break;
-        memcpy(c->rx_buf + c->rx_len, c->ooo_buf[best] + skip, cp);
+        memcpy(c->rx_buf + c->rx_len, c->ooo_buf, cp);
         c->rx_len += cp;
         c->rcv_nxt += (uint32_t)cp;
-        if (cp == available) {
-            c->ooo_slot_valid[best] = 0;
-            c->ooo_len[best] = 0;
-            if (c->ooo_valid > 0) c->ooo_valid--;
-        } else {
-            size_t consumed = skip + cp;
-            memmove(c->ooo_buf[best],
-                    c->ooo_buf[best] + consumed,
-                    c->ooo_len[best] - consumed);
-            c->ooo_len[best] -= consumed;
-            c->ooo_seq[best] = c->rcv_nxt;
+        if (cp < c->ooo_len) {
+            memmove(c->ooo_buf, c->ooo_buf + cp, c->ooo_len - cp);
+            c->ooo_len -= cp;
+            c->ooo_seq += (uint32_t)cp;
             break;
         }
+        c->ooo_valid = 0;
+        c->ooo_len = 0;
     }
+    if (c->ooo_valid)
+        return;
     (void)ops;
 }
 
@@ -239,53 +212,14 @@ static size_t tcp_accept_inorder(net_tcp_conn_t *c, uint32_t seq, const uint8_t 
     return accepted;
 }
 
-static void tcp_try_complete_fin(net_tcp_conn_t *c, const net_tcp_ops_t *ops) {
-    if (!c || !c->peer_fin_pending || c->peer_fin)
-        return;
-    if (c->rcv_nxt != c->peer_fin_seq)
-        return;
-    c->peer_fin = 1;
-    c->peer_fin_pending = 0;
-    c->rcv_nxt++;
-    c->established = 0;
-    if (ops)
-        (void)tcp_send_seg(c, ops, 0x10u, NULL, 0);
-    tcp_trace("tcp: complete pending fin rcv_nxt=%u\n", (unsigned)c->rcv_nxt);
-}
-
 static void tcp_store_ooo(net_tcp_conn_t *c, uint32_t seq, const uint8_t *payload, size_t payload_len) {
-    if (!c || !payload || payload_len == 0)
-        return;
-    /* Never truncate: a partial OOO slot would ACK a hole and corrupt streams. */
-    if (payload_len > NET_TCP_OOO_BYTES)
-        return;
-    int slot = -1;
-    int farthest = -1;
-    for (int i = 0; i < NET_TCP_OOO_SLOTS; ++i) {
-        if (!c->ooo_slot_valid[i]) {
-            if (slot < 0) slot = i;
-            continue;
-        }
-        if (c->ooo_seq[i] == seq) {
-            if (c->ooo_len[i] >= payload_len)
-                return;
-            slot = i;
-            break;
-        }
-        if (farthest < 0 ||
-            tcp_seq_after(c->ooo_seq[i], c->ooo_seq[farthest]))
-            farthest = i;
-    }
-    if (slot < 0 && farthest >= 0 &&
-        tcp_seq_after(c->ooo_seq[farthest], seq))
-        slot = farthest;
-    if (slot >= 0) {
-        if (!c->ooo_slot_valid[slot])
-            c->ooo_valid++;
-        memcpy(c->ooo_buf[slot], payload, payload_len);
-        c->ooo_len[slot] = payload_len;
-        c->ooo_seq[slot] = seq;
-        c->ooo_slot_valid[slot] = 1;
+    if (!c->ooo_valid || seq < c->ooo_seq || (seq == c->ooo_seq && payload_len > c->ooo_len)) {
+        if (payload_len > sizeof(c->ooo_buf))
+            payload_len = sizeof(c->ooo_buf);
+        memcpy(c->ooo_buf, payload, payload_len);
+        c->ooo_len = payload_len;
+        c->ooo_seq = seq;
+        c->ooo_valid = 1;
     }
 }
 
@@ -294,7 +228,7 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
     uint8_t frame[TCP_FRAME_BUF];
     int got = 0;
     for (int i = 0; i < budget; i++) {
-        int n = ops->recv_frame(ops->context, frame, sizeof(frame));
+        int n = ops->recv_frame(frame, sizeof(frame));
         if (n <= 0) continue;
         if ((size_t)n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t)) {
             tcp_return_frame(ops, frame, (size_t)n);
@@ -354,15 +288,6 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
         if (payload_len > frame_pay)
             payload_len = frame_pay;
         const uint8_t *payload = frame + sizeof(eth_hdr_t) + ihl + doff;
-        /* Never ACK corrupted bytes into the stream. The sender will
-         * retransmit when rcv_nxt does not advance. */
-        size_t tcp_len = ip_tot - ihl;
-        if (tcp_len > (size_t)n - sizeof(eth_hdr_t) - ihl ||
-            tcp_checksum(src_ip_be, dst_ip_be,
-                         (const uint8_t *)th, tcp_len) != 0xFFFFu) {
-            got = 1;
-            continue;
-        }
 
         if (th->flags & 0x04u) {
             int rst_ok = 0;
@@ -426,56 +351,38 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
 
         if (payload_len > 0) {
             size_t before = c->rx_len;
-            if (seq == c->rcv_nxt || !tcp_seq_after(seq, c->rcv_nxt)) {
-                uint32_t rcv_before = c->rcv_nxt;
-                size_t acc = tcp_accept_inorder(c, seq, payload, payload_len);
-                /* Frame is already off the NIC — park any unaccepted bytes in
-                 * OOO so a full rx_buf cannot permanently lose the tail. */
-                if (acc < payload_len && !tcp_seq_after(seq, rcv_before)) {
-                    size_t off = (seq == rcv_before)
-                        ? acc
-                        : (size_t)(rcv_before - seq) + acc;
-                    if (off < payload_len)
-                        tcp_store_ooo(c, c->rcv_nxt, payload + off, payload_len - off);
-                }
+            if (seq == c->rcv_nxt || seq < c->rcv_nxt) {
+                (void)tcp_accept_inorder(c, seq, payload, payload_len);
                 tcp_try_merge_ooo(c, ops);
-            } else {
+            } else if (!c->ooo_valid || seq < c->ooo_seq) {
                 tcp_store_ooo(c, seq, payload, payload_len);
             }
             if (c->rx_len > before && c->rx_len - before >= 512)
                 tcp_trace("tcp: rx +%u total=%u seq=%u\n",
                     (unsigned)(c->rx_len - before), (unsigned)c->rx_len, (unsigned)seq);
-            tcp_try_complete_fin(c, ops);
             (void)tcp_send_seg(c, ops, 0x10u, NULL, 0);
             got = 1;
         }
 
         if (th->flags & 0x01u) {
-            /* Allow FIN while established OR while draining after prior data. */
-            if (!c->established && !c->peer_fin_pending && !c->peer_fin) {
+            if (!c->established) {
                 got = 1;
                 continue;
             }
             uint32_t fin_seq = seq + (uint32_t)payload_len;
             tcp_trace("tcp: peer fin seq=%u rcv_nxt=%u\n", (unsigned)fin_seq, (unsigned)c->rcv_nxt);
+            int fin_ok = 0;
             if (fin_seq == c->rcv_nxt) {
                 c->peer_fin = 1;
-                c->peer_fin_pending = 0;
                 c->rcv_nxt++;
-                c->established = 0;
-                (void)tcp_send_seg(c, ops, 0x10u, NULL, 0);
-            } else if (!tcp_seq_after(fin_seq, c->rcv_nxt)) {
-                /* Duplicate FIN already covered by rcv_nxt. */
+                fin_ok = 1;
+            } else if (fin_seq < c->rcv_nxt) {
                 c->peer_fin = 1;
-                c->peer_fin_pending = 0;
+                fin_ok = 1;
+            }
+            if (fin_ok) {
                 c->established = 0;
                 (void)tcp_send_seg(c, ops, 0x10u, NULL, 0);
-            } else {
-                /* FIN ahead of a gap / unread payload — remember it. */
-                c->peer_fin_pending = 1;
-                c->peer_fin_seq = fin_seq;
-                (void)tcp_send_seg(c, ops, 0x10u, NULL, 0);
-                tcp_try_complete_fin(c, ops);
             }
             got = 1;
         }
@@ -488,23 +395,13 @@ int net_tcp_connect(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t dst_ip
     if (ops->recv_frame) {
         uint8_t drain[TCP_FRAME_BUF];
         for (int d = 0; d < 64; d++) {
-            int dn = ops->recv_frame(ops->context, drain, sizeof(drain));
+            int dn = ops->recv_frame(drain, sizeof(drain));
             if (dn <= 0) break;
             if (ops->return_frame)
                 ops->return_frame(drain, (size_t)dn);
         }
     }
-    /* Preserve L2 next-hop staged by the caller; memset used to wipe it and
-     * left nonblocking SYN retransmits dependent on a global MAC flag. */
-    uint8_t saved_mac[6];
-    int saved_mac_valid = c->peer_mac_valid;
-    if (saved_mac_valid)
-        memcpy(saved_mac, c->peer_mac, 6);
     memset(c, 0, sizeof(*c));
-    if (saved_mac_valid) {
-        memcpy(c->peer_mac, saved_mac, 6);
-        c->peer_mac_valid = 1;
-    }
     c->used = 1;
     c->dst_ip_be = dst_ip_be;
     c->dst_port = dst_port;
@@ -521,33 +418,19 @@ int net_tcp_connect(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t dst_ip
         return -1;
     }
     c->snd_nxt = isn + 1;
-    c->connect_syn_ms = ops->time_ms();
     tcp_trace("tcp: syn sent isn=%u sport=%u dport=%u\n",
         (unsigned)isn, (unsigned)c->src_port, (unsigned)c->dst_port);
     if (timeout_ms == 0) {
-        (void)net_tcp_service(c, ops, 8);
-        if (c->established) {
-            c->connect_pending = 0;
-            return 0;
-        }
-        if (c->connect_refused && !c->established) {
-            c->connect_pending = 0;
-            return -3;
-        }
         c->connect_pending = 1;
-        return 0; /* caller maps to EINPROGRESS */
+        return 0;
     }
-    for (int y = 0; y < 8; y++) {
-        (void)net_tcp_service(c, ops, 16);
+    for (int y = 0; y < 64; y++) {
+        (void)net_tcp_service(c, ops, 256);
         if (c->established) {
             c->connect_pending = 0;
             return 0;
         }
-        if (c->connect_refused && !c->established) {
-            c->connect_pending = 0;
-            return -3;
-        }
-        ops->yield(ops->context);
+        ops->yield();
     }
     return net_tcp_connect_poll(c, ops, timeout_ms);
 }
@@ -567,8 +450,6 @@ int net_tcp_server_reply_syn(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32
     c->rcv_nxt = client_seq + 1u;
     c->rx_len = 0;
     c->ooo_valid = 0;
-    memset(c->ooo_slot_valid, 0, sizeof(c->ooo_slot_valid));
-    memset(c->ooo_len, 0, sizeof(c->ooo_len));
     static const uint8_t mss_opt[4] = { 0x02, 0x04, 0x05, 0xB4 };
     if (tcp_send_seg_len(c, ops, 0x12u, NULL, 0, mss_opt, sizeof(mss_opt)) != 0)
         return -1;
@@ -599,24 +480,6 @@ int net_tcp_server_resend_synack(net_tcp_conn_t *c, const net_tcp_ops_t *ops) {
     return r;
 }
 
-static void tcp_rexmit_syn_if_due(net_tcp_conn_t *c, const net_tcp_ops_t *ops) {
-    if (!c || !ops || !ops->time_ms || !c->connect_pending || c->established)
-        return;
-    uint64_t now = ops->time_ms();
-    uint64_t last = c->connect_syn_ms ? c->connect_syn_ms : now;
-    if (now - last < 1000)
-        return;
-    uint32_t save = c->snd_nxt;
-    c->snd_nxt = save - 1;
-    {
-        static const uint8_t mss_opt[4] = { 0x02, 0x04, 0x05, 0xB4 };
-        (void)tcp_send_seg_len(c, ops, 0x02u, NULL, 0, mss_opt, sizeof(mss_opt));
-    }
-    c->snd_nxt = save;
-    c->connect_syn_ms = now;
-    tcp_trace("tcp: syn rexmit sport=%u\n", (unsigned)c->src_port);
-}
-
 int net_tcp_connect_poll(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t timeout_ms) {
     if (!c || !ops || !ops->time_ms || !ops->yield) return -1;
     if (c->established) {
@@ -629,26 +492,10 @@ int net_tcp_connect_poll(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t t
     }
     if (!c->connect_pending && !c->used) return -1;
     uint64_t start = ops->time_ms();
+    uint64_t last_syn = start;
     if (timeout_ms == 0) {
-        /* Nonblocking / select progress: one shot. Never clear connect_pending
-         * on "still waiting" — a short wait inside poll/select used to call
-         * this with 200ms and then abort the handshake after the first tick. */
-        (void)net_tcp_service(c, ops, 8);
-        tcp_rexmit_syn_if_due(c, ops);
-        if (c->established) {
-            c->connect_pending = 0;
-            return 0;
-        }
-        if (c->connect_refused && !c->established) {
-            c->connect_pending = 0;
-            return -3;
-        }
-        return -1;
-    }
-    while ((ops->time_ms() - start) < timeout_ms) {
-        ops->yield(ops->context);
-        for (int burst = 0; burst < 2; burst++) {
-            (void)net_tcp_service(c, ops, 16);
+        for (int i = 0; i < 64; i++) {
+            (void)net_tcp_service(c, ops, 256);
             if (c->established) {
                 c->connect_pending = 0;
                 return 0;
@@ -658,17 +505,42 @@ int net_tcp_connect_poll(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t t
                 return -3;
             }
         }
-        tcp_rexmit_syn_if_due(c, ops);
-        for (int r = 0; r < 4; r++)
-            (void)net_tcp_service(c, ops, 16);
-        if (c->established) {
-            c->connect_pending = 0;
-            return 0;
+        return -1;
+    }
+    uint64_t busy_until = start + 400;
+    while ((ops->time_ms() - start) < timeout_ms) {
+        ops->yield();
+        for (int burst = 0; burst < 16; burst++) {
+            (void)net_tcp_service(c, ops, 256);
+            if (c->established) {
+                c->connect_pending = 0;
+                return 0;
+            }
+            if (c->connect_refused && !c->established) {
+                c->connect_pending = 0;
+                return -3;
+            }
         }
-        if (c->connect_refused && !c->established) {
-            c->connect_pending = 0;
-            return -3;
+        uint64_t now = ops->time_ms();
+        if (now - last_syn >= 1000) {
+            uint32_t save = c->snd_nxt;
+            c->snd_nxt = save - 1;
+            {
+                static const uint8_t mss_opt[4] = { 0x02, 0x04, 0x05, 0xB4 };
+                (void)tcp_send_seg_len(c, ops, 0x02u, NULL, 0, mss_opt, sizeof(mss_opt));
+            }
+            c->snd_nxt = save;
+            last_syn = now;
+            tcp_trace("tcp: syn rexmit sport=%u\n", (unsigned)c->src_port);
+            for (int r = 0; r < 32; r++)
+                (void)net_tcp_service(c, ops, 256);
+            if (c->established) {
+                c->connect_pending = 0;
+                return 0;
+            }
         }
+        if (now < busy_until)
+            continue;
     }
     c->connect_pending = 0;
     tcp_trace("tcp: connect give up peer_pkts=%d syn=%u\n",
@@ -688,12 +560,12 @@ int net_tcp_send(net_tcp_conn_t *c, const net_tcp_ops_t *ops, const uint8_t *dat
         if (tcp_send_seg(c, ops, 0x18u, data + off, chunk) != 0) return (off > 0) ? (int)off : -1;
         c->snd_nxt += (uint32_t)chunk;
         /* Do not block until peer ACK here: HTTP servers may reply+close before send() returns. */
-        for (int poll = 0; poll < 32; poll++) {
-            (void)net_tcp_service(c, ops, 8);
+        for (int poll = 0; poll < 256; poll++) {
+            (void)net_tcp_service(c, ops, 32);
             if (c->snd_una >= seq0 + (uint32_t)chunk)
                 break;
-            if ((poll & 3) == 3)
-                ops->yield(ops->context);
+            if ((poll & 31) == 31)
+                ops->yield();
         }
         off += chunk;
     }
@@ -705,28 +577,22 @@ int net_tcp_flush_tx(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t timeo
     if (!c->established || c->snd_una >= c->snd_nxt) return 0;
     uint64_t start = ops->time_ms();
     while ((ops->time_ms() - start) < timeout_ms) {
-        (void)net_tcp_service(c, ops, 16);
+        (void)net_tcp_service(c, ops, 64);
         if (c->snd_una >= c->snd_nxt)
             return 0;
-        ops->yield(ops->context);
+        ops->yield();
     }
     return (c->snd_una >= c->snd_nxt) ? 0 : -2;
 }
 
 int net_tcp_window_update(net_tcp_conn_t *c, const net_tcp_ops_t *ops) {
-    if (!c || !ops) return -1;
-    /* Still advertise window after peer FIN while draining, and while a
-     * pending FIN waits on a gap that OOO merge may close. */
-    if (!c->established && !c->peer_fin_pending && c->rx_len == 0 && !c->ooo_valid)
-        return -1;
-    tcp_try_merge_ooo(c, ops);
-    tcp_try_complete_fin(c, ops);
+    if (!c || !ops || !c->established) return -1;
     return tcp_send_seg(c, ops, 0x10u, NULL, 0);
 }
 
 static void net_tcp_drain_rx(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int max_rounds) {
     for (int r = 0; r < max_rounds; r++) {
-        (void)net_tcp_service(c, ops, 16);
+        (void)net_tcp_service(c, ops, 128);
         if (c->rx_len > 0)
             break;
     }
@@ -734,26 +600,18 @@ static void net_tcp_drain_rx(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int ma
 
 int net_tcp_recv(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t *out, size_t cap, uint32_t timeout_ms) {
     if (!c || !ops || !out || cap == 0) return -1;
-    /* Pull any OOO bytes that fit now that the app may have drained rx_buf. */
-    tcp_try_merge_ooo(c, ops);
-    tcp_try_complete_fin(c, ops);
     if (c->rx_len > 0) {
         size_t n = (c->rx_len > cap) ? cap : c->rx_len;
         memcpy(out, c->rx_buf, n);
         if (n < c->rx_len) memmove(c->rx_buf, c->rx_buf + n, c->rx_len - n);
         c->rx_len -= n;
-        tcp_try_merge_ooo(c, ops);
-        tcp_try_complete_fin(c, ops);
         (void)net_tcp_window_update(c, ops);
         return (int)n;
     }
     uint64_t start = ops->time_ms();
     uint64_t last_win = start;
     do {
-        /* A blocking socket must relinquish the CPU between bounded checks.
-         * Thousands of empty recv_frame calls here starved every other BSP
-         * userspace task when browsers opened idle speculative connections. */
-        net_tcp_drain_rx(c, ops, 1);
+        net_tcp_drain_rx(c, ops, 32);
         if (c->rx_len > 0) {
             size_t n = (c->rx_len > cap) ? cap : c->rx_len;
             memcpy(out, c->rx_buf, n);
@@ -769,8 +627,7 @@ int net_tcp_recv(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t *out, size
             (void)net_tcp_window_update(c, ops);
             last_win = now;
         }
-        if (timeout_ms != 0)
-            ops->yield(ops->context);
+        ops->yield();
     } while ((ops->time_ms() - start) < timeout_ms);
     return -2;
 }
@@ -785,7 +642,7 @@ int net_tcp_close(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t timeout_
         while ((ops->time_ms() - start) < timeout_ms) {
             (void)net_tcp_service(c, ops, 32);
             if (c->peer_fin || c->snd_una >= c->snd_nxt) break;
-            ops->yield(ops->context);
+            ops->yield();
         }
     }
     memset(c, 0, sizeof(*c));

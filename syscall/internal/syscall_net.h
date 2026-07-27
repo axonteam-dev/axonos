@@ -94,8 +94,6 @@ typedef struct {
     int sock_domain;
     /* socket(AF_INET6) is IPv4 internally; getsockname must still report v4-mapped sockaddr_in6. */
     int ipv6_stub;
-    /* Linux IPV6_V6ONLY (default 0 = /proc/sys/net/ipv6/bindv6only). */
-    int ipv6_only;
     /* socket(AF_UNIX) is created as IPv4 internally; nscd uses connect(sockaddr_un). */
     int unix_domain_stub;
     int unix_bound;
@@ -141,10 +139,6 @@ typedef struct {
     /* glibc tries TCP :53 first; many routers RST -> ECONNREFUSED. Fake connect and use UDP for DNS. */
     int dns_tcp_udp_bridge;
     int nonblock; /* O_NONBLOCK: recv must not fake-EAGAIN after an internal short timeout */
-    int async; /* FIOASYNC / O_ASYNC — SIGIO enable (nginx channel); delivery optional */
-    int owner; /* F_SETOWN: pid (>0) or -pgid; SIGIO/SIGURG recipient */
-    int sigio_signum; /* F_SETSIG; 0 = default SIGIO */
-    int reuseaddr; /* SO_REUSEADDR / SO_REUSEPORT */
     int tcp_listening; /* INET stream socket in listen() state */
     net_tcp_conn_t tcp;
     int kref; /* references from fs_file handles sharing this ksock */

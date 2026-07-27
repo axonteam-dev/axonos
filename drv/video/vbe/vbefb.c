@@ -3,7 +3,7 @@
 #include <string.h>
 #include <mmio.h>
 #include <heap.h>
-#include <font.h>
+#include <fonts/default_8x16.h>
 #include <vga.h>
 #include <klog.h>
 #include <pit.h>
@@ -110,13 +110,35 @@ static void draw_cell_to_framebuffer(uint32_t cx, uint32_t cy) {
 	uint8_t *front = (uint8_t *)vbe_get_frontbuffer();
 	if (!front) return;
 
-	font_w = font_cell_width();
-	font_h = font_cell_height();
 	uint32_t px = cx * font_w;
 	uint32_t py = cy * font_h;
 	uint32_t pitch = vbe_get_pitch();
 	uint32_t bytespp = (vbe_get_bpp() + 7) / 8;
-	font_blit_glyph(front, pitch, bytespp, px, py, ch, fg_pix, bg_pix);
+
+	if (bytespp == 4) {
+		for (uint32_t row = 0; row < font_h; row++) {
+			uint8_t glyph = font8x16[(uint8_t)ch][row];
+			uint32_t *line = (uint32_t *)(front + (size_t)(py + row) * pitch + px * 4);
+			for (uint32_t bit = 0; bit < font_w; bit++)
+				line[bit] = (glyph & (1u << (7 - bit))) ? fg_pix : bg_pix;
+		}
+	} else {
+		for (uint32_t row = 0; row < font_h; row++) {
+			uint8_t glyph = font8x16[(uint8_t)ch][row];
+			uint8_t *line = front + (size_t)(py + row) * pitch + px * bytespp;
+			for (uint32_t bit = 0; bit < font_w; bit++) {
+				uint32_t pixel = (glyph & (1u << (7 - bit))) ? fg_pix : bg_pix;
+				if (bytespp == 3) {
+					line[bit * 3 + 0] = (uint8_t)(pixel & 0xFF);
+					line[bit * 3 + 1] = (uint8_t)((pixel >> 8) & 0xFF);
+					line[bit * 3 + 2] = (uint8_t)((pixel >> 16) & 0xFF);
+				} else if (bytespp == 2) {
+					line[bit * 2 + 0] = (uint8_t)(pixel & 0xFF);
+					line[bit * 2 + 1] = (uint8_t)((pixel >> 8) & 0xFF);
+				}
+			}
+		}
+	}
 	vbe_dirty_mark(px, py, font_w, font_h);
 }
 
@@ -449,8 +471,6 @@ void vbefb_restore_screen(const uint8_t *src, uint32_t src_cols, uint32_t src_ro
 int vbefb_init(uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp) {
 	fb_width = width; fb_height = height; fb_pitch = pitch; fb_bpp = bpp;
 	bytes_per_pixel = (fb_bpp + 7) / 8;
-	font_w = font_cell_width();
-	font_h = font_cell_height();
 	cols = fb_width / font_w;
 	rows = fb_height / font_h;
 	if (cols == 0 || rows == 0) return -1;

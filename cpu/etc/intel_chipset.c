@@ -7,6 +7,7 @@
 #include <serial.h>
 #include <heap.h>
 #include <stddef.h>
+#include <klog.h>
 
 
 static intel_chipset_t intel_chipset;

@@ -265,11 +265,9 @@ static int exec_map_stack_tip(thread_t *tc, uintptr_t tip_lo, uintptr_t tip_hi) 
         return -1;
     tip_lo &= ~0xFFFULL;
     tip_hi = (tip_hi + 0xFFFULL) & ~0xFFFULL;
-    /* Cap tip — never prefault the whole 8MiB slot. Linux ARG_MAX is large;
-     * 256KiB was too small for bash -c "$(curl …/install.sh)" (~34KiB script
-     * plus env) when the tip started below stack_top-256K. Keep 2MiB headroom. */
-    if (tip_hi - tip_lo > 2u * 1024u * 1024u)
-        tip_lo = tip_hi - 2u * 1024u * 1024u;
+    /* Cap tip — never prefault the whole 8MiB slot. */
+    if (tip_hi - tip_lo > 256u * 1024u)
+        tip_lo = tip_hi - 256u * 1024u;
     /*
      * Linux get_arg_page(bprm->mm): install the tip only in the nascent mm.
      * The old mm is consulted solely to reject accidental frame sharing.
@@ -667,9 +665,7 @@ static int elf_needs_private_user_pages(thread_t *tc) {
     return tc->mm->pml4 != k->pml4;
 }
 
-/* Linux applies R_X86_64_RELATIVE for ET_DYN (PIE + ld.so) before user entry.
- * IRELATIVE for ET_EXEC static binaries is applied by glibc CRT before main —
- * do not invoke IFUNC resolvers from the kernel. */
+/* Linux applies R_X86_64_RELATIVE for ET_DYN (PIE + ld.so) before user entry. */
 static int elf_apply_rela_relative(uint64_t load_base, const Elf64_Phdr *phdrs, int phnum) {
     if (!phdrs || phnum <= 0 || load_base == 0) return 0;
     const Elf64_Rela *rela = NULL;
@@ -697,20 +693,12 @@ static int elf_apply_rela_relative(uint64_t load_base, const Elf64_Phdr *phdrs, 
     size_t nrel = relasz / relaent;
     for (size_t i = 0; i < nrel; i++) {
         const Elf64_Rela *r = (const Elf64_Rela *)((const char *)rela + i * relaent);
-        uint32_t rtype = (uint32_t)ELF64_R_TYPE(r->r_info);
+        if (ELF64_R_TYPE(r->r_info) != ELF_R_X86_64_RELATIVE)
+            continue;
         uint64_t *where = (uint64_t *)(uintptr_t)(load_base + r->r_offset);
         if ((uintptr_t)where < load_base || (uintptr_t)where >= (uintptr_t)MMIO_IDENTITY_LIMIT)
             return -1;
-        if (rtype == ELF_R_X86_64_RELATIVE) {
-            *where = load_base + (uint64_t)r->r_addend;
-        } else if (rtype == ELF_R_X86_64_IRELATIVE) {
-            typedef uint64_t (*irel_fn_t)(void);
-            irel_fn_t resolver = (irel_fn_t)(uintptr_t)(load_base + (uint64_t)r->r_addend);
-            if ((uintptr_t)resolver < load_base ||
-                (uintptr_t)resolver >= (uintptr_t)MMIO_IDENTITY_LIMIT)
-                return -1;
-            *where = resolver();
-        }
+        *where = load_base + (uint64_t)r->r_addend;
     }
     return 0;
 }
@@ -1663,6 +1651,8 @@ int kernel_execve_from_path(const char *path, const char *const argv[],
         } else {
             mm_release(new_mm);
         }
+        kprintf("execve: failed after activate rc=%d path=%s\n",
+                rc, path ? path : "?");
         return rc;
     }
 
@@ -1900,7 +1890,10 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         thread_t *tc = thread_current();
         if (elf_needs_private_user_pages(tc)) {
             uintptr_t tip_lo = final_stack > 0x8000u ? (final_stack - 0x8000u) : final_stack;
-            if (exec_map_stack_tip(tc, tip_lo, stack_top) != 0) return -1;
+            if (exec_map_stack_tip(tc, tip_lo, stack_top) != 0) {
+                kprintf("execve: failed to map stack tip (linux demand-stack)\n");
+                return -1;
+            }
         }
     }
 
@@ -1995,7 +1988,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
     uintptr_t fs_base = 0;
     if (aux_base == 0) {
         if (exec_seed_static_tls(stack_top, random_addr, &main_tls, &fs_base) != 0) {
-            kprintf("axonOS: failed to seed static TLS\n");
+            kprintf("execve: failed to seed static TLS\n");
             return -1;
         }
         msr_write_u64_local(MSR_FS_BASE_LOCAL, (uint64_t)fs_base);

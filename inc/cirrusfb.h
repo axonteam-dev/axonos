@@ -5,15 +5,13 @@
 #include <stddef.h>
 
 /*
- * Software text console (fbcon): glyphs into a linear framebuffer.
- * Cell size comes from the active font (default 8x16 or loaded .pf2).
+ * Software text console: 8x16 glyphs into a linear framebuffer.
  * Used by VMware SVGA (vmwgfx) and by the Cirrus PCI driver — not tied to Cirrus silicon.
+ * (Name is historical; the GPU is chosen by video_register_driver / vmwgfx_kernel_init.)
  */
 /* hw_cursor: Cirrus VGA sequencer cursor only; must be 0 on VMware SVGA (no Cirrus HW). */
 int cirrusfb_init(void *fb, uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp, uint32_t fb_size,
                   int hw_cursor);
-/* After font_load_pf2: recompute cols/rows and redraw. */
-int cirrusfb_recompute_geometry(void);
 int cirrusfb_is_ready(void);
 uint32_t cirrusfb_cols(void);
 uint32_t cirrusfb_rows(void);
@@ -22,13 +20,8 @@ void cirrusfb_putchar(uint8_t ch, uint8_t attr);
 /* TTY/devfs output: no ESC/CSI parsing (devfs already parses; avoids stale klog ANSI state). */
 void cirrusfb_putchar_literal(uint8_t ch, uint8_t attr);
 void cirrusfb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr);
-/* Fast path: same-attr run of printable glyphs (no per-cell flush). */
-void cirrusfb_putch_run(uint32_t x, uint32_t y, const uint8_t *chars, uint32_t n, uint8_t attr);
 void cirrusfb_set_cursor(uint32_t x, uint32_t y);
 void cirrusfb_get_cursor(uint32_t *x, uint32_t *y);
-/* Coalesce glyph/cursor updates across one tty write() (nano/htop redraw). */
-void cirrusfb_begin_batch(void);
-void cirrusfb_end_batch(void);
 void cirrusfb_clear(uint8_t attr);
 void cirrusfb_update_cursor(void);
 /* Pack screen like devfs tty buffer: [ch,attr] per cell, row-major, size = cols*rows*2 */

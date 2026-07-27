@@ -689,15 +689,23 @@ void kprintf(const char* fmt, ...)
 	va_start(ap, fmt);
 
 	uint8_t color = 0x07; // светло-серый на чёрном
-	unsigned long vga_fl;
-	acquire_irqsave(&vga_lock_spin, &vga_fl);
 	/* Keep devfs active tty cursor in sync with framebuffer/VGA backend.
-	 * Must use console_get/set_cursor (fb-aware), not VGA CRTC ports. */
+	 * Must use console_get/set_cursor (fb-aware), not VGA CRTC ports.
+	 *
+	 * When a tty is active, putc goes through console_set_cursor /
+	 * vga_putch_xy which take vga_lock_spin themselves. Holding the lock
+	 * here would deadlock on re-acquire (single-CPU spin). Only hold the
+	 * outer lock for the direct console_putc_nolock path. */
 	struct devfs_tty *tty = NULL;
-	if (devfs_is_ready()) {
+	unsigned long vga_fl = 0;
+	int hold_vga = 0;
+	if (devfs_is_ready())
 		tty = devfs_get_tty_by_index(devfs_get_active());
-		if (tty)
-			console_set_cursor(tty->cursor_x, tty->cursor_y);
+	if (tty) {
+		console_set_cursor(tty->cursor_x, tty->cursor_y);
+	} else {
+		acquire_irqsave(&vga_lock_spin, &vga_fl);
+		hold_vga = 1;
 	}
 	for (const char *p = fmt; *p; ) {
 		// Color tags are no longer supported; treat them as normal characters.
@@ -708,7 +716,10 @@ void kprintf(const char* fmt, ...)
 				cx = tty->cursor_x;
 				cy = tty->cursor_y;
 			} else {
-				console_get_cursor(&cx, &cy);
+				/* Already hold vga_lock_spin — do not call locking getters. */
+				uint16_t pos = get_cursor_nolock();
+				cx = (pos % (MAX_COLS * 2)) / 2;
+				cy = pos / (MAX_COLS * 2);
 			}
 			uint32_t spaces = 8u - (cx % 8u);
 			if (spaces == 0) spaces = 8;
@@ -858,15 +869,20 @@ PRINT_NUMBER_BASE10:
  		}
  	}
 
-	release_irqrestore(&vga_lock_spin, vga_fl);
+	if (hold_vga)
+		release_irqrestore(&vga_lock_spin, vga_fl);
 	va_end(ap);
 }
 
 void vga_set_cursor(uint32_t x, uint32_t y) {
 	if (cirrusfb_is_ready()) { cirrusfb_set_cursor(x, y); return; }
 	if (vbe_is_available()) { vbefb_set_cursor(x, y); return; }
-	set_cursor_x((uint16_t)x);
-	set_cursor_y((uint16_t)y);
+	if (x >= MAX_COLS) x = MAX_COLS - 1;
+	if (y >= MAX_ROWS) y = MAX_ROWS - 1;
+	unsigned long fl;
+	acquire_irqsave(&vga_lock_spin, &fl);
+	set_cursor_nolock((uint16_t)((y * MAX_COLS + x) * 2));
+	release_irqrestore(&vga_lock_spin, fl);
 }
 
 void vga_get_cursor(uint32_t* x, uint32_t* y) {

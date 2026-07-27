@@ -307,7 +307,7 @@ static int vmwgfx_mmio_id_only_window(volatile uint32_t *reg) {
 }
 
 /*
- * Coarse scan (4K step) up to cap - used only after strict verify fails.
+ * Coarse scan (4K step) up to cap — used only after strict verify fails.
  * Confirmed later by svga_negotiate_id / pick_mode (false positives get dropped).
  */
 static int vmwgfx_scan_bar_for_reg_window_loose(uint64_t pa, uint64_t bar_sz, size_t *reg_off_out) {
@@ -1178,7 +1178,6 @@ int vmwgfx_kernel_init(void) {
 
 	fbdev_register_linear(vd->mmio_base, g_vmwgfx.fb_pa + (uint64_t)g_vmwgfx.fb_offset,
 	                      (size_t)usable, vd->width, vd->height, vd->pitch, vd->bpp);
-	fbdev_sysfs_publish(g_vmwgfx.bus, g_vmwgfx.device, g_vmwgfx.function);
 
 	klogprintf("vmwgfx: ready %02x:%02x.%u %ux%u@%u fb=%p pa=0x%llx\n",
 	           g_vmwgfx.bus, g_vmwgfx.device, g_vmwgfx.function,

@@ -69,8 +69,7 @@ static int user_mmap_unmap_pages(thread_t *t, uintptr_t addr, size_t len) {
                                (uint64_t)addr + (uint64_t)len);
 }
 
-static int user_mmap_install_pages(uintptr_t addr, size_t len, uintptr_t top_limit,
-                                   int shared_mapping) {
+static int user_mmap_install_pages(uintptr_t addr, size_t len, uintptr_t top_limit) {
     if ((uint64_t)addr + (uint64_t)len > (uint64_t)top_limit)
         return -1;
     uint64_t req_lo = (uint64_t)addr & ~0xFFFULL;
@@ -80,22 +79,10 @@ static int user_mmap_install_pages(uintptr_t addr, size_t len, uintptr_t top_lim
     if (req_lo >= req_hi)
         return -1;
     /*
-     * MAP_SHARED anon must stay coherent across fork (nginx accept mutex /
-     * slab zones). Use identity VA==PA leaves; fork + #PF keep them shared.
-     * MAP_PRIVATE: never identity-map into a private mm (ash GPF after fork).
+     * Linux MAP_PRIVATE anon: do_mmap → new zero pages. Never map_page_2m(va,va)
+     * on a private mm — that re-identities into the parent/sibling phys and
+     * causes ash GPF at RIP=="ls" after fork.
      */
-    if (shared_mapping) {
-        uintptr_t map_begin = addr & ~((uintptr_t)PAGE_SIZE_2M - 1);
-        uintptr_t map_end = (uintptr_t)(((uint64_t)addr + (uint64_t)len + PAGE_SIZE_2M - 1) &
-                                        ~((uint64_t)PAGE_SIZE_2M - 1));
-        if (map_begin >= map_end || map_end > top_limit)
-            return -1;
-        for (uintptr_t va = map_begin; va < map_end; va += PAGE_SIZE_2M) {
-            if (map_page_2m(va, va, PG_PRESENT | PG_RW | PG_US) != 0)
-                return -1;
-        }
-        return 0;
-    }
     {
         thread_t *t = thread_get_current_user();
         if (!t)
@@ -104,21 +91,9 @@ static int user_mmap_install_pages(uintptr_t addr, size_t len, uintptr_t top_lim
         if (t && t->mm && k && t->mm->pml4 && k->pml4 &&
             t->mm->pml4 != k->pml4) {
             mm_t *share = t->mm_ptemplate ? t->mm_ptemplate : k;
-            if (!share || !share->pml4)
+            if (mm_privatize_identity_range_blank(t->mm, req_lo, req_hi) != 0)
                 return -1;
-            /*
-             * Linux do_mmap/do_anonymous_page: private anon → fresh zero pages.
-             * mm_demote_user_identity leaves !US identity; unmap must see those
-             * (mm_va_leaf_pa). Only clear [req_lo,req_hi) — wiping the whole
-             * covering 2MiB destroyed sibling anon maps (curl body buffer) so
-             * the later write(stdout) copy_from_user EFAULT'd → curl error 23.
-             */
-            if (mm_unmap_user_range(t->mm, share->pml4, req_lo, req_hi) != 0)
-                return -1;
-            if (mm_make_private_range_bulk_zero_force(t->mm, req_lo, req_hi,
-                                                     share) != 0)
-                return -1;
-            return 0;
+            return mm_make_private_range(t->mm, req_lo, req_hi, 0, share);
         }
     }
     uintptr_t map_begin = addr & ~((uintptr_t)PAGE_SIZE_2M - 1);
@@ -378,7 +353,7 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         if (user_mmap_unmap_pages(tcur, addr, len) != 0)
             return user_mm_ret_err(USER_MM_EFAULT);
         mmap_vma_kind = USER_VMA_KIND_MMAP_LAZY;
-    } else if (user_mmap_install_pages(addr, len, top_limit, shared_mapping) != 0) {
+    } else if (user_mmap_install_pages(addr, len, top_limit) != 0) {
         return user_mm_ret_err(USER_MM_EFAULT);
     }
 

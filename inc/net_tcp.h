@@ -3,16 +3,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef int (*net_tcp_send_l4_fn)(void *context, uint32_t dst_ip_be, uint8_t proto,
-                                  const void *l4, size_t l4_len);
-typedef int (*net_tcp_recv_frame_fn)(void *context, void *buf, size_t cap);
+typedef int (*net_tcp_send_l4_fn)(uint32_t dst_ip_be, uint8_t proto, const void *l4, size_t l4_len);
+typedef int (*net_tcp_recv_frame_fn)(void *buf, size_t cap);
 typedef uint64_t (*net_tcp_time_ms_fn)(void);
-typedef void (*net_tcp_yield_fn)(void *context);
+typedef void (*net_tcp_yield_fn)(void);
 /* Shared RX queue: put back a frame that does not belong to this TCP connection (Linux: other sockets still see it). */
 typedef void (*net_tcp_return_frame_fn)(const void *frame, size_t n);
 
 typedef struct {
-    void *context;
     uint32_t local_ip_be;
     net_tcp_send_l4_fn send_l4;
     net_tcp_recv_frame_fn recv_frame;
@@ -27,10 +25,7 @@ typedef struct {
     int connect_pending; /* nonblocking connect: SYN sent, awaiting SYN-ACK */
     int connect_peer_pkts; /* RX TCP segments from peer during connect (debug) */
     int connect_refused; /* valid RST while connecting: SO_ERROR/errno = ECONNREFUSED */
-    uint64_t connect_syn_ms; /* last SYN (re)transmit time for nonblocking poll */
     int peer_fin;
-    int peer_fin_pending; /* FIN seen but rcv_nxt has not reached fin seq yet */
-    uint32_t peer_fin_seq; /* seq of FIN (after any payload on that segment) */
     int peer_rst;
     uint32_t dst_ip_be;
     uint16_t dst_port;
@@ -42,18 +37,11 @@ typedef struct {
     /* Bigger receive window for HTTP downloads; 8 KiB caused frequent sender stalls. */
     uint8_t rx_buf[65536];
     size_t rx_len;
-    /*
-     * Bounded selective reassembly queue. A single saved segment cannot
-     * represent normal VMware/NAT reordering and used to silently lose tails
-     * when an in-order retransmit overlapped the saved segment.
-     */
-#define NET_TCP_OOO_SLOTS 16
-#define NET_TCP_OOO_BYTES 1600
-    uint8_t ooo_buf[NET_TCP_OOO_SLOTS][NET_TCP_OOO_BYTES];
-    size_t ooo_len[NET_TCP_OOO_SLOTS];
-    uint32_t ooo_seq[NET_TCP_OOO_SLOTS];
-    uint8_t ooo_slot_valid[NET_TCP_OOO_SLOTS];
-    int ooo_valid; /* number of occupied slots */
+    /* One out-of-order segment (reordering after ~15 KiB was stalling wget). */
+    uint8_t ooo_buf[2048];
+    size_t ooo_len;
+    uint32_t ooo_seq;
+    int ooo_valid;
     /* Server path: L2 address learned from the client's SYN (avoid ARP before SYN-ACK). */
     uint8_t peer_mac[6];
     int peer_mac_valid;

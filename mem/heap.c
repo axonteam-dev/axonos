@@ -399,20 +399,6 @@ uintptr_t heap_region_end_exclusive(void) {
     return hi;
 }
 
-int heap_ptr_is_kmalloc(const void *ptr) {
-    if (!ptr || !heap_ptr_in_range(ptr))
-        return 0;
-    const heap_block_header_t *blk =
-        (const heap_block_header_t *)((const uint8_t *)ptr - sizeof(heap_block_header_t));
-    if (!heap_ptr_in_range(blk))
-        return 0;
-    unsigned long flags = 0;
-    acquire_irqsave(&heap_lock, &flags);
-    int ok = (blk->magic == HEAP_MAGIC_ALLOC && !blk->free);
-    release_irqrestore(&heap_lock, flags);
-    return ok;
-}
-
 /* Return largest single free payload size currently available (doesn't include header). */
 static size_t heap_largest_free_block(void) {
     size_t max = 0;

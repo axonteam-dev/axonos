@@ -542,31 +542,6 @@ void user_vma_teardown_unmap_for_exec(thread_t *runner) {
     release_irqrestore(&g_user_vma_lock, fl);
 }
 
-int user_vma_allows_write(thread_t *runner, uintptr_t va) {
-    if (!runner || va < 0x200000u || va >= (uintptr_t)MMIO_IDENTITY_LIMIT)
-        return 0;
-    unsigned long fl = 0;
-    int allow = 0;
-    acquire_irqsave(&g_user_vma_lock, &fl);
-    for (int i = 0; i < USER_VMA_MAX; i++) {
-        if (!g_user_vmas[i].used)
-            continue;
-        if (!user_vma_tid_matches_runner_mm_nolock(runner,
-                                                   (uint64_t)g_user_vmas[i].tid))
-            continue;
-        if ((g_user_vmas[i].prot & 2) == 0)
-            continue;
-        uintptr_t a = g_user_vmas[i].addr;
-        uintptr_t e = a + g_user_vmas[i].len;
-        if (va >= a && va < e) {
-            allow = 1;
-            break;
-        }
-    }
-    release_irqrestore(&g_user_vma_lock, fl);
-    return allow;
-}
-
 int user_vma_is_shared_page(uint64_t tid, uintptr_t va) {
     unsigned long fl = 0;
     int shared = 0;
@@ -695,17 +670,16 @@ int user_vma_fault_lazy_anon(uint64_t cr2) {
         }
     }
     release_irqrestore(&g_user_vma_lock, fl);
-    (void)zlen;
     /*
-     * Linux do_anonymous_page: one 4K zero page. Never map_page_2m(va,va) +
-     * memset of a 2MiB chunk (zeros vfork parent phys / sibling anon pages).
+     * Linux do_anonymous_page: private mm gets anon zero pages — never
+     * map_page_2m(va,va)+VA memset (that zeros the vfork parent's brk phys).
      */
     {
         mm_t *k = mm_kernel();
         if (t->mm && k && t->mm->pml4 && k->pml4 && t->mm->pml4 != k->pml4) {
             mm_t *share = t->mm_ptemplate ? t->mm_ptemplate : k;
-            uint64_t lo = (uint64_t)cr2 & ~0xFFFULL;
-            uint64_t hi = lo + 0x1000ULL;
+            uint64_t lo = (uint64_t)va2m;
+            uint64_t hi = lo + (uint64_t)zlen;
             if (mm_privatize_identity_range_blank(t->mm, lo, hi) != 0)
                 return 0;
             if (mm_make_private_range_noyield(t->mm, lo, hi, 0, share) != 0)
@@ -715,7 +689,7 @@ int user_vma_fault_lazy_anon(uint64_t cr2) {
     }
     if (map_page_2m((uint64_t)va2m, (uint64_t)va2m, PG_PRESENT | PG_RW | PG_US) != 0)
         return 0;
-    memset((void *)(uintptr_t)((uint64_t)cr2 & ~0xFFFULL), 0, 0x1000u);
+    memset((void *)(uintptr_t)va2m, 0, zlen);
     return 1;
 }
 
@@ -768,23 +742,16 @@ int user_vma_fault_nonpresent(uint64_t cr2, uint64_t err) {
             mm_t *share = t->mm_ptemplate ? t->mm_ptemplate : k;
             uint64_t lo = (uint64_t)(cr2 & ~0xFFFULL);
             uint64_t hi = lo + 0x1000ULL;
-            if (hit_copy.kind == USER_VMA_KIND_SHM) {
-                /*
-                 * MAP_SHARED anon uses identity VA==PA. Do not privatize/blank —
-                 * that breaks nginx master↔worker shared zones. Install the same
-                 * identity leaf into this mm so writers stay coherent.
-                 */
-                if (mm_clear_range_private(t->mm, share->pml4, lo, hi) != 0)
-                    return 0;
-                /* map_page_2m updates live CR3 (already this process after #PF). */
-                if (map_page_2m((uint64_t)(lo & ~((uint64_t)PAGE_SIZE_2M - 1)),
-                                (uint64_t)(lo & ~((uint64_t)PAGE_SIZE_2M - 1)),
-                                PG_PRESENT | PG_RW | PG_US) != 0)
-                    return 0;
-                return 1;
+            if (hit_copy.kind == USER_VMA_KIND_MMAP_LAZY) {
+                lo = (uint64_t)va2m;
+                uint64_t hit_end = (uint64_t)hit_copy.addr + (uint64_t)hit_copy.len;
+                uint64_t chunk_end = lo + (uint64_t)PAGE_SIZE_2M;
+                if (chunk_end > hit_end)
+                    chunk_end = hit_end;
+                if (chunk_end <= lo)
+                    return 1;
+                hi = chunk_end;
             }
-            /* Linux do_anonymous_page: commit one 4K page. Filling a whole 2MiB
-             * chunk re-zeroed sibling anon pages in the same huge leaf. */
             if (mm_privatize_identity_range_blank(t->mm, lo, hi) != 0)
                 return 0;
             if (mm_make_private_range_noyield(t->mm, lo, hi, 0, share) != 0)

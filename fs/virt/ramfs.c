@@ -190,26 +190,16 @@ static struct ramfs_node *ramfs_resolve_link(struct ramfs_node *n) {
     return (n && n->link_target) ? n->link_target : n;
 }
 
-static void ramfs_free_data_owned(struct ramfs_node *n) {
-    if (!n || !n->data)
-        return;
-    if (!n->data_borrowed && heap_ptr_is_kmalloc(n->data))
-        kfree(n->data);
-    n->data = NULL;
-    n->data_borrowed = 0;
-    n->capacity = 0;
-}
-
 static void ramfs_free_node_shallow(struct ramfs_node *n) {
     if (!n) return;
     if (n->name) kfree(n->name);
-    ramfs_free_data_owned(n);
+    if (n->data && !n->data_borrowed) kfree(n->data);
     kfree(n);
 }
 
 static int ramfs_materialize_node_locked(struct ramfs_node *n) {
     if (!n || n->is_dir || !n->data_borrowed) return 0;
-    if (n->size == 0 || !n->data) {
+    if (n->size == 0) {
         n->data = NULL;
         n->data_borrowed = 0;
         n->capacity = 0;
@@ -222,29 +212,6 @@ static int ramfs_materialize_node_locked(struct ramfs_node *n) {
     n->data_borrowed = 0;
     n->capacity = n->size;
     return 0;
-}
-
-/*
- * Before krealloc/kfree: ensure n->data is a live kmalloc block.
- * Empty initfs borrows used to leave a raw archive pointer with
- * data_borrowed=0 → krealloc(initrd) Oops (repos.conf / vi :w).
- */
-static int ramfs_ensure_heap_data_locked(struct ramfs_node *n) {
-    if (!n || n->is_dir)
-        return 0;
-    if (n->data_borrowed)
-        return ramfs_materialize_node_locked(n);
-    if (!n->data)
-        return 0;
-    if (heap_ptr_is_kmalloc(n->data))
-        return 0;
-    if (n->size == 0) {
-        n->data = NULL;
-        n->capacity = 0;
-        return 0;
-    }
-    n->data_borrowed = 1;
-    return ramfs_materialize_node_locked(n);
 }
 
 static struct ramfs_node *ramfs_find_child(struct ramfs_node *parent, const char *name) {
@@ -527,23 +494,11 @@ int ramfs_create_borrowed_file(const char *path, const void *data, size_t size) 
     }
     unsigned long irqf;
     acquire_irqsave(&n->io_lock, &irqf);
-    /*
-     * Linux empty regular file: no backing pages. Never keep a raw initrd
-     * pointer when size==0 — that left data_borrowed=0 and later krealloc'd
-     * the archive address (heap: invalid realloc / fake ramfs OOM).
-     */
-    if (data && size > 0) {
-        n->data = (char *)data;
-        n->data_borrowed = 1;
-        n->size = size;
-        n->capacity = size;
-    } else {
-        n->data = NULL;
-        n->data_borrowed = 0;
-        n->size = 0;
-        n->capacity = 0;
-    }
-    f->size = (off_t)n->size;
+    n->data = (char *)data;
+    n->data_borrowed = (data && size > 0) ? 1 : 0;
+    n->size = size;
+    n->capacity = size;
+    f->size = (off_t)size;
     release_irqrestore(&n->io_lock, irqf);
     ramfs_release(f);
     return 0;
@@ -725,13 +680,18 @@ int ramfs_ftruncate(struct fs_file *file, off_t length) {
         return 0;
     }
     if (newsize == 0) {
-        ramfs_free_data_owned(n);
+        if (n->data && !n->data_borrowed) {
+            kfree(n->data);
+        }
+        n->data = NULL;
+        n->data_borrowed = 0;
         n->size = 0;
+        n->capacity = 0;
         file->size = 0;
         release_irqrestore(&n->io_lock, irqf);
         return 0;
     }
-    if (ramfs_ensure_heap_data_locked(n) != 0) {
+    if (n->data_borrowed && ramfs_materialize_node_locked(n) != 0) {
         release_irqrestore(&n->io_lock, irqf);
         return -12;
     }
@@ -811,7 +771,7 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
      * an ordinary spinlock still serializes this transaction safely.
      */
     acquire(&n->io_lock);
-    if (ramfs_ensure_heap_data_locked(n) != 0) {
+    if (n->data_borrowed && ramfs_materialize_node_locked(n) != 0) {
         release(&n->io_lock);
         return -1;
     }
@@ -991,41 +951,13 @@ int ramfs_remove(const char *path) {
      */
     thread_t* ct = thread_current();
     if (ct && ct->euid != 0) return -1;
-    /* unlink(2): do not follow the final symlink; operate on the dentry. */
-    struct ramfs_node *n = ramfs_lookup_nofollow(path);
+    struct ramfs_node *n = ramfs_lookup(path);
     if (!n) return -3;
     struct ramfs_node *p = n->parent;
     if (!p) return -4;
-
-    /* Hard-link dentry: drop the name, keep the inode until nlink==0. */
-    if (n->link_target) {
-        struct ramfs_node *target = n->link_target;
-        ramfs_unlink_from_parent(n);
-        if (n->name) kfree(n->name);
-        kfree(n);
-        if (target->nlink > 0)
-            target->nlink--;
-        if (target->nlink == 0) {
-            if (target->parent)
-                ramfs_unlink_from_parent(target);
-            if (target->name) {
-                kfree(target->name);
-                target->name = NULL;
-            }
-            ramfs_free_data_owned(target);
-            kfree(target);
-        }
-        return 0;
-    }
-
     ramfs_unlink_from_parent(n);
-    if (n->nlink > 0)
-        n->nlink--;
-    /* Still named via hard-link dentries — leave orphan inode alive. */
-    if (!n->is_dir && n->nlink > 0)
-        return 0;
-
     /* free recursively */
+    /* simple recursive free */
     struct ramfs_node *stack[64]; int sp = 0;
     stack[sp++] = n;
     while (sp) {
@@ -1036,10 +968,55 @@ int ramfs_remove(const char *path) {
             if (sp < 64) stack[sp++] = c;
         }
         if (cur->name) kfree(cur->name);
-        ramfs_free_data_owned(cur);
+        if (cur->data && !cur->data_borrowed) kfree(cur->data);
         kfree(cur);
     }
     return 0;
+}
+
+/* Whiteout marker: S_IFCHR with uid=0xffff (overlayfs upper). */
+#define RAMFS_WHITEOUT_UID 0xffffu
+
+int ramfs_make_whiteout(const char *path) {
+    struct fs_file *f = NULL;
+    int rc;
+    if (!path || path[0] != '/')
+        return -1;
+    (void)ramfs_remove(path);
+    rc = ramfs_create(path, &f);
+    if (rc != 0 || !f || !f->driver_private) {
+        if (f) ramfs_release(f);
+        return -1;
+    }
+    {
+        struct ramfs_file_handle *fh = (struct ramfs_file_handle *)f->driver_private;
+        struct ramfs_node *n = fh->node;
+        n->mode = S_IFCHR | 0;
+        n->uid = RAMFS_WHITEOUT_UID;
+        n->gid = 0;
+        n->size = 0;
+        if (n->data && !n->data_borrowed)
+            kfree(n->data);
+        n->data = NULL;
+        n->capacity = 0;
+        n->data_borrowed = 0;
+    }
+    ramfs_release(f);
+    return 0;
+}
+
+int ramfs_path_is_whiteout(const char *path) {
+    struct ramfs_node *n;
+    if (!path)
+        return 0;
+    n = ramfs_lookup_nofollow(path);
+    if (!n)
+        return 0;
+    return ((n->mode & 0170000) == S_IFCHR) && (n->uid == RAMFS_WHITEOUT_UID);
+}
+
+struct fs_driver *ramfs_get_driver(void) {
+    return &ramfs_driver;
 }
 
 int ramfs_register(void) {

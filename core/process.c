@@ -50,10 +50,6 @@ static process_t *process_alloc_locked(process_t *parent) {
     p->sid = (int)p->pid;
     strncpy(p->cwd, "/", sizeof(p->cwd));
     p->cwd[sizeof(p->cwd) - 1] = '\0';
-    /* Default: one supplementary group matching egid (root). */
-    p->ngroups = 1;
-    p->groups[0] = 0;
-    p->dumpable = 1; /* Linux SUID_DUMP_USER */
 
     if (parent) {
         p->next_sibling = parent->first_child;
@@ -64,14 +60,6 @@ static process_t *process_alloc_locked(process_t *parent) {
         p->gid = parent->gid;
         p->egid = parent->egid;
         p->sgid = parent->sgid;
-        p->ngroups = parent->ngroups;
-        if (p->ngroups < 0)
-            p->ngroups = 0;
-        p->dumpable = parent->dumpable;
-        if (p->ngroups > AXON_NGROUPS_MAX)
-            p->ngroups = AXON_NGROUPS_MAX;
-        if (p->ngroups > 0)
-            memcpy(p->groups, parent->groups, (size_t)p->ngroups * sizeof(gid_t));
         p->umask = parent->umask;
         p->pgid = parent->pgid;
         p->sid = parent->sid;
@@ -111,8 +99,7 @@ void process_attach_thread(process_t *process, thread_t *thread) {
      * CLONE_THREAD peers must not overwrite leader (that broke kill/ps).
      * Unify process->pid with leader->tid so /proc and kill share one namespace.
      */
-    int first_attach = (process->leader == NULL);
-    if (first_attach) {
+    if (!process->leader) {
         process->leader = thread;
         process->pid = thread->tid ? thread->tid : 1;
         if (next_pid <= process->pid)
@@ -132,27 +119,10 @@ void process_attach_thread(process_t *process, thread_t *thread) {
     process->gid = thread->gid;
     process->egid = thread->egid;
     process->sgid = thread->sgid;
-    process->ngroups = thread->ngroups;
-    if (process->ngroups < 0)
-        process->ngroups = 0;
-    if (process->ngroups > AXON_NGROUPS_MAX)
-        process->ngroups = AXON_NGROUPS_MAX;
-    if (process->ngroups > 0)
-        memcpy(process->groups, thread->groups,
-               (size_t)process->ngroups * sizeof(gid_t));
     process->umask = thread->umask;
     memcpy(process->cwd, thread->cwd, sizeof(process->cwd));
-    /*
-     * Publish fds only on the first attach (leader / new process).
-     * CLONE_THREAD peers arrive with empty thread->fds; copying that over the
-     * shared process table wiped stdin/stdout so the next open()/socket()
-     * reused fd 0/1/2. write() via syscall_fd_get then hit a socket instead of
-     * the tty → curl error 23 ("passed N returned 0").
-     */
-    if (first_attach) {
-        for (int i = 0; i < PROCESS_MAX_FD; ++i)
-            process->fds[i] = thread->fds[i];
-    }
+    for (int i = 0; i < PROCESS_MAX_FD; ++i)
+        process->fds[i] = thread->fds[i];
     release_irqrestore(&process_lock, flags);
 }
 
@@ -172,14 +142,6 @@ void process_sync_from_thread(process_t *process, thread_t *thread) {
     process->gid = thread->gid;
     process->egid = thread->egid;
     process->sgid = thread->sgid;
-    process->ngroups = thread->ngroups;
-    if (process->ngroups < 0)
-        process->ngroups = 0;
-    if (process->ngroups > AXON_NGROUPS_MAX)
-        process->ngroups = AXON_NGROUPS_MAX;
-    if (process->ngroups > 0)
-        memcpy(process->groups, thread->groups,
-               (size_t)process->ngroups * sizeof(gid_t));
     process->umask = thread->umask;
     memcpy(process->cwd, thread->cwd, sizeof(process->cwd));
     for (int i = 0; i < PROCESS_MAX_FD; ++i)
@@ -196,16 +158,10 @@ process_t *process_find(uint64_t pid) {
         process_t *p = process_table[i];
         if (!p || p->pid != pid)
             continue;
-        /* Prefer a live task with a live leader. Do not mutate state here —
-         * demoting to ZOMBIE during lookup left /sbin/init stuck as Z in htop. */
+        /* Prefer a live task; a recycled TGID must not hit a stale zombie. */
         if (p->state == PROCESS_ALIVE) {
-            if (p->leader && p->leader->state != THREAD_TERMINATED) {
-                result = p;
-                break;
-            }
-            if (!zombie)
-                zombie = p;
-            continue;
+            result = p;
+            break;
         }
         if (!zombie)
             zombie = p;
@@ -499,8 +455,6 @@ int process_collect_signal_targets(process_t *caller, int pid,
         process_t *p = process_table[i];
         if (!p || p->state != PROCESS_ALIVE || !p->leader)
             continue;
-        if (p->leader->state == THREAD_TERMINATED)
-            continue;
         int match;
         if (pid > 0)
             match = p->pid == (uint64_t)(unsigned)pid;
@@ -553,70 +507,4 @@ int process_signal_targets(process_t *caller, int pid, int sig) {
         }
     }
     return count;
-}
-
-#ifndef SIGALRM
-#define SIGALRM 14
-#endif
-
-void process_arm_itimer_real(process_t *p, uint64_t expire_ms, uint32_t interval_ms) {
-    if (!p)
-        return;
-    unsigned long flags;
-    acquire_irqsave(&process_lock, &flags);
-    p->itimer_interval_ms = interval_ms;
-    p->itimer_expire_ms = expire_ms;
-    release_irqrestore(&process_lock, flags);
-}
-
-void process_get_itimer_real(process_t *p, uint32_t *value_ms, uint32_t *interval_ms,
-                             uint64_t now_ms) {
-    if (value_ms)
-        *value_ms = 0;
-    if (interval_ms)
-        *interval_ms = 0;
-    if (!p)
-        return;
-    unsigned long flags;
-    acquire_irqsave(&process_lock, &flags);
-    if (interval_ms)
-        *interval_ms = p->itimer_interval_ms;
-    if (value_ms) {
-        if (p->itimer_expire_ms == 0 || now_ms >= p->itimer_expire_ms)
-            *value_ms = 0;
-        else {
-            uint64_t rem = p->itimer_expire_ms - now_ms;
-            *value_ms = rem > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)rem;
-        }
-    }
-    release_irqrestore(&process_lock, flags);
-}
-
-void process_itimer_tick(uint64_t now_ms) {
-    unsigned long flags;
-    acquire_irqsave(&process_lock, &flags);
-    for (int i = 0; i < PROCESS_TABLE_MAX; ++i) {
-        process_t *p = process_table[i];
-        if (!p || p->state != PROCESS_ALIVE || p->itimer_expire_ms == 0)
-            continue;
-        if (now_ms < p->itimer_expire_ms)
-            continue;
-        if (p->itimer_interval_ms)
-            p->itimer_expire_ms = now_ms + (uint64_t)p->itimer_interval_ms;
-        else
-            p->itimer_expire_ms = 0;
-        process_t *fire = p;
-        release_irqrestore(&process_lock, flags);
-        for (int ti = 0; ti < thread_get_count(); ++ti) {
-            thread_t *t = thread_get_by_index(ti);
-            if (!t || t->process != fire || t->state == THREAD_TERMINATED)
-                continue;
-            t->pending_signals |= (1ULL << (SIGALRM - 1));
-            if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING)
-                thread_unblock((int)(t->tid ? t->tid : 1));
-        }
-        thread_request_resched();
-        acquire_irqsave(&process_lock, &flags);
-    }
-    release_irqrestore(&process_lock, flags);
 }

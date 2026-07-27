@@ -4,6 +4,7 @@
 #include <serial.h>
 #include <string.h>
 #include <pit.h>
+#include <apic_timer.h>
 #include <vga.h>
 
 /*

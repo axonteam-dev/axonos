@@ -1,13 +1,14 @@
 #include <cirrusfb.h>
 #include <stdint.h>
 #include <string.h>
-#include <font.h>
+#include <fonts/default_8x16.h>
 #include <vga.h>
 #include <klog.h>
 #include <video.h>
 #include <pit.h>
 #include <devfs.h>
-#include <heap.h>
+#include <mmio.h>
+#include <serial.h>
 
 /* VGA Sequencer registers for Cirrus hardware cursor */
 #define VGA_SEQ_INDEX   0x3C4
@@ -41,9 +42,8 @@ static int g_hwcursor_ok = 0;
 
 static uint32_t g_cols = 0;
 static uint32_t g_rows = 0;
-
-static inline uint32_t FONT_W(void) { return font_cell_width(); }
-static inline uint32_t FONT_H(void) { return font_cell_height(); }
+static const uint32_t FONT_W = 8;
+static const uint32_t FONT_H = 16;
 
 typedef struct { uint8_t ch; uint8_t attr; } cell_t;
 static cell_t *g_textbuf = NULL;
@@ -62,9 +62,6 @@ static uint64_t g_swcursor_last_phase = 0;
 /* Coalesce SVGA FIFO updates: many glyphs -> one dirty rect + one SYNC. */
 static int g_fb_dirty = 0;
 static uint32_t g_dirty_x0 = 0, g_dirty_y0 = 0, g_dirty_x1 = 0, g_dirty_y1 = 0;
-static int g_batch_depth = 0;
-static int g_hwcursor_deferred = 0;
-static uint32_t g_hwcursor_def_x = 0, g_hwcursor_def_y = 0;
 
 static void fb_dirty_mark(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 	if (w == 0 || h == 0) return;
@@ -86,35 +83,13 @@ static void fb_dirty_mark(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 	if (y1 > g_dirty_y1) g_dirty_y1 = y1;
 }
 
-static void hwcursor_set_pos(uint32_t x, uint32_t y);
-
 static void cirrusfb_flush_dirty(void) {
 	if (!g_fb_dirty || !g_ready) return;
-	/* Nested tty write batches: keep dirty until outermost end_batch. */
-	if (g_batch_depth > 0) return;
 	uint32_t w = g_dirty_x1 - g_dirty_x0 + 1;
 	uint32_t h = g_dirty_y1 - g_dirty_y0 + 1;
 	video_flush_region_pixels(g_dirty_x0, g_dirty_y0, w, h);
 	video_display_sync();
 	g_fb_dirty = 0;
-}
-
-void cirrusfb_begin_batch(void) {
-	if (g_batch_depth < 64)
-		g_batch_depth++;
-}
-
-void cirrusfb_end_batch(void) {
-	if (g_batch_depth <= 0)
-		return;
-	g_batch_depth--;
-	if (g_batch_depth > 0)
-		return;
-	if (g_hwcursor_deferred && g_ready && g_hwcursor_ok) {
-		hwcursor_set_pos(g_hwcursor_def_x, g_hwcursor_def_y);
-		g_hwcursor_deferred = 0;
-	}
-	cirrusfb_flush_dirty();
 }
 
 /* ANSI: kputchar() goes straight here when Cirrus is active — devfs may not see all output. */
@@ -164,13 +139,36 @@ static void draw_glyph_noflush(uint32_t cx, uint32_t cy, uint8_t ch, uint8_t att
 		return;
 	uint32_t fg_pix = rgb_to_pixel(attr_to_rgb(attr, 1));
 	uint32_t bg_pix = rgb_to_pixel(attr_to_rgb(attr, 0));
-	uint32_t fw = FONT_W();
-	uint32_t fh = FONT_H();
-	uint32_t px = cx * fw;
-	uint32_t py = cy * fh;
+
+	uint32_t px = cx * FONT_W;
+	uint32_t py = cy * FONT_H;
 	uint32_t bpp = (g_bpp + 7) / 8;
-	font_blit_glyph(g_fb, g_pitch, bpp, px, py, ch, fg_pix, bg_pix);
-	fb_dirty_mark(px, py, fw, fh);
+
+	if (bpp == 4) {
+		for (uint32_t row = 0; row < FONT_H; row++) {
+			uint8_t glyph = font8x16[ch][row];
+			uint32_t *line = (uint32_t *)((uint8_t *)g_fb + (py + row) * g_pitch + px * 4);
+			for (uint32_t bit = 0; bit < FONT_W; bit++) {
+				line[bit] = (glyph & (1u << (7 - bit))) ? fg_pix : bg_pix;
+			}
+		}
+	} else {
+		for (uint32_t row = 0; row < FONT_H; row++) {
+			uint8_t glyph = font8x16[ch][row];
+			uint8_t *line = (uint8_t *)g_fb + (py + row) * g_pitch + px * bpp;
+			for (uint32_t bit = 0; bit < FONT_W; bit++) {
+				uint32_t pix = (glyph & (1u << (7 - bit))) ? fg_pix : bg_pix;
+				if (bpp == 3) {
+					line[bit * 3 + 0] = pix & 0xFF;
+					line[bit * 3 + 1] = (pix >> 8) & 0xFF;
+					line[bit * 3 + 2] = (pix >> 16) & 0xFF;
+				} else if (bpp == 2) {
+					*(uint16_t *)(line + bit * 2) = (uint16_t)pix;
+				}
+			}
+		}
+	}
+	fb_dirty_mark(px, py, FONT_W, FONT_H);
 }
 
 static void draw_text_row_noflush(uint32_t row) {
@@ -194,17 +192,17 @@ static void swcursor_draw_at(uint32_t cx, uint32_t cy) {
 	if (!g_ready || !g_textbuf || !g_fb) return;
 	if (cx >= g_cols || cy >= g_rows) return;
 
-	uint32_t px = cx * FONT_W();
-	uint32_t py = cy * FONT_H();
+	uint32_t px = cx * FONT_W;
+	uint32_t py = cy * FONT_H;
 	uint32_t bpp = (g_bpp + 7) / 8;
 
 	uint8_t attr = g_textbuf[cy * g_cols + cx].attr;
 	uint32_t fg_pix = rgb_to_pixel(attr_to_rgb(attr, 1));
 
 	/* Underscore cursor: paint bottom 2 scanlines in FG color. */
-	for (uint32_t row = (FONT_H() - 2); row < FONT_H(); row++) {
+	for (uint32_t row = (FONT_H - 2); row < FONT_H; row++) {
 		uint8_t *line = (uint8_t*)g_fb + (py + row) * g_pitch + px * bpp;
-		for (uint32_t bit = 0; bit < FONT_W(); bit++) {
+		for (uint32_t bit = 0; bit < FONT_W; bit++) {
 			if (bpp == 4) {
 				*(uint32_t*)(line + bit * 4) = fg_pix;
 			} else if (bpp == 3) {
@@ -216,7 +214,7 @@ static void swcursor_draw_at(uint32_t cx, uint32_t cy) {
 			}
 		}
 	}
-	fb_dirty_mark(px, py + (FONT_H() - 2), FONT_W(), 2);
+	fb_dirty_mark(px, py + (FONT_H - 2), FONT_W, 2);
 }
 
 static void put_pixel_noflush(uint32_t px, uint32_t py, uint32_t pix) {
@@ -244,7 +242,7 @@ void cirrusfb_dismiss_boot_logo(void) {
 	g_margin_rows = 0;
 	for (uint32_t r = 0; r < rows && r < g_rows; r++)
 		draw_text_row_noflush(r);
-	fb_dirty_mark(0, 0, g_width, rows * FONT_H());
+	fb_dirty_mark(0, 0, g_width, rows * FONT_H);
 	cirrusfb_flush_dirty();
 }
 
@@ -261,8 +259,8 @@ static void scroll_up(void) {
 			g_textbuf[(g_rows - 1) * g_cols + x].attr = g_current_attr;
 		}
 		size_t row_bytes = g_pitch;
-		size_t move_bytes = row_bytes * (g_height - FONT_H());
-		memmove(g_fb, (uint8_t *)g_fb + FONT_H() * row_bytes, move_bytes);
+		size_t move_bytes = row_bytes * (g_height - FONT_H);
+		memmove(g_fb, (uint8_t *)g_fb + FONT_H * row_bytes, move_bytes);
 		draw_text_row_noflush(g_rows - 1);
 	} else {
 		size_t row_cells = (size_t)g_cols * sizeof(cell_t);
@@ -273,8 +271,8 @@ static void scroll_up(void) {
 			g_textbuf[(g_rows - 1) * g_cols + x].ch = ' ';
 			g_textbuf[(g_rows - 1) * g_cols + x].attr = g_current_attr;
 		}
-		uint32_t y0 = top * FONT_H();
-		uint32_t y1 = (top + 1) * FONT_H();
+		uint32_t y0 = top * FONT_H;
+		uint32_t y1 = (top + 1) * FONT_H;
 		size_t move_bytes = (size_t)g_pitch * (g_height - y1);
 		memmove((uint8_t *)g_fb + y0 * g_pitch,
 		        (uint8_t *)g_fb + y1 * g_pitch,
@@ -364,8 +362,8 @@ static void hwcursor_set_pos(uint32_t x, uint32_t y) {
 	if (!g_hwcursor_ok) return;
 
 	/* Pixel position for cursor hotspot */
-	uint32_t px = x * FONT_W();
-	uint32_t py = y * FONT_H() + FONT_H() - 2; /* Position at bottom of cell (underscore style) */
+	uint32_t px = x * FONT_W;
+	uint32_t py = y * FONT_H + FONT_H - 2; /* Position at bottom of cell (underscore style) */
 
 	/* SR13: X position bits 7:0 */
 	seq_write(SR13_CURSOR_X_LO, (uint8_t)(px & 0xFF));
@@ -402,8 +400,8 @@ int cirrusfb_init(void *fb, uint32_t width, uint32_t height, uint32_t pitch, uin
 	g_pitch = pitch;
 	g_bpp = bpp;
 	g_fb_size = fb_size ? fb_size : (pitch * height);
-	g_cols = width / FONT_W();
-	g_rows = height / FONT_H();
+	g_cols = width / FONT_W;
+	g_rows = height / FONT_H;
 	if (g_cols == 0 || g_rows == 0) return -1;
 
 	extern void *kmalloc(size_t);
@@ -454,78 +452,6 @@ void cirrusfb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	g_textbuf[y * g_cols + x].attr = attr;
 	draw_glyph_noflush(x, y, ch, attr);
 	cirrusfb_flush_dirty();
-}
-
-void cirrusfb_putch_run(uint32_t x, uint32_t y, const uint8_t *chars, uint32_t n, uint8_t attr) {
-	if (!g_ready || !g_textbuf || !chars || n == 0 || y >= g_rows || x >= g_cols)
-		return;
-	if (x + n > g_cols)
-		n = g_cols - x;
-	uint32_t fw = FONT_W();
-	uint32_t fh = FONT_H();
-	uint32_t bpp = (g_bpp + 7) / 8;
-	uint32_t fg_pix = rgb_to_pixel(attr_to_rgb(attr, 1));
-	uint32_t bg_pix = rgb_to_pixel(attr_to_rgb(attr, 0));
-	for (uint32_t i = 0; i < n; i++) {
-		uint8_t ch = chars[i];
-		g_textbuf[y * g_cols + x + i].ch = ch;
-		g_textbuf[y * g_cols + x + i].attr = attr;
-		if (g_logo_visible && g_margin_rows > 0 && y < g_margin_rows)
-			continue;
-		font_blit_glyph(g_fb, g_pitch, bpp, (x + i) * fw, y * fh, ch, fg_pix, bg_pix);
-	}
-	fb_dirty_mark(x * fw, y * fh, n * fw, fh);
-	cirrusfb_flush_dirty();
-}
-
-int cirrusfb_recompute_geometry(void) {
-	if (!g_ready || !g_fb)
-		return -1;
-	uint32_t fw = FONT_W();
-	uint32_t fh = FONT_H();
-	if (fw == 0 || fh == 0)
-		return -1;
-	uint32_t nc = g_width / fw;
-	uint32_t nr = g_height / fh;
-	if (nc == 0 || nr == 0)
-		return -1;
-	if (nc == g_cols && nr == g_rows) {
-		/* Same grid — just repaint with new glyph bitmaps. */
-		for (uint32_t r = 0; r < g_rows; r++)
-			draw_text_row_noflush(r);
-		fb_dirty_mark(0, 0, g_width, g_height);
-		cirrusfb_flush_dirty();
-		return 0;
-	}
-	cell_t *nt = (cell_t *)kmalloc(nc * nr * sizeof(cell_t));
-	if (!nt)
-		return -1;
-	for (uint32_t i = 0; i < nc * nr; i++) {
-		nt[i].ch = ' ';
-		nt[i].attr = 0x07;
-	}
-	uint32_t copy_cols = nc < g_cols ? nc : g_cols;
-	uint32_t copy_rows = nr < g_rows ? nr : g_rows;
-	if (g_textbuf) {
-		for (uint32_t r = 0; r < copy_rows; r++)
-			for (uint32_t c = 0; c < copy_cols; c++)
-				nt[r * nc + c] = g_textbuf[r * g_cols + c];
-		kfree(g_textbuf);
-	}
-	g_textbuf = nt;
-	g_cols = nc;
-	g_rows = nr;
-	if (g_cursor_x >= g_cols) g_cursor_x = g_cols - 1;
-	if (g_cursor_y >= g_rows) g_cursor_y = g_rows - 1;
-	if (g_margin_rows >= g_rows)
-		g_margin_rows = 0;
-	for (uint32_t r = 0; r < g_rows; r++)
-		draw_text_row_noflush(r);
-	fb_dirty_mark(0, 0, g_width, g_height);
-	cirrusfb_flush_dirty();
-	klogprintf("fbcon: geometry %ux%u cell=%ux%u (font reload)\n",
-		   g_cols, g_rows, fw, fh);
-	return 0;
 }
 
 static void cirrusfb_putchar_inner(uint8_t ch, uint8_t attr) {
@@ -603,13 +529,7 @@ void cirrusfb_set_cursor(uint32_t x, uint32_t y) {
 	g_cursor_y = y;
 
 	if (g_hwcursor_ok) {
-		if (g_batch_depth > 0) {
-			g_hwcursor_def_x = x;
-			g_hwcursor_def_y = y;
-			g_hwcursor_deferred = 1;
-		} else {
-			hwcursor_set_pos(x, y);
-		}
+		hwcursor_set_pos(x, y);
 	} else {
 		if (g_swcursor_visible) swcursor_draw_at(x, y);
 	}

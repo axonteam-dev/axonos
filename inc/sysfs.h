@@ -25,8 +25,6 @@ int sysfs_mount(const char *path);
 
 int sysfs_mkdir(const char *path);
 int sysfs_create_file(const char *path, const struct sysfs_attr *attr);
-/* Linux class device symlink, e.g. /sys/class/graphics/fb0 -> ../../devices/platform/... */
-int sysfs_create_symlink(const char *path, const char *target);
 int sysfs_remove(const char *path);
 
 /* Fill stat for an open sysfs file (driver-specific) */

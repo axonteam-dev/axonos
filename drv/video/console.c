@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include <cirrusfb.h>
 #include <devfs.h>
-#include <font.h>
 
 void console_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	if (cirrusfb_is_ready()) {
@@ -22,10 +21,10 @@ int console_max_rows() {
 		return (int)cirrusfb_rows();
 	}
 	if (vbe_is_available()) {
-		uint32_t h = vbe_get_height();
-		uint32_t fh = font_cell_height();
-		if (fh == 0) return MAX_ROWS;
-		return (int)(h / fh);
+		uint32_t w = vbe_get_height();
+		uint32_t fontw = 16;
+		if (fontw == 0) return MAX_ROWS;
+		return (int)(w / fontw);
 	}
 	return MAX_ROWS;
 }
@@ -36,33 +35,21 @@ int console_max_cols() {
 	}
 	if (vbe_is_available()) {
 		uint32_t w = vbe_get_width();
-		uint32_t fw = font_cell_width();
-		if (fw == 0) return MAX_COLS;
-		return (int)(w / fw);
+		uint32_t fontw = 8;
+		if (fontw == 0) return MAX_COLS;
+		return (int)(w / fontw);
 	}
 	return MAX_COLS;
 }
 
 void console_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t ch, uint8_t attr) {
 	if (cirrusfb_is_ready()) {
-		uint8_t run[256];
-		cirrusfb_begin_batch();
 		for (uint32_t ry = 0; ry < h; ry++) {
-			uint32_t left = w;
-			uint32_t cx = x;
-			while (left) {
-				uint32_t n = left > (uint32_t)sizeof(run) ? (uint32_t)sizeof(run) : left;
-				for (uint32_t i = 0; i < n; i++)
-					run[i] = ch;
-				cirrusfb_putch_run(cx, y + ry, run, n, attr);
-				cx += n;
-				left -= n;
+			for (uint32_t rx = 0; rx < w; rx++) {
+				cirrusfb_putch_xy(x + rx, y + ry, ch, attr);
 			}
 		}
-		cirrusfb_end_batch();
-		return;
-	}
-	if (vbe_is_available()) {
+	} else if (vbe_is_available()) {
 		for (uint32_t ry = 0; ry < h; ry++) {
 			for (uint32_t rx = 0; rx < w; rx++) {
 				vbefb_set_cursor(x + rx, y + ry);
@@ -82,8 +69,6 @@ void console_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
 	if (!s) return;
 	if (cirrusfb_is_ready()) {
 		uint32_t cx = x, cy = y;
-		uint32_t maxc = (uint32_t)console_max_cols();
-		cirrusfb_begin_batch();
 		for (size_t i = 0; s[i]; ) {
 			if (s[i] == '\t') {
 				uint32_t n = 8 - (cx % 8);
@@ -91,30 +76,16 @@ void console_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
 				for (uint32_t k = 0; k < n; k++) {
 					cirrusfb_putch_xy(cx, cy, ' ', attr);
 					cx++;
-					if (cx >= maxc) { cx = 0; cy++; }
+					if (cx >= (uint32_t)console_max_cols()) { cx = 0; cy++; }
 				}
 				i++;
-				continue;
-			}
-			/* Coalesce printable runs on one row — one dirty rect. */
-			size_t j = i;
-			while (s[j] && s[j] != '\t' && s[j] != '\n' && s[j] != '\r' &&
-			       cx + (uint32_t)(j - i) < maxc)
-				j++;
-			if (j > i) {
-				cirrusfb_putch_run(cx, cy, (const uint8_t *)s + i,
-						   (uint32_t)(j - i), attr);
-				cx += (uint32_t)(j - i);
-				i = j;
-				if (cx >= maxc) { cx = 0; cy++; }
 				continue;
 			}
 			cirrusfb_putch_xy(cx, cy, (uint8_t)s[i], attr);
 			i++;
 			cx++;
-			if (cx >= maxc) { cx = 0; cy++; }
+			if (cx >= (uint32_t)console_max_cols()) { cx = 0; cy++; }
 		}
-		cirrusfb_end_batch();
 	} else if (vbe_is_available()) {
 		uint32_t cx = x, cy = y;
 		for (size_t i = 0; s[i]; ) {
@@ -205,44 +176,7 @@ void console_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
 	}
 }
 
-/* Defer VGA CRTC cursor ports across one tty write (nano redraw). */
-static int g_tty_batch = 0;
-static int g_tty_cursor_pending = 0;
-static uint32_t g_tty_cursor_x = 0, g_tty_cursor_y = 0;
-
-void console_begin_tty_batch(void) {
-	g_tty_batch++;
-	if (cirrusfb_is_ready())
-		cirrusfb_begin_batch();
-}
-
-void console_end_tty_batch(void) {
-	if (g_tty_batch <= 0)
-		return;
-	g_tty_batch--;
-	if (g_tty_batch > 0)
-		return;
-	if (g_tty_cursor_pending) {
-		g_tty_cursor_pending = 0;
-		if (cirrusfb_is_ready())
-			cirrusfb_set_cursor(g_tty_cursor_x, g_tty_cursor_y);
-		else if (vbe_is_available())
-			vbefb_set_cursor(g_tty_cursor_x, g_tty_cursor_y);
-		else
-			vga_set_cursor(g_tty_cursor_x, g_tty_cursor_y);
-	}
-	if (cirrusfb_is_ready())
-		cirrusfb_end_batch();
-}
-
 void console_set_cursor(uint32_t x, uint32_t y) {
-	if (g_tty_batch > 0) {
-		/* Record only — apply once in console_end_tty_batch(). */
-		g_tty_cursor_x = x;
-		g_tty_cursor_y = y;
-		g_tty_cursor_pending = 1;
-		return;
-	}
 	if (cirrusfb_is_ready()) { cirrusfb_set_cursor(x,y); return; }
 	if (vbe_is_available()) { vbefb_set_cursor(x,y); return; }
 	vga_set_cursor(x,y);

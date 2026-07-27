@@ -7,6 +7,7 @@
 
 int ramfs_register(void);
 int ramfs_unregister(void);
+struct fs_driver *ramfs_get_driver(void);
 int ramfs_mkdir(const char *path);
 int ramfs_remove(const char *path);
 /* create a symbolic link at 'path' pointing to 'target' */
@@ -15,6 +16,9 @@ int ramfs_symlink(const char *path, const char *target);
 int ramfs_link(const char *oldpath, const char *newpath);
 /* create a regular file backed by immutable boot-time data; copied on first write */
 int ramfs_create_borrowed_file(const char *path, const void *data, size_t size);
+/* Overlay whiteout helpers (char-dev marker, Linux overlay-compatible idea). */
+int ramfs_make_whiteout(const char *path);
+int ramfs_path_is_whiteout(const char *path);
 
 #ifdef __cplusplus
 extern "C" {

@@ -32,7 +32,7 @@ PRODUCTION_CFLAGS := -DAXON_PRODUCTION=1 -DDEVEL_DEBUG=0 \
 	-DAXON_WGET_DNS_TRACE=0 -DKBD_DEBUG=0 \
 	-UQEMU_LOG_ENABLE -DKERNEL_LOG_TIME=1
 
-CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -path './userland' -prune -o -path './core/nss_dns_shim' -prune -o -path './core/nss_files_shim' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
+CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -path './third_party' -prune -o -path './tools' -prune -o -path './userland' -prune -o -path './core/nss_dns_shim' -prune -o -path './core/nss_files_shim' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
 COBJS := $(patsubst %.c,$(BUILD_DIR)/%.c.o,$(CSRCS))
 DEPS := $(COBJS:.o=.d)
 
@@ -59,15 +59,13 @@ NSS_DNS_SHIM := $(BUILD_DIR)/nss_dns/shim
 NSS_DNS_BLOB_OBJ := $(BUILD_DIR)/nss_dns/shim_blob.o
 NSS_FILES_SHIM := $(BUILD_DIR)/nss_files/shim
 NSS_FILES_BLOB_OBJ := $(BUILD_DIR)/nss_files/shim_blob.o
-ASCII_PF2 := $(BUILD_DIR)/fonts/ascii.pf2
-ASCII_PF2_BLOB_OBJ := $(BUILD_DIR)/fonts/ascii_pf2_blob.o
-ASCII_PF2_SRC := $(firstword $(wildcard /usr/share/grub/ascii.pf2 /boot/grub/fonts/ascii.pf2))
 
 .PHONY: all kernel iso clean run for-production
 
 all: iso
 
 for-production:
+	@$(MAKE) clean
 	@$(MAKE) OPTFLAGS='-O0 -g0' CFLAGS_EXTRA='$(PRODUCTION_CFLAGS)' iso
 
 kernel: $(KERNEL_BIN)
@@ -147,25 +145,7 @@ $(CA_TRUST_BLOB_OBJ): $(CA_TRUST_PEM)
 	objcopy --redefine-sym $$START=ca_trust_pem_start --redefine-sym $$END=ca_trust_pem_end $@.tmp $@ && \
 	rm -f $@.tmp
 
-$(ASCII_PF2):
-	@mkdir -p $(dir $@)
-	@if [ -n "$(ASCII_PF2_SRC)" ] && [ -f "$(ASCII_PF2_SRC)" ]; then \
-		cp "$(ASCII_PF2_SRC)" $@; \
-	else \
-		echo "warning: no host ascii.pf2 — font blob empty" >&2; \
-		printf '' > $@; \
-	fi
-
-$(ASCII_PF2_BLOB_OBJ): $(ASCII_PF2)
-	@echo "LD(BIN) [ascii.pf2]	$<"
-	@ld -r -b binary -o $@.tmp $< && \
-	START=$$(nm $@.tmp | awk '$$3 ~ /^_binary_.*_start$$/ {print $$3; exit}') && \
-	END=$$(nm $@.tmp | awk '$$3 ~ /^_binary_.*_end$$/ {print $$3; exit}') && \
-	test -n "$$START" && test -n "$$END" && \
-	objcopy --redefine-sym $$START=ascii_pf2_blob_start --redefine-sym $$END=ascii_pf2_blob_end $@.tmp $@ && \
-	rm -f $@.tmp
-
-$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(NSS_FILES_BLOB_OBJ) $(CA_TRUST_BLOB_OBJ) $(ASCII_PF2_BLOB_OBJ) $(PAYLOAD_COBJS)
+$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(NSS_FILES_BLOB_OBJ) $(CA_TRUST_BLOB_OBJ) $(PAYLOAD_COBJS)
 	@mkdir -p $(BUILD_DIR)
 	@echo "LD		$@"
 	@ld -m elf_x86_64 -T linker.payload.ld -o $@ $^
@@ -202,10 +182,6 @@ $(GRUB_DIR):
 
 iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg archive
 	@cp $(KERNEL_ELF) $(ISO_BOOT)/axonos.elf
-	@mkdir -p $(GRUB_DIR)/fonts
-	@if [ -f /usr/share/grub/ascii.pf2 ]; then cp /usr/share/grub/ascii.pf2 $(GRUB_DIR)/fonts/; fi
-	@if [ -f /usr/share/grub/unicode.pf2 ]; then cp /usr/share/grub/unicode.pf2 $(GRUB_DIR)/fonts/; fi
-	@if [ -f /usr/share/grub/euro.pf2 ]; then cp /usr/share/grub/euro.pf2 $(GRUB_DIR)/fonts/; fi
 	@grub-mkrescue -o $(ISO_IMAGE) $(ISO_DIR) 2>/dev/null || { \
 		@echo "grub-mkrescue failed: try installing grub-pc-bin or xorriso" >&2; exit 1; \
 	}
@@ -238,12 +214,27 @@ disk:
 	@dd if=/dev/zero of=../disk.img bs=1M count=10
 	@mkfs.fat -F 32 ../disk.img
 
+# Host helpers for converting legacy initfs.cpio → initfs.squashfs (podman/alpine).
+MKINITFS_SQUASH := tools/mkinitfs-squashfs.sh
+
 archive:
-	@if [ ! -f iso/boot/initfs.cpio ]; then \
-		wget -P build apm.axont.ru/Packages/initfs.tar.xz; \
-		tar -xf build/initfs.tar.xz -C iso/boot/; \
-		rm build/initfs.tar.xz; \
+	@if [ ! -f iso/boot/initfs.squashfs ]; then \
+		if [ -f initfs.squashfs ]; then \
+			cp -f initfs.squashfs iso/boot/initfs.squashfs; \
+		elif [ -f initfs.cpio ]; then \
+			$(MKINITFS_SQUASH) initfs.cpio iso/boot/initfs.squashfs; \
+		elif [ -f iso/boot/initfs.cpio ]; then \
+			$(MKINITFS_SQUASH) iso/boot/initfs.cpio iso/boot/initfs.squashfs; \
+		else \
+			wget -P build apm.axont.ru/Packages/initfs.tar.xz; \
+			tar -xf build/initfs.tar.xz -C iso/boot/; \
+			rm -f build/initfs.tar.xz; \
+			if [ -f iso/boot/initfs.cpio ] && [ ! -f iso/boot/initfs.squashfs ]; then \
+				$(MKINITFS_SQUASH) iso/boot/initfs.cpio iso/boot/initfs.squashfs; \
+			fi; \
+		fi; \
 	fi
+	@test -f iso/boot/initfs.squashfs
 
 clean:
 	@rm -rf $(BUILD_DIR)

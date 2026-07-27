@@ -11,15 +11,9 @@
 #include <thread.h>
 #include <stdint.h>
 
-#ifndef S_IFLNK
-#define S_IFLNK 0120000
-#endif
-
 struct sysfs_node {
     char *name;
     int is_dir;
-    int is_lnk;
-    char *link_target; /* for is_lnk */
     struct sysfs_node *parent;
     struct sysfs_node *children;
     struct sysfs_node *next;
@@ -64,8 +58,6 @@ static struct sysfs_node *sysfs_alloc_node(const char *name, size_t len, int is_
     memcpy(n->name, name, len);
     n->name[len] = '\0';
     n->is_dir = is_dir;
-    n->is_lnk = 0;
-    n->link_target = NULL;
     /* initialize POSIX-like metadata */
     n->ino = sysfs_next_ino++;
     n->mode = (is_dir ? (S_IFDIR | 0555) : (S_IFREG | 0444));
@@ -86,7 +78,6 @@ static void sysfs_free_node(struct sysfs_node *n) {
         c = next;
     }
     if (n->attr) kfree(n->attr);
-    if (n->link_target) kfree(n->link_target);
     if (n->name) kfree(n->name);
     kfree(n);
 }
@@ -216,7 +207,7 @@ int sysfs_create_file(const char *path, const struct sysfs_attr *attr) {
         node = sysfs_alloc_node(name, name_len, 0);
         if (!node) { release(&sysfs_lock); return -1; }
         sysfs_insert_child(parent, node);
-    } else if (node->is_dir || node->is_lnk) {
+    } else if (node->is_dir) {
         release(&sysfs_lock);
         return -1;
     }
@@ -227,59 +218,6 @@ int sysfs_create_file(const char *path, const struct sysfs_attr *attr) {
     memcpy(node->attr, attr, sizeof(struct sysfs_attr));
     /* compute size for sysfs file content if possible */
     sysfs_update_node_size(node);
-    release(&sysfs_lock);
-    return 0;
-}
-
-int sysfs_create_symlink(const char *path, const char *target) {
-    if (!sysfs_root || !path || !target) return -1;
-    if (strncmp(path, "/sys/", 5) != 0) return -1;
-    const char *rel = path + 5;
-    const char *last_slash = strrchr(rel, '/');
-    struct sysfs_node *parent = sysfs_root;
-    const char *name = rel;
-    if (last_slash) {
-        size_t parent_len = (size_t)(last_slash - rel);
-        char *parent_path = (char*)kmalloc(parent_len + 1);
-        if (!parent_path) return -1;
-        memcpy(parent_path, rel, parent_len);
-        parent_path[parent_len] = '\0';
-        parent = sysfs_ensure_dir(sysfs_root, parent_path, 1);
-        kfree(parent_path);
-        if (!parent) return -1;
-        name = last_slash + 1;
-    }
-    while (*name == '/') name++;
-    size_t name_len = strlen(name);
-    if (name_len == 0) return -1;
-    size_t tlen = strlen(target);
-    char *tdup = (char *)kmalloc(tlen + 1);
-    if (!tdup) return -1;
-    memcpy(tdup, target, tlen + 1);
-
-    acquire(&sysfs_lock);
-    struct sysfs_node *node = sysfs_find_child_n(parent, name, name_len);
-    if (!node) {
-        node = sysfs_alloc_node(name, name_len, 0);
-        if (!node) {
-            release(&sysfs_lock);
-            kfree(tdup);
-            return -1;
-        }
-        sysfs_insert_child(parent, node);
-    } else if (node->is_dir) {
-        release(&sysfs_lock);
-        kfree(tdup);
-        return -1;
-    }
-    if (node->link_target)
-        kfree(node->link_target);
-    node->is_lnk = 1;
-    node->is_dir = 0;
-    node->link_target = tdup;
-    node->mode = (mode_t)(S_IFLNK | 0777);
-    node->size = tlen;
-    node->nlink = 1;
     release(&sysfs_lock);
     return 0;
 }
@@ -313,9 +251,8 @@ static int sysfs_open(const char *path, struct fs_file **out_file) {
     memcpy(pp, path, plen);
     f->path = pp;
     f->fs_private = sysfs_driver.driver_data;
-    /* Symlinks use FS_TYPE_REG + S_IFLNK in mode (same as ramfs). */
     f->type = node->is_dir ? FS_TYPE_DIR : FS_TYPE_REG;
-    f->size = node->is_lnk && node->link_target ? strlen(node->link_target) : node->size;
+    f->size = node->size;
     h = (struct sysfs_handle*)kmalloc(sizeof(struct sysfs_handle));
     if (!h) goto out_unlock;
     h->node = node;
@@ -376,8 +313,7 @@ static ssize_t sysfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             de.inode = (uint32_t)(child->ino & 0xFFFFFFFFu);
             de.rec_len = (uint16_t)rec_len;
             de.name_len = (uint8_t)namelen;
-            de.file_type = child->is_dir ? EXT2_FT_DIR :
-                           (child->is_lnk ? EXT2_FT_SYMLINK : EXT2_FT_REG_FILE);
+            de.file_type = child->is_dir ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
 
             memcpy(tmp, &de, 8);
             memcpy(tmp + 8, child->name, namelen);
@@ -397,16 +333,6 @@ static ssize_t sysfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         node->atime = (time_t)rtc_ticks;
         release(&sysfs_lock);
         return (ssize_t)written;
-    }
-
-    /* symlink: content is the link target (Linux readlink via fs_read). */
-    if (node->is_lnk && node->link_target) {
-        size_t len = strlen(node->link_target);
-        if ((size_t)offset >= len) return 0;
-        size_t to_copy = len - (size_t)offset;
-        if (to_copy > size) to_copy = size;
-        memcpy(buf, node->link_target + offset, to_copy);
-        return (ssize_t)to_copy;
     }
 
     /* regular file: copy show pointer under lock and call it without holding lock */

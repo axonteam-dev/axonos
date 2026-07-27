@@ -32,8 +32,6 @@ int user_vma_fork_privatize_mapped(mm_t *child_mm, mm_t *parent_mm,
                                    uint64_t *parent_l4, uint64_t from_tid);
 /* True if VA falls in a MAP_SHARED / SysV SHM VMA for this tid (must not COW). */
 int user_vma_is_shared_page(uint64_t tid, uintptr_t va);
-/* True if runner's address space has a VMA covering va with PROT_WRITE. */
-int user_vma_allows_write(thread_t *runner, uintptr_t va);
 
 int user_vma_add(uint64_t tid, uintptr_t addr, size_t len, int prot, int kind);
 int user_vma_add_mm(mm_t *mm, uintptr_t addr, size_t len, int prot, int kind);

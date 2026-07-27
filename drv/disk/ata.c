@@ -25,6 +25,7 @@
 #include <vga.h>
 #include <ramfs.h>
 #include <pci.h>
+#include <klog.h>
 
 #include <fat32.h>
 
@@ -471,7 +472,7 @@ void ata_dma_init(void) {
 	/* replace with real handler below */
 	idt_set_handler(32 + 14, (void (*)(cpu_registers_t*))0);
 	/* set proper handler and unmask IRQs */
-	extern void ata_irq_dispatch_wrapper(); /* forward declaration for casting convenience */
+	extern void ata_irq_dispatch_wrapper(cpu_registers_t *regs);
 	idt_set_handler(32 + 14, (void (*)(cpu_registers_t*))ata_irq_dispatch_wrapper);
 	pic_unmask_irq(14);
 	idt_set_handler(32 + 15, (void (*)(cpu_registers_t*))ata_irq_dispatch_wrapper);

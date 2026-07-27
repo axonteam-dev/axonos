@@ -7,6 +7,7 @@
 #include <serial.h>
 #include <pic.h>
 #include <debug.h>
+#include <klog.h>
 
 // Глобальный счетчик тиков RTC
 volatile uint64_t rtc_ticks = 0;

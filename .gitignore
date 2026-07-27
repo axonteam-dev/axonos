@@ -1,8 +1,11 @@
 build/
 .build/
 iso/boot/initfs.cpio
+iso/boot/initfs.squashfs
 iso/boot/axonos.elf
 build/
 *.o
 *.deb
 *.d
+initfs.squashfs
+*.iso

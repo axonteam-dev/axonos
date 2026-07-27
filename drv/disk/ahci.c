@@ -4,6 +4,7 @@
 #include <disk.h>
 #include <heap.h>
 #include <string.h>
+#include <stdio.h>
 #include <devfs.h>
 #include <fat32.h>
 #include <ramfs.h>
@@ -11,6 +12,7 @@
 #include <paging.h>
 #include <pit.h>
 #include <scsi.h>
+#include <klog.h>
 
 /* AHCI SATA driver (minimal but functional).
    - Discovers AHCI controllers via PCI class/subclass/prog_if.

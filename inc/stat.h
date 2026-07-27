@@ -17,20 +17,11 @@ struct stat {
     nlink_t st_nlink;
     unsigned int st_uid;
     unsigned int st_gid;
-    dev_t st_rdev; /* Linux: encoded major/minor for char/block nodes */
     off_t st_size;
     time_t st_atime;
     time_t st_mtime;
     time_t st_ctime;
 };
-
-/* Linux makedev for small majors (fb=29, tty=4, …) — matches glibc new_encode_dev for maj<0x1000, min<0x100. */
-#ifndef MKDEV
-#define MKDEV(ma, mi) ((dev_t)((((dev_t)(ma) & 0xfffu) << 8) | ((dev_t)(mi) & 0xffu)))
-#endif
-#ifndef FB_MAJOR
-#define FB_MAJOR 29
-#endif
 
 /* File type macros */
 #ifndef S_IFDIR

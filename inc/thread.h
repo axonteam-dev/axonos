@@ -33,11 +33,8 @@ typedef struct thread {
         uint64_t tid;
         process_t *process;             /* Linux process identity/lifecycle owner */
         char name[32];                 // thread name (urmomissofaturmomissofaturmomiss)
-        /* Process start tick for /proc/<pid>/stat starttime. */
+        /* Process start tick for /proc/<pid>/stat starttime and utime approximation. */
         uint64_t start_ticks;
-        /* Accumulated USER_HZ (100Hz) runtime for /proc/<pid>/stat utime/stime. */
-        uint64_t utime_ticks;
-        uint64_t stime_ticks;
 
         /* POSIX-ish job control identifiers */
         int pgid;                      // process group id
@@ -53,16 +50,9 @@ typedef struct thread {
         uid_t uid;
         uid_t euid;
         uid_t suid;
-        /* Linux iopl(2) level 0..3 (CAP_SYS_RAWIO); used by Xorg xf86EnableIOPorts. */
-        uint8_t iopl;
         gid_t gid;
         gid_t egid;
         gid_t sgid;
-#ifndef AXON_NGROUPS_MAX
-#define AXON_NGROUPS_MAX 32
-#endif
-        int ngroups;
-        gid_t groups[AXON_NGROUPS_MAX];
         /* file mode creation mask (umask) for mkdir/open */
         unsigned int umask;
 
@@ -212,13 +202,6 @@ thread_t* thread_create(void (*entry)(void), const char* name);
 thread_t* thread_create_blocked(void (*entry)(void), const char* name);
 void thread_yield();
 void thread_ring3_preempt_if_waiters(void);
-void thread_request_resched(void);
-void thread_cond_resched(void);
-/* Charge the current task one timer tick (user vs system) for /proc accounting. */
-void thread_account_timer_tick(int user_mode);
-/* Aggregate USER_HZ counters for /proc/stat (cpu line). */
-void thread_cpu_times_user_hz(uint64_t *user, uint64_t *nice, uint64_t *system,
-                              uint64_t *idle);
 void thread_schedule();
 thread_t* thread_current();
 void thread_stop(int pid);

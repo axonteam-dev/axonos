@@ -150,6 +150,14 @@ static void vbefb_erase_cells(uint32_t x0, uint32_t x1, uint32_t y) {
 }
 
 static void vbefb_emit_tty_char(uint8_t ch) {
+	/* Swallow C0 junk (BEL etc.) — never map to CP437 glyphs. */
+	if (ch < 0x20u && ch != '\n' && ch != '\r' && ch != '\t' && ch != '\b')
+		return;
+	if (ch == 0x7Fu) {
+		if (cursor_x > 0) cursor_x--;
+		return;
+	}
+
 	int control_path = (ch == '\n' || ch == '\r' || ch == '\t' || ch == '\b');
 	uint32_t old_cx = cursor_x;
 	uint32_t old_cy = cursor_y;

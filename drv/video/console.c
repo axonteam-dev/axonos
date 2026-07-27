@@ -316,5 +316,6 @@ void console_putc_tty_literal(uint8_t ch, uint8_t attr) {
 		vbefb_putchar_literal(ch, attr);
 		return;
 	}
-	kputchar(ch, attr);
+	/* Bypass VGA ANSI FSM — '[' from klog timestamps must not complete a stale ESC. */
+	vga_putchar_literal(ch, attr);
 }

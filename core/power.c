@@ -3,6 +3,7 @@
 #include <klog.h>
 #include <serial.h>
 #include <string.h>
+#include <apic_timer.h>
 #include <pit.h>
 #include <vga.h>
 

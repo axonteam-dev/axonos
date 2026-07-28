@@ -3,6 +3,7 @@
 #include <heap.h>
 #include <debug.h>
 #include <string.h>
+#include <klog.h>
 #include <spinlock.h>
 #include <disk.h>
 #include <thread.h>
@@ -15,7 +16,7 @@ static int request_count = 0;
 static int iothread_initialized = 0;
 
 // I/O поток
-static struct thread_t* io_thread = NULL;
+static thread_t* io_thread = NULL;
 
 // Объявления внутренних функций
 static void io_worker_thread(void);

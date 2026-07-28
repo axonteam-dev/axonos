@@ -1,6 +1,7 @@
 #include <net_tcp.h>
 #include <heap.h>
 #include <string.h>
+#include <klog.h>
 
 extern void klogprintf(const char *fmt, ...);
 

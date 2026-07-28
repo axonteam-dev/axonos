@@ -8,6 +8,7 @@
 #include <pit.h>
 #include <devfs.h>
 #include <heap.h>
+#include <serial.h>
 
 /* VGA Sequencer registers for Cirrus hardware cursor */
 #define VGA_SEQ_INDEX   0x3C4

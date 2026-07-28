@@ -5,6 +5,7 @@
 #include <mmio.h>
 #include <paging.h>
 #include <vga.h>
+#include <klog.h>
 
 #define MMIO_IDENTITY_LIMIT ((uint64_t)0x100000000ULL) /* 4GiB */
 /* Place MMIO pool above user region (user stack at 256 MiB; heap/mmap below).
@@ -106,7 +107,7 @@ void *mmio_map_phys(uint64_t pa, size_t len) {
 			/* rollback: unmap previous mapped pages and free slots */
 			for (size_t q = 0; q < p; q++) {
 				uint64_t vaq = MMIO_POOL_BASE_VA + (uint64_t)(start + q) * PAGE_SIZE_2M;
-				(void)unmap_page_2m((void*)vaq);
+				(void)unmap_page_2m(vaq);
 			}
 			acquire(&mmio_pool_lock);
 			for (size_t j = 0; j < pages_needed; j++) {
@@ -175,7 +176,7 @@ void *mmio_map_framebuffer(uint64_t pa, size_t len) {
 		if (map_page_2m(va_page, pa_map, flags) != 0) {
 			for (size_t q = 0; q < p; q++) {
 				uint64_t vaq = MMIO_POOL_BASE_VA + (uint64_t)(start + q) * PAGE_SIZE_2M;
-				(void)unmap_page_2m((void *)vaq);
+				(void)unmap_page_2m(vaq);
 			}
 			acquire(&mmio_pool_lock);
 			for (size_t j = 0; j < pages_needed; j++) {
@@ -221,7 +222,7 @@ void mmio_unmap(void *va, size_t len) {
 	/* unmap pages */
 	for (size_t p = 0; p < count; p++) {
 		uintptr_t vaq = pool_base + (idx + p) * PAGE_SIZE_2M;
-		(void)unmap_page_2m((void*)vaq);
+		(void)unmap_page_2m((uint64_t)vaq);
 	}
 }
 

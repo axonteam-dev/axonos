@@ -8,6 +8,7 @@
 #include <heap.h>
 #include <vga.h>
 #include <scsi.h>
+#include <klog.h>
 
 #define ATA_REG_DATA(base)      (base + 0)
 #define ATA_REG_FEATURES(base)  (base + 1)

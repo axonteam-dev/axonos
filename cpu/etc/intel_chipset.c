@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <serial.h>
 #include <heap.h>
+#include <klog.h>
 #include <stddef.h>
 
 

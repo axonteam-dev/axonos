@@ -11,6 +11,8 @@
 #include <paging.h>
 #include <pit.h>
 #include <scsi.h>
+#include <klog.h>
+#include <vga.h>
 
 /* AHCI SATA driver (minimal but functional).
    - Discovers AHCI controllers via PCI class/subclass/prog_if.

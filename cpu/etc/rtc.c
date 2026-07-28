@@ -6,6 +6,7 @@
 #include <rtc.h>
 #include <serial.h>
 #include <pic.h>
+#include <klog.h>
 #include <debug.h>
 
 // Глобальный счетчик тиков RTC

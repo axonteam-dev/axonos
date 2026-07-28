@@ -8,6 +8,8 @@
 #include <string.h>
 #include <pit.h>
 #include <paging.h>
+#include <klog.h>
+#include <vga.h>
 
 #define NVME_PCI_CLASS_STORAGE 0x01
 #define NVME_PCI_SUBCLASS_NVM  0x08

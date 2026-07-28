@@ -5,6 +5,7 @@
 
 #include <dns.h>
 #include <string.h>
+#include <klog.h>
 
 #define DNS_PORT     53
 #define DNS_TYPE_A   1

@@ -6217,22 +6217,10 @@ static void dl_fd_clear(int fd) {
 }
 
 static void boot_io_log(thread_t *cur, const char *tag, int fd, uint64_t extra) {
-    if (AXON_PRODUCTION)
-        return;
     if (!is_init_user(cur)) return;
     const char *p = thread_fd_path(cur, fd);
-    kprintf("boot-io: %s fd=%d path=%s x=0x%llx\n", tag, fd, p ? p : "?", (unsigned long long)extra);
-}
-
-static void dl_fd_paths_dump(void) {
-    if (AXON_PRODUCTION)
-        return;
-    kprintf("dl-fd-paths ===\n");
-    for (int i = 0; i < 64; i++) {
-        if (g_dl_fd_path[i][0])
-            kprintf("dl-fd %2d path=%s\n", i, g_dl_fd_path[i]);
-    }
-    kprintf("dl-fd-paths === end ===\n");
+    devel_printf("boot-io: %s fd=%d path=%s x=0x%llx\n",
+        tag, fd, p ? p : "?", (unsigned long long)extra);
 }
 
 /* Ring buffer of recent PID1/ld.so syscalls; dumped on exit_group so a short
@@ -17081,7 +17069,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (code == ARCH_SET_GS)
                     code = ARCH_SET_FS;
                 if (addr < 0x200000ULL || addr >= (uint64_t)USER_STACK_TOP) {
-                    kprintf("arch_prctl SET_FS: bad addr=0x%llx\n", (unsigned long long)addr);
+                    devel_printf("arch_prctl SET_FS: bad addr=0x%llx\n", (unsigned long long)addr);
                     return ret_err(EFAULT);
                 }
                 {
@@ -17091,7 +17079,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     uint64_t map_hi = (addr + 0x4000ULL + 0xFFFULL) & ~0xFFFULL;
                     if (map_hi > (uint64_t)USER_STACK_TOP) map_hi = (uint64_t)USER_STACK_TOP;
                     if (user_map_ensure_present_us_2m(map_lo, map_hi) != 0) {
-                        kprintf("arch_prctl SET_FS: map fail addr=0x%llx lo=0x%llx hi=0x%llx\n",
+                        devel_printf("arch_prctl SET_FS: map fail addr=0x%llx lo=0x%llx hi=0x%llx\n",
                             (unsigned long long)addr,
                             (unsigned long long)map_lo, (unsigned long long)map_hi);
                         return ret_err(EFAULT);
@@ -17152,26 +17140,26 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     (cur->name[0] && (strstr(cur->name, "mount") ||
                                       strstr(cur->name, "busybox") ||
                                       strstr(cur->name, "linuxrc"))))
-                    kprintf("arch_prctl SET_FS: tid=%llu fs=0x%llx guard=0x%llx tmpl=%d\n",
+                    devel_printf("arch_prctl SET_FS: tid=%llu fs=0x%llx guard=0x%llx tmpl=%d\n",
                         (unsigned long long)(cur->tid ? cur->tid : 1),
                         (unsigned long long)addr, (unsigned long long)old_guard,
                         cur->mm_ptemplate ? 1 : 0);
                 return 0;
             } else if (code == ARCH_GET_FS) {
                 if (addr < 0x200000ULL || addr >= (uint64_t)MMIO_IDENTITY_LIMIT) {
-                    kprintf("arch_prctl GET_FS: bad addr=0x%llx\n", (unsigned long long)addr);
+                    devel_printf("arch_prctl GET_FS: bad addr=0x%llx\n", (unsigned long long)addr);
                     return ret_err(EFAULT);
                 }
                 if (copy_to_user_safe((void *)(uintptr_t)addr, &cur->user_fs_base, sizeof(cur->user_fs_base)) != 0) {
-                    kprintf("arch_prctl GET_FS: copy fail addr=0x%llx\n", (unsigned long long)addr);
+                    devel_printf("arch_prctl GET_FS: copy fail addr=0x%llx\n", (unsigned long long)addr);
                     return ret_err(EFAULT);
                 }
                 return 0;
             } else if (code == ARCH_GET_GS) {
-                kprintf("arch_prctl GET_GS: ENOSYS\n");
+                devel_printf("arch_prctl GET_GS: ENOSYS\n");
                 return ret_err(ENOSYS);
             }
-            kprintf("arch_prctl: EINVAL code=0x%llx addr=0x%llx\n",
+            devel_printf("arch_prctl: EINVAL code=0x%llx addr=0x%llx\n",
                 (unsigned long long)code, (unsigned long long)addr);
             return ret_err(EINVAL);
         }
@@ -17193,7 +17181,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
             /* BusyBox inittab: mount -o remount,rw / — fstype may be empty. */
             if (mnt_flags & MS_REMOUNT_LOCAL) {
-                kprintf("mount: remount flags=0x%llx target=%s (no-op ok)\n",
+                devel_printf("mount: remount flags=0x%llx target=%s (no-op ok)\n",
                     (unsigned long long)mnt_flags, target);
                 return 0;
             }
@@ -18469,7 +18457,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         }
     }
     if (pid1_dl_trace_thread(trace_t) && (int64_t)ret < 0) {
-        kprintf("dl-trace syscall_err n=%llu errno=%d name=%s a1=0x%llx a2=0x%llx\n",
+        devel_printf("dl-trace syscall_err n=%llu errno=%d name=%s a1=0x%llx a2=0x%llx\n",
             (unsigned long long)num, (int)(-(int64_t)ret),
             trace_t && trace_t->name[0] ? trace_t->name : "?",
             (unsigned long long)a1, (unsigned long long)a2);

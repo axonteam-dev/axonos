@@ -14,6 +14,7 @@
 #include <axonos.h>
 #include <ramfs.h>
 #include <vga.h>
+#include <klog.h>
 
 /* Disable local debug prints in this file */
 #ifdef klogprintf

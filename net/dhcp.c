@@ -11,6 +11,7 @@
 #include <e1000.h>
 #include <pit.h>
 #include <thread.h>
+#include <klog.h>
 
 extern void klogprintf(const char *fmt, ...);
 

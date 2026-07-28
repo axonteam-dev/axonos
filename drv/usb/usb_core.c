@@ -6,6 +6,8 @@
 #include <devfs.h>
 #include <sysfs.h>
 #include <pci.h>
+#include <klog.h>
+#include <vga.h>
 
 static usb_host_controller_t g_hc[USB_MAX_HC];
 static int g_hc_count = 0;

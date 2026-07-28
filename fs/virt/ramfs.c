@@ -9,6 +9,7 @@
 #include <thread.h>
 #include <vga.h>
 #include <spinlock.h>
+#include <klog.h>
 
 struct ramfs_node {
     char *name;

@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
 ASM := nasm
-ASM_ELF_FLAGS := -f elf64
+ASM_ELF_FLAGS := -f elf64 -P scripts/gnu-stack.nasm
 ASM_BIN_FLAGS := -f bin
 BUILD_DIR := build
 ISO_DIR := iso
@@ -42,7 +42,16 @@ CC := gcc -m64
 CFLAGS_EXTRA ?=
 OPTFLAGS ?= -g
 CFLAGS := $(OPTFLAGS) -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel \
+	-Wa,--noexecstack \
 	-Iinc -I$(AUTOCONF_DIR) -include kconfig.h -MMD -MP $(CFLAGS_EXTRA)
+LDFLAGS := -m elf_x86_64 -z noexecstack
+
+# ld -b binary objects lack .note.GNU-stack; add it with objcopy (quiet, no ld warn).
+define mark_noexecstack
+	@: > $(BUILD_DIR)/.empty_note
+	@objcopy --add-section .note.GNU-stack=$(BUILD_DIR)/.empty_note \
+		--set-section-flags .note.GNU-stack=contents,readonly $(1)
+endef
 
 CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -path './third_party' -prune -o -path './tools' -prune -o -path './userland' -prune -o -path './core/nss_dns_shim' -prune -o -path './core/nss_files_shim' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
 COBJS := $(patsubst %.c,$(BUILD_DIR)/%.c.o,$(CSRCS))
@@ -123,6 +132,7 @@ $(AP_TRAMP_OBJ): $(AP_TRAMP_BIN)
 		--redefine-sym _binary_$(AP_TRAMP_BIN_SYM)_start=ap_trampoline_bin_start \
 		--redefine-sym _binary_$(AP_TRAMP_BIN_SYM)_end=ap_trampoline_bin_end \
 		"$@"
+	@$(call mark_noexecstack,$@)
 
 $(NSS_DNS_SHIM): core/nss_dns_shim/nss_dns.c
 	@mkdir -p $(dir $@)
@@ -137,6 +147,7 @@ $(NSS_DNS_BLOB_OBJ): $(NSS_DNS_SHIM)
 	test -n "$$START" && test -n "$$END" && \
 	objcopy --redefine-sym $$START=nss_dns_so_blob_start --redefine-sym $$END=nss_dns_so_blob_end $@.tmp $@ && \
 	rm -f $@.tmp
+	@$(call mark_noexecstack,$@)
 
 # nostdlib — must not NEEDED libc.so.6 (static busybox dlopen).
 $(NSS_FILES_SHIM): core/nss_files_shim/nss_files.c
@@ -154,6 +165,7 @@ $(NSS_FILES_BLOB_OBJ): $(NSS_FILES_SHIM)
 	test -n "$$START" && test -n "$$END" && \
 	objcopy --redefine-sym $$START=nss_files_so_blob_start --redefine-sym $$END=nss_files_so_blob_end $@.tmp $@ && \
 	rm -f $@.tmp
+	@$(call mark_noexecstack,$@)
 
 $(CA_TRUST_PEM): core/isrgrootx1.pem
 	@mkdir -p $(dir $@)
@@ -167,6 +179,7 @@ $(CA_TRUST_BLOB_OBJ): $(CA_TRUST_PEM)
 	test -n "$$START" && test -n "$$END" && \
 	objcopy --redefine-sym $$START=ca_trust_pem_start --redefine-sym $$END=ca_trust_pem_end $@.tmp $@ && \
 	rm -f $@.tmp
+	@$(call mark_noexecstack,$@)
 
 $(ASCII_PF2):
 	@mkdir -p $(dir $@)
@@ -185,11 +198,12 @@ $(ASCII_PF2_BLOB_OBJ): $(ASCII_PF2)
 	test -n "$$START" && test -n "$$END" && \
 	objcopy --redefine-sym $$START=ascii_pf2_blob_start --redefine-sym $$END=ascii_pf2_blob_end $@.tmp $@ && \
 	rm -f $@.tmp
+	@$(call mark_noexecstack,$@)
 
 $(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(NSS_FILES_BLOB_OBJ) $(CA_TRUST_BLOB_OBJ) $(ASCII_PF2_BLOB_OBJ) $(PAYLOAD_COBJS)
 	@mkdir -p $(BUILD_DIR)
 	@echo "LD		$@"
-	@ld -m elf_x86_64 -T linker.payload.ld -o $@ $^
+	@ld $(LDFLAGS) -T linker.payload.ld -o $@ $^
 
 $(PAYLOAD_LZ4): $(PAYLOAD_ELF)
 	@echo "LZ4		$<"
@@ -203,11 +217,12 @@ $(PAYLOAD_BLOB_OBJ): $(PAYLOAD_LZ4)
 		--redefine-sym _binary_$(PAYLOAD_LZ4_SYM)_end=_binary_build_payload_lz4_end \
 		--redefine-sym _binary_$(PAYLOAD_LZ4_SYM)_size=_binary_build_payload_lz4_size \
 		"$@"
+	@$(call mark_noexecstack,$@)
 
 $(KERNEL_ELF): $(MULTIBOOT_OBJ) $(STUB_OBJ) $(PAYLOAD_BLOB_OBJ)
 	@mkdir -p $(BUILD_DIR)
 	@echo "LD		$@"
-	@ld -m elf_x86_64 -T linker.stub.ld -o $@ $^
+	@ld $(LDFLAGS) -T linker.stub.ld -o $@ $^
 
 $(KERNEL_BIN): $(KERNEL_ELF)
 	@objcopy -O binary $< $@

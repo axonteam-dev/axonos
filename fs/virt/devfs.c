@@ -539,7 +539,8 @@ static void devfs_tty_emit_byte(struct devfs_tty *tty, int tty_on_vga, uint8_t c
         else
             console_putch_xy(tty->cursor_x, tty->cursor_y, ch, tty->current_attr);
         devfs_tty_advance_cursor(tty);
-        /* Do not touch HW cursor here; console_end_tty_batch / CSI paths sync it. */
+        /* Keep fbcon SW cursor on the cell after the glyph (echo has no end_batch). */
+        console_set_cursor(tty->cursor_x, tty->cursor_y);
     } else {
         /* store_at_cursor already wrote the glyph; virtual path only advances. */
         uint32_t cols = devfs_tty_cols();

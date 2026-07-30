@@ -757,20 +757,23 @@ static int vmwgfx_fifo_append_u32(vmwgfx_ctx_t *ctx, uint32_t value) {
 	return 0;
 }
 
-static void vmwgfx_fifo_emit_update(vmwgfx_ctx_t *ctx, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+static int vmwgfx_fifo_emit_update(vmwgfx_ctx_t *ctx, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 	if (!ctx->fifo_va || w == 0 || h == 0)
-		return;
+		return -1;
+	/* Full UPDATE is 5 dwords; require room up front so we never leave a partial cmd. */
 	if (vmwgfx_fifo_free_bytes(ctx) < 20)
-		return;
+		return -1;
 	if (vmwgfx_fifo_append_u32(ctx, SVGA_CMD_UPDATE) != 0)
-		return;
+		return -1;
 	if (vmwgfx_fifo_append_u32(ctx, x) != 0)
-		return;
+		return -1;
 	if (vmwgfx_fifo_append_u32(ctx, y) != 0)
-		return;
+		return -1;
 	if (vmwgfx_fifo_append_u32(ctx, w) != 0)
-		return;
-	(void)vmwgfx_fifo_append_u32(ctx, h);
+		return -1;
+	if (vmwgfx_fifo_append_u32(ctx, h) != 0)
+		return -1;
+	return 0;
 }
 
 /*
@@ -797,13 +800,24 @@ static void vmwgfx_fifo_submit_update(vmwgfx_ctx_t *ctx, uint32_t x, uint32_t y,
 	if (y1 > g_upd_y1) g_upd_y1 = y1;
 }
 
-static void vmwgfx_fifo_flush_pending_update(vmwgfx_ctx_t *ctx) {
+static int vmwgfx_fifo_flush_pending_update(vmwgfx_ctx_t *ctx) {
 	if (!g_upd_pending)
-		return;
+		return 0;
 	uint32_t w = g_upd_x1 - g_upd_x0 + 1;
 	uint32_t h = g_upd_y1 - g_upd_y0 + 1;
-	vmwgfx_fifo_emit_update(ctx, g_upd_x0, g_upd_y0, w, h);
+	if (vmwgfx_fifo_emit_update(ctx, g_upd_x0, g_upd_y0, w, h) != 0) {
+		/*
+		 * FIFO full: drain the host queue and retry once.  Never clear
+		 * g_upd_pending on failure — that dropped damage permanently and
+		 * left glyphs invisible until a full redraw (setfont/clear).
+		 */
+		svga_reg_write32(ctx, SVGA_REG_SYNC, 1);
+		vmwgfx_io_barrier();
+		if (vmwgfx_fifo_emit_update(ctx, g_upd_x0, g_upd_y0, w, h) != 0)
+			return -1;
+	}
 	g_upd_pending = 0;
+	return 0;
 }
 
 /*
@@ -929,7 +943,7 @@ static void vmwgfx_display_sync(video_device_t *dev) {
 	(void)dev;
 	if (!g_vmwgfx.present || !g_vmwgfx.scanout_on)
 		return;
-	vmwgfx_fifo_flush_pending_update(&g_vmwgfx);
+	(void)vmwgfx_fifo_flush_pending_update(&g_vmwgfx);
 	svga_reg_write32(&g_vmwgfx, SVGA_REG_SYNC, 1);
 	vmwgfx_io_barrier();
 }

@@ -235,18 +235,19 @@ void cirrusfb_end_batch(void) {
 		hwcursor_set_pos(g_hwcursor_def_x, g_hwcursor_def_y);
 		g_hwcursor_deferred = 0;
 	}
+	/*
+	 * Publish text while the SW cursor is still frozen so a timer blink cannot
+	 * repaint an old blank cell over the just-written glyphs (vmwgfx UPDATE
+	 * then made "byte 0" stick until setfont/clear).  Draw the cursor only
+	 * after the text rect is in VRAM.
+	 */
+	cirrusfb_flush_dirty();
 	if (g_ready && !g_hwcursor_ok) {
 		g_swcursor_frozen = 0;
 		if (g_swcursor_visible)
 			swcursor_draw_at(g_cursor_x, g_cursor_y);
+		cirrusfb_flush_dirty();
 	}
-	/*
-	 * One ordered commit for the completed tty transaction.  Deferring large
-	 * batches let later cursor paints overtake text damage in VRAM, so byte 0
-	 * stayed blank until a full redraw (setfont/clear).  The shadow is the
-	 * source of truth; publish its complete dirty union before returning.
-	 */
-	cirrusfb_flush_dirty();
 }
 
 /* ANSI: kputchar() goes straight here when Cirrus is active — devfs may not see all output. */
@@ -393,8 +394,11 @@ static void scroll_up(void) {
 	uint32_t clear_y = g_height - fh;
 	uint32_t bg_pix = rgb_to_pixel(attr_to_rgb(g_current_attr, 0));
 	int twin = (g_shadow && g_vram && g_fb == g_shadow && g_bpp == 32) ? 1 : 0;
+	/* Nested under tty write batch: keep freeze until cirrusfb_end_batch(). */
+	int own_freeze = (g_batch_depth == 0);
 
-	g_swcursor_frozen = 1;
+	if (own_freeze)
+		g_swcursor_frozen = 1;
 
 	if (top == 0) {
 		memmove(g_textbuf, g_textbuf + g_cols, (size_t)g_cols * (g_rows - 1) * sizeof(cell_t));
@@ -450,7 +454,8 @@ static void scroll_up(void) {
 		cirrusfb_flush_dirty();
 	}
 
-	g_swcursor_frozen = 0;
+	if (own_freeze)
+		g_swcursor_frozen = 0;
 }
 
 static void clamp_cursor_to_margin(void) {
@@ -634,9 +639,25 @@ uint32_t cirrusfb_rows(void) { return g_rows; }
 
 void cirrusfb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	if (!g_ready || !g_textbuf || x >= g_cols || y >= g_rows) return;
+	/*
+	 * Unbatched echo/klog: freeze the SW cursor around the paint so a timer
+	 * blink cannot redraw a stale blank cell over this glyph before flush.
+	 */
+	int own_freeze = 0;
+	if (g_batch_depth == 0 && !g_hwcursor_ok) {
+		if (g_swcursor_visible)
+			swcursor_erase_at(g_cursor_x, g_cursor_y);
+		g_swcursor_frozen = 1;
+		own_freeze = 1;
+	}
 	g_textbuf[y * g_cols + x].ch = ch;
 	g_textbuf[y * g_cols + x].attr = attr;
 	draw_glyph_noflush(x, y, ch, attr);
+	if (own_freeze) {
+		g_swcursor_frozen = 0;
+		if (g_swcursor_visible)
+			swcursor_draw_at(g_cursor_x, g_cursor_y);
+	}
 	cirrusfb_flush_dirty();
 }
 
@@ -784,6 +805,21 @@ void cirrusfb_set_cursor(uint32_t x, uint32_t y) {
 	if (y >= g_rows) y = g_rows - 1;
 	if (g_margin_rows > 0 && y < g_margin_rows)
 		y = g_margin_rows;
+	/*
+	 * Inside a tty write batch the SW cursor stays erased until end_batch.
+	 * Only update the logical position; painting here raced with glyphs and
+	 * left the first cells blank on vmwgfx until a full redraw.
+	 */
+	if (g_batch_depth > 0 || g_swcursor_frozen) {
+		g_cursor_x = x;
+		g_cursor_y = y;
+		if (g_hwcursor_ok) {
+			g_hwcursor_def_x = x;
+			g_hwcursor_def_y = y;
+			g_hwcursor_deferred = 1;
+		}
+		return;
+	}
 	uint32_t ox = g_cursor_x, oy = g_cursor_y;
 	if (!g_hwcursor_ok && g_swcursor_visible) {
 		swcursor_erase_at(ox, oy);
@@ -792,13 +828,7 @@ void cirrusfb_set_cursor(uint32_t x, uint32_t y) {
 	g_cursor_y = y;
 
 	if (g_hwcursor_ok) {
-		if (g_batch_depth > 0) {
-			g_hwcursor_def_x = x;
-			g_hwcursor_def_y = y;
-			g_hwcursor_deferred = 1;
-		} else {
-			hwcursor_set_pos(x, y);
-		}
+		hwcursor_set_pos(x, y);
 	} else {
 		if (g_swcursor_visible) swcursor_draw_at(x, y);
 	}
@@ -929,10 +959,19 @@ void cirrusfb_scroll_region(uint32_t top, uint32_t bottom) {
 	uint32_t band_h = (bottom - top) * fh;
 	size_t move_bytes = (size_t)g_pitch * band_h;
 	int twin = (g_shadow && g_vram && g_fb == g_shadow && g_bpp == 32) ? 1 : 0;
+	/*
+	 * Newline scroll runs inside tty write batches (ls, etc.).  Clearing
+	 * g_swcursor_frozen here used to re-enable timer blink mid-write, so the
+	 * SW cursor could stamp a blank cell over the first glyphs until a full
+	 * redraw (setfont).  Only own the freeze when not already batched.
+	 */
+	int own_freeze = (g_batch_depth == 0);
 
-	g_swcursor_frozen = 1;
-	if (!g_hwcursor_ok)
-		swcursor_erase_at(g_cursor_x, g_cursor_y);
+	if (own_freeze) {
+		g_swcursor_frozen = 1;
+		if (!g_hwcursor_ok)
+			swcursor_erase_at(g_cursor_x, g_cursor_y);
+	}
 
 	if (twin && g_fb_dirty) {
 		cirrusfb_shadow_to_vram(g_dirty_x0, g_dirty_y0,
@@ -966,9 +1005,11 @@ void cirrusfb_scroll_region(uint32_t top, uint32_t bottom) {
 		fb_dirty_mark(0, y0, g_width, (bottom - top + 1) * fh);
 		cirrusfb_flush_dirty();
 	}
-	g_swcursor_frozen = 0;
-	if (!g_hwcursor_ok && g_swcursor_visible)
-		swcursor_draw_at(g_cursor_x, g_cursor_y);
+	if (own_freeze) {
+		g_swcursor_frozen = 0;
+		if (!g_hwcursor_ok && g_swcursor_visible)
+			swcursor_draw_at(g_cursor_x, g_cursor_y);
+	}
 }
 
 void cirrusfb_set_margin_rows(uint32_t rows) {

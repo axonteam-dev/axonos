@@ -17,6 +17,7 @@
 #include <pit.h>
 #include <rtc.h>
 #include <heap.h>
+#include <pmm.h>
 #include <paging.h>
 #include <sysinfo.h>
 #include <thread.h>
@@ -29,6 +30,7 @@
 #include <fs.h>
 #include <ext2.h>
 #include <ramfs.h>
+#include <tmpfs.h>
 #include <sysfs.h>
 #include <fbdev.h>
 #include <procfs.h>
@@ -84,19 +86,228 @@ extern const char nss_dns_so_blob_end[];
 extern const char nss_files_so_blob_start[];
 extern const char nss_files_so_blob_end[];
 
+static int ramfs_mkdir_p(const char *path)
+{
+    char tmp[512];
+    size_t len;
+    char *p;
+    int rc;
+
+    if (!path || path[0] != '/')
+        return -1;
+    len = strlen(path);
+    if (len == 0 || len >= sizeof(tmp))
+        return -1;
+    memcpy(tmp, path, len + 1);
+    /* Strip trailing slash so the final component is created too. */
+    while (len > 1 && tmp[len - 1] == '/') {
+        tmp[len - 1] = '\0';
+        len--;
+    }
+    for (p = tmp + 1; *p; p++) {
+        if (*p != '/')
+            continue;
+        *p = '\0';
+        if (tmp[1] != '\0') {
+            rc = ramfs_mkdir(tmp);
+            if (rc != 0 && rc != -4) /* -4 = EEXIST */
+                return -1;
+        }
+        *p = '/';
+    }
+    /* Final component (loop only creates parents on '/'). */
+    if (tmp[1] != '\0') {
+        rc = ramfs_mkdir(tmp);
+        if (rc != 0 && rc != -4)
+            return -1;
+    }
+    return 0;
+}
+
+/*
+ * Install into overlay upper (ramfs). Upper wins over squashfs lower — same as
+ * Linux overlay. Borrowed file points at immutable boot blob (no ftruncate
+ * promote, which kept failing and left stock relative gendepends.sh).
+ */
 static int ramfs_write_blob(const char *path, const void *blob, size_t len)
 {
-    if (!path || !blob || len == 0U)
+    char parent[512];
+    char *slash;
+    size_t plen;
+    int rc;
+
+    if (!path || !blob || len == 0U || path[0] != '/')
         return -1;
-    (void)fs_unlink(path);
-    struct fs_file *lf = fs_create_file(path);
-    if (!lf)
-        lf = fs_open(path);
-    if (!lf)
+
+    plen = strlen(path);
+    if (plen >= sizeof(parent))
         return -1;
-    fs_write(lf, blob, len, 0);
-    fs_file_free(lf);
+    memcpy(parent, path, plen + 1);
+    slash = strrchr(parent, '/');
+    if (!slash)
+        return -1;
+    if (slash != parent) {
+        *slash = '\0';
+        if (ramfs_mkdir_p(parent) != 0) {
+            kprintf("blob: mkdir -p failed %s\n", parent);
+            return -1;
+        }
+    }
+
+    (void)ramfs_remove(path);
+    rc = ramfs_create_borrowed_file(path, blob, len);
+    if (rc != 0) {
+        (void)ramfs_remove(path);
+        rc = ramfs_create_borrowed_file(path, blob, len);
+    }
+    if (rc != 0) {
+        kprintf("blob: upper create failed %s rc=%d\n", path, rc);
+        return -1;
+    }
+
+    {
+        struct fs_file *vf = fs_open(path);
+        char *got;
+        ssize_t n;
+        if (!vf) {
+            kprintf("blob: vfs re-open failed %s\n", path);
+            return -1;
+        }
+        got = (char *)kmalloc(len + 1);
+        if (!got) {
+            fs_file_free(vf);
+            return -1;
+        }
+        n = fs_read(vf, got, len, 0);
+        fs_file_free(vf);
+        if (n != (ssize_t)len || memcmp(got, blob, len) != 0) {
+            kprintf("blob: verify mismatch %s n=%zd\n", path, n);
+            kfree(got);
+            return -1;
+        }
+        got[len] = '\0';
+        if (strstr(path, "gendepends") && !strstr(got, "\n/etc/init.d")) {
+            kprintf("blob: missing /etc/init.d marker %s\n", path);
+            kfree(got);
+            return -1;
+        }
+        kfree(got);
+    }
+    (void)ramfs_chmod(path, S_IFREG | 0755);
     return 0;
+}
+
+#include "gendepends_blob.h"
+#include "init_sh_blob.h"
+
+/*
+ * Initfs OpenRC 0.53 ships gendepends.sh / init.sh with relative "etc/…" paths
+ * (pre-RC_SCRIPTDIRS packaging). Upstream OpenRC uses absolute @SYSCONFDIR@.
+ * Install the corrected scripts (same as a fixed package), not runtime sed.
+ */
+static int openrc_patch_relative_etc(const char *path)
+{
+    struct fs_file *f;
+    char *buf;
+    ssize_t n;
+    size_t sz;
+    int dirty = 0;
+
+    f = fs_open(path);
+    if (f && f->size == 0) {
+        fs_file_free(f);
+        (void)ramfs_remove(path);
+        f = fs_open(path);
+    }
+    if (!f || f->size <= 0)
+        return -1;
+    sz = (size_t)f->size;
+    if (sz > 64u * 1024u) {
+        fs_file_free(f);
+        return -1;
+    }
+    buf = (char *)kmalloc(sz + 64);
+    if (!buf) {
+        fs_file_free(f);
+        return -1;
+    }
+    n = fs_read(f, buf, sz, 0);
+    fs_file_free(f);
+    if (n != (ssize_t)sz) {
+        kfree(buf);
+        return -1;
+    }
+    buf[sz] = '\0';
+
+    /* Stock: `for _dir in \\\netc/init.d` and `. "$_dir/$RC_SERVICE"`. */
+    {
+        char *p = strstr(buf, "\netc/init.d");
+        while (p) {
+            size_t tail = sz - (size_t)(p - buf) - 1u; /* bytes after the '\n' */
+            memmove(p + 2, p + 1, tail + 1); /* keep NUL */
+            p[1] = '/';
+            sz++;
+            dirty = 1;
+            p = strstr(p + 2, "\netc/init.d");
+        }
+    }
+    {
+        char *p = strstr(buf, ". \"$_dir/$RC_SERVICE\"");
+        if (p) {
+            const char *rep = ". \"./$RC_SERVICE\"";
+            size_t old_l = strlen(". \"$_dir/$RC_SERVICE\"");
+            size_t new_l = strlen(rep);
+            size_t off = (size_t)(p - buf);
+            if (new_l <= old_l) {
+                memcpy(p, rep, new_l);
+                memmove(p + new_l, p + old_l, sz - off - old_l + 1);
+                sz = sz - old_l + new_l;
+                dirty = 1;
+            }
+        }
+    }
+    {
+        char *p = strstr(buf, "[ -e etc/rc.conf ]");
+        if (p) {
+            const char *rep = "[ -e /etc/rc.conf ]";
+            size_t old_l = strlen("[ -e etc/rc.conf ]");
+            size_t new_l = strlen(rep);
+            size_t off = (size_t)(p - buf);
+            memmove(p + new_l, p + old_l, sz - off - old_l + 1);
+            memcpy(p, rep, new_l);
+            sz = sz - old_l + new_l;
+            dirty = 1;
+        }
+    }
+
+    if (!dirty) {
+        kfree(buf);
+        return 0; /* already absolute */
+    }
+    if (ramfs_write_blob(path, buf, sz) != 0) {
+        kfree(buf);
+        return -1;
+    }
+    kfree(buf);
+    return 0;
+}
+
+static void boot_install_openrc_scripts(void)
+{
+    int gd = ramfs_write_blob("/usr/lib/rc/sh/gendepends.sh",
+                              gendepends_blob, gendepends_blob_len);
+    int ish = ramfs_write_blob("/usr/lib/rc/sh/init.sh",
+                               init_sh_blob, init_sh_blob_len);
+    if (gd != 0)
+        gd = openrc_patch_relative_etc("/usr/lib/rc/sh/gendepends.sh");
+    if (gd == 0)
+        klogprintf("boot: installed OpenRC gendepends.sh\n");
+    else
+        klogprintf("boot: FAILED gendepends.sh install\n");
+    if (ish == 0)
+        klogprintf("boot: installed OpenRC init.sh\n");
+    else
+        klogprintf("boot: FAILED init.sh install\n");
 }
 
 static void ramfs_install_libnss_dns(void)
@@ -247,13 +458,25 @@ void kernel_sysfs_populate_default(void) {
 }
 
 static int boot_try_run_init(void) {
-    /* OpenRC-first when shipped; otherwise standard Linux init paths from initfs. */
+    /* OpenRC PID1 is openrc-init (/sbin/init → openrc-init in initfs).
+     * Prefer it over BusyBox linuxrc. /sbin/openrc is the runlevel helper, not PID1. */
     static const char *candidates[] = {
-        "/sbin/init",
         "/linuxrc",
+        "/sbin/openrc-init",
+        "/usr/sbin/openrc-init",
+        "/sbin/init",
         "/bin/sh",
         NULL
     };
+    int have_openrc = 0;
+    {
+        struct stat st;
+        if (vfs_stat("/sbin/openrc-init", &st) == 0 ||
+            vfs_stat("/usr/sbin/openrc-init", &st) == 0 ||
+            vfs_stat("/sbin/openrc", &st) == 0 ||
+            vfs_stat("/usr/sbin/openrc", &st) == 0)
+            have_openrc = 1;
+    }
     for (int i = 0; candidates[i]; i++) {
         const char *p = candidates[i];
         struct stat st;
@@ -585,7 +808,23 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         if (heap_size < (128ULL * 1024ULL * 1024ULL))
             kprintf("warning: kernel heap only %llu MiB after user-VA split — increase VM RAM (docker needs ≥2GiB)\n",
                     (unsigned long long)(heap_size / (1024ULL * 1024ULL)));
-        heap_init(heap_start, heap_size);
+        /*
+         * Linux: buddy owns pages; kmalloc is a small-object layer.
+         * Carve Soft_OWNED frames out of the high end of this arena so
+         * fork/exec cannot exhaust the object heap (was ~392MiB OOM).
+         */
+        {
+            uintptr_t arena_hi = heap_start + heap_size;
+            const size_t OBJECT_HEAP = 128ULL * 1024ULL * 1024ULL;
+            const size_t PMM_MIN = 64ULL * 1024ULL * 1024ULL;
+            if (heap_size > OBJECT_HEAP + PMM_MIN) {
+                heap_size = OBJECT_HEAP;
+                heap_init(heap_start, heap_size);
+                pmm_init(heap_start + heap_size, arena_hi);
+            } else {
+                heap_init(heap_start, heap_size);
+            }
+        }
         kprintf("Kernel starting... heap_start: %p heap_size=%llu heap_total=%llu heap_base=%p ram_mb=%d kernel_end: %p initrd: %p..%p\n",
                 (void*)heap_start,
                 (unsigned long long)heap_size,
@@ -873,10 +1112,48 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         fs_write(pf, root_passwd_line, root_passwd_len, 0);
         fs_file_free(pf);
     }
-    /* Member lists required: BusyBox id(1) getgrouplist fails on "root:x:0:". */
+    /* Member lists required: BusyBox id(1) getgrouplist fails on "root:x:0:".
+     * Include Linux base groups OpenRC checkpath expects (uucp for /run/lock). */
     static const char root_group_line[] =
         "root:x:0:root,miha\n"
+        "daemon:x:1:\n"
+        "bin:x:2:\n"
+        "sys:x:3:\n"
+        "adm:x:4:\n"
+        "tty:x:5:\n"
+        "disk:x:6:\n"
+        "lp:x:7:\n"
+        "mail:x:8:\n"
+        "news:x:9:\n"
+        "uucp:x:10:\n"
+        "man:x:12:\n"
+        "proxy:x:13:\n"
+        "kmem:x:15:\n"
+        "dialout:x:20:\n"
+        "fax:x:21:\n"
+        "voice:x:22:\n"
+        "cdrom:x:24:\n"
+        "floppy:x:25:\n"
+        "tape:x:26:\n"
+        "sudo:x:27:miha\n"
+        "audio:x:29:\n"
+        "dip:x:30:\n"
+        "www-data:x:33:\n"
+        "backup:x:34:\n"
+        "operator:x:37:\n"
+        "list:x:38:\n"
+        "irc:x:39:\n"
+        "src:x:40:\n"
+        "shadow:x:42:\n"
+        "utmp:x:43:\n"
+        "video:x:44:\n"
+        "sasl:x:45:\n"
+        "plugdev:x:46:\n"
+        "staff:x:50:\n"
+        "games:x:60:\n"
         "users:x:100:miha\n"
+        "messagebus:x:101:\n"
+        "nogroup:x:65534:\n"
         "miha:x:1000:miha\n";
     const size_t root_group_len = sizeof(root_group_line) - 1;
     struct fs_file *gf = fs_create_file("/etc/group");
@@ -915,10 +1192,10 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         }
     }
     (void)ramfs_mkdir("/var");
-    (void)ramfs_mkdir("/var/run");
+    /* Do NOT mkdir /var/run — squashfs has /var/run -> /run. mkdir on overlay
+     * upper would shadow that symlink and break Linux /var/run semantics. */
     (void)ramfs_mkdir("/var/log");  /* ensure exists for wtmp (klog also creates it) */
     (void)ramfs_mkdir("/var/log/nginx");
-    (void)ramfs_mkdir("/var/run");
     (void)ramfs_mkdir("/srv");
     (void)ramfs_mkdir("/srv/www");
     {
@@ -977,36 +1254,44 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             }
         }
     }
+    /* Linux: /run is a tmpfs (often already mounted by initramfs). Pre-mount so
+     * OpenRC mountinfo -q /run succeeds and init.sh skips fstabinfo/mount.
+     * Never mkdir /var/run — squashfs ships /var/run -> /run.
+     * Final verify + remount happens after /proc is up (see below). */
     (void)ramfs_mkdir("/run");
+    if (tmpfs_mount("/run") != 0)
+        kprintf("boot: warning: failed to mount tmpfs on /run (will retry)\n");
+    else
+        kprintf("boot: tmpfs mounted on /run\n");
     (void)ramfs_mkdir("/run/lock");
     (void)ramfs_mkdir("/run/openrc");
-    (void)ramfs_mkdir("/run/openrc/daemons");
-    (void)ramfs_mkdir("/run/openrc/started");
-    (void)ramfs_mkdir("/run/openrc/stopped");
-    (void)ramfs_mkdir("/run/openrc/starting");
-    (void)ramfs_mkdir("/run/openrc/stopping");
-    (void)ramfs_mkdir("/run/openrc/inactive");
-    (void)ramfs_mkdir("/run/openrc/wasinactive");
-    (void)ramfs_mkdir("/run/openrc/failed");
-    (void)ramfs_mkdir("/run/openrc/crashed");
-    (void)ramfs_mkdir("/run/openrc/hotplugged");
-    (void)ramfs_mkdir("/run/openrc/scheduled");
-    (void)ramfs_mkdir("/run/openrc/exclusive");
-    (void)ramfs_mkdir("/run/openrc/options");
-    if (ramfs_symlink("/var/run/openrc", "/run/openrc") != 0)
-        (void)ramfs_mkdir("/var/run/openrc");
-    if (ramfs_symlink("/var/lock", "/run/lock") != 0)
-        (void)ramfs_mkdir("/var/lock");
     {
-        struct fs_file *sf = fs_open("/run/openrc/softlevel");
-        if (!sf) sf = fs_create_file("/run/openrc/softlevel");
-        if (sf) {
-            static const char softlevel[] = "sysinit\n";
-            if (sf->size == 0)
-                fs_write(sf, softlevel, sizeof(softlevel) - 1, 0);
-            fs_file_free(sf);
+        struct stat st;
+        if (vfs_lstat("/var/run", &st) != 0)
+            (void)ramfs_symlink("/var/run", "/run");
+        if (vfs_lstat("/var/lock", &st) != 0)
+            (void)ramfs_symlink("/var/lock", "/run/lock");
+    }
+
+    /* Linux /etc/fstab — OpenRC fstabinfo --mount /proc|/run uses this. */
+    {
+        static const char fstab[] =
+            "# <file system>\t<mount point>\t<type>\t<options>\t\t<dump>\t<pass>\n"
+            "proc\t\t/proc\t\tproc\tdefaults\t\t0\t0\n"
+            "sysfs\t\t/sys\t\tsysfs\tdefaults\t\t0\t0\n"
+            "devtmpfs\t/dev\t\tdevtmpfs\tmode=0755\t\t0\t0\n"
+            "tmpfs\t\t/run\t\ttmpfs\tmode=0755,nosuid,nodev\t0\t0\n"
+            "tmpfs\t\t/tmp\t\ttmpfs\tmode=1777,nosuid,nodev\t0\t0\n";
+        struct fs_file *ff = fs_create_file("/etc/fstab");
+        if (!ff) ff = fs_open("/etc/fstab");
+        if (ff) {
+            (void)vfs_ftruncate(ff, 0);
+            fs_write(ff, fstab, sizeof(fstab) - 1, 0);
+            fs_file_free(ff);
         }
     }
+    /* Do not create /etc/conf.d/rc — OpenRC 0.53 warns and wants rc.conf only. */
+    (void)fs_unlink("/etc/conf.d/rc");
     (void)ramfs_mkdir("/tmp");  /* passwd uses mkstemp in /tmp for shadow update */
     (void)ramfs_mkdir("/var/tmp");
     /* tmux and many POSIX tools expect sticky tmp dirs (01777). */
@@ -1201,7 +1486,24 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 klogprintf("boot: warning: failed to link /sbin/openrc-run\n");
             }
         }
+        /* Same for openrc / openrc-init when only usr/sbin is populated. */
+        if (vfs_stat("/sbin/openrc", &st) != 0 && vfs_stat("/usr/sbin/openrc", &st) == 0) {
+            (void)ramfs_mkdir("/sbin");
+            (void)ramfs_symlink("/sbin/openrc", "/usr/sbin/openrc");
+        }
+        if (vfs_stat("/sbin/openrc-init", &st) != 0 && vfs_stat("/usr/sbin/openrc-init", &st) == 0) {
+            (void)ramfs_mkdir("/sbin");
+            (void)ramfs_symlink("/sbin/openrc-init", "/usr/sbin/openrc-init");
+        }
+        if (vfs_stat("/sbin/init", &st) != 0) {
+            if (vfs_stat("/sbin/openrc-init", &st) == 0)
+                (void)ramfs_symlink("/sbin/init", "/sbin/openrc-init");
+            else if (vfs_stat("/usr/sbin/openrc-init", &st) == 0)
+                (void)ramfs_symlink("/sbin/init", "/usr/sbin/openrc-init");
+        }
     }
+
+    boot_install_openrc_scripts();
 
     /* Compatibility: many distros' adduser scripts call /sbin/addgroup explicitly,
      * while initfs may only provide /usr/sbin/addgroup. Create a tiny wrapper if needed. */
@@ -1226,7 +1528,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     /* OpenRC rc_sys() reads /proc before init.sh mounts it; provide proc early.
      * Same for sysfs: openrc's sysfs service greps /proc/filesystems and mounts
-     * /sys — pre-mount so mountinfo sees it and remount is a no-op. */
+     * /sys — pre-mount so mountinfo sees it and remount is a no-op.
+     * /run tmpfs is pre-mounted earlier (with /etc/fstab) so mountinfo -q /run
+     * succeeds — same as a Linux initramfs leaving /run mounted. */
     {
         (void)procfs_register();
         (void)ramfs_mkdir("/proc");
@@ -1241,8 +1545,49 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         else
             klogprintf("boot: warning: failed to mount /sys\n");
     }
+    /* Confirm /run is visible the way OpenRC mountinfo reads it. Retry mount
+     * here (after /proc) so a transient early failure still leaves tmpfs on
+     * /run before openrc-init starts. Dump the VFS mount table to the console. */
+    {
+        (void)ramfs_mkdir("/run");
+        if (tmpfs_mount("/run") != 0)
+            kprintf("boot: RETRY failed: tmpfs on /run\n");
+        struct fs_driver *md = fs_get_mount_driver_exact("/run");
+        if (!md || !md->ops || !md->ops->name || strcmp(md->ops->name, "tmpfs") != 0)
+            kprintf("boot: /run NOT tmpfs in mount table — OpenRC will try mount\n");
+        else
+            kprintf("boot: /run ready for mountinfo (tmpfs)\n");
+        {
+            int n = fs_mount_count();
+            kprintf("boot: VFS mounts (%d):\n", n);
+            for (int i = 0; i < n; i++) {
+                char mp[64], dn[32];
+                if (fs_mount_get(i, mp, sizeof(mp), dn, sizeof(dn)) == 0)
+                    kprintf("  [%d] %s on %s\n", i, dn, mp);
+            }
+        }
+        /* Exact bytes OpenRC mountinfo parses via fopen("/proc/mounts"). */
+        {
+            struct fs_file *mf = fs_open("/proc/mounts");
+            if (!mf) {
+                kprintf("boot: FATAL cannot open /proc/mounts\n");
+            } else {
+                char buf[1024];
+                ssize_t nr = fs_read(mf, buf, sizeof(buf) - 1, 0);
+                fs_file_free(mf);
+                if (nr <= 0) {
+                    kprintf("boot: FATAL /proc/mounts empty (read=%zd)\n", nr);
+                } else {
+                    buf[nr] = '\0';
+                    kprintf("boot: /proc/mounts (%zd bytes):\n%s", nr, buf);
+                    if (!strstr(buf, " /run "))
+                        kprintf("boot: FATAL /proc/mounts missing ' /run '\n");
+                }
+            }
+        }
+    }
 
-    // Prefer linuxrc/init if present; fallback to kernel shell.
+    // Prefer OpenRC (openrc-init) over BusyBox linuxrc; shell is last resort.
     if (boot_try_run_init() != 0) {
         klogprintf("fatal: There is nothing to run. Download the correct initfs from https://apm.axont.ru/Packages/initfs.cpio and place it in the root of the boot device.");
     }

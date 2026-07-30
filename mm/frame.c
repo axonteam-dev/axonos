@@ -1,6 +1,7 @@
 #include <frame.h>
 #include <heap.h>
 #include <paging.h>
+#include <pmm.h>
 #include <spinlock.h>
 #include <string.h>
 
@@ -9,7 +10,7 @@
 
 typedef struct frame_meta {
     uint64_t pa;
-    void *raw;
+    void *raw; /* non-NULL only for legacy kmalloc-backed frames */
     unsigned refs;
     /* Freelist link when refs==0; PA hash chain when refs>0. */
     int link;
@@ -82,21 +83,27 @@ static int frame_take_free_locked(void) {
     return slot;
 }
 
-static void frame_hash_insert_locked(int slot) {
-    if (!frame_hash) {
-        frames[slot].link = -1;
+static void frame_return_free_locked(int slot) {
+    if (!frames || slot < 0 || slot >= frames_cap)
         return;
-    }
+    frames[slot].pa = 0;
+    frames[slot].raw = NULL;
+    frames[slot].refs = 0;
+    frames[slot].link = frame_free_head;
+    frame_free_head = slot;
+}
+
+static void frame_hash_insert_locked(int slot) {
+    if (!frames || !frame_hash || slot < 0)
+        return;
     unsigned h = frame_hash_pa(frames[slot].pa);
     frames[slot].link = frame_hash[h];
     frame_hash[h] = slot;
 }
 
 static void frame_hash_remove_locked(int slot) {
-    if (!frame_hash) {
-        frames[slot].link = -1;
+    if (!frames || !frame_hash || slot < 0)
         return;
-    }
     unsigned h = frame_hash_pa(frames[slot].pa);
     int *pp = &frame_hash[h];
     while (*pp >= 0) {
@@ -109,37 +116,45 @@ static void frame_hash_remove_locked(int slot) {
     }
 }
 
-static void frame_return_free_locked(int slot) {
-    frames[slot].pa = 0;
-    frames[slot].raw = NULL;
-    frames[slot].refs = 0;
-    frames[slot].link = frame_free_head;
-    frame_free_head = slot;
-}
-
 void *frame_alloc(void) {
     if (!frames)
         return NULL;
-    void *raw = kmalloc((size_t)PAGE_SIZE_4K * 2u);
-    if (!raw)
-        return NULL;
-    uintptr_t aligned = ((uintptr_t)raw + PAGE_SIZE_4K - 1u) &
-                        ~((uintptr_t)PAGE_SIZE_4K - 1u);
+
+    void *page = NULL;
+    void *raw = NULL;
+
+    /* Prefer PMM (4KiB from reserved arena). Fall back to kmalloc only if
+     * pmm was not carved at boot — never the steady-state path. */
+    if (pmm_ready()) {
+        page = pmm_alloc_page();
+        if (!page)
+            return NULL;
+    } else {
+        raw = kmalloc((size_t)PAGE_SIZE_4K * 2u);
+        if (!raw)
+            return NULL;
+        page = (void *)(((uintptr_t)raw + PAGE_SIZE_4K - 1u) &
+                        ~((uintptr_t)PAGE_SIZE_4K - 1u));
+    }
+
     unsigned long flags;
     acquire_irqsave(&frame_lock, &flags);
     int slot = frame_take_free_locked();
     if (slot >= 0) {
-        frames[slot].pa = (uint64_t)aligned;
+        frames[slot].pa = (uint64_t)(uintptr_t)page;
         frames[slot].raw = raw;
         frames[slot].refs = 1;
         frame_hash_insert_locked(slot);
     }
     release_irqrestore(&frame_lock, flags);
     if (slot < 0) {
-        kfree(raw);
+        if (raw)
+            kfree(raw);
+        else
+            pmm_free_page(page);
         return NULL;
     }
-    return (void *)aligned;
+    return page;
 }
 
 void *frame_alloc_zero(void) {
@@ -183,23 +198,27 @@ int frame_retain(uint64_t pa) {
 void frame_release(uint64_t pa) {
     pa &= PG_ADDR_MASK;
     void *raw = NULL;
+    int free_pmm = 0;
     unsigned long flags;
     acquire_irqsave(&frame_lock, &flags);
     int slot = frame_slot_locked(pa);
     if (slot >= 0 && --frames[slot].refs == 0) {
         raw = frames[slot].raw;
+        free_pmm = (raw == NULL);
         frame_hash_remove_locked(slot);
         frame_return_free_locked(slot);
     }
     release_irqrestore(&frame_lock, flags);
     if (raw)
         kfree(raw);
+    else if (free_pmm)
+        pmm_free_page((void *)(uintptr_t)pa);
 }
 
 unsigned frame_refcount(uint64_t pa) {
     pa &= PG_ADDR_MASK;
-    unsigned refs = 0;
     unsigned long flags;
+    unsigned refs = 0;
     acquire_irqsave(&frame_lock, &flags);
     int slot = frame_slot_locked(pa);
     if (slot >= 0)

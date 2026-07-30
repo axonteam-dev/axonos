@@ -185,6 +185,7 @@ static uint64_t elf_load_base_for_image(const Elf64_Ehdr *eh, const Elf64_Phdr *
 }
 
 static int elf_needs_private_user_pages(thread_t *tc);
+static thread_t *elf_bprm_thread(void);
 static int mark_user_identity_range_2m(uint64_t va_begin, uint64_t va_end);
 
 /*
@@ -672,52 +673,313 @@ static int elf_needs_private_user_pages(thread_t *tc) {
     return tc->mm->pml4 != k->pml4;
 }
 
-/* Linux applies R_X86_64_RELATIVE for ET_DYN (PIE + ld.so) before user entry.
- * IRELATIVE for ET_EXEC static binaries is applied by glibc CRT before main —
- * do not invoke IFUNC resolvers from the kernel. */
-static int elf_apply_rela_relative(uint64_t load_base, const Elf64_Phdr *phdrs, int phnum) {
-    if (!phdrs || phnum <= 0 || load_base == 0) return 0;
-    const Elf64_Rela *rela = NULL;
-    size_t relasz = 0;
-    size_t relaent = sizeof(Elf64_Rela);
+/*
+ * Thread whose mm receives the ELF image (Linux bprm->mm).
+ * kernel_execve_init installs a nascent private mm on the ring0 preparer;
+ * that must win over thread_get_current_user() (often NULL on PID1), otherwise
+ * PT_LOAD stays identity-mapped without Soft_OWNED and fork() skips it — the
+ * child then #PF on the first instruction after clone (glibc _Fork @cmp rax).
+ */
+static thread_t *elf_bprm_thread(void) {
+    thread_t *tc = thread_current();
+    if (tc && elf_needs_private_user_pages(tc))
+        return tc;
+    if (tc && tc->ring == 3)
+        return tc;
+    thread_t *u = thread_get_current_user();
+    if (u)
+        return u;
+    return tc;
+}
 
+/* Store one qword into the loaded image. Private mm must use leaf PA — a plain
+ * user-VA store under the wrong CR3 fills identity phys and leaves GOT slots 0
+ * (static IFUNC then `jmp *GOT` → RIP=0). */
+static int elf_store_u64_into_mm(mm_t *mm, uint64_t va, uint64_t val) {
+    if (va + sizeof(uint64_t) > (uint64_t)MMIO_IDENTITY_LIMIT)
+        return -1;
+    if (mm) {
+        uint64_t leaf = 0;
+        if (mm_va_leaf_pa(mm, va, &leaf) != 0)
+            return -1;
+        uint64_t page = leaf & ~0xFFFULL;
+        if (page == (va & ~0xFFFULL))
+            return -1;
+        *(uint64_t *)(uintptr_t)(page + (va & 0xFFFULL)) = val;
+        return 0;
+    }
+    *(uint64_t *)(uintptr_t)va = val;
+    return 0;
+}
+
+static int elf_va_to_file_off(const Elf64_Phdr *phdrs, int phnum, uint64_t load_base,
+                             uint64_t va, uint64_t *out_off) {
+    if (!phdrs || !out_off) return -1;
+    for (int i = 0; i < phnum; i++) {
+        if (phdrs[i].p_type != ELF_PT_LOAD) continue;
+        uint64_t lo = load_base + phdrs[i].p_vaddr;
+        uint64_t hi = lo + phdrs[i].p_filesz;
+        if (va < lo || va >= hi) continue;
+        *out_off = phdrs[i].p_offset + (va - lo);
+        return 0;
+    }
+    return -1;
+}
+
+/*
+ * Apply R_X86_64_RELATIVE / IRELATIVE.
+ * ET_DYN: PT_DYNAMIC (Linux load_elf / ld.so contract for RELATIVE).
+ * ET_EXEC: .rela.plt IRELATIVE — glibc CRT also runs ARCH_SETUP_IREL; we apply
+ * via Soft_OWNED leaf PA after image publish so GOT cannot stay as zero/PLT
+ * self-jmps when user VA GOT writes fail. Resolver results must land in RX
+ * PT_LOAD (never brk/TLS/mmap — the 0xec00000 / 0x803668 Oops class).
+ *
+ * IFUNC must run with the process CR3 held for the whole apply. A stale
+ * swapper CR3 makes resolver VA fetch identity garbage and plant anon/mmap
+ * targets (user RIP=0xec00000 on zero pages).
+ */
+static void elf_text_range(const Elf64_Phdr *phdrs, int phnum, uint64_t load_base,
+                           uint64_t *lo_out, uint64_t *hi_out) {
+    uint64_t lo = UINT64_MAX, hi = 0;
+    *lo_out = 0;
+    *hi_out = 0;
+    if (!phdrs || phnum <= 0)
+        return;
+    for (int i = 0; i < phnum; i++) {
+        if (phdrs[i].p_type != ELF_PT_LOAD || (phdrs[i].p_flags & 1u) == 0)
+            continue;
+        uint64_t a = load_base + phdrs[i].p_vaddr;
+        uint64_t b = a + phdrs[i].p_memsz;
+        if (a < lo)
+            lo = a;
+        if (b > hi)
+            hi = b;
+    }
+    if (lo != UINT64_MAX) {
+        *lo_out = lo;
+        *hi_out = hi;
+    }
+}
+
+/* Read Soft_OWNED image bytes via leaf PA (independent of current CR3). */
+static int elf_load_u8_from_mm(mm_t *mm, uint64_t va, void *dst, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    if (!dst || n == 0)
+        return 0;
+    while (n) {
+        uint64_t leaf = 0;
+        uint64_t page, off;
+        size_t chunk;
+        if (mm) {
+            if (mm_va_leaf_pa(mm, va, &leaf) != 0)
+                return -1;
+            page = leaf & ~0xFFFULL;
+            if (page == (va & ~0xFFFULL))
+                return -1;
+            off = va & 0xFFFULL;
+            chunk = (size_t)(0x1000ULL - off);
+            if (chunk > n)
+                chunk = n;
+            memcpy(d, (const void *)(uintptr_t)(page + off), chunk);
+        } else {
+            off = va & 0xFFFULL;
+            chunk = (size_t)(0x1000ULL - off);
+            if (chunk > n)
+                chunk = n;
+            memcpy(d, (const void *)(uintptr_t)va, chunk);
+        }
+        va += chunk;
+        d += chunk;
+        n -= chunk;
+    }
+    return 0;
+}
+
+static int elf_apply_rela_buffer(mm_t *mm, uint64_t load_base,
+                                 const Elf64_Rela *rela, size_t nrel, size_t relaent,
+                                 uint64_t text_lo, uint64_t text_hi) {
+    if (!rela || nrel == 0 || relaent < sizeof(Elf64_Rela))
+        return 0;
+    typedef uint64_t (*irel_fn_t)(void);
+    uint64_t saved_cr3 = paging_read_cr3();
+    uint64_t want_cr3 = saved_cr3;
+    unsigned long irqf;
+    int bad = 0;
+    if (mm && mm->pml4) {
+        want_cr3 = mm->cr3 ? mm->cr3 : (uint64_t)(uintptr_t)mm->pml4;
+        if ((saved_cr3 & ~0xFFFULL) != (want_cr3 & ~0xFFFULL))
+            paging_write_cr3(want_cr3);
+    }
+    /* Hold IF=0 for the whole walk so a tick cannot switch CR3 mid-apply. */
+    asm volatile("pushfq; pop %0; cli" : "=r"(irqf) :: "memory");
+    for (size_t i = 0; i < nrel; i++) {
+        const Elf64_Rela *r = (const Elf64_Rela *)((const char *)rela + i * relaent);
+        uint32_t rtype = (uint32_t)ELF64_R_TYPE(r->r_info);
+        uint64_t where_va = load_base + r->r_offset;
+        if (where_va >= (uint64_t)MMIO_IDENTITY_LIMIT) {
+            bad = 1;
+            break;
+        }
+        if (rtype == ELF_R_X86_64_RELATIVE) {
+            if (elf_store_u64_into_mm(mm, where_va, load_base + (uint64_t)r->r_addend) != 0) {
+                bad = 1;
+                break;
+            }
+        } else if (rtype == ELF_R_X86_64_IRELATIVE) {
+            uint64_t resolver_va = load_base + (uint64_t)r->r_addend;
+            uint64_t target;
+            uint8_t probe[8];
+            if (resolver_va < 0x400000ULL || resolver_va >= (uint64_t)MMIO_IDENTITY_LIMIT) {
+                bad = 1;
+                break;
+            }
+            if (text_lo && text_hi &&
+                (resolver_va < text_lo || resolver_va >= text_hi))
+                continue;
+            /* Refuse Soft_OWNED holes / zero pages as IFUNC bodies. */
+            if (elf_load_u8_from_mm(mm, resolver_va, probe, sizeof(probe)) != 0)
+                continue;
+            if (probe[0] == 0 && probe[1] == 0 && probe[2] == 0 && probe[3] == 0)
+                continue;
+            if ((paging_read_cr3() & ~0xFFFULL) != (want_cr3 & ~0xFFFULL))
+                paging_write_cr3(want_cr3);
+            {
+                irel_fn_t resolver = (irel_fn_t)(uintptr_t)resolver_va;
+                target = resolver();
+            }
+            if (target == 0 || target >= (uint64_t)MMIO_IDENTITY_LIMIT)
+                continue;
+            if (text_lo && text_hi && (target < text_lo || target >= text_hi))
+                continue;
+            if (elf_store_u64_into_mm(mm, where_va, target) != 0) {
+                bad = 1;
+                break;
+            }
+        }
+    }
+    if ((paging_read_cr3() & ~0xFFFULL) != (saved_cr3 & ~0xFFFULL))
+        paging_write_cr3(saved_cr3);
+    asm volatile("push %0; popfq" ::"r"(irqf) : "memory", "cc");
+    return bad ? -1 : 0;
+}
+
+static int elf_apply_rela_relative(struct fs_file *f, uint64_t load_base,
+                                   const Elf64_Ehdr *eh, const Elf64_Phdr *phdrs, int phnum) {
+    if (!f || !eh || !phdrs || phnum <= 0) return 0;
+    thread_t *tc = elf_bprm_thread();
+    mm_t *mm = (tc && elf_needs_private_user_pages(tc)) ? tc->mm : NULL;
+    uint64_t text_lo = 0, text_hi = 0;
+    elf_text_range(phdrs, phnum, load_base, &text_lo, &text_hi);
+
+    /* ET_DYN / PIE via PT_DYNAMIC. */
     for (int i = 0; i < phnum; i++) {
         if (phdrs[i].p_type != ELF_PT_DYNAMIC) continue;
-        if (phdrs[i].p_memsz < sizeof(Elf64_Dyn)) return -1;
-        const Elf64_Dyn *dyn = (const Elf64_Dyn *)(uintptr_t)(load_base + phdrs[i].p_vaddr);
-        size_t n = (size_t)(phdrs[i].p_memsz / sizeof(Elf64_Dyn));
+        if (phdrs[i].p_filesz < sizeof(Elf64_Dyn)) return -1;
+        size_t dyn_bytes = (size_t)phdrs[i].p_filesz;
+        if (dyn_bytes > 64u * 1024u) return -1;
+        Elf64_Dyn *dyn = (Elf64_Dyn *)kmalloc(dyn_bytes);
+        if (!dyn) return -1;
+        if (fs_read(f, dyn, dyn_bytes, (size_t)phdrs[i].p_offset) != (ssize_t)dyn_bytes) {
+            kfree(dyn);
+            return -1;
+        }
+        uint64_t rela_va = 0;
+        size_t relasz = 0;
+        size_t relaent = sizeof(Elf64_Rela);
+        size_t n = dyn_bytes / sizeof(Elf64_Dyn);
         for (size_t j = 0; j < n; j++) {
             if (dyn[j].d_tag == ELF_DT_NULL) break;
             if (dyn[j].d_tag == ELF_DT_RELA)
-                rela = (const Elf64_Rela *)(uintptr_t)(load_base + dyn[j].d_un);
+                rela_va = (uint64_t)dyn[j].d_un;
             else if (dyn[j].d_tag == ELF_DT_RELASZ)
                 relasz = (size_t)dyn[j].d_un;
             else if (dyn[j].d_tag == ELF_DT_RELAENT && dyn[j].d_un != 0)
                 relaent = (size_t)dyn[j].d_un;
         }
-        break;
-    }
-    if (!rela || relasz == 0 || relaent < sizeof(Elf64_Rela))
-        return 0;
-    size_t nrel = relasz / relaent;
-    for (size_t i = 0; i < nrel; i++) {
-        const Elf64_Rela *r = (const Elf64_Rela *)((const char *)rela + i * relaent);
-        uint32_t rtype = (uint32_t)ELF64_R_TYPE(r->r_info);
-        uint64_t *where = (uint64_t *)(uintptr_t)(load_base + r->r_offset);
-        if ((uintptr_t)where < load_base || (uintptr_t)where >= (uintptr_t)MMIO_IDENTITY_LIMIT)
+        kfree(dyn);
+        if (!rela_va || relasz == 0 || relaent < sizeof(Elf64_Rela))
+            return 0;
+        uint64_t rela_off = 0;
+        if (elf_va_to_file_off(phdrs, phnum, load_base, load_base + rela_va, &rela_off) != 0 &&
+            elf_va_to_file_off(phdrs, phnum, load_base, rela_va, &rela_off) != 0)
             return -1;
-        if (rtype == ELF_R_X86_64_RELATIVE) {
-            *where = load_base + (uint64_t)r->r_addend;
-        } else if (rtype == ELF_R_X86_64_IRELATIVE) {
-            typedef uint64_t (*irel_fn_t)(void);
-            irel_fn_t resolver = (irel_fn_t)(uintptr_t)(load_base + (uint64_t)r->r_addend);
-            if ((uintptr_t)resolver < load_base ||
-                (uintptr_t)resolver >= (uintptr_t)MMIO_IDENTITY_LIMIT)
-                return -1;
-            *where = resolver();
+        if (relasz > 2u * 1024u * 1024u) return -1;
+        void *buf = kmalloc(relasz);
+        if (!buf) return -1;
+        if (fs_read(f, buf, relasz, (size_t)rela_off) != (ssize_t)relasz) {
+            kfree(buf);
+            return -1;
         }
+        int rc = elf_apply_rela_buffer(mm, load_base, (const Elf64_Rela *)buf,
+                                       relasz / relaent, relaent, text_lo, text_hi);
+        kfree(buf);
+        return rc;
+    }
+
+    /* Static ET_EXEC: SHT_RELA (.rela.plt IFUNC). */
+    if (eh->e_type != 2 /* ET_EXEC */)
+        return 0;
+    if (eh->e_shoff == 0 || eh->e_shnum == 0 || eh->e_shentsize != sizeof(Elf64_Shdr))
+        return 0;
+    {
+        size_t shsz = (size_t)eh->e_shnum * sizeof(Elf64_Shdr);
+        Elf64_Shdr *shdrs;
+        if (shsz > 256u * 1024u)
+            return 0;
+        shdrs = (Elf64_Shdr *)kmalloc(shsz);
+        if (!shdrs)
+            return -1;
+        if (fs_read(f, shdrs, shsz, (size_t)eh->e_shoff) != (ssize_t)shsz) {
+            kfree(shdrs);
+            return -1;
+        }
+        for (uint16_t si = 0; si < eh->e_shnum; si++) {
+            void *buf;
+            size_t nrel;
+            int rc;
+            if (shdrs[si].sh_type != ELF_SHT_RELA)
+                continue;
+            if (shdrs[si].sh_entsize < sizeof(Elf64_Rela) || shdrs[si].sh_size == 0)
+                continue;
+            if (shdrs[si].sh_size > 2u * 1024u * 1024u)
+                continue;
+            buf = kmalloc((size_t)shdrs[si].sh_size);
+            if (!buf) {
+                kfree(shdrs);
+                return -1;
+            }
+            if (fs_read(f, buf, (size_t)shdrs[si].sh_size,
+                        (size_t)shdrs[si].sh_offset) !=
+                (ssize_t)shdrs[si].sh_size) {
+                kfree(buf);
+                kfree(shdrs);
+                return -1;
+            }
+            nrel = (size_t)shdrs[si].sh_size / (size_t)shdrs[si].sh_entsize;
+            rc = elf_apply_rela_buffer(mm, load_base, (const Elf64_Rela *)buf,
+                                       nrel, (size_t)shdrs[si].sh_entsize,
+                                       text_lo, text_hi);
+            kfree(buf);
+            if (rc != 0) {
+                kfree(shdrs);
+                return rc;
+            }
+        }
+        kfree(shdrs);
     }
     return 0;
+}
+
+/* Make Soft_OWNED PT_LOAD visible via user VA (CR3 reload + invlpg). */
+static void elf_publish_private_image(mm_t *mm, uint64_t lo, uint64_t hi) {
+    if (!mm || !mm->pml4 || hi <= lo)
+        return;
+    uint64_t cr3 = mm->cr3 ? mm->cr3 : ((uint64_t)(uintptr_t)mm->pml4);
+    paging_write_cr3(cr3);
+    lo &= ~0xFFFULL;
+    hi = (hi + 0xFFFULL) & ~0xFFFULL;
+    for (uint64_t va = lo; va < hi && va < (uint64_t)MMIO_IDENTITY_LIMIT; va += 0x1000ULL)
+        invlpg((void *)(uintptr_t)va);
 }
 
 /*
@@ -731,9 +993,7 @@ static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
     if (va_end > MMIO_IDENTITY_LIMIT) va_end = MMIO_IDENTITY_LIMIT;
     if (va_begin >= va_end) return 0;
     {
-        thread_t *tc = thread_current();
-        if (!tc || tc->ring != 3)
-            tc = thread_get_current_user();
+        thread_t *tc = elf_bprm_thread();
         if (tc && elf_needs_private_user_pages(tc))
             return 0;
     }
@@ -951,9 +1211,7 @@ void exec_ensure_user_mappings(void) {
      * the kernel page tables (and the frozen vfork parent's) and hangs boot
      * at openrc-exec-enter. Only the legacy shared-CR3 path needs this.
      */
-    thread_t *tc = thread_current();
-    if (!tc || tc->ring != 3)
-        tc = thread_get_current_user();
+    thread_t *tc = elf_bprm_thread();
     if (tc && elf_needs_private_user_pages(tc))
         return;
     mark_broad_user_ranges_for_exec();
@@ -1152,9 +1410,7 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
         {
             uint64_t map_lo = vstart & ~0xFFFULL;
             uint64_t map_hi = (vend + 0xFFFULL) & ~0xFFFULL;
-            thread_t *tc = thread_current();
-            if (!tc || tc->ring != 3)
-                tc = thread_get_current_user();
+            thread_t *tc = elf_bprm_thread();
             if (tc && elf_needs_private_user_pages(tc)) {
                 /* Linux load_elf: map into current->mm only; never walk oldmm PTs. */
                 mm_t *share = mm_kernel();
@@ -1183,9 +1439,7 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
             }
         }
         if (ph->p_filesz > 0) {
-            thread_t *tc = thread_current();
-            if (!tc || tc->ring != 3)
-                tc = thread_get_current_user();
+            thread_t *tc = elf_bprm_thread();
             if (tc && elf_needs_private_user_pages(tc) && tc->mm) {
                 /*
                  * Stream PT_LOAD into private pages. A single kmalloc(p_filesz)
@@ -1236,9 +1490,7 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
             }
         }
         if (ph->p_memsz > ph->p_filesz) {
-            thread_t *tc = thread_current();
-            if (!tc || tc->ring != 3)
-                tc = thread_get_current_user();
+            thread_t *tc = elf_bprm_thread();
             size_t zlen = (size_t)(ph->p_memsz - ph->p_filesz);
             uint64_t zva = (uint64_t)(uintptr_t)dst + (uint64_t)ph->p_filesz;
             if (tc && elf_needs_private_user_pages(tc) && tc->mm) {
@@ -1253,21 +1505,8 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
         }
         if (vstart < loaded_lo) loaded_lo = vstart;
         if (vend > loaded_hi) loaded_hi = vend;
-        /* Round vend for brk only — never mark PTEs past p_memsz (unmapped 2MiB tail). */
-        {
-            uint64_t vend_rounded = (vend + PAGE_SIZE_2M - 1) & ~(PAGE_SIZE_2M - 1);
-            if (vend_rounded > vend && vend_rounded <= USER_IMAGE_LIMIT)
-                vend = vend_rounded;
-        }
+        /* Linux: brk follows real ELF mem end, not a 2MiB-rounded window. */
         if (vend > brk_end) brk_end = vend;
-    }
-
-    if (eh.e_type == 3 /* ET_DYN */) {
-        if (elf_apply_rela_relative(load_base, phdrs, (int)eh.e_phnum) != 0) {
-            kfree(phdrs);
-            fs_file_free(f);
-            return -1;
-        }
     }
 
     /* Pass 2: mark user-accessible after all segments are copied (avoid RO before memset). */
@@ -1280,6 +1519,69 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
             fs_file_free(f);
             return -1;
         }
+    }
+
+    /* Soft_OWNED was filled via leaf PA under direct-map CR3 — publish for VA
+     * before IFUNC resolvers run (they fetch .text through the process CR3). */
+    {
+        thread_t *tc = elf_bprm_thread();
+        if (tc && elf_needs_private_user_pages(tc) && tc->mm &&
+            loaded_lo < loaded_hi) {
+            elf_publish_private_image(tc->mm, loaded_lo, loaded_hi);
+            /*
+             * Verify every file-backed page via leaf PA (not only entry).
+             * A hole mid-image leaves IFUNC/CRT reading zeros and planting
+             * anon mmap addresses into GOT → user RIP=0xec00000.
+             */
+            for (int pi = 0; pi < (int)eh.e_phnum; pi++) {
+                Elf64_Phdr *ph = &phdrs[pi];
+                uint64_t va, end, foff;
+                if (ph->p_type != 1 /* PT_LOAD */ || ph->p_filesz == 0)
+                    continue;
+                va = load_base + ph->p_vaddr;
+                end = va + ph->p_filesz;
+                foff = ph->p_offset;
+                while (va < end) {
+                    uint8_t expect[64], got[64];
+                    size_t n = sizeof(expect);
+                    if (end - va < n)
+                        n = (size_t)(end - va);
+                    if (fs_read(f, expect, n, (size_t)foff) != (ssize_t)n) {
+                        kprintf("elf: Soft_OWNED verify read failed %s va=0x%llx\n",
+                                path ? path : "(null)", (unsigned long long)va);
+                        kfree(phdrs);
+                        fs_file_free(f);
+                        return -1;
+                    }
+                    if (elf_load_u8_from_mm(tc->mm, va, got, n) != 0 ||
+                        memcmp(got, expect, n) != 0) {
+                        kprintf("elf: Soft_OWNED mismatch %s va=0x%llx (IFUNC/GOT risk)\n",
+                                path ? path : "(null)", (unsigned long long)va);
+                        kfree(phdrs);
+                        fs_file_free(f);
+                        return -1;
+                    }
+                    /* Step by page to keep verify cheap on large ET_EXEC. */
+                    {
+                        uint64_t next = (va + 0x1000ULL) & ~0xFFFULL;
+                        if (next <= va)
+                            break;
+                        if (next > end)
+                            next = end;
+                        foff += (next - va);
+                        va = next;
+                    }
+                }
+            }
+        }
+    }
+
+    /* RELATIVE / IRELATIVE after Soft_OWNED is visible via user VA. */
+    if (elf_apply_rela_relative(f, load_base, &eh, phdrs, (int)eh.e_phnum) != 0) {
+        kprintf("elf: RELA/IRELATIVE apply failed %s\n", path ? path : "(null)");
+        kfree(phdrs);
+        fs_file_free(f);
+        return -1;
     }
 
     if (brk_end) {
@@ -1439,9 +1741,7 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
 
     /* Same as main exec path: build in kernel, publish via leaf PAs. */
     {
-        thread_t *tc = thread_current();
-        if (!tc || tc->ring != 3)
-            tc = thread_get_current_user();
+        thread_t *tc = elf_bprm_thread();
         mm_t *tip_mm = (tc && elf_needs_private_user_pages(tc)) ? tc->mm : NULL;
         size_t tip_bytes = (size_t)(stack_top - final_stack);
         void *tip_kimg = kmalloc(tip_bytes ? tip_bytes : 8u);
@@ -1744,9 +2044,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         fs_file_free(probe);
     }
     {
-        thread_t *tc = thread_current();
-        if (!tc || tc->ring != 3)
-            tc = thread_get_current_user();
+        thread_t *tc = elf_bprm_thread();
         if (tc) {
             if (tc->mm_ptemplate) {
                 mm_release(tc->mm_ptemplate);
@@ -1842,9 +2140,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
     /* PG_US for the loaded image comes from make_private / mark_user_range_exec.
      * Remapping 0x400000..0x800000 as identity would alias the vfork parent. */
     {
-        thread_t *tc = thread_current();
-        if (!tc || tc->ring != 3)
-            tc = thread_get_current_user();
+        thread_t *tc = elf_bprm_thread();
         if (!tc || !elf_needs_private_user_pages(tc))
             (void)mark_user_identity_range_2m(0x400000ULL, 0x800000ULL);
     }
@@ -1943,9 +2239,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
     }
 
     /* Build argv/env/auxv in a kernel buffer; publish once via leaf PAs. */
-    thread_t *tip_tc = thread_current();
-    if (!tip_tc || tip_tc->ring != 3)
-        tip_tc = thread_get_current_user();
+    thread_t *tip_tc = elf_bprm_thread();
     mm_t *tip_mm = (tip_tc && elf_needs_private_user_pages(tip_tc)) ? tip_tc->mm : NULL;
     size_t tip_bytes = (size_t)(stack_top - final_stack);
     void *tip_kimg = kmalloc(tip_bytes ? tip_bytes : 8u);
@@ -2061,6 +2355,23 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         cur_user->user_stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
         cur_user->user_stack_limit = stack_top;
         cur_user->user_fs_base = (uint64_t)fs_base;
+        /*
+         * posix_spawn/clone(child_stack) leaves saved_user_rsp on a heap/brk
+         * slab (~0x8008d80). enter_user_mode normally replaces RSP, but any
+         * fall-through through syscall.S iret would resume on that zeroed
+         * brk stack (argc/auxv = 0 → IFUNC/RIP=0). Keep every RSP copy on
+         * the new argv tip under USER_STACK_TOP.
+         */
+        cur_user->saved_user_rsp = (uint64_t)final_stack;
+        cur_user->saved_user_rip = entry;
+        if (cur_user->saved_syscall_frame) {
+            cur_user->saved_syscall_frame[13] = entry;
+            cur_user->saved_syscall_frame[15] = (uint64_t)final_stack;
+        }
+        if (cur_user->syscall_frame_kbuf) {
+            cur_user->syscall_frame_kbuf[13] = entry;
+            cur_user->syscall_frame_kbuf[15] = (uint64_t)final_stack;
+        }
         thread_proc_env_set(cur_user, envp);
         /* update display name */
         strncpy(cur_user->name, path, sizeof(cur_user->name) - 1);
@@ -2096,6 +2407,15 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         if (loaded_brk_end != 0) {
             user_as_set_brk_after_load(cur_user, loaded_brk_end,
                 loaded_image_hi > 0 ? (uintptr_t)loaded_image_hi : 0);
+        }
+        /* Linux execve: cwd stays; OpenRC helpers assume "/". Force root so
+         * relative etc/ paths and gendepends discovery cannot depend on a
+         * leftover posix_spawn/workdir. */
+        strncpy(cur_user->cwd, "/", sizeof(cur_user->cwd));
+        cur_user->cwd[sizeof(cur_user->cwd) - 1] = '\0';
+        if (cur_user->process) {
+            strncpy(cur_user->process->cwd, "/", sizeof(cur_user->process->cwd));
+            cur_user->process->cwd[sizeof(cur_user->process->cwd) - 1] = '\0';
         }
     } else {
         /* Spawn a scheduled user thread and block caller until it exits.
@@ -2161,11 +2481,13 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
                 loaded_image_hi > 0 ? (uintptr_t)loaded_image_hi : 0);
         }
         /* Mark PID 1 only for kernel-launched init candidates */
-        if (strcmp(path, "/linuxrc") == 0 || strcmp(path, "/init") == 0 ||
+        int is_pid1_path = (strcmp(path, "/linuxrc") == 0 ||
+            strcmp(path, "/init") == 0 ||
             strcmp(path, "/sbin/init") == 0 ||
-            strcmp(path, "/sbin/openrc-init") == 0) {
+            strcmp(path, "/sbin/openrc-init") == 0 ||
+            strcmp(path, "/usr/sbin/openrc-init") == 0);
+        if (is_pid1_path)
             thread_mark_init_user(ut);
-        }
         /* inherit basic POSIX-ish attributes and stdio from caller (usually tid0 osh) */
         if (caller) {
             ut->uid = caller->uid;
@@ -2190,9 +2512,19 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
             caller->state = THREAD_BLOCKED;
         }
         thread_proc_env_set(ut, envp);
-        /* A kernel-launched program is a session and process-group leader. */
-        ut->sid = (int)(ut->tid ? ut->tid : 1);
-        ut->pgid = (int)(ut->tid ? ut->tid : 1);
+        /* A kernel-launched program is a session and process-group leader.
+         * PID1 must keep sid/pgid=1 (thread_mark_init_user); do not clobber
+         * with the thread slot id after that. */
+        if (is_pid1_path ||
+            (int)(ut->tid ? ut->tid : 1) == thread_get_init_user_tid()) {
+            ut->sid = 1;
+            ut->pgid = 1;
+            if (ut->process)
+                process_claim_pid1(ut->process);
+        } else {
+            ut->sid = (int)(ut->tid ? ut->tid : 1);
+            ut->pgid = (int)(ut->tid ? ut->tid : 1);
+        }
         if (ut->attached_tty >= 0) {
             devfs_set_tty_fg_pgrp(ut->attached_tty, ut->pgid);
         }
@@ -2262,7 +2594,10 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         qemu_debug_printf("execve: DEBUG entry outside identity map: 0x%llx\n", (unsigned long long)entry);
     }
 
-    /* Transfer to user mode (does not return on success). */
+    /* Transfer to user mode (does not return on success for ring0 spawn).
+     * In-place ring3 exec returns 0 and lets syscall.S iret with the patched
+     * frame — enter_user_mode from deep in syscall_do left posix_spawn children
+     * on the old brk child_stack (RSP≈0x8008d80, empty auxv → RIP=0). */
     {
         thread_t *tc = thread_current();
         if (!tc)
@@ -2276,11 +2611,6 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
                 mm_release(tc->mm_ptemplate);
                 tc->mm_ptemplate = NULL;
             }
-            /*
-             * Finish exec_mmap: tip/ELF are installed on the active new mm.
-             * Now complete_vfork_done + mmput(old). Parent was kept frozen
-             * through tip publish (unlike waking at activate time).
-             */
             if (tc->mm)
                 mm_switch(tc->mm);
             if (tc->exec_discard_mm) {
@@ -2293,6 +2623,43 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
             if (tc->user_fs_base)
                 set_user_fs_base(tc->user_fs_base);
         }
+    }
+    {
+        uintptr_t stack_lo = (uintptr_t)USER_STACK_TOP - (uintptr_t)USER_STACK_SIZE;
+        if (final_stack < stack_lo || final_stack >= (uintptr_t)USER_STACK_TOP) {
+            kprintf("execve: refusing bad argv stack path=%s rsp=0x%llx (want [0x%llx,0x%llx))\n",
+                    path ? path : "?",
+                    (unsigned long long)final_stack,
+                    (unsigned long long)stack_lo,
+                    (unsigned long long)USER_STACK_TOP);
+            return -1;
+        }
+    }
+    if (cur_user) {
+        /* Re-assert live syscall frame slots immediately before return. */
+        cur_user->saved_user_rsp = (uint64_t)final_stack;
+        cur_user->saved_user_rip = entry;
+        cur_user->user_rip = entry;
+        cur_user->user_stack = final_stack;
+        if (cur_user->saved_syscall_frame) {
+            cur_user->saved_syscall_frame[13] = entry;
+            cur_user->saved_syscall_frame[14] = 0; /* execve success */
+            cur_user->saved_syscall_frame[15] = (uint64_t)final_stack;
+        }
+        if (cur_user->syscall_frame_kbuf) {
+            cur_user->syscall_frame_kbuf[13] = entry;
+            cur_user->syscall_frame_kbuf[14] = 0;
+            cur_user->syscall_frame_kbuf[15] = (uint64_t)final_stack;
+        }
+        cur_user->exec_trampoline_rip = entry;
+        cur_user->exec_trampoline_rsp = (uint64_t)final_stack;
+        cur_user->exec_trampoline_rax = 0;
+        cur_user->exec_trampoline_flag = 1;
+        devel_printf("exec-iret: path=%s rip=0x%llx rsp=0x%llx (via syscall frame)\n",
+            path ? path : "?",
+            (unsigned long long)entry,
+            (unsigned long long)final_stack);
+        return 0;
     }
     enter_user_mode(entry, final_stack);
     return 0; /* not reached */

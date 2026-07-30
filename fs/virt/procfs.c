@@ -136,7 +136,7 @@ static int procfs_build_root_dir(struct procfs_handle *h) {
     size_t len = 0, cap = 0;
     static const char *top[] = {
         "meminfo", "cpuinfo", "uptime", "loadavg", "mounts", "filesystems",
-        "stat", "partitions", "sys", "bus", "tty", "ttydebug", "net", "scsi"
+        "stat", "partitions", "cmdline", "sys", "bus", "tty", "ttydebug", "net", "scsi"
     };
     for (size_t ti = 0; ti < sizeof(top) / sizeof(top[0]); ti++) {
         const char *name = top[ti];
@@ -240,6 +240,33 @@ static ssize_t procfs_show_cmdline(char *buf, size_t size, void *priv) {
     memcpy(buf, comm, len);
     if (len < size) buf[len++] = '\0';
     return (ssize_t)len;
+}
+
+/* Linux /proc/<pid>/environ: NUL-separated KEY=val from execve envp.
+ * OpenRC init.sh compares md5sum of two VAR=… reads to detect a live /proc. */
+static ssize_t procfs_show_environ(char *buf, size_t size, void *priv) {
+    int pid = (int)(uintptr_t)priv;
+    size_t w = 0;
+    if (!buf || size == 0)
+        return 0;
+    thread_t *t = procfs_thread_by_id(pid);
+    if (!t || !t->proc_environ) {
+        buf[0] = '\0';
+        return 1;
+    }
+    for (int i = 0; t->proc_environ[i] && w < size; i++) {
+        const char *e = t->proc_environ[i];
+        size_t l = strlen(e) + 1; /* include NUL */
+        if (w + l > size)
+            l = size - w;
+        memcpy(buf + w, e, l);
+        w += l;
+    }
+    if (w == 0) {
+        buf[0] = '\0';
+        return 1;
+    }
+    return (ssize_t)w;
 }
 
 static char procfs_state_char(const thread_t *t) {
@@ -886,6 +913,14 @@ static ssize_t procfs_generate_plain(int file_id, char *buf, size_t cap) {
 	if (file_id == 15) return procfs_show_kernel_stat(buf, cap, NULL);
 	if (file_id == 16) return procfs_show_mounts(buf, cap, NULL);
 	if (file_id == 17) return procfs_show_filesystems(buf, cap, NULL);
+	if (file_id == 18) {
+		/* Linux /proc/cmdline — trailing newline required. */
+		const char *s = "BOOT_IMAGE=axonos init=/sbin/openrc-init\n";
+		size_t n = strlen(s);
+		if (n > cap) n = cap;
+		memcpy(buf, s, n);
+		return (ssize_t)n;
+	}
 	if (file_id == 40) return procfs_show_scsi(buf, cap, NULL);
 	if (file_id == 41 || file_id == 42) return procfs_show_pci(buf, cap, NULL);
 	if (file_id == 30) return usb_proc_bus_devices_show(buf, cap, NULL);
@@ -1129,6 +1164,15 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
                 *out_file = f;
                 return 0;
             }
+			if (first_len == 7 && strncmp(p, "cmdline", 7) == 0) {
+				h->kind = 7; f->type = FS_TYPE_REG;
+				f->size = 0;
+				f->driver_private = h;
+				h->file_id = 18; /* kernel cmdline */
+				procfs_fill_kind7_cache(h, f);
+				*out_file = f;
+				return 0;
+			}
 			if (first_len == 4 && strncmp(p, "stat", 4) == 0) {
 				h->kind = 7; f->type = FS_TYPE_REG;
 				f->size = 0;
@@ -1375,6 +1419,8 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					h->kind = 3; h->pid = pid; h->file_id = 2; f->type = FS_TYPE_REG;
 				} else if (strncmp(rest, "statm", 5) == 0 && rest[5] == '\0') {
 					h->kind = 3; h->pid = pid; h->file_id = 3; f->type = FS_TYPE_REG;
+				} else if (strncmp(rest, "environ", 7) == 0 && rest[7] == '\0') {
+					h->kind = 3; h->pid = pid; h->file_id = 4; f->type = FS_TYPE_REG;
 				} else if (strncmp(rest, "mounts", 6) == 0 && rest[6] == '\0') {
 					/* /proc/self/mounts == /proc/mounts (Linux) */
 					h->kind = 7; h->file_id = 16; f->type = FS_TYPE_REG; f->size = 0;
@@ -1386,7 +1432,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					kfree(h); kfree(pp); kfree(f); return -1;
 				}
 				/* compute size */
-				size_t cap = 4096;
+				size_t cap = (h->file_id == 4) ? (16u * 1024u) : 4096u;
 				h->cache = (char*)kmalloc(cap);
 				if (h->cache) {
 					ssize_t full = 0;
@@ -1394,6 +1440,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					else if (h->file_id == 1) full = procfs_show_stat(h->cache, cap, h);
 					else if (h->file_id == 2) full = procfs_show_status(h->cache, cap, (void*)(uintptr_t)h->pid);
 					else if (h->file_id == 3) full = procfs_show_statm(h->cache, cap, (void*)(uintptr_t)h->pid);
+					else if (h->file_id == 4) full = procfs_show_environ(h->cache, cap, (void*)(uintptr_t)h->pid);
 					if (full > 0) {
 						f->size = (size_t)full;
 						h->cache_len = f->size;
@@ -1434,9 +1481,10 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
     }
 
     if (h->kind == 2) {
-        /* /proc/<pid> dir: entries cmdline/stat/status/statm */
-        const char *names[5] = { "task", "cmdline", "stat", "status", "statm" };
-        const uint8_t types[5] = { EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE };
+        /* /proc/<pid> dir: entries cmdline/stat/status/statm/environ */
+        const char *names[6] = { "task", "cmdline", "stat", "status", "statm", "environ" };
+        const uint8_t types[6] = { EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
+                                   EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE };
         size_t pos = 0;
         size_t written = 0;
         uint8_t *out = (uint8_t*)buf;
@@ -1475,7 +1523,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
             }
             pos += rec_len;
         }
-        for (int idx = 0; idx < 5; idx++) {
+        for (int idx = 0; idx < 6; idx++) {
             size_t namelen = strlen(names[idx]);
             size_t rec_len = 8 + namelen;
             rec_len = (rec_len + 3) & ~3u;

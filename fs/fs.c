@@ -178,6 +178,40 @@ struct fs_driver *fs_get_mount_driver(const char *path) {
     return fs_match_mount(path);
 }
 
+struct fs_driver *fs_get_mount_driver_exact(const char *path) {
+    if (!path) return NULL;
+    size_t len = strlen(path);
+    while (len > 1 && path[len - 1] == '/')
+        len--;
+    for (int i = 0; i < g_mount_count; i++) {
+        struct mount_entry *m = &g_mounts[i];
+        if (!m->driver) continue;
+        if (m->path_len != len) continue;
+        if (strncmp(m->path, path, len) == 0)
+            return m->driver;
+    }
+    return NULL;
+}
+
+int fs_get_mount_index(const char *path) {
+    if (!path) return -1;
+    size_t path_len = strlen(path);
+    size_t best_len = 0;
+    int best = -1;
+    for (int i = 0; i < g_mount_count; i++) {
+        struct mount_entry *m = &g_mounts[i];
+        if (!m->driver) continue;
+        if (path_len < m->path_len) continue;
+        if (strncmp(path, m->path, m->path_len) != 0) continue;
+        if (path[m->path_len] != '\0' && path[m->path_len] != '/') continue;
+        if (m->path_len > best_len) {
+            best_len = m->path_len;
+            best = i;
+        }
+    }
+    return best;
+}
+
 /* helper: returns true if file is associated with driver 'drv'.
    file->fs_private may point to drv->driver_data or to drv itself.
    Never treat NULL==NULL as a match: pipe ends and unset mounts must not
@@ -861,7 +895,7 @@ int vfs_fstat(struct fs_file *file, struct stat *st) {
         const char *name = drv->ops ? drv->ops->name : NULL;
         if (name && strcmp(name, "sysfs") == 0) {
             if (sysfs_fill_stat(file, st) == 0) goto fix_mode;
-        } else if (name && strcmp(name, "ramfs") == 0) {
+        } else if (name && (strcmp(name, "ramfs") == 0 || strcmp(name, "tmpfs") == 0)) {
             if (ramfs_fill_stat(file, st) == 0) goto fix_mode;
         } else if (name && strcmp(name, "procfs") == 0) {
             if (procfs_fill_stat(file, st) == 0) goto fix_mode;
@@ -888,14 +922,20 @@ fix_mode:
             st->st_mode = (st->st_mode & 07777u) | want_type;
         }
     }
-    if (st->st_dev == 0)
-        st->st_dev = (dev_t)1;
+    /* Linux: each mount is a distinct st_dev so tools can detect mountpoints
+     * (stat(path).st_dev != stat(path/..).st_dev). */
+    {
+        int mi = file->path ? fs_get_mount_index(file->path) : -1;
+        st->st_dev = (dev_t)(mi >= 0 ? (mi + 2) : 1);
+    }
     return 0;
 done:
     st->st_size = (off_t)file->size;
     st->st_nlink = 1;
-    if (st->st_dev == 0)
-        st->st_dev = (dev_t)1;
+    {
+        int mi = file->path ? fs_get_mount_index(file->path) : -1;
+        st->st_dev = (dev_t)(mi >= 0 ? (mi + 2) : 1);
+    }
     return 0;
 }
 
@@ -906,14 +946,14 @@ int vfs_ftruncate(struct fs_file *file, off_t length) {
         if (!drv) continue;
         if (!fs_file_matches_driver(drv, file)) continue;
         const char *name = drv->ops ? drv->ops->name : NULL;
-        if (name && strcmp(name, "ramfs") == 0)
+        if (name && (strcmp(name, "ramfs") == 0 || strcmp(name, "tmpfs") == 0))
             return ramfs_ftruncate(file, length);
         if (name && strcmp(name, "fat32") == 0)
             return fat32_ftruncate(file, length);
         if (name && (strcmp(name, "overlay") == 0 || strcmp(name, "overlayfs") == 0))
             return overlayfs_ftruncate(file, length);
-        /* Open file belongs to a driver we do not truncate yet */
-        return -95; /* EOPNOTSUPP */
+        /* Matched a driver without truncate — try others (e.g. wrap vs inner). */
+        continue;
     }
     return -95; /* EOPNOTSUPP */
 }

@@ -1,13 +1,19 @@
 #pragma once
 
-#include <stddef.h>
 #include <stdint.h>
+#include <stddef.h>
 
-/* After ramfs_register(): create /var/log and flush buffered pre-init lines to /var/log/kernel. */
+/* After ramfs_register(): create /var/log; log lines live in a fixed ring (printk-style). */
 void klog_init(void);
 
-/* Kernel printf that appends to /var/log/kernel (best-effort) and to qemu debug. */
+/* Kernel printf → console + fixed ring buffer (+ qemu debug). */
 void klogprintf(const char *fmt, ...);
+
+/* /dev/kmsg and SYS_syslog: inject a message into the printk ring. */
+void klog_user_write(const char *s, size_t n);
+/* Copy ring bytes into buf; returns bytes copied (Linux SYSLOG_ACTION_READ_ALL). */
+long klog_syslog_read_all(char *buf, size_t size);
+size_t klog_syslog_buf_size(void);
 
 /* Calibrate TSC-based high-resolution timestamping (non-blocking if APIC not ready). */
 void klog_calibrate_tsc(void);

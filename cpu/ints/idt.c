@@ -147,13 +147,49 @@ static void ud_fault_handler(cpu_registers_t* regs) {
                                         return;
                                 } else if (reg == 2 /* WRFSBASE */) {
                                         uint64_t new_fs = gpr ? *gpr : 0;
-                                        /* keep stack canary stable across FS changes: copy old fs:0x28 into new fs:0x28 */
                                         uint64_t old_fs = rdmsr_u64(MSR_FS_BASE);
                                         uint64_t old_guard = 0;
-                                        if (old_fs + 0x30 < (uint64_t)MMIO_IDENTITY_LIMIT) old_guard = *(volatile uint64_t*)(uintptr_t)(old_fs + 0x28);
-                                        else if (0x30 < (uint64_t)MMIO_IDENTITY_LIMIT) old_guard = *(volatile uint64_t*)(uintptr_t)0x28;
+                                        thread_t *ut = thread_current();
+                                        if (!ut || ut->ring != 3)
+                                                ut = thread_get_current_user();
+                                        mm_t *umm = (ut && ut->mm && ut->mm != mm_kernel()) ? ut->mm : NULL;
+                                        /*
+                                         * Always read/write the canary via leaf PA when the
+                                         * task has a private mm. Soft_OWNED leaves have
+                                         * page!=VA; identity leaves have page==VA — both
+                                         * must copy. Skipping the identity case left
+                                         * old_guard=0 and skipped the store → stack smash
+                                         * in static OpenRC helpers after WRFSBASE.
+                                         */
+                                        if (umm && old_fs + 0x30u < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                                                uint64_t leaf = 0;
+                                                if (mm_va_leaf_pa(umm, old_fs + 0x28u, &leaf) == 0) {
+                                                        uint64_t page = leaf & ~0xFFFULL;
+                                                        old_guard = *(volatile uint64_t *)(uintptr_t)(page + ((old_fs + 0x28u) & 0xFFFULL));
+                                                } else if (old_fs + 0x30u < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                                                        old_guard = *(volatile uint64_t *)(uintptr_t)(old_fs + 0x28u);
+                                                }
+                                        } else if (old_fs + 0x30u < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                                                old_guard = *(volatile uint64_t *)(uintptr_t)(old_fs + 0x28u);
+                                        } else if (0x30u < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                                                old_guard = *(volatile uint64_t *)(uintptr_t)0x28;
+                                        }
                                         wrmsr_u64(MSR_FS_BASE, new_fs);
-                                        if (new_fs + 0x30 < (uint64_t)MMIO_IDENTITY_LIMIT) *(volatile uint64_t*)(uintptr_t)(new_fs + 0x28) = old_guard;
+                                        if (ut)
+                                                ut->user_fs_base = new_fs;
+                                        if (new_fs + 0x30u < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                                                if (umm) {
+                                                        uint64_t leaf = 0;
+                                                        if (mm_va_leaf_pa(umm, new_fs + 0x28u, &leaf) == 0) {
+                                                                uint64_t page = leaf & ~0xFFFULL;
+                                                                *(volatile uint64_t *)(uintptr_t)(page + ((new_fs + 0x28u) & 0xFFFULL)) = old_guard;
+                                                        } else {
+                                                                *(volatile uint64_t *)(uintptr_t)(new_fs + 0x28u) = old_guard;
+                                                        }
+                                                } else {
+                                                        *(volatile uint64_t *)(uintptr_t)(new_fs + 0x28u) = old_guard;
+                                                }
+                                        }
                                         regs->rip += (uint64_t)(found_off + 4);
                                         return;
                                 } else if (reg == 3 /* WRGSBASE */) {
@@ -310,9 +346,18 @@ static int fault_try_user_stack_page(uint64_t cr2, uint64_t err) {
 static int fault_try_user_identity_us(uint64_t cr2, uint64_t err) {
         if ((err & 1u) == 0)
                 return 0; /* not present — different path */
-        if (err & 0x10u)
-                return 0; /* instruction fetch — do not widen NX/identity blindly */
         uintptr_t a = (uintptr_t)cr2;
+        /* Soft-fix U=0 for user access in the low identity window.
+         * Instruction fetch (err bit4) is allowed when a tracked executable
+         * VMA covers the page — Linux maps those with U=1 at load; leftover
+         * demoted identity leaves after fork must not SIGSEGV _Fork return. */
+        if (err & 0x10u) {
+                thread_t *t = thread_current();
+                if (!t || t->ring != 3)
+                        t = thread_get_current_user();
+                if (!t || !user_vma_covers_page(t->tid ? t->tid : 1, a))
+                        return 0;
+        }
         /* Soft-fix U=0 for any user data access in the low identity window.
          * Previous fixed ceilings (TOP, TOP+2MiB, TOP+128MiB) were exactly hit
          * by AVX overruns (CR2=0x40000000/0x40200000/0x48000000). */
@@ -752,11 +797,29 @@ pte_dump_done:
             }
             if (regs->rip == 0 && regs->rsp >= 0x200000ULL &&
                 regs->rsp + 16ULL < (uint64_t)MMIO_IDENTITY_LIMIT) {
-                uint64_t *sp = (uint64_t *)(uintptr_t)regs->rsp;
+                uint64_t s0 = 0, s1 = 0;
+                thread_t *ft2 = thread_current();
+                if (!ft2 || ft2->ring != 3)
+                    ft2 = thread_get_current_user();
+                mm_t *fmm = (ft2 && ft2->mm && ft2->mm != mm_kernel()) ? ft2->mm : NULL;
+                if (fmm) {
+                    uint64_t leaf = 0;
+                    if (mm_va_leaf_pa(fmm, regs->rsp, &leaf) == 0) {
+                        uint64_t page = leaf & ~0xFFFULL;
+                        if (page != (regs->rsp & ~0xFFFULL)) {
+                            s0 = *(uint64_t *)(uintptr_t)(page + (regs->rsp & 0xFFFULL));
+                            s1 = *(uint64_t *)(uintptr_t)(page + ((regs->rsp + 8) & 0xFFFULL));
+                        }
+                    }
+                } else {
+                    uint64_t *sp = (uint64_t *)(uintptr_t)regs->rsp;
+                    s0 = sp[0];
+                    s1 = sp[1];
+                }
                 kprintf("user-pf-null-rip: rsp=0x%llx [0]=0x%llx [1]=0x%llx rbp=0x%llx rdi=0x%llx\n",
                         (unsigned long long)regs->rsp,
-                        (unsigned long long)sp[0],
-                        (unsigned long long)sp[1],
+                        (unsigned long long)s0,
+                        (unsigned long long)s1,
                         (unsigned long long)regs->rbp,
                         (unsigned long long)regs->rdi);
             }

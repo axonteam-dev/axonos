@@ -270,6 +270,16 @@ void thread_mark_init_user(thread_t* t) {
                 if (p)
                         process_attach_thread(p, t);
         }
+        /*
+         * openrc-init exits immediately unless getpid()==1. Our init thread
+         * usually has tid>1 (kernel threads already occupy early slots), and
+         * process_attach_thread unifies process->pid with leader tid — so force
+         * Linux-style PID 1 for the marked init process.
+         */
+        if (t->process)
+                process_claim_pid1(t->process);
+        t->pgid = 1;
+        t->sid = 1;
         if (init_user_tid < 0) {
                 init_user_tid = (int)t->tid;
                 return;
@@ -361,6 +371,20 @@ static int thread_zombie_autoreap_ok(thread_t *t) {
         if (t == &main_thread || thread_is_any_idle(t)) return 0;
         if (t->waiter_tid >= 0) return 0;
         if (t->exit_status == (int)0x80000000) return 0;
+        /*
+         * Linux: a zombie keeps its PID until the parent wait()s. Do not
+         * free the thread while a living parent process still owns it —
+         * BusyBox ash / OpenRC fstabinfo posix_spawn waitpid(pid) then
+         * gets ECHILD and treats a successful mount(2) as failure.
+         */
+        if (t->process && t->process->parent &&
+            t->process->parent->state != PROCESS_ZOMBIE &&
+            t->process->state == PROCESS_ZOMBIE)
+                return 0;
+        if (t->process && t->process->parent &&
+            t->process->parent->state != PROCESS_ZOMBIE &&
+            t->process->leader == t)
+                return 0;
         /* Boot often leaves a dead /sbin/init while /linuxrc stays PID1-ish. */
         if (t->name[0] && (strstr(t->name, "/sbin/init") ||
                            strcmp(t->name, "init") == 0))
@@ -907,6 +931,9 @@ void user_thread_entry(void) {
 			(unsigned long long)self->user_stack,
 			(unsigned long long)self->user_fs_base);
 	}
+	/* Install the task mm before ring3 (Linux switch_mm). */
+	if (self->mm)
+		mm_switch(self->mm);
 	/* Init path never calls mark_broad_user_ranges; ensure full user mappings before user mode.
 	   fork/vfork/clone3 children set user_stack_base; re-marking their private mm causes #PF. */
 	if (self->user_stack_base == 0 &&

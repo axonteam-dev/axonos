@@ -98,15 +98,57 @@ static int ov_ensure_parent_upper(const char *path)
         return 0;
     *slash = '\0';
     if (ov_upper_open(tmp, &chk) == 0) {
+        int ok = (chk->type == FS_TYPE_DIR);
         ov_release_inner(chk);
-        return 0;
+        return ok ? 0 : -1;
     }
     if (ov_ensure_parent_upper(tmp) != 0)
         return -1;
     if (ramfs_mkdir(tmp) != 0) {
         if (ov_upper_open(tmp, &chk) != 0)
             return -1;
+        int ok = (chk->type == FS_TYPE_DIR);
         ov_release_inner(chk);
+        if (!ok)
+            return -1;
+    }
+    return 0;
+}
+
+/*
+ * O_TRUNC / ftruncate(0): create an empty upper (Linux overlay copy-up for
+ * truncate-to-zero). Do NOT full-copy lower then discard — that kmallocs a
+ * squashfs block and on failure leaves an orphan empty upper that permanently
+ * shadows the good lower file.
+ */
+static int ov_copy_up_empty(const char *path)
+{
+    struct fs_file *up = NULL;
+    if (!path)
+        return -1;
+    if (ramfs_path_is_whiteout(path)) {
+        if (ramfs_remove(path) != 0)
+            return -1;
+    }
+    if (ov_upper_open(path, &up) == 0) {
+        int ok = (up->type == FS_TYPE_REG);
+        ov_release_inner(up);
+        return ok ? 0 : -1;
+    }
+    if (ov_ensure_parent_upper(path) != 0)
+        return -1;
+    if (ov_upper_create(path, &up) != 0)
+        return -1;
+    ov_release_inner(up);
+    /* Match lower mode so sourced scripts stay readable/executable. */
+    {
+        struct fs_file *lo = NULL;
+        struct stat st;
+        if (squashfs_open_path(path, &lo) == 0) {
+            if (squashfs_fill_stat(lo, &st) == 0)
+                (void)ramfs_chmod(path, st.st_mode);
+            ov_release_inner(lo);
+        }
     }
     return 0;
 }
@@ -125,8 +167,9 @@ static int ov_copy_up(const char *path)
     if (ramfs_path_is_whiteout(path))
         return -1;
     if (ov_upper_open(path, &upper) == 0) {
+        int ok = (upper->type == FS_TYPE_REG);
         ov_release_inner(upper);
-        return 0;
+        return ok ? 0 : -1;
     }
     if (squashfs_open_path(path, &lower) != 0)
         return -1;
@@ -162,38 +205,35 @@ static int ov_copy_up(const char *path)
     }
     if (sz > 0) {
         buf = (uint8_t *)kmalloc(CHUNK);
-        if (!buf) {
-            ov_release_inner(lower);
-            ov_release_inner(upper);
-            return -1;
-        }
+        if (!buf)
+            goto copy_fail;
         while (off < sz) {
             size_t want = sz - off;
             ssize_t nr, nw;
             if (want > CHUNK)
                 want = CHUNK;
             nr = squashfs_read_file(lower, buf, want, off);
-            if (nr <= 0) {
-                kfree(buf);
-                ov_release_inner(lower);
-                ov_release_inner(upper);
-                return -1;
-            }
+            if (nr <= 0)
+                goto copy_fail;
             nw = ov_upper()->ops->write(upper, buf, (size_t)nr, off);
-            if (nw != nr) {
-                kfree(buf);
-                ov_release_inner(lower);
-                ov_release_inner(upper);
-                return -1;
-            }
+            if (nw != nr)
+                goto copy_fail;
             off += (size_t)nr;
         }
         kfree(buf);
+        buf = NULL;
     }
     ov_release_inner(lower);
     ov_release_inner(upper);
     (void)ramfs_chmod(path, st.st_mode);
     return 0;
+copy_fail:
+    /* Never leave an orphan upper that shadows a good squashfs lower. */
+    kfree(buf);
+    ov_release_inner(lower);
+    ov_release_inner(upper);
+    (void)ramfs_remove(path);
+    return -1;
 }
 
 static int ov_name_in_blob(const uint8_t *blob, size_t len, const char *name)
@@ -682,13 +722,32 @@ int overlayfs_fill_stat(struct fs_file *file, struct stat *st)
 int overlayfs_ftruncate(struct fs_file *file, off_t length)
 {
     struct overlay_file_handle *fh;
+    struct fs_file *neu = NULL;
     if (!file || !file->driver_private)
         return -9;
     fh = (struct overlay_file_handle *)file->driver_private;
     if (fh->layer == OV_LAYER_MERGED_DIR)
         return -95;
-    if (overlay_promote_for_write(file) != 0)
-        return -30; /* EROFS-ish */
+    if (fh->layer == OV_LAYER_LOWER) {
+        /* Truncate-to-zero: empty upper only (see ov_copy_up_empty). */
+        if (length == 0) {
+            if (ov_copy_up_empty(file->path) != 0)
+                return -30;
+        } else if (ov_copy_up(file->path) != 0) {
+            return -30;
+        }
+        if (ov_upper_open(file->path, &neu) != 0)
+            return -30;
+        ov_release_inner(fh->inner);
+        fh->inner = neu;
+        fh->layer = OV_LAYER_UPPER;
+        file->size = neu->size;
+    } else if (fh->layer != OV_LAYER_UPPER) {
+        return -30;
+    }
+    fh = (struct overlay_file_handle *)file->driver_private;
+    if (!fh || !fh->inner)
+        return -30;
     return ramfs_ftruncate(fh->inner, length);
 }
 

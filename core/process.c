@@ -118,23 +118,45 @@ process_t *process_create_init(void) {
     return process_create(NULL);
 }
 
+void process_claim_pid1(process_t *process) {
+    if (!process)
+        return;
+    unsigned long flags;
+    acquire_irqsave(&process_lock, &flags);
+    /* Previous failed init attempts may still hold PID 1 as zombies. */
+    for (int i = 0; i < PROCESS_TABLE_MAX; ++i) {
+        process_t *o = process_table[i];
+        if (!o || o == process || o->pid != 1)
+            continue;
+        o->pid = next_pid++;
+        if (o->pid == 0 || o->pid == 1)
+            o->pid = next_pid++;
+    }
+    process->pid = 1;
+    process->pgid = 1;
+    process->sid = 1;
+    if (next_pid <= 1)
+        next_pid = 2;
+    release_irqrestore(&process_lock, flags);
+}
+
 void process_attach_thread(process_t *process, thread_t *thread) {
     if (!process || !thread)
         return;
     unsigned long flags;
     acquire_irqsave(&process_lock, &flags);
     /*
-     * Linux TGID = PID of the thread-group leader. First attach wins as leader;
-     * CLONE_THREAD peers must not overwrite leader (that broke kill/ps).
-     * Unify process->pid with leader->tid so /proc and kill share one namespace.
+     * Linux: TGID/PID is allocated at process creation and is not reused until
+     * the zombie is waited on (process_reap). Do not overwrite process->pid with
+     * thread->tid — tid slots are recycled by thread_reap while a zombie may
+     * still hold that number, producing duplicate PIDs. BusyBox ash records the
+     * fork() return value and matches waitpid(-1) against it; colliding PIDs
+     * leave ps_status at -1 so getstatus() yields a non-zero exit and
+     * `if ! mountinfo` / `if ! mount` take the failure path despite exit(0).
      */
     int first_attach = (process->leader == NULL);
-    if (first_attach) {
+    if (first_attach)
         process->leader = thread;
-        process->pid = thread->tid ? thread->tid : 1;
-        if (next_pid <= process->pid)
-            next_pid = process->pid + 1;
-    }
     thread->process = process;
     process->mm = thread->mm;
     /* Fork sets sid/pgid on the thread after process_create inherited them.

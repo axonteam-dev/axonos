@@ -20,6 +20,7 @@
 #include <fbdev.h>
 #include <cirrusfb.h>
 #include <mouse.h>
+#include <klog.h>
 
 #define DEVFS_TTY_COUNT 6
 
@@ -579,6 +580,7 @@ static const char * const devfs_special_names[] = {
     "urandom",
     "full",
     "ptmx",         /* Unix98 PTY master multiplexor (node present; pty pair TBD) */
+    "kmsg",         /* Linux MEM_MAJOR 1, minor 11 — OpenRC seed_dev / udev */
 };
 static const int devfs_special_count = sizeof(devfs_special_names) / sizeof(devfs_special_names[0]);
 
@@ -1294,6 +1296,9 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                         return -28;
                     case 9: /* /dev/ptmx stub */
                         return -1;
+                    case 10: /* /dev/kmsg — userspace printk inject */
+                        klog_user_write((const char *)buf, size);
+                        return (ssize_t)size;
                     default: break;
                 }
             }

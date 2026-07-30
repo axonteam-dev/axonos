@@ -1772,18 +1772,27 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                     uint64_t leaf2 = e2 & PG_ADDR_MASK_2M;
                     /* Entire 2MiB identity window — not a privatized user leaf.
                      * Exception: MAP_SHARED anon also uses identity VA==PA and
-                     * must be installed into the child (nginx shm zones). */
+                     * must be installed into the child (nginx shm zones).
+                     * Also copy ELF_LOAD / other VMA-backed identity pages: PID1
+                     * used to load without Soft_OWNED; skipping left the child
+                     * with demoted U=0 text and #PF right after clone/_Fork. */
                     int shared_2m = parent_for_vma &&
                         (user_vma_is_shared_page_mm(parent_for_vma, (uintptr_t)va_l2) ||
                          user_vma_is_shared_page(owner_tid, (uintptr_t)va_l2));
-                    if (leaf2 == va_l2 && !(e2 & PG_SOFT_OWNED) && !shared_2m)
+                    int vma_backed = user_vma_covers_page(owner_tid, (uintptr_t)va_l2);
+                    if (leaf2 == va_l2 && !(e2 & PG_SOFT_OWNED) && !shared_2m && !vma_backed)
                         continue;
                     uint64_t chunk_end = va_l2 + PAGE_SIZE_2M;
                     if (chunk_end > limit)
                         chunk_end = limit;
                     for (uint64_t va = va_l2; va < chunk_end; va += PAGE_SIZE_4K) {
                         uint64_t pa = leaf2 + (va - va_l2);
-                        if (pa == (va & ~0xFFFULL) && !(e2 & PG_SOFT_OWNED) && !shared_2m)
+                        int shared_pg = shared_2m ||
+                            (parent_for_vma &&
+                             (user_vma_is_shared_page_mm(parent_for_vma, (uintptr_t)va) ||
+                              user_vma_is_shared_page(owner_tid, (uintptr_t)va)));
+                        int page_vma = vma_backed || user_vma_covers_page(owner_tid, (uintptr_t)va);
+                        if (pa == (va & ~0xFFFULL) && !(e2 & PG_SOFT_OWNED) && !shared_pg && !page_vma)
                             continue;
                         if (mm_fork_copy_user_leaf(child, parent_for_vma,
                                 parent_l4, owner_tid, va, pa, e2,
@@ -1806,11 +1815,13 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                     uint64_t pa = e1 & PG_ADDR_MASK;
                     if (pa >= (uint64_t)MMIO_IDENTITY_LIMIT || !pt_page_pa_ok(e1))
                         continue;
-                    /* Skip bare identity leaves unless MAP_SHARED (nginx shm). */
+                    /* Skip bare identity leaves unless MAP_SHARED (nginx shm)
+                     * or a tracked VMA covers the page (ELF_LOAD / mmap). */
                     int shared_4k = parent_for_vma &&
                         (user_vma_is_shared_page_mm(parent_for_vma, (uintptr_t)va) ||
                          user_vma_is_shared_page(owner_tid, (uintptr_t)va));
-                    if (pa == (va & ~0xFFFULL) && !(e1 & PG_SOFT_OWNED) && !shared_4k)
+                    int page_vma = user_vma_covers_page(owner_tid, (uintptr_t)va);
+                    if (pa == (va & ~0xFFFULL) && !(e1 & PG_SOFT_OWNED) && !shared_4k && !page_vma)
                         continue;
                     if (mm_fork_copy_user_leaf(child, parent_for_vma,
                             parent_l4, owner_tid, va, pa, e1,
@@ -2399,9 +2410,10 @@ int mm_wp_fault_writable(mm_t *mm, uint64_t va, mm_t *share_cmp_mm) {
     if (mm_make_private_range_noyield(mm, pg, pg + 0x1000ULL, 1,
                                       share_cmp_mm) == 0)
         return 0;
-    if (mm_make_private_range_noyield(mm, pg, pg + 0x1000ULL, 0,
-                                      share_cmp_mm) == 0)
-        return 0;
+    /*
+     * Never copy_old=0 here: zero-replacing a present stack/TLS leaf wiped
+     * glibc canaries (TCGETS → isatty → "*** stack smashing detected ***").
+     */
     return -1;
 }
 
@@ -2616,14 +2628,24 @@ static int mm_ensure_soft_owned_writable(mm_t *mm, mm_t *share_cmp_mm,
         int cow = mm_cow_fault_page(mm, page, share);
         if (cow != 0 && cow != -2)
             return -1;
-        if (mm_user_leaf_pa(mm, page, 1, &existing) == 0 &&
-            (existing & ~0xFFFULL) != page)
+        /*
+         * Any present PG_US|PG_RW leaf is fine for kernel stores (wait4 status,
+         * siginfo, …). Requiring Soft_OWNED (PA!=VA) rejected identity stack
+         * pages → copy_to_user EFAULT → ash treated mountinfo/mount exit(0) as
+         * failure → "Unable to mount tmpfs on /run" despite mount(2) ok.
+         */
+        if (mm_user_leaf_pa(mm, page, 1, &existing) == 0)
             return 0;
-        /* Present but not a private frame — force private RW. */
+        /* Present but not writable — force private RW. */
         if (mm_wp_fault_writable(mm, page, share) == 0 &&
-            mm_user_leaf_pa(mm, page, 1, &existing) == 0 &&
-            (existing & ~0xFFFULL) != page)
+            mm_user_leaf_pa(mm, page, 1, &existing) == 0)
             return 0;
+        /*
+         * Present user leaf we could not make writable. Must not demand-zero:
+         * that replaced stack tip Soft_OWNED pages under TCGETS and cleared
+         * the canary at rsp+0x28 → ebegin "*** stack smashing detected ***".
+         */
+        return -1;
     }
     /*
      * Demand-fill (lazy mmap / not-yet-touched malloc arena). Same as
@@ -2684,14 +2706,36 @@ static int mm_user_memcpy_via_pa(mm_t *mm, uint64_t va, void *kbuf, size_t n,
         uint64_t va_page = va & ~0xFFFULL;
         if (pa_page == va_page) {
             /*
-             * Still identity: swapper may have a hole. Read/write the user VA
-             * under this mm's L4 only long enough to bounce through kbuf path
-             * is wrong for to_user (kbuf is source). Refuse — caller must
-             * re-ensure Soft_OWNED.
+             * Identity leaf (PA==VA): swapper may have a hole at that PA, so
+             * bounce under the process CR3 via the user VA. Reads and writes
+             * both need this — refusing to_user left wait4 status* stuck at
+             * ash's ps_status=-1 while the kernel logged status=0x0, so
+             * OpenRC `if ! mount` took the failure path.
              */
-            rc = -1;
+            uint64_t proc = (uint64_t)(uintptr_t)mm->pml4;
+            paging_write_cr3(proc);
+            if (to_user)
+                memcpy((void *)(uintptr_t)va, kbuf, n);
+            else
+                memcpy(kbuf, (const void *)(uintptr_t)va, n);
+            invlpg((void *)(uintptr_t)va);
+            paging_write_cr3(mm_direct_map_cr3());
+            rc = 0;
         } else if (to_user) {
             memcpy((void *)(uintptr_t)pa, kbuf, n);
+            /*
+             * Soft_OWNED store is via PA under swapper CR3. The task TLB may
+             * still cache a prior leaf for this VA (COW break / privatize).
+             * BusyBox ash then reads waitpid's *status through the stale TLB
+             * entry while mm_copy_from_user (PA) already sees the new value —
+             * OpenRC `if ! mount` fails despite wait4 logging status=0x0.
+             */
+            {
+                uint64_t proc = mm->cr3 ? mm->cr3 : (uint64_t)(uintptr_t)mm->pml4;
+                paging_write_cr3(proc);
+                invlpg((void *)(uintptr_t)va);
+                paging_write_cr3(mm_direct_map_cr3());
+            }
         } else {
             memcpy(kbuf, (const void *)(uintptr_t)pa, n);
         }

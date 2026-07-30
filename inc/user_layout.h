@@ -11,9 +11,9 @@
 #define USER_IMAGE_BASE       ((uintptr_t)0x00400000ULL)
 #define USER_MMAP_BASE        ((uintptr_t)0x08000000ULL)
 /*
- * ~1.3GiB user mmap for Go arenas; kernel heap starts at STACK_TOP+16MiB.
- * On a 2GiB VM that still leaves ~400MiB+ for kmalloc/frame_alloc; on ≥4GiB
- * the heap may grow into high identity RAM (see init.c).
+ * ~1.3GiB user mmap for Go arenas; kmalloc object heap starts at STACK_TOP+16MiB
+ * (capped ~128MiB) with a PMM arena above it for Soft_OWNED frames.
+ * On a 2GiB VM that still leaves hundreds of MiB for user pages.
  */
 #define USER_STACK_TOP_LAYOUT ((uintptr_t)0x60000000ULL)
 #define USER_MMAP_TOP         ((uintptr_t)0x5E000000ULL)

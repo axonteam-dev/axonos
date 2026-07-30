@@ -43,6 +43,9 @@ int user_vma_fork_privatize_mapped(mm_t *child_mm, mm_t *parent_mm,
 int user_vma_is_shared_page(uint64_t tid, uintptr_t va);
 /* True if runner's address space has a VMA covering va with PROT_WRITE. */
 int user_vma_allows_write(thread_t *runner, uintptr_t va);
+/* True if tid has any VMA covering va (ELF/mmap). Used by fork to not skip
+ * identity-mapped image pages that lack Soft_OWNED. */
+int user_vma_covers_page(uint64_t tid, uintptr_t va);
 
 int user_vma_add(uint64_t tid, uintptr_t addr, size_t len, int prot, int kind);
 int user_vma_add_mm(mm_t *mm, uintptr_t addr, size_t len, int prot, int kind);

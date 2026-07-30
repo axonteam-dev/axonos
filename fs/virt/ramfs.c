@@ -1132,6 +1132,52 @@ struct fs_driver *ramfs_get_driver(void) {
     return &ramfs_driver;
 }
 
+/* Linux tmpfs/ramfs mount: same leaf store as root ramfs, distinct fstype name
+ * so /proc/mounts and OpenRC mountinfo treat /run as tmpfs — not detmpfs. */
+static struct fs_driver tmpfs_driver;
+static struct fs_driver_ops tmpfs_ops;
+static int tmpfs_ready = 0;
+
+int tmpfs_mount(const char *path) {
+    if (!path || path[0] != '/') {
+        kprintf("tmpfs_mount: bad path\n");
+        return -1;
+    }
+    if (!ramfs_root) {
+        kprintf("tmpfs_mount: ramfs_root NULL path=%s\n", path);
+        return -1;
+    }
+    /* Exact mountpoint: longest-prefix would see overlay on "/" as covering /run. */
+    {
+        struct fs_driver *md = fs_get_mount_driver_exact(path);
+        if (md == &tmpfs_driver)
+            return 0;
+        if (md) {
+            const char *n = (md->ops && md->ops->name) ? md->ops->name : "?";
+            kprintf("tmpfs_mount: EBUSY path=%s have=%s\n", path, n);
+            return -1;
+        }
+    }
+    if (!tmpfs_ready) {
+        tmpfs_ops = ramfs_ops;
+        tmpfs_ops.name = "tmpfs";
+        tmpfs_driver.ops = &tmpfs_ops;
+        tmpfs_driver.driver_data = (void *)ramfs_root;
+        if (fs_register_driver(&tmpfs_driver) != 0) {
+            kprintf("tmpfs_mount: fs_register_driver failed path=%s\n", path);
+            return -1;
+        }
+        tmpfs_ready = 1;
+    }
+    (void)ramfs_mkdir(path);
+    if (fs_mount(path, &tmpfs_driver) != 0) {
+        kprintf("tmpfs_mount: fs_mount failed path=%s mounts=%d\n",
+                path, fs_mount_count());
+        return -1;
+    }
+    return 0;
+}
+
 int ramfs_register(void) {
     /* init root */
     ramfs_root = ramfs_alloc_node("", 1);

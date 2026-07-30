@@ -1,9 +1,9 @@
 /*
- * core/klog.c — kernel ring buffer log + /var/log/kernel
+ * core/klog.c — Linux-style printk ring buffer
  *
- * Until klog_init(): messages go only to console + a fixed early buffer (no VFS).
- * klog_init() creates /var/log, flushes the early buffer to /var/log/kernel, then
- * each line is appended in a single fs_write (one contiguous buffer: timestamp + text).
+ * Fixed-size circular buffer (like log_buf). Console + qemu debug get every
+ * line; VFS is not a growing sink — unbounded /var/log/kernel appends used to
+ * exhaust the kmalloc heap via ramfs krealloc.
  */
 
 #include <klog.h>
@@ -13,20 +13,21 @@
 #include <stdio.h>
 #include <fs.h>
 #include <ramfs.h>
-#include <stat.h>
 #include <spinlock.h>
 #include <string.h>
 #include <apic_timer.h>
 #include <pit.h>
 #include <devfs.h>
+#include <stddef.h>
 
 static spinlock_t klog_lock;
 static int klog_inited;
 
-/* Early log ring: no kmalloc, safe before klog_init() and avoids fragile heap+vfs races. */
-#define KLOG_EARLY_SZ (96 * 1024)
-static char klog_early[KLOG_EARLY_SZ];
-static size_t klog_early_used;
+/* Single ring for early + post-init (Linux log_buf). */
+#define KLOG_RING_SZ (256 * 1024)
+static char klog_ring[KLOG_RING_SZ];
+static size_t klog_ring_pos;  /* next write offset */
+static size_t klog_ring_len;  /* bytes valid (<= KLOG_RING_SZ) */
 
 #define KLOG_TS_MAX 48
 #define KLOG_MSG_MAX 900
@@ -126,31 +127,19 @@ static uint64_t klog_get_time_us(void) {
 	return pit_get_time_us();
 }
 
-static void klog_early_append(const char *p, size_t n) {
-	if (!p || n == 0) return;
-	if (klog_early_used + n > KLOG_EARLY_SZ) {
-		static int once;
-		if (!once) {
-			once = 1;
-			kprintf("klog: early buffer full; dropping further pre-init lines\n");
-		}
+/* Caller must hold klog_lock. Overwrite oldest when full. */
+static void klog_ring_append(const char *p, size_t n) {
+	size_t i;
+	if (!p || n == 0)
 		return;
+	for (i = 0; i < n; i++) {
+		klog_ring[klog_ring_pos] = p[i];
+		klog_ring_pos++;
+		if (klog_ring_pos >= KLOG_RING_SZ)
+			klog_ring_pos = 0;
+		if (klog_ring_len < KLOG_RING_SZ)
+			klog_ring_len++;
 	}
-	memcpy(klog_early + klog_early_used, p, n);
-	klog_early_used += n;
-}
-
-/* Caller must hold klog_lock + irq disabled. */
-static void klog_flush_early_to_file(void) {
-	if (klog_early_used == 0) return;
-	struct fs_file *f = fs_create_file("/var/log/kernel");
-	if (!f)
-		f = fs_open("/var/log/kernel");
-	if (!f)
-		return;
-	(void)fs_write(f, klog_early, klog_early_used, 0);
-	fs_file_free(f);
-	klog_early_used = 0;
 }
 
 void klog_init(void) {
@@ -162,22 +151,67 @@ void klog_init(void) {
 	}
 	(void)ramfs_mkdir("/var");
 	(void)ramfs_mkdir("/var/log");
-	klog_flush_early_to_file();
+	/*
+	 * Optional empty placeholder for userspace that stats the path.
+	 * Do not seed or append the ring here — that was the OOM path.
+	 */
+	{
+		struct fs_file *f = fs_create_file("/var/log/kernel");
+		if (!f)
+			f = fs_open("/var/log/kernel");
+		if (f)
+			fs_file_free(f);
+	}
 	klog_inited = 1;
 	release_irqrestore(&klog_lock, irqf);
 }
 
+void klog_user_write(const char *s, size_t n) {
+	unsigned long irqf;
+	if (!s || n == 0)
+		return;
+	acquire_irqsave(&klog_lock, &irqf);
+	klog_ring_append(s, n);
+	release_irqrestore(&klog_lock, irqf);
+	/* Mirror to console like a printk from userspace. */
+	klog_console_write_sync_tty(s, n);
+#ifdef QEMU_LOG_ENABLE
+	qemu_debug_printf("%.*s", (int)n, s);
+#endif
+}
+
+long klog_syslog_read_all(char *buf, size_t size) {
+	unsigned long irqf;
+	size_t n, start, i;
+	if (!buf || size == 0)
+		return 0;
+	acquire_irqsave(&klog_lock, &irqf);
+	n = klog_ring_len;
+	if (n > size)
+		n = size;
+	if (klog_ring_len < KLOG_RING_SZ)
+		start = 0;
+	else
+		start = klog_ring_pos;
+	for (i = 0; i < n; i++)
+		buf[i] = klog_ring[(start + i) % KLOG_RING_SZ];
+	release_irqrestore(&klog_lock, irqf);
+	return (long)n;
+}
+
+size_t klog_syslog_buf_size(void) {
+	return KLOG_RING_SZ;
+}
+
 void klogprintf(const char *fmt, ...) {
 	/*
-	 * Format under the lock with IRQs off, then release before console/VFS.
+	 * Format under the lock with IRQs off, then release before console.
 	 * Painting VBE/tty cell-by-cell with IF=0 froze the machine for seconds
-	 * per line (SSH connect sniff / any hot-path klog) and dropped NIC RX.
+	 * per line and dropped NIC RX.
 	 */
 	char line[KLOG_OUT_MAX];
 	size_t outlen = 0;
 	int do_console = 0;
-	int early = 0;
-	int inited = 0;
 
 	{
 		unsigned long irqf;
@@ -236,16 +270,8 @@ void klogprintf(const char *fmt, ...) {
 		memcpy(line, msg, outlen);
 		line[outlen] = '\0';
 #endif
-		/* Console is independent of KERNEL_LOG_TIME timestamps. Without this,
-		 * post-APIC boot (almost all klogprintf) looks hung on VGA. */
 		do_console = 1;
-
-		inited = klog_inited;
-		if (!inited) {
-			klog_early_append(line, outlen);
-			early = 1;
-		}
-
+		klog_ring_append(line, outlen);
 		release_irqrestore(&klog_lock, irqf);
 	}
 
@@ -255,21 +281,4 @@ void klogprintf(const char *fmt, ...) {
 #ifdef QEMU_LOG_ENABLE
 	qemu_debug_printf("%s", line);
 #endif
-
-	if (early)
-		return;
-
-	if (inited) {
-		struct fs_file *f = fs_open("/var/log/kernel");
-		if (!f)
-			f = fs_create_file("/var/log/kernel");
-		if (f) {
-			size_t off = (size_t)f->size;
-			struct stat st;
-			if (vfs_fstat(f, &st) == 0 && st.st_size >= 0)
-				off = (size_t)st.st_size;
-			(void)fs_write(f, line, outlen, off);
-			fs_file_free(f);
-		}
-	}
 }

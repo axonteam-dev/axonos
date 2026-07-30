@@ -752,6 +752,26 @@ int user_vma_allows_write(thread_t *runner, uintptr_t va) {
     return allow;
 }
 
+int user_vma_covers_page(uint64_t tid, uintptr_t va) {
+    if (va < 0x200000u || va >= (uintptr_t)MMIO_IDENTITY_LIMIT)
+        return 0;
+    unsigned long fl = 0;
+    int hit = 0;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (!g_user_vmas[i].used || g_user_vmas[i].tid != tid)
+            continue;
+        uintptr_t a = g_user_vmas[i].addr;
+        uintptr_t e = a + g_user_vmas[i].len;
+        if (va >= a && va < e) {
+            hit = 1;
+            break;
+        }
+    }
+    release_irqrestore(&g_user_vma_lock, fl);
+    return hit;
+}
+
 int user_vma_is_shared_page(uint64_t tid, uintptr_t va) {
     unsigned long fl = 0;
     int shared = 0;

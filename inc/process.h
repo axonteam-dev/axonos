@@ -81,6 +81,8 @@ void process_init(void);
 process_t *process_create(process_t *parent);
 process_t *process_create_init(void);
 void process_attach_thread(process_t *process, thread_t *thread);
+/* Force getpid()==1 for system init (openrc-init refuses otherwise). */
+void process_claim_pid1(process_t *process);
 void process_sync_from_thread(process_t *process, thread_t *thread);
 process_t *process_find(uint64_t pid);
 process_t *process_find_child(process_t *parent, int pid, int pgid,

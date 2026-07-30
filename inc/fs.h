@@ -67,8 +67,12 @@ int fs_unregister_driver(struct fs_driver *drv);
 int fs_mount(const char *path, struct fs_driver *drv);
 /* Unmount previously mounted path. Returns 0 on success, -1 on error */
 int fs_unmount(const char *path);
-/* Return driver mounted for path (NULL if none) */
+/* Return driver mounted for path (NULL if none) — longest prefix match. */
 struct fs_driver *fs_get_mount_driver(const char *path);
+/* Exact mountpoint only (Linux: path is a mount point, not merely under one). */
+struct fs_driver *fs_get_mount_driver_exact(const char *path);
+/* Mount table index for longest-prefix match, or -1. Used for st_dev. */
+int fs_get_mount_index(const char *path);
 /* Get mount path for a registered driver. Returns 0 on success and fills out, -1 if not found. */
 int fs_get_mount_path(const struct fs_driver *drv, char *out, size_t outlen);
 /* Get the matching mount prefix for a given path (longest prefix). Returns 0 on success. */

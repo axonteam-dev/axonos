@@ -30,6 +30,7 @@
 #include <console.h>
 #include <font.h>
 #include <ramfs.h>
+#include <tmpfs.h>
 #include <squashfs.h>
 #include <overlayfs.h>
 #include <dhcp.h>
@@ -705,11 +706,13 @@ static int apply_exec_trampoline(thread_t *t) {
     if (!t || !t->exec_trampoline_flag) return -1;
     if (!t->saved_syscall_frame) return -1;
     uintptr_t base = (uintptr_t)t->saved_syscall_frame;
+    uintptr_t rdx_slot = base + 12u * sizeof(uint64_t); /* frame[12] saved rdx */
     uintptr_t rcx_slot = base + 13u * sizeof(uint64_t); /* frame[13] saved rcx (user RIP) */
     uintptr_t rax_slot = base + 14u * sizeof(uint64_t); /* frame[14] saved rax */
     uintptr_t rsp_slot = base + 15u * sizeof(uint64_t); /* frame[15] saved user RSP */
 
     /* safety: ensure writing within identity map */
+    if (rdx_slot + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
     if (rcx_slot + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
     if (rax_slot + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
     if (rsp_slot + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
@@ -723,6 +726,20 @@ static int apply_exec_trampoline(thread_t *t) {
 
     /* Also set saved rax so final popped rax becomes our chosen value */
     *(uint64_t*)(uintptr_t)rax_slot = (uint64_t)t->exec_trampoline_rax;
+
+    /*
+     * Linux start_thread / ELF entry: %rdx = 0 for static binaries (no
+     * rtld_fini). In-place execve used to leave execve's envp in %rdx;
+     * glibc _start does `mov %rdx,%r9` then __cxa_atexit(rtld_fini) — so
+     * envp/mmap was registered as an exit handler → user RIP=0xec00000 /
+     * stack on __run_exit_handlers. Clear here and in saved_user_rdx so
+     * syscall_finalize_user_frame cannot put envp back.
+     */
+    *(uint64_t *)(uintptr_t)rdx_slot = 0;
+    t->saved_user_rdx = 0;
+    syscall_user_saved_rdx = 0;
+    if (t->syscall_frame_kbuf)
+        t->syscall_frame_kbuf[12] = 0;
 
     /* memory barrier */
     asm volatile("mfence" ::: "memory");
@@ -6518,6 +6535,62 @@ static void resolve_user_path(thread_t *cur, const char *path_u,
 }
 
 /* Resolve path for openat: dirfd base or cwd. Returns 0 on success, negative errno on error. */
+static int resolve_user_path_at(thread_t *cur, int dirfd, const char *path_u, char *out, size_t out_cap);
+
+/*
+ * Linux mknod(2)/mknodat(2). OpenRC seed_dev uses BusyBox mknod (SYS_mknodat)
+ * for /dev/kmsg etc. when the node is missing.
+ */
+static uint64_t syscall_do_mknod(thread_t *cur, const char *path, mode_t mode,
+                                 uint64_t rdev) {
+    (void)cur;
+    (void)rdev;
+    if (!path || path[0] == '\0')
+        return ret_err(EINVAL);
+    mode_t type = mode & (mode_t)0170000;
+    if (type == 0)
+        type = S_IFREG;
+
+    struct stat st;
+    if (vfs_stat(path, &st) == 0)
+        return ret_err(EEXIST);
+
+    if (type == S_IFCHR && strncmp(path, "/dev/", 5) == 0) {
+        /* Known specials (null, kmsg, …) already exist after boot mount. */
+        if (vfs_stat(path, &st) == 0 && (st.st_mode & S_IFCHR) == S_IFCHR)
+            return ret_err(EEXIST);
+        if (devfs_create_char_node(path, NULL) == 0)
+            return 0;
+        /* Node may already be a built-in special — treat as success if present. */
+        if (vfs_stat(path, &st) == 0 && (st.st_mode & S_IFCHR) == S_IFCHR)
+            return 0;
+        return ret_err(EPERM);
+    }
+
+    if (type == S_IFREG || type == (mode_t)0010000 /* S_IFIFO */) {
+        struct fs_file *f = fs_create_file(path);
+        if (!f)
+            return ret_err(EEXIST);
+        fs_file_free(f);
+        (void)fs_chmod(path, (mode & 07777u) | type);
+        return 0;
+    }
+
+    if (type == S_IFDIR)
+        return ret_err(EPERM);
+
+    /* Char/block outside /dev: create a regular node with the requested mode. */
+    {
+        struct fs_file *f = fs_create_file(path);
+        if (!f)
+            return ret_err(EIO);
+        fs_file_free(f);
+        if (fs_chmod(path, (mode & 07777u) | type) != 0)
+            return ret_err(EPERM);
+        return 0;
+    }
+}
+
 static int resolve_user_path_at(thread_t *cur, int dirfd, const char *path_u, char *out, size_t out_cap) {
     if (!out || out_cap == 0) return -EFAULT;
     out[0] = '\0';
@@ -6586,6 +6659,50 @@ static int copy_to_user_safe(void *uptr, const void *kptr, size_t n) {
 fault:
     uaccess_clear(t);
     return -1;
+}
+
+/*
+ * wait4 status*: pin the waiter's mm (not thread_current()/uaccess_thread),
+ * store, then read back. BusyBox ash leaves ps_status at -1 until *status is
+ * updated; a store that "succeeds" into the wrong mm left OpenRC believing
+ * mountinfo/mount/fstabinfo failed despite exit_group code=0 / wait4 0x0.
+ */
+static int wait4_copy_status(thread_t *waiter, int status) {
+    if (!waiter || !waiter->sc_a2)
+        return 0;
+    uint64_t uaddr = waiter->sc_a2;
+    if (!user_range_ok((const void *)(uintptr_t)uaddr, sizeof(status)))
+        return -1;
+    if (waiter->mm)
+        mm_switch(waiter->mm);
+    if (waiter->mm && waiter->mm != mm_kernel()) {
+        mm_t *share = waiter->mm_ptemplate ? waiter->mm_ptemplate : mm_kernel();
+        if (mm_copy_to_user(waiter->mm, share, uaddr, &status, sizeof(status)) != 0)
+            return -1;
+        /*
+         * Verify what userspace will see via its VA (process CR3 + invlpg),
+         * not the PA path used by mm_copy_from_user — that hid TLB staleness.
+         */
+        {
+            int got = 0x7fffffff;
+            uint64_t proc = waiter->mm->cr3 ? waiter->mm->cr3
+                                           : (uint64_t)(uintptr_t)waiter->mm->pml4;
+            uint64_t saved = paging_read_cr3();
+            paging_write_cr3(proc);
+            invlpg((void *)(uintptr_t)uaddr);
+            memcpy(&got, (const void *)(uintptr_t)uaddr, sizeof(got));
+            paging_write_cr3(saved);
+            if (got != status) {
+                kprintf("wait4: status VA verify fail u=0x%llx wrote=0x%x "
+                        "va_read=0x%x parent=%s\n",
+                    (unsigned long long)uaddr, (unsigned)status, (unsigned)got,
+                    waiter->name[0] ? waiter->name : "?");
+                return -1;
+            }
+        }
+        return 0;
+    }
+    return copy_to_user_safe((void *)(uintptr_t)uaddr, &status, sizeof(status));
 }
 
 static int copy_from_user_raw(void *kdst, const void *usrc, size_t n) {
@@ -8183,6 +8300,14 @@ static uint64_t do_linux_fork(thread_t *cur,
                 (unsigned long long)(child->tid ? child->tid : 1), 0);
             fork_dbg(cur, 9, "return pid",
                 (unsigned long long)process_pid(child), 0, 0);
+            if (cur->name[0] && (strstr(cur->name, "openrc") ||
+                                 strstr(cur->name, "/sh") ||
+                                 strstr(cur->name, "fstabinfo") ||
+                                 strstr(cur->name, "busybox")))
+                kprintf("fork-ret: parent=%s child_pid=%llu child_tid=%d\n",
+                    cur->name,
+                    (unsigned long long)process_pid(child),
+                    (int)(child->tid ? child->tid : 1));
             return process_pid(child);
 }
 
@@ -8407,6 +8532,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 CLONE_FS_OLD = 0x00000200u,
                 CLONE_FILES_OLD = 0x00000400u,
                 CLONE_SIGHAND_OLD = 0x00000800u,
+                CLONE_VFORK_OLD = 0x00004000u,
                 CLONE_THREAD_OLD = 0x00010000u,
                 CLONE_SYSVSEM_OLD = 0x00040000u,
                 CLONE_SETTLS_OLD = 0x00080000u,
@@ -8633,6 +8759,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 } else {
                     thread_unblock((int)(child->tid ? child->tid : 1));
                 }
+                /* See clone3: posix_spawn fallback via __clone also uses VFORK. */
+                if ((flags & CLONE_VFORK_OLD) && child->process && cur->process) {
+                    process_set_vfork_parent(child->process, cur->process);
+                    cur->vfork_waiting = 1;
+                    cur->vfork_saved_ret = (uint64_t)child_user_tid;
+                    if (!thread_block_current_atomic())
+                        thread_block((int)(cur->tid ? cur->tid : 1));
+                }
                 {
                     static int clone_ok_left = 8;
                     if (clone_ok_left-- > 0)
@@ -8642,6 +8776,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             (unsigned long long)child_rsp,
                             (unsigned long long)child->user_fs_base);
                 }
+                if (cur->name[0] && (strstr(cur->name, "openrc") ||
+                                     strstr(cur->name, "/sh") ||
+                                     strstr(cur->name, "fstabinfo") ||
+                                     strstr(cur->name, "busybox")))
+                    kprintf("clone-ret: parent=%s child_pid=%u child_tid=%d flags=0x%llx\n",
+                        cur->name, (unsigned)child_user_tid,
+                        (int)(child->tid ? child->tid : 1),
+                        (unsigned long long)flags);
                 return (uint64_t)child_user_tid;
             }
 
@@ -8695,6 +8837,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (saved_rcx == 0) return ret_err(EINVAL);
             enum {
                 CLONE3_CLONE_VM = 0x00000100u,
+                CLONE3_CLONE_VFORK = 0x00004000u,
                 CLONE3_CLONE_SIGHAND = 0x00000800u,
                 CLONE3_CLONE_THREAD = 0x00010000u,
                 CLONE3_CLONE_SETTLS = 0x00080000u,
@@ -8773,7 +8916,22 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 child->saved_user_rsi = cur->saved_user_rsi;
                 child->saved_user_rbp = cur->saved_user_rbp;
                 child->saved_user_rbx = cur->saved_user_rbx;
-                child->saved_user_rdx = cur->saved_user_rdx;
+                /* glibc __clone3 child: `call *%rdx` with start_routine still in
+                 * %rdx and arg in %r8 (moved from %rcx before SYSCALL). Snapshot
+                 * those from the live frame — not a stale saved_user_* copy. */
+                {
+                    uint64_t fn = cur->saved_user_rdx;
+                    uint64_t arg = cur->saved_user_r8;
+                    if (cur->saved_syscall_frame) {
+                        fn = cur->saved_syscall_frame[12];
+                        arg = cur->saved_syscall_frame[7];
+                    } else if (cur->syscall_frame_kbuf) {
+                        fn = cur->syscall_frame_kbuf[12];
+                        arg = cur->syscall_frame_kbuf[7];
+                    }
+                    child->saved_user_rdx = fn;
+                    child->saved_user_r8 = arg;
+                }
                 child->saved_user_rcx = saved_rcx;
                 child->saved_user_rip = saved_rcx;
                 child->saved_user_rsp = (uint64_t)child_rsp;
@@ -8782,6 +8940,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 /* glibc clone3.S: call *%rdx with start_routine. */
                 child->clone_preserve_rdx = 1;
                 fork_build_gpr_snap_from_thread(child);
+                child->fork_gpr_snap[7] = child->saved_user_r8;
+                child->fork_gpr_snap[12] = child->saved_user_rdx;
                 child->fork_gpr_snap[13] = saved_rcx;
                 child->fork_gpr_snap[14] = 0;
                 child->fork_gpr_snap[15] = (uint64_t)child_rsp;
@@ -8873,6 +9033,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 rebuild_syscall_frame(cur);
                 {
                     int ctid = (int)(child->tid ? child->tid : 1);
+                    /* Linux clone(2)/clone3: parent return value is the child's
+                     * TGID (process pid for a new task), not the internal thread
+                     * slot. posix_spawn waitpid()'s that value — returning tid
+                     * when tid!=pid made waitpid miss the zombie → ECHILD →
+                     * fstabinfo treated a successful mount(2) as failure. */
+                    uint64_t child_nr = linux_task_tid(child);
+                    if (child_nr == 0)
+                        child_nr = (uint64_t)(child->tid ? child->tid : 1);
                     /* CLONE_VM harness path: unblock now (per-thread syscall stacks). */
                     if (flags & CLONE3_CLONE_THREAD) {
                         cur->fork_child_to_publish = child;
@@ -8887,8 +9055,21 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             (unsigned long long)child->user_rip,
                             (unsigned long long)child->user_stack);
                     }
+                    /*
+                     * Linux CLONE_VFORK: freeze parent until child execs/exits.
+                     * glibc posix_spawn (__spawnix) munmaps the child stack as
+                     * soon as clone returns — without this wait the child runs
+                     * on a freed stack → RIP=0 (fstabinfo Oops).
+                     */
+                    if ((flags & CLONE3_CLONE_VFORK) && child->process && cur->process) {
+                        process_set_vfork_parent(child->process, cur->process);
+                        cur->vfork_waiting = 1;
+                        cur->vfork_saved_ret = child_nr;
+                        if (!thread_block_current_atomic())
+                            thread_block((int)(cur->tid ? cur->tid : 1));
+                    }
+                    return child_nr;
                 }
-                return (uint64_t)(child->tid ? child->tid : 1);
             }
             {
                 uint64_t clone3_ret_rip =
@@ -9379,7 +9560,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 pid1_dl_log_stat("readlink-req", kpath);
 
             /* /proc/self/fd/N and /proc/<pid>/fd/N must resolve to the open file path
-               before the generic "non-symlink => return path" hack. glibc _dl_get_file_id
+               before the generic non-symlink EINVAL path. glibc _dl_get_file_id
                relies on this for shared-library identity checks. */
             if (strncmp(kpath, "/proc/", 6) == 0) {
                 const char *p = kpath + 6;
@@ -9423,30 +9604,38 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
             }
 
-            /* Workaround: realpath/canonicalize and Busybox adduser readlink paths to resolve
-               them. When a path exists as regular file or dir (not symlink), POSIX readlink
-               would fail with EINVAL. Return the path as link target so programs succeed. */
+            /*
+             * Linux/POSIX: readlink on a non-symlink returns EINVAL.
+             * Returning the path as its own target made glibc __realpath
+             * follow the same path forever → ELOOP ("Too many levels of
+             * symbolic links") and broke OpenRC fstabinfo/mount/init.d.
+             */
             {
                 struct stat st;
-                if (vfs_lstat(kpath, &st) == 0 && (st.st_mode & S_IFLNK) != S_IFLNK) {
-                    if (bufsiz == 0) return ret_err(EINVAL);
-                    size_t L = strlen(kpath);
-                    if (L > bufsiz) L = bufsiz;
-                    memcpy(buf, kpath, L);
-                    return (uint64_t)L;
-                }
+                if (vfs_lstat(kpath, &st) == 0 && (st.st_mode & S_IFLNK) != S_IFLNK)
+                    return ret_err(EINVAL);
             }
 
-            ssize_t rr = vfs_readlink(kpath, buf, bufsiz);
-            if (rr >= 0) {
-                if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(kpath)) {
-                    char tmp[256];
-                    size_t tl = (size_t)rr < sizeof(tmp) - 1 ? (size_t)rr : sizeof(tmp) - 1;
-                    memcpy(tmp, buf, tl);
-                    tmp[tl] = '\0';
-                    kprintf("dl-trace readlink ok path=%s target=%s len=%zd\n", kpath, tmp, rr);
+            {
+                char kbuf[256];
+                size_t cap = bufsiz < sizeof(kbuf) ? bufsiz : sizeof(kbuf);
+                ssize_t rr;
+                if (cap == 0)
+                    return ret_err(EINVAL);
+                rr = vfs_readlink(kpath, kbuf, cap);
+                if (rr >= 0) {
+                    if (copy_to_user_safe(buf, kbuf, (size_t)rr) != 0)
+                        return ret_err(EFAULT);
+                    if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(kpath)) {
+                        char tmp[256];
+                        size_t tl = (size_t)rr < sizeof(tmp) - 1 ? (size_t)rr : sizeof(tmp) - 1;
+                        memcpy(tmp, kbuf, tl);
+                        tmp[tl] = '\0';
+                        kprintf("dl-trace readlink ok path=%s target=%s len=%zd\n",
+                                kpath, tmp, rr);
+                    }
+                    return (uint64_t)rr;
                 }
-                return (uint64_t)rr;
             }
 
             /* Fallbacks for common procfs symlinks used by libc/busybox. */
@@ -9455,7 +9644,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 size_t L = strlen(target);
                 if (bufsiz == 0) return ret_err(EINVAL);
                 if (L > bufsiz) L = bufsiz;
-                memcpy(buf, target, L);
+                if (copy_to_user_safe(buf, target, L) != 0) return ret_err(EFAULT);
                 return (uint64_t)L; /* no NUL terminator */
             }
             if (strncmp(kpath, "/proc/", 6) == 0) {
@@ -9479,7 +9668,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         size_t L = strlen(target);
                         if (bufsiz == 0) return ret_err(EINVAL);
                         if (L > bufsiz) L = bufsiz;
-                        memcpy(buf, target, L);
+                        if (copy_to_user_safe(buf, target, L) != 0) return ret_err(EFAULT);
                         return (uint64_t)L;
                     }
                     if (strncmp(p, "fd/", 3) == 0) {
@@ -9503,7 +9692,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             size_t L = strlen(target);
                             if (bufsiz == 0) return ret_err(EINVAL);
                             if (L > bufsiz) L = bufsiz;
-                            memcpy(buf, target, L);
+                            if (copy_to_user_safe(buf, target, L) != 0) return ret_err(EFAULT);
                             return (uint64_t)L;
                         }
                     }
@@ -9566,34 +9755,40 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             if (bufsiz == 0) return ret_err(EINVAL);
                             size_t L = strlen(target);
                             if (L > bufsiz) L = bufsiz;
-                            memcpy(buf, target, L);
+                            if (copy_to_user_safe(buf, target, L) != 0) return ret_err(EFAULT);
                             return (uint64_t)L;
                         }
                     }
                 }
             }
 
+            /* Linux: non-symlink → EINVAL (never return path as its own target). */
             {
                 struct stat st;
-                if (vfs_lstat(path, &st) == 0 && (st.st_mode & S_IFLNK) != S_IFLNK) {
-                    if (bufsiz == 0) return ret_err(EINVAL);
-                    size_t L = strlen(path);
-                    if (L > bufsiz) L = bufsiz;
-                    memcpy(buf, path, L);
-                    return (uint64_t)L;
-                }
+                if (vfs_lstat(path, &st) == 0 && (st.st_mode & S_IFLNK) != S_IFLNK)
+                    return ret_err(EINVAL);
             }
 
-            ssize_t rr = vfs_readlink(path, buf, bufsiz);
-            if (rr >= 0) {
-                if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(path)) {
-                    char tmp[256];
-                    size_t tl = (size_t)rr < sizeof(tmp) - 1 ? (size_t)rr : sizeof(tmp) - 1;
-                    memcpy(tmp, buf, tl);
-                    tmp[tl] = '\0';
-                    kprintf("dl-trace readlinkat ok path=%s target=%s len=%zd\n", path, tmp, rr);
+            {
+                char kbuf[256];
+                size_t cap = bufsiz < sizeof(kbuf) ? bufsiz : sizeof(kbuf);
+                ssize_t rr;
+                if (cap == 0)
+                    return ret_err(EINVAL);
+                rr = vfs_readlink(path, kbuf, cap);
+                if (rr >= 0) {
+                    if (copy_to_user_safe(buf, kbuf, (size_t)rr) != 0)
+                        return ret_err(EFAULT);
+                    if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(path)) {
+                        char tmp[256];
+                        size_t tl = (size_t)rr < sizeof(tmp) - 1 ? (size_t)rr : sizeof(tmp) - 1;
+                        memcpy(tmp, kbuf, tl);
+                        tmp[tl] = '\0';
+                        kprintf("dl-trace readlinkat ok path=%s target=%s len=%zd\n",
+                                path, tmp, rr);
+                    }
+                    return (uint64_t)rr;
                 }
-                return (uint64_t)rr;
             }
             return ret_err(ENOENT);
         }
@@ -10075,8 +10270,86 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             return 0;
         }
         case SYS_syslog: {
-
-            return ENOSYS;
+            /* Linux klogctl(type, buf, len) — BusyBox dmesg / OpenRC dmesg service. */
+            int type = (int)a1;
+            char *buf_u = (char *)(uintptr_t)a2;
+            int len = (int)a3;
+            enum {
+                SYSLOG_ACTION_CLOSE = 0,
+                SYSLOG_ACTION_OPEN = 1,
+                SYSLOG_ACTION_READ = 2,
+                SYSLOG_ACTION_READ_ALL = 3,
+                SYSLOG_ACTION_READ_CLEAR = 4,
+                SYSLOG_ACTION_CLEAR = 5,
+                SYSLOG_ACTION_CONSOLE_OFF = 6,
+                SYSLOG_ACTION_CONSOLE_ON = 7,
+                SYSLOG_ACTION_CONSOLE_LEVEL = 8,
+                SYSLOG_ACTION_SIZE_UNREAD = 9,
+                SYSLOG_ACTION_SIZE_BUFFER = 10
+            };
+            switch (type) {
+            case SYSLOG_ACTION_CLOSE:
+            case SYSLOG_ACTION_OPEN:
+            case SYSLOG_ACTION_CONSOLE_OFF:
+            case SYSLOG_ACTION_CONSOLE_ON:
+            case SYSLOG_ACTION_CONSOLE_LEVEL:
+            case SYSLOG_ACTION_CLEAR:
+                return 0;
+            case SYSLOG_ACTION_SIZE_BUFFER:
+                return (uint64_t)klog_syslog_buf_size();
+            case SYSLOG_ACTION_SIZE_UNREAD:
+                return (uint64_t)klog_syslog_buf_size();
+            case SYSLOG_ACTION_READ:
+            case SYSLOG_ACTION_READ_ALL:
+            case SYSLOG_ACTION_READ_CLEAR: {
+                if (len < 0)
+                    return ret_err(EINVAL);
+                if (len == 0)
+                    return 0;
+                if (!buf_u || !user_range_ok(buf_u, (size_t)len))
+                    return ret_err(EFAULT);
+                char *tmp = (char *)kmalloc((size_t)len);
+                if (!tmp)
+                    return ret_err(ENOMEM);
+                long n = klog_syslog_read_all(tmp, (size_t)len);
+                if (n < 0) {
+                    kfree(tmp);
+                    return ret_err(EIO);
+                }
+                if (n > 0 && copy_to_user_safe(buf_u, tmp, (size_t)n) != 0) {
+                    kfree(tmp);
+                    return ret_err(EFAULT);
+                }
+                kfree(tmp);
+                return (uint64_t)n;
+            }
+            default:
+                return ret_err(EINVAL);
+            }
+        }
+        case SYS_mknod: {
+            /* mknod(pathname, mode, dev) */
+            const char *path_u = (const char *)(uintptr_t)a1;
+            mode_t mode = (mode_t)a2;
+            uint64_t dev = a3;
+            if (!path_u || (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT)
+                return ret_err(EFAULT);
+            char path[256];
+            resolve_user_path(cur, path_u, path, sizeof(path));
+            return syscall_do_mknod(cur, path, mode, dev);
+        }
+        case SYS_mknodat: {
+            /* mknodat(dirfd, pathname, mode, dev) — BusyBox mknod */
+            int dirfd = (int)a1;
+            const char *path_u = (const char *)(uintptr_t)a2;
+            mode_t mode = (mode_t)a3;
+            uint64_t dev = a4;
+            if (!path_u || (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT)
+                return ret_err(EFAULT);
+            char path[256];
+            int rc = resolve_user_path_at(cur, dirfd, path_u, path, sizeof(path));
+            if (rc != 0) return ret_err(-rc);
+            return syscall_do_mknod(cur, path, mode, dev);
         }
         case SYS_writev: {
             int fd = (int)a1;
@@ -13746,7 +14019,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (kenvp) { for (int i=0;i<envc;i++) if (kenvp[i]) kfree((void*)kenvp[i]); kfree(kenvp); }
             for (int i=0;i<argc;i++) if (kargv[i]) kfree((void*)kargv[i]);
             if (kargv) kfree((void*)kargv);
-            if (cur && cur->name[0] &&
+            if (rc != 0 && cur && cur->name[0] &&
                 (strstr(cur->name, "openrc") || strstr(cur->name, "linuxrc")))
                 kprintf("execve-fail: tid=%llu path=%s rc=%d argc=%d envc=%d\n",
                     (unsigned long long)(cur->tid ? cur->tid : 1),
@@ -13755,12 +14028,68 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (rc == 0) {
                 sysv_shm_detach_all_for_tid((uint64_t)(cur && cur->tid ? cur->tid : 1));
                 user_vma_remove_all_for_tid((uint64_t)(cur && cur->tid ? cur->tid : 1));
-                /* Success is noreturn via enter_user_mode. If we got here, jump. */
+                /*
+                 * In-place exec must return through syscall.S iretq with the
+                 * patched frame. Calling enter_user_mode from deep inside
+                 * syscall_do left posix_spawn children on the old brk
+                 * child_stack (RSP≈0x8008d80 → empty auxv → RIP=0).
+                 */
                 if (cur && cur->user_rip && cur->user_stack) {
-                    devel_printf("execve: fallthrough jump path=%s rip=0x%llx\n",
-                        resolved_path, (unsigned long long)cur->user_rip);
+                    uintptr_t stack_lo =
+                        (uintptr_t)USER_STACK_TOP - (uintptr_t)USER_STACK_SIZE;
+                    if (cur->user_stack < stack_lo ||
+                        cur->user_stack >= (uintptr_t)USER_STACK_TOP) {
+                        kprintf("execve: bad tip after load path=%s rsp=0x%llx\n",
+                                resolved_path,
+                                (unsigned long long)cur->user_stack);
+                        return ret_err(EFAULT);
+                    }
+                    if (!cur->exec_trampoline_flag) {
+                        cur->exec_trampoline_rip = cur->user_rip;
+                        cur->exec_trampoline_rsp = (uint64_t)cur->user_stack;
+                        cur->exec_trampoline_rax = 0;
+                        cur->exec_trampoline_flag = 1;
+                    }
+                    if (apply_exec_trampoline(cur) != 0) {
+                        /*
+                         * No live syscall frame (clone child_stack path): patching
+                         * nothing and returning leaves RSP on the old brk stack
+                         * (≈0x8008d80 → empty auxv → RIP=0). Jump directly.
+                         */
+                        if (!cur->saved_syscall_frame && !cur->syscall_frame_kbuf) {
+                            devel_printf("execve: enter_user path=%s rip=0x%llx rsp=0x%llx\n",
+                                resolved_path, (unsigned long long)cur->user_rip,
+                                (unsigned long long)cur->user_stack);
+                            cur->fork_child_user_rip = 0;
+                            cur->exec_trampoline_flag = 0;
+                            enter_user_mode(cur->user_rip, cur->user_stack);
+                            return 0; /* noreturn */
+                        }
+                        cur->saved_user_rsp = cur->user_stack;
+                        cur->saved_user_rip = cur->user_rip;
+                        /* Same ELF-entry contract as apply_exec_trampoline. */
+                        cur->saved_user_rdx = 0;
+                        syscall_user_saved_rdx = 0;
+                        if (cur->saved_syscall_frame) {
+                            cur->saved_syscall_frame[12] = 0;
+                            cur->saved_syscall_frame[13] = cur->user_rip;
+                            cur->saved_syscall_frame[14] = 0;
+                            cur->saved_syscall_frame[15] = cur->user_stack;
+                        }
+                        if (cur->syscall_frame_kbuf) {
+                            cur->syscall_frame_kbuf[12] = 0;
+                            cur->syscall_frame_kbuf[13] = cur->user_rip;
+                            cur->syscall_frame_kbuf[14] = 0;
+                            cur->syscall_frame_kbuf[15] = cur->user_stack;
+                        }
+                        syscall_exec_trampoline_active = 1;
+                        syscall_user_rsp_saved = cur->user_stack;
+                    }
+                    devel_printf("execve: iret path=%s rip=0x%llx rsp=0x%llx\n",
+                        resolved_path, (unsigned long long)cur->user_rip,
+                        (unsigned long long)cur->user_stack);
                     cur->fork_child_user_rip = 0;
-                    enter_user_mode(cur->user_rip, cur->user_stack);
+                    return 0;
                 }
                 return ret_err(EFAULT);
             }
@@ -13913,18 +14242,47 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         int status = dead->exit_status;
                         int dead_pid = (int)dead->pid;
                         thread_t *dead_thread = dead->leader;
-                        if (waiter->sc_a2 &&
-                            copy_to_user_safe((void *)(uintptr_t)waiter->sc_a2,
-                                              &status, sizeof(status)) != 0)
-                            return ret_err(EFAULT);
+                        const char *pn = waiter->name[0] ? waiter->name : "";
+                        const char *cn = (dead_thread && dead_thread->name[0])
+                            ? dead_thread->name : "";
+                        if (strstr(pn, "fstabinfo") || strstr(pn, "openrc") ||
+                            strstr(pn, "/sh") || strstr(pn, "busybox") ||
+                            strstr(cn, "mount") || strstr(cn, "mountinfo") ||
+                            strstr(cn, "fstabinfo") ||
+                            (status != 0 && (strstr(pn, "busybox") || strstr(cn, "busybox"))))
+                            kprintf("wait4: parent=%s child=%s pid=%d status=0x%x "
+                                    "(exited=%d code=%d signaled=%d sig=%d) "
+                                    "wait_pid_arg=%d status_u=0x%llx\n",
+                                pn, cn, dead_pid, (unsigned)status,
+                                ((status) & 0x7f) == 0,
+                                ((status) >> 8) & 0xff,
+                                ((status) & 0x7f) != 0 && ((status) & 0x7f) != 0x7f,
+                                (status) & 0x7f,
+                                pid_arg,
+                                (unsigned long long)waiter->sc_a2);
+                        if (waiter->sc_a2) {
+                            if (wait4_copy_status(waiter, status) != 0) {
+                                kprintf("wait4: EFAULT status*=0x%llx parent=%s "
+                                        "child=%s pid=%d status=0x%x\n",
+                                    (unsigned long long)waiter->sc_a2,
+                                    pn, cn, dead_pid, (unsigned)status);
+                                return ret_err(EFAULT);
+                            }
+                        }
                         if (dead_thread) {
                             int dead_tid = (int)(dead_thread->tid ?
                                                  dead_thread->tid : 1);
                             dead_thread->process = NULL;
                             dead->leader = NULL;
+                            /* Linux: free the PID (process table) before the
+                             * thread slot. tid may equal a recycled slot index;
+                             * releasing the slot first allowed a new fork to
+                             * observe the old zombie PID still in the table. */
+                            (void)process_reap(waiter->process, dead);
                             (void)thread_reap(dead_tid);
+                        } else {
+                            (void)process_reap(waiter->process, dead);
                         }
-                        (void)process_reap(waiter->process, dead);
                         waiter->wait4_last_echild = 0;
                         if (waiter->name[0] && strstr(waiter->name, "linuxrc")) {
                             static int wait4_ok_left = 16;
@@ -13973,26 +14331,46 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         if (zombie_by_tid) {
                             int st = zombie_by_tid->exit_status;
                             int dead_pid = (int)process_pid(zombie_by_tid);
-                            if (waiter->sc_a2 &&
-                                copy_to_user_safe((void *)(uintptr_t)waiter->sc_a2,
-                                                  &st, sizeof(st)) != 0)
-                                return ret_err(EFAULT);
+                            if (waiter->sc_a2) {
+                                if (wait4_copy_status(waiter, st) != 0) {
+                                    kprintf("wait4: EFAULT (tid-path) status*=0x%llx "
+                                            "pid=%d status=0x%x\n",
+                                        (unsigned long long)waiter->sc_a2,
+                                        dead_pid, (unsigned)st);
+                                    return ret_err(EFAULT);
+                                }
+                            }
                             zombie_by_tid->exit_status = 0x80000000;
                             zombie_by_tid->waiter_tid = -1;
-                            if (zombie_by_tid->process)
-                                process_mark_zombie(zombie_by_tid->process, st);
-                            (void)thread_reap((int)(zombie_by_tid->tid ?
-                                                    zombie_by_tid->tid : 1));
+                            {
+                                int dead_tid = (int)(zombie_by_tid->tid ?
+                                                     zombie_by_tid->tid : 1);
+                                if (zombie_by_tid->process) {
+                                    if (zombie_by_tid->process->state != PROCESS_ZOMBIE)
+                                        process_mark_zombie(zombie_by_tid->process, st);
+                                    (void)process_reap(waiter->process,
+                                                       zombie_by_tid->process);
+                                }
+                                zombie_by_tid->process = NULL;
+                                (void)thread_reap(dead_tid);
+                            }
                             devel_printf("wait4-reap-tid: parent=%llu child_pid=%d (via parent_tid)\n",
                                 (unsigned long long)(waiter->tid ? waiter->tid : 1),
                                 dead_pid);
                             return (uint64_t)(unsigned)dead_pid;
                         }
                         if (!live_by_tid) {
-                            if (waiter->name[0] && strstr(waiter->name, "linuxrc")) {
+                            if (waiter->name[0] && (strstr(waiter->name, "linuxrc") ||
+                                strstr(waiter->name, "fstabinfo") ||
+                                strstr(waiter->name, "openrc") ||
+                                strstr(waiter->name, "mountinfo"))) {
                                 static int wait4_echild_left = 12;
                                 if (wait4_echild_left-- > 0) {
                                     uint64_t me = process_pid(waiter);
+                                    kprintf("wait4-ECHILD: tid=%llu me_pid=%llu pid_arg=%d name=%s\n",
+                                        (unsigned long long)(waiter->tid ? waiter->tid : 1),
+                                        (unsigned long long)me, pid_arg,
+                                        waiter->name[0] ? waiter->name : "?");
                                     devel_printf("wait4-ECHILD: tid=%llu me_pid=%llu pid_arg=%d opts=0x%x\n",
                                         (unsigned long long)(waiter->tid ? waiter->tid : 1),
                                         (unsigned long long)me, pid_arg, options);
@@ -14053,7 +14431,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 int has_waitable_child = 0;
                 int w4_pid = (int)tcur->sc_a1;
                 if (w4_pid > 0) {
-                    thread_t *c = thread_get(w4_pid);
+                    /* Linux waitpid(pid): pid is TGID, not an internal tid slot.
+                     * Prefer process_find; fall back to thread_get for legacy
+                     * CLONE_THREAD cases where the arg is a tid. */
+                    process_t *p = process_find((uint64_t)(unsigned)w4_pid);
+                    thread_t *c = (p && p->leader) ? p->leader : thread_get(w4_pid);
                     if (c && c->parent_tid == (int)tcur->tid) {
                         found = c;
                         has_waitable_child = 1;
@@ -14216,16 +14598,23 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         }
                     }
                     if (tcur->sc_a2) {
-                        int *status_u = (int *)(uintptr_t)tcur->sc_a2;
-                        if (copy_to_user_safe(status_u, &st, sizeof(st)) != 0) return ret_err(EFAULT);
+                        if (wait4_copy_status(tcur, st) != 0)
+                            return ret_err(EFAULT);
                     }
                     found->waiter_tid = -1;
                     /* mark reaped */
                     found->exit_status = 0x80000000;
-                    /* free slot/resources so fork doesn't hit MAX_THREADS */
+                    /* free process PID first, then tid slot (pid != tid). */
                     {
-                        extern int thread_reap(int pid);
-                        (void)thread_reap(dead_pid);
+                        int dead_tid = (int)(found->tid ? found->tid : 1);
+                        if (found->process && tcur->process) {
+                            if (found->process->state != PROCESS_ZOMBIE)
+                                process_mark_zombie(found->process, st);
+                            (void)process_reap(tcur->process, found->process);
+                        }
+                        found->process = NULL;
+                        extern int thread_reap(int tid);
+                        (void)thread_reap(dead_tid);
                     }
                     if (!find_terminated_child(tcur))
                         tcur->pending_signals &= ~(1ULL << (SIGCHLD - 1));
@@ -14942,6 +15331,42 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         return 0;
                 }
                 return ret_err(ENOTTY);
+            }
+
+            /*
+             * KDGKBMODE (0x4B44) / KDSKBMODE (0x4B45): keyboard translation mode.
+             * OpenRC keymaps/consolefont run /bin/kbd_mode; without these, ioctl
+             * returns EINVAL, perror runs, then the process dies at RIP=0xec00000
+             * on the exit path. Linux vt: mode is K_RAW..K_OFF; set passes the
+             * mode as the ioctl arg value, get writes through an int*.
+             */
+            if (req == 0x4B44 || req == 0x4B45) {
+                static int console_kbd_mode = 0x01; /* K_XLATE */
+                if (!devfs_is_tty_file(f))
+                    return ret_err(ENOTTY);
+                if (req == 0x4B44) {
+                    int mode = console_kbd_mode;
+                    if (!argp || !user_range_ok(argp, sizeof(int)))
+                        return ret_err(EFAULT);
+                    if (copy_to_user_safe(argp, &mode, sizeof(mode)) != 0)
+                        return ret_err(EFAULT);
+                    return 0;
+                }
+                {
+                    int mode = (int)(intptr_t)argp;
+                    if (mode < 0 || mode > 4) /* K_RAW..K_OFF */
+                        return ret_err(EINVAL);
+                    console_kbd_mode = mode;
+                    return 0;
+                }
+            }
+
+            /* KDSKBENT (0x4B46): set one keymap entry — accept and ignore. */
+            if (req == 0x4B46) {
+                if (!devfs_is_tty_file(f))
+                    return ret_err(ENOTTY);
+                (void)argp;
+                return 0;
             }
 
             /* For the remaining tty-specific ioctls, require a real tty file. */
@@ -16593,7 +17018,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (sr != 0) {
                     if (is_init_user(cur) || (cur && cur->name[0] && strstr(cur->name, "openrc")))
                         devel_printf("pid1 newfstatat ENOENT path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
-                    if (pid1_dl_trace_thread(cur))
+                    /* Only spam ENOENT for ld.so paths — OpenRC probes
+                     * /proc/vz, /.dockerenv, /usr/etc/* constantly. */
+                    if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(path))
                         kprintf("dl-trace newfstatat ENOENT path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
                     return ret_err(ENOENT);
                 }
@@ -17126,14 +17553,15 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     }
                 }
 
-                if (addr + 0x30 <= (uint64_t)USER_STACK_TOP) {
-                    uint64_t cur_guard = 0;
-                    (void)copy_from_user_raw(&cur_guard,
-                        (const void *)(uintptr_t)(addr + 0x28), sizeof(cur_guard));
-                    if (cur_guard == 0)
-                        (void)copy_to_user_safe((void *)(uintptr_t)(addr + 0x28),
-                            &old_guard, sizeof(old_guard));
-                }
+                /*
+                 * Always install old fs:0x28 into the new TCB. Frames entered
+                 * before SET_FS still compare against the old canary; keeping a
+                 * different glibc-written value here → "*** stack smashing ***"
+                 * in mountinfo/fstabinfo right after TLS setup.
+                 */
+                if (addr + 0x30 <= (uint64_t)USER_STACK_TOP)
+                    (void)copy_to_user_safe((void *)(uintptr_t)(addr + 0x28),
+                        &old_guard, sizeof(old_guard));
                 init_clear_rtld_errno(cur);
                 /* Log PID1 and early sysinit children (mount) — TLS/brk bugs. */
                 if (is_init_user(cur) ||
@@ -17223,11 +17651,38 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 } else {
                     errno_out = EBUSY;
                 }
-            } else if (strcmp(k_type, "devfs") == 0 || strcmp(k_type, "devtmpfs") == 0 || strcmp(k_type, "tmpfs") == 0) {
-                /* tmpfs as mount type for /dev: treat same as devtmpfs (init inittab fallback) */
+            } else if (strcmp(k_type, "devfs") == 0 || strcmp(k_type, "devtmpfs") == 0) {
+                /* Linux devtmpfs — device nodes only; never alias tmpfs. */
                 ramfs_mkdir(target);
                 rc = devfs_mount(target);
                 if (rc != 0) errno_out = EBUSY;
+            } else if (strcmp(k_type, "tmpfs") == 0 || strcmp(k_type, "ramfs") == 0) {
+                /* OpenRC init.sh / fstabinfo: mount -t tmpfs … /run
+                 * Exact mountpoint check (not longest-prefix): "/" overlay must
+                 * not count as an existing tmpfs on "/run". */
+                kprintf("mount: tmpfs request target=%s\n", target);
+                ramfs_mkdir(target);
+                {
+                    struct fs_driver *md = fs_get_mount_driver_exact(target);
+                    if (md && md->ops && md->ops->name &&
+                        (strcmp(md->ops->name, "tmpfs") == 0 ||
+                         strcmp(md->ops->name, "ramfs") == 0)) {
+                        /* Linux mount(8): already mounted same type → success for
+                         * our virtual mounts (OpenRC remounts are no-ops). */
+                        rc = 0;
+                        kprintf("mount: tmpfs already on %s (ok)\n", target);
+                    } else if (md) {
+                        errno_out = EBUSY;
+                        kprintf("mount: tmpfs EBUSY on %s have=%s\n", target,
+                                md->ops && md->ops->name ? md->ops->name : "?");
+                    } else {
+                        rc = tmpfs_mount(target);
+                        if (rc != 0)
+                            errno_out = EBUSY;
+                        else
+                            kprintf("mount: tmpfs mounted %s\n", target);
+                    }
+                }
             } else if (strcmp(k_type, "squashfs") == 0) {
                 struct fs_driver *md = fs_get_mount_driver(target);
                 if (md && md->ops && md->ops->name &&
@@ -17280,6 +17735,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 errno_out = EINVAL;
             }
 
+            if (rc != 0)
+                kprintf("mount: fail type=%s target=%s errno=%d\n",
+                        k_type, target, errno_out);
             kfree(k_type);
             return (rc == 0) ? 0 : ret_err(errno_out);
         }
@@ -17882,6 +18340,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (cur) {
                 int ignore_sigchld = (user_sig_actions[SIGCHLD].handler == SIG_IGN) ||
                     ((user_sig_actions[SIGCHLD].flags & SA_NOCLDWAIT) != 0);
+                {
+                    const char *nm = cur->name[0] ? cur->name : "";
+                    if (strstr(nm, "mount") || strstr(nm, "fstabinfo") ||
+                        strstr(nm, "mountinfo") || strstr(nm, "busybox"))
+                        kprintf("exit_group: name=%s code=%d status=0x%x parent=%d\n",
+                            nm, (int)a1, (unsigned)((int)a1 & 0xFF) << 8,
+                            cur->parent_tid);
+                }
                 devfs_tty_remove_waiter_from_all_ttys((int)(cur->tid ? cur->tid : 1));
                 exit_group_reap_peer_threads(cur);
                 int code = (int)a1;
@@ -18504,6 +18970,16 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         thread_schedule();
     else
         thread_cond_resched();
+    /* Linux switch_mm: after schedule the running task must own CR3. Fork/dup
+     * walks use direct-map CR3; without this, iretq can resume on swapper and
+     * the next user I-fetch hits demoted U=0 identity leaves. */
+    {
+        thread_t *rt = thread_current();
+        if (!rt || rt->ring != 3)
+            rt = thread_get_current_user();
+        if (rt && rt->mm)
+            mm_switch(rt->mm);
+    }
     if (num == SYS_set_robust_list && trace_t && trace_t->name[0] &&
         strstr(trace_t->name, "linuxrc"))
         devel_printf("robust-dispatch-return: tid=%llu\n",

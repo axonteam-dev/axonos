@@ -43,6 +43,19 @@ typedef struct {
     int64_t r_addend;
 } Elf64_Rela;
 
+typedef struct {
+    uint32_t sh_name;
+    uint32_t sh_type;
+    uint64_t sh_flags;
+    uint64_t sh_addr;
+    uint64_t sh_offset;
+    uint64_t sh_size;
+    uint32_t sh_link;
+    uint32_t sh_info;
+    uint64_t sh_addralign;
+    uint64_t sh_entsize;
+} Elf64_Shdr;
+
 #define ELF64_R_TYPE(i)   ((uint32_t)((i) & 0xffffffffu))
 #define ELF64_R_SYM(i)    ((uint32_t)((i) >> 32))
 
@@ -53,6 +66,7 @@ enum {
     ELF_DT_RELA    = 7,
     ELF_DT_RELASZ  = 8,
     ELF_DT_RELAENT = 9,
+    ELF_SHT_RELA   = 4,
     ELF_R_X86_64_RELATIVE = 8,
     ELF_R_X86_64_IRELATIVE = 37,
 };

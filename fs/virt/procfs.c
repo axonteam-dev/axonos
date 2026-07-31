@@ -807,6 +807,7 @@ static ssize_t procfs_show_filesystems(char *buf, size_t size, void *priv) {
         "nodev\ttmpfs\n"
         "nodev\tramfs\n"
         /* ext2 omitted: no on-disk mount yet (BusyBox auto-probe). */
+        "\tminix\n"
         "\tvfat\n"
         "\tmsdos\n";
     size_t len = sizeof(text) - 1;

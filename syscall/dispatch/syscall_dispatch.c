@@ -19,6 +19,7 @@
 #include <rtc.h>
 #include <spinlock.h>
 #include <fat32.h>
+#include <minix.h>
 #include <disk.h>
 #include <e1000.h>
 #include <usb.h>
@@ -17967,7 +17968,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (rc != 0)
                         errno_out = EBUSY;
                 }
-            } else if (strcmp(k_type, "fat32") == 0 || strcmp(k_type, "vfat") == 0 ||
+            } else if (strcmp(k_type, "minix") == 0 || strcmp(k_type, "minixfs") == 0 ||
+                       strcmp(k_type, "fat32") == 0 || strcmp(k_type, "vfat") == 0 ||
                        strcmp(k_type, "msdos") == 0 || strcmp(k_type, "auto") == 0) {
                 if (!src_u) { kfree(k_type); return ret_err(EINVAL); }
                 char *k_src_raw = copy_user_cstr(src_u, 256);
@@ -17984,32 +17986,71 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     kfree(k_type);
                     return ret_err(EINTR);
                 }
-                /* Ensure FAT32 state is initialized for this device. */
+
                 {
-                    int pr = fat32_probe_and_mount(dev_id);
-                    if (pr != 0) {
-                        if (pr == -EINTR || thread_has_interrupt_signal(cur)) {
+                    int try_minix = (strcmp(k_type, "minix") == 0 ||
+                                     strcmp(k_type, "minixfs") == 0 ||
+                                     strcmp(k_type, "auto") == 0);
+                    int try_fat = (strcmp(k_type, "fat32") == 0 ||
+                                   strcmp(k_type, "vfat") == 0 ||
+                                   strcmp(k_type, "msdos") == 0 ||
+                                   strcmp(k_type, "auto") == 0);
+                    struct fs_driver *drv = NULL;
+                    int pr = -1;
+
+#ifdef MINIX_SUPPORT
+                    if (try_minix) {
+                        pr = minix_probe_and_mount(dev_id);
+                        if (pr == 0)
+                            drv = minix_get_driver();
+                        else if (pr == -EINTR || thread_has_interrupt_signal(cur)) {
                             kfree(k_type);
                             return ret_err(EINTR);
+                        } else if (strcmp(k_type, "auto") != 0) {
+                            errno_out = (pr == -EIO) ? EIO : EINVAL;
+                            klogprintf("mount: fail type=%s source=%s target=%s rc=%d\n",
+                                       k_type, source, target, pr);
+                            kfree(k_type);
+                            return ret_err(errno_out);
                         }
-                        errno_out = (pr == -EIO) ? EIO : EINVAL;
-                        /* printk-style: do not spam the VGA console mid-mount. */
+                    }
+#else
+                    (void)try_minix;
+#endif
+#ifdef FAT32_SUPPORT
+                    if (!drv && try_fat) {
+                        pr = fat32_probe_and_mount(dev_id);
+                        if (pr == 0)
+                            drv = fat32_get_driver();
+                        else if (pr == -EINTR || thread_has_interrupt_signal(cur)) {
+                            kfree(k_type);
+                            return ret_err(EINTR);
+                        } else if (strcmp(k_type, "auto") != 0 || !try_minix) {
+                            errno_out = (pr == -EIO) ? EIO : EINVAL;
+                            klogprintf("mount: fail type=%s source=%s target=%s rc=%d\n",
+                                       k_type, source, target, pr);
+                            kfree(k_type);
+                            return ret_err(errno_out);
+                        }
+                    }
+#else
+                    (void)try_fat;
+#endif
+                    if (!drv) {
+                        errno_out = EINVAL;
                         klogprintf("mount: fail type=%s source=%s target=%s rc=%d\n",
                                    k_type, source, target, pr);
                         kfree(k_type);
                         return ret_err(errno_out);
                     }
+                    if (thread_has_interrupt_signal(cur)) {
+                        kfree(k_type);
+                        return ret_err(EINTR);
+                    }
+                    (void)fs_mkdir(target);
+                    rc = fs_mount(target, drv);
+                    if (rc != 0) errno_out = EBUSY;
                 }
-                if (thread_has_interrupt_signal(cur)) {
-                    kfree(k_type);
-                    return ret_err(EINTR);
-                }
-                struct fs_driver *drv = fat32_get_driver();
-                if (!drv) { kfree(k_type); return ret_err(EINVAL); }
-
-                (void)fs_mkdir(target);
-                rc = fs_mount(target, drv);
-                if (rc != 0) errno_out = EBUSY;
             } else if (strcmp(k_type, "ext2") == 0 || strcmp(k_type, "ext3") == 0 ||
                        strcmp(k_type, "ext4") == 0) {
                 /* No on-disk ext* yet (memory images only) — fail fast, no I/O. */
@@ -18059,6 +18100,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (drv && drv->ops && drv->ops->name) {
                 if (strcmp(drv->ops->name, "fat32") == 0) {
                     fat32_unmount_cleanup();
+                } else if (strcmp(drv->ops->name, "minix") == 0) {
+                    minix_unmount_cleanup();
                 }
             }
             return 0;

@@ -41,6 +41,7 @@
 #include <mb2_linux_shim.h>
 #include <ramfs.h>
 #include <fat32.h>
+#include <minix.h>
 #include <intel_chipset.h>
 #include <disk.h>
 #include <mmio.h>
@@ -983,6 +984,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // Registering all disk file systems
 #ifdef FAT32_SUPPORT
     fat32_register();
+#endif
+#ifdef MINIX_SUPPORT
+    minix_register();
 #endif
 
     if (e1000_init() != 0) {

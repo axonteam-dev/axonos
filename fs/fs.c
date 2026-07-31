@@ -12,6 +12,7 @@
 #include <procfs.h>
 #include <devfs.h>
 #include <fat32.h>
+#include <minix.h>
 #include <squashfs.h>
 #include <overlayfs.h>
 
@@ -907,6 +908,8 @@ int vfs_fstat(struct fs_file *file, struct stat *st) {
             if (overlayfs_fill_stat(file, st) == 0) goto fix_mode;
         } else if (name && strcmp(name, "fat32") == 0) {
             if (fat32_fill_stat(file, st) == 0) goto fix_mode;
+        } else if (name && strcmp(name, "minix") == 0) {
+            if (minix_fill_stat(file, st) == 0) goto fix_mode;
         }
         break;
     }

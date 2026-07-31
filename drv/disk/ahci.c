@@ -199,6 +199,7 @@ typedef struct {
 	void *clb_mem;
 	void *fb_mem;
 	void *ctba_mem[AHCI_MAX_SLOTS];
+	void *dma_bounce; /* 64KiB, for DMA that must not cross pages */
 } ahci_port_state_t;
 
 static ahci_port_state_t g_ports[DISK_MAX_DEVICES]; /* indexed by disk device_id */
@@ -407,29 +408,21 @@ static int ahci_issue_cmd(ahci_port_state_t *st, int slot, uint32_t expect_min_p
 	}
 	/* Issue command */
 	uint32_t bit = (1u << slot);
+	asm volatile("mfence" ::: "memory");
 	p->ci = bit;
-	/* Poll for completion */
+	/* Poll until CI clears (DHRS alone is not completion — can false-succeed writes). */
 	for (int i = 0; i < 5000000; i++) {
-		/* TFES means command failed. */
 		if (p->is & PxIS_TFES) return -1;
-		/* Completion can be observed either by CI bit clear or D2H interrupt status. */
 		if ((p->ci & bit) == 0) break;
-		if (p->is & 0x00000002u) break; /* DHRS */
-		/* If error bit in IS, abort */
 		asm volatile("pause");
 	}
-	/* Hard timeout: command never completed. */
-	if ((p->ci & bit) != 0 && (p->is & 0x00000002u) == 0) {
-		/* Try hard recovery once on timeout. */
+	if ((p->ci & bit) != 0) {
 		(void)ahci_port_recover_full(st);
 		return -2;
 	}
 	/* Check task file error */
 	if (p->tfd & 0x01u) return -1;
-	if (expect_min_prdbc > 0) {
-		hba_cmd_header_t *cmd_list = (hba_cmd_header_t*)st->clb_mem;
-		uint32_t prdbc = cmd_list[slot].prdbc;
-	}
+	(void)expect_min_prdbc;
 	return 0;
 }
 
@@ -454,7 +447,8 @@ static int ahci_identify(ahci_port_state_t *st) {
 	memset((void*)hdr, 0, sizeof(*hdr));
 	hdr->ctba = saved_ctba;
 	hdr->ctbau = saved_ctbau;
-	hdr->dw0 = CMDH_CFL(sizeof(fis_reg_h2d_t) / 4) | CMDH_PMP(0) | CMDH_C | CMDH_PRDTL(1);
+	/* No CMDH_C: that bit clears PxCI on H2D R_OK before data DMA finishes. */
+	hdr->dw0 = CMDH_CFL(sizeof(fis_reg_h2d_t) / 4) | CMDH_PMP(0) | CMDH_PRDTL(1);
 	hdr->prdbc = 0;
 
 	/* command table */
@@ -516,46 +510,54 @@ static int ahci_identify(ahci_port_state_t *st) {
 static int ahci_rw(int device_id, uint32_t lba, void *buf, uint32_t sectors, int is_write) {
 	if (device_id < 0 || device_id >= DISK_MAX_DEVICES) return -1;
 	ahci_port_state_t *st = &g_ports[device_id];
-	if (!st->used) return -1;
+	if (!st->used || !st->dma_bounce) return -1;
 	if (!buf || sectors == 0) return 0;
 
 	hba_port_t *p = &st->hba->ports[st->port_no];
 	if (ahci_port_wait_ready(p) != 0) return -1;
 
-	/* limit per-command sectors to avoid huge PRDT */
-	const uint32_t max_sectors = 128; /* 64KiB */
-	uint8_t *bp = (uint8_t*)buf;
+	const uint32_t max_sectors = 128;
+	uint8_t *bp = (uint8_t *)buf;
+	uint8_t *bounce = (uint8_t *)st->dma_bounce;
+	uint64_t bounce_pa = virt_to_phys((uint64_t)(uintptr_t)bounce);
+	if (!bounce_pa) return -1;
+
 	uint32_t done = 0;
 	while (done < sectors) {
 		uint32_t nsec = (sectors - done) > max_sectors ? max_sectors : (sectors - done);
+		size_t nbytes = (size_t)nsec * 512u;
+
+		if (is_write)
+			memcpy(bounce, bp, nbytes);
 
 		int slot = ahci_find_free_slot(p);
 		if (slot < 0) return -1;
 
-		hba_cmd_header_t *cmd_list = (hba_cmd_header_t*)st->clb_mem;
+		hba_cmd_header_t *cmd_list = (hba_cmd_header_t *)st->clb_mem;
 		hba_cmd_header_t *hdr = &cmd_list[slot];
 		uint32_t saved_ctba = hdr->ctba;
 		uint32_t saved_ctbau = hdr->ctbau;
-		memset((void*)hdr, 0, sizeof(*hdr));
+		memset((void *)hdr, 0, sizeof(*hdr));
 		hdr->ctba = saved_ctba;
 		hdr->ctbau = saved_ctbau;
+		/* Do not set CMDH_C on DMA R/W. AHCI "C" (Clear Busy upon R_OK) clears
+		 * PxCI when the H2D FIS is ACKed — before the data phase. With a bounce
+		 * buffer that made reads memcpy stale zeros while writes still persisted
+		 * (payload already in bounce before issue). */
 		hdr->dw0 = CMDH_CFL(sizeof(fis_reg_h2d_t) / 4) |
 		           CMDH_PMP(0) |
-		           CMDH_C |
 		           (is_write ? CMDH_W : 0) |
 		           CMDH_PRDTL(1);
 		hdr->prdbc = 0;
 
-		hba_cmd_table_t *tbl = (hba_cmd_table_t*)st->ctba_mem[slot];
-		memset((void*)tbl, 0, 256);
+		hba_cmd_table_t *tbl = (hba_cmd_table_t *)st->ctba_mem[slot];
+		memset((void *)tbl, 0, 256);
 
-		uint64_t pa = virt_to_phys((uint64_t)(uintptr_t)bp);
-		if (!pa) return -1;
-		tbl->prdt[0].dba = (uint32_t)(pa & 0xFFFFFFFFu);
-		tbl->prdt[0].dbau = (uint32_t)(pa >> 32);
-		tbl->prdt[0].dbc = PRDT_DBC(nsec * 512u) | PRDT_I;
+		tbl->prdt[0].dba = (uint32_t)(bounce_pa & 0xFFFFFFFFu);
+		tbl->prdt[0].dbau = (uint32_t)(bounce_pa >> 32);
+		tbl->prdt[0].dbc = PRDT_DBC((uint32_t)nbytes) | PRDT_I;
 
-		fis_reg_h2d_t *fis = (fis_reg_h2d_t*)tbl->cfis;
+		fis_reg_h2d_t *fis = (fis_reg_h2d_t *)tbl->cfis;
 		memset(fis, 0, sizeof(*fis));
 		fis->fis_type = FIS_TYPE_REG_H2D;
 		fis->c = 1;
@@ -567,16 +569,17 @@ static int ahci_rw(int device_id, uint32_t lba, void *buf, uint32_t sectors, int
 		fis->lba3 = (uint8_t)((l >> 24) & 0xFF);
 		fis->lba4 = (uint8_t)((l >> 32) & 0xFF);
 		fis->lba5 = (uint8_t)((l >> 40) & 0xFF);
-		fis->device = 1u << 6; /* LBA */
+		fis->device = 1u << 6;
 		fis->countl = (uint8_t)(nsec & 0xFF);
 		fis->counth = (uint8_t)((nsec >> 8) & 0xFF);
 
-		/* Some virtual AHCI controllers don't update PRDBC for host-to-device DMA writes.
-		   Require PRDBC only for reads; for writes rely on CI/TFD/IS completion checks. */
-		uint32_t expect = is_write ? 0u : (nsec * 512u);
+		uint32_t expect = is_write ? 0u : (uint32_t)nbytes;
 		if (ahci_issue_cmd(st, slot, expect) != 0) return -1;
 
-		bp += nsec * 512u;
+		if (!is_write)
+			memcpy(bp, bounce, nbytes);
+
+		bp += nbytes;
 		done += nsec;
 	}
 	return 0;
@@ -599,12 +602,13 @@ static int ahci_init_port(ahci_port_state_t *st) {
 	p->serr = 0xFFFFFFFFu;
 	p->is = 0xFFFFFFFFu;
 
-	/* allocate command list (1K aligned) and FIS (256 aligned) */
 	void *clb = kmalloc_aligned(1024, 1024);
 	void *fb = kmalloc_aligned(256, 256);
-	if (!clb || !fb) return -1;
+	void *bounce = kmalloc_aligned(128u * 512u, 4096);
+	if (!clb || !fb || !bounce) return -1;
 	st->clb_mem = clb;
 	st->fb_mem = fb;
+	st->dma_bounce = bounce;
 
 	uint64_t clb_pa = virt_to_phys((uint64_t)(uintptr_t)clb);
 	uint64_t fb_pa  = virt_to_phys((uint64_t)(uintptr_t)fb);
@@ -721,19 +725,16 @@ static int ahci_register_disk(int controller_idx, int port_no, hba_mem_t *hba, u
 		}
 	}
 
-	if (id >= 0 && id < 26) {
-		char devpath[32];
-		char letter = (char)('a' + id);
-		snprintf(devpath, sizeof(devpath), "/dev/sd%c", letter);
+	{
 		uint32_t secs = g_ports[id].sectors ? g_ports[id].sectors : 0xFFFFFFFFu;
-		devfs_create_block_node(devpath, id, secs);
-		snprintf(devpath, sizeof(devpath), "/dev/hd%d", id);
-		devfs_create_block_node(devpath, id, secs);
-		(void)scsi_register_disk_as_lun(id, secs, "AHCI   ", g_ports[id].model[0] ? g_ports[id].model : "SATA", "1.0 ");
+		int sd = disk_publish_sd(id, secs);
+		(void)scsi_register_disk_as_lun(id, secs, "AHCI   ",
+			g_ports[id].model[0] ? g_ports[id].model : "SATA", "1.0 ");
+		klogprintf("ahci: registered disk \"%s\" sectors=%u → /dev/sd%c\n",
+		           g_ports[id].model[0] ? g_ports[id].model : "unknown",
+		           g_ports[id].sectors,
+		           (sd >= 0 && sd < 26) ? (char)('a' + sd) : '?');
 	}
-
-	klogprintf("ahci: registered disk \"%s\" sectors=%u\n", g_ports[id].model[0] ? g_ports[id].model : "unknown",
-	           g_ports[id].sectors);
 	return id;
 }
 

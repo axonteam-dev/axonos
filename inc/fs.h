@@ -87,6 +87,8 @@ int fs_mount_get(int index, char *out_path, size_t out_path_len, char *out_fs_na
 /* High-level helpers which dispatch to registered drivers in registration order */
 struct fs_file *fs_create_file(const char *path);
 struct fs_file *fs_open(const char *path);
+/* Like fs_open(), but do not follow a final symlink (lstat/lgetxattr semantics). */
+struct fs_file *fs_open_nofollow(const char *path);
 ssize_t fs_read(struct fs_file *file, void *buf, size_t size, size_t offset);
 ssize_t fs_write(struct fs_file *file, const void *buf, size_t size, size_t offset);
 void fs_file_free(struct fs_file *file);

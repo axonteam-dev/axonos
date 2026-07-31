@@ -65,6 +65,7 @@
 void ata_dma_init(void);
 void scsi_init(void);
 int pvscsi_init(void);
+int mptspi_init(void);
 
 static char g_cwd[256] = "/";
 
@@ -290,24 +291,6 @@ static int openrc_patch_relative_etc(const char *path)
     }
     kfree(buf);
     return 0;
-}
-
-static void boot_install_openrc_scripts(void)
-{
-    int gd = ramfs_write_blob("/usr/lib/rc/sh/gendepends.sh",
-                              gendepends_blob, gendepends_blob_len);
-    int ish = ramfs_write_blob("/usr/lib/rc/sh/init.sh",
-                               init_sh_blob, init_sh_blob_len);
-    if (gd != 0)
-        gd = openrc_patch_relative_etc("/usr/lib/rc/sh/gendepends.sh");
-    if (gd == 0)
-        klogprintf("boot: installed OpenRC gendepends.sh\n");
-    else
-        klogprintf("boot: FAILED gendepends.sh install\n");
-    if (ish == 0)
-        klogprintf("boot: installed OpenRC init.sh\n");
-    else
-        klogprintf("boot: FAILED init.sh install\n");
 }
 
 static void ramfs_install_libnss_dns(void)
@@ -1044,6 +1027,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             scsi_init();
             ata_dma_init();
             (void)pvscsi_init();
+            (void)mptspi_init();
             (void)nvme_init();
             {
                 int n = devfs_block_count();
@@ -1056,6 +1040,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         klogprintf("  /dev/%s disk_id=%d sectors=%u\n", name, did, (unsigned)secs);
                 }
             }
+            klog_sync_varlog();
             (void)usb_publish_devfs_nodes();
         }
         /* initialize stdio fds for current thread (main) */
@@ -1294,6 +1279,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     (void)fs_unlink("/etc/conf.d/rc");
     (void)ramfs_mkdir("/tmp");  /* passwd uses mkstemp in /tmp for shadow update */
     (void)ramfs_mkdir("/var/tmp");
+    /* Materialize /mnt in overlay upper so mkdir /mnt/foo works without -p races. */
+    (void)ramfs_mkdir("/mnt");
     /* tmux and many POSIX tools expect sticky tmp dirs (01777). */
     (void)fs_chmod("/tmp", S_IFDIR | 01777);
     (void)fs_chmod("/var/tmp", S_IFDIR | 01777);
@@ -1422,11 +1409,15 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
     /* /etc/motd: message of the day, shown after successful login */
     {
-        static const char motd[] = "\nWelcome to " OS_NAME " " OS_VERSION "\n"
-                                   "  * Website: https://axont.ru\n"
-                                   "  * GitHub: https://github.com/axonteam-dev/axonos.git\n"
-                                   "  * AxonHub: https://xhub.axont.ru/ \n"
-                                   "Feedback on axont@axont.ru\n\n";
+        static const char motd[] = "\nWelcome to " OS_NAME " " OS_VERSION "-" OS_PREFIX "\n"
+                                   "The programs included with the AxonOS system are free software;\n"
+                                   "the exact distribution terms for each program are described in the web.\n"
+                                   "\n"
+                                   "AxonOS is distributed under the MIT License.\n"
+                                   "AxonOS comes with ABSOLUTELY NO WARRANTY, to the extent\n"
+                                   "permitted by applicable law.\n"
+                                   "\n"
+                                   "Unauthorized access is prohibited. All activities are logged.\n\n";
         struct fs_file *mf = fs_create_file("/etc/motd");
         if (!mf) mf = fs_open("/etc/motd");
         if (mf) {
@@ -1502,8 +1493,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 (void)ramfs_symlink("/sbin/init", "/usr/sbin/openrc-init");
         }
     }
-
-    boot_install_openrc_scripts();
 
     /* Compatibility: many distros' adduser scripts call /sbin/addgroup explicitly,
      * while initfs may only provide /usr/sbin/addgroup. Create a tiny wrapper if needed. */
@@ -1586,6 +1575,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             }
         }
     }
+
+    /* Final printk snapshot for /var/log/kernel (ring stays authoritative via /dev/kmsg). */
+    klog_sync_varlog();
 
     // Prefer OpenRC (openrc-init) over BusyBox linuxrc; shell is last resort.
     if (boot_try_run_init() != 0) {

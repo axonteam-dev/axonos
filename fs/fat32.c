@@ -16,6 +16,11 @@
 #include <vga.h>
 #include <klog.h>
 
+/* Linux errno — killable block I/O may return -EINTR. */
+#ifndef EINTR
+#define EINTR 4
+#endif
+
 /* Disable local debug prints in this file */
 #ifdef klogprintf
 #undef klogprintf
@@ -114,12 +119,41 @@ static uint8_t fat32_lfn_checksum(const uint8_t shortname11[11]) {
     return sum;
 }
 
-/* parse boot sector at given LBA; return 0 on success */
+/* FAT boot vs MBR: both end with 0x55AA. Do NOT treat a FAT VBR as an MBR or
+ * we walk garbage "partition" LBAs and AHCI can hang for minutes. */
+static int fat_boot_kind(const uint8_t *buf) {
+    if (!buf || buf[510] != 0x55 || buf[511] != 0xAA)
+        return 0;
+    if (buf[0] != 0xEB && buf[0] != 0xE9)
+        return 0;
+    if (memcmp(buf + 0x52, "FAT32", 5) == 0)
+        return 32;
+    if (memcmp(buf + 0x36, "FAT16", 5) == 0 || memcmp(buf + 0x36, "FAT12", 5) == 0 ||
+        memcmp(buf + 0x36, "FAT", 3) == 0)
+        return 16;
+    /* Some mkfs omit the ASCII tag; accept plausible BPB with FAT32 FSInfo fields. */
+    {
+        uint16_t bps = (uint16_t)buf[11] | ((uint16_t)buf[12] << 8);
+        uint8_t spc = buf[13];
+        uint16_t fat16_spf = (uint16_t)buf[22] | ((uint16_t)buf[23] << 8);
+        uint32_t fat32_spf = (uint32_t)buf[36] | ((uint32_t)buf[37] << 8) |
+                            ((uint32_t)buf[38] << 16) | ((uint32_t)buf[39] << 24);
+        if (bps == 512 && spc != 0 && is_pow2_u32(spc) && fat32_spf != 0 && fat16_spf == 0)
+            return 32;
+        if (bps == 512 && spc != 0 && is_pow2_u32(spc) && fat16_spf != 0)
+            return 16;
+    }
+    return 0;
+}
+
+/* parse boot sector at given LBA; return 0 on success (FAT32 only for I/O path) */
 static int fat32_parse_boot(struct fat32_mount *m, uint32_t lba) {
     uint8_t buf[512];
-    if (read_sector(m->device_id, lba, buf) != 0) return -1;
-    /* basic checks */
-    if (buf[510] != 0x55 || buf[511] != 0xAA) return -1;
+    {
+        int rr = read_sector(m->device_id, lba, buf);
+        if (rr != 0) return (rr < 0) ? rr : -1;
+    }
+    if (fat_boot_kind(buf) != 32) return -1;
     uint16_t bytes_per_sector = *(uint16_t*)(buf + 11);
     uint8_t sectors_per_cluster = *(uint8_t*)(buf + 13);
     uint16_t reserved = *(uint16_t*)(buf + 14);
@@ -146,12 +180,9 @@ static int fat32_parse_boot(struct fat32_mount *m, uint32_t lba) {
     return 0;
 }
 
-/* try mount boot sector at lba; return 0 on success */
+/* Probe on-disk FAT32 and bind g_fat. Always re-reads the device. */
 int fat32_mount_from_device(int device_id) {
-    /* allow remounting same device; if another device is requested, switch context */
     if (g_fat) {
-        if (g_fat->device_id == device_id) return 0;
-        klogprintf("fat32: switching mounted device %d -> %d\n", g_fat->device_id, device_id);
         kfree(g_fat);
         g_fat = NULL;
         fat32_driver.driver_data = NULL;
@@ -162,38 +193,63 @@ int fat32_mount_from_device(int device_id) {
     m->device_id = device_id;
     m->partition_lba = 0;
     klogprintf("fat32: probing device %d at LBA 0\n", device_id);
-    if (fat32_parse_boot(m, 0) == 0) {
-        klogprintf("fat32: found BPB at LBA 0 on device %d\n", device_id);
-        g_fat = m;
-        fat32_driver.driver_data = (void*)g_fat;
-        klogprintf("FAT32: mounted from device %d (LBA 0) - ready for manual mount\n", device_id);
-        return 0;
-    } else {
-        klogprintf("fat32: no valid BPB at LBA 0 on device %d\n", device_id);
-    }
-    /* maybe MBR with partition table: read sector 0 and check partition entries */
+
     uint8_t buf[512];
-    if (read_sector(device_id, 0, buf) != 0) { kfree(m); return -1; }
-    if (buf[510] != 0x55 || buf[511] != 0xAA) { kfree(m); return -1; }
+    {
+        int rr = read_sector(device_id, 0, buf);
+        if (rr != 0) {
+            kfree(m);
+            /* Preserve -EINTR from killable block I/O. */
+            return (rr < 0) ? rr : -1;
+        }
+    }
+    int kind0 = fat_boot_kind(buf);
+    if (kind0 == 32) {
+        int pb = fat32_parse_boot(m, 0);
+        if (pb == 0) {
+            g_fat = m;
+            fat32_driver.driver_data = (void*)g_fat;
+            klogprintf("FAT32: mounted from device %d (LBA 0)\n", device_id);
+            return 0;
+        }
+        if (pb == -EINTR) {
+            kfree(m);
+            return pb;
+        }
+    } else if (kind0 == 16) {
+        /* BusyBox mkfs.vfat often makes FAT16; we only implement FAT32 I/O. */
+        klogprintf("fat32: device %d is FAT12/16 at LBA 0 (need FAT32 / mkfs.vfat -F 32)\n",
+                   device_id);
+        kfree(m);
+        return -1;
+    }
+
+    /* Only scan MBR partitions when LBA0 is not a FAT volume boot record. */
+    if (kind0 != 0 || buf[510] != 0x55 || buf[511] != 0xAA) {
+        kfree(m);
+        return -1;
+    }
     klogprintf("fat32: read MBR on device %d, scanning partitions\n", device_id);
-    /* partition table at offset 446, 4 entries of 16 bytes */
     for (int i = 0; i < 4; i++) {
         uint8_t *pe = buf + 446 + i * 16;
         uint8_t part_type = pe[4];
         uint32_t start_lba = *(uint32_t*)(pe + 8);
         uint32_t part_sectors = *(uint32_t*)(pe + 12);
-        if (start_lba == 0 || part_sectors == 0) continue;
-        klogprintf("fat32: checking partition %d type=0x%02x start=%u sectors=%u\n", i, part_type, start_lba, part_sectors);
-        /* Try to parse boot sector at partition start regardless of reported type */
+        if (part_type == 0 || start_lba == 0 || part_sectors == 0) continue;
+        if (part_type == 0xCD) continue; /* isohybrid marker */
         m->partition_lba = start_lba;
-        if (fat32_parse_boot(m, m->partition_lba) == 0) {
-            klogprintf("fat32: found BPB at partition %d start %u on device %d\n", i, start_lba, device_id);
-            g_fat = m;
-            fat32_driver.driver_data = (void*)g_fat;
-            klogprintf("fat32: mounted from device %d (partition %d) - ready for manual mount\n", device_id, i);
-            return 0;
-        } else {
-            klogprintf("fat32: no valid BPB at partition %d start %u\n", i, start_lba);
+        {
+            int pb = fat32_parse_boot(m, m->partition_lba);
+            if (pb == 0) {
+                g_fat = m;
+                fat32_driver.driver_data = (void*)g_fat;
+                klogprintf("fat32: mounted from device %d (partition %d)\n", device_id, i);
+                return 0;
+            }
+            if (pb == -EINTR) {
+                kfree(m);
+                return pb;
+            }
         }
     }
     kfree(m);
@@ -511,12 +567,28 @@ static void fat32_release(struct fs_file *file) {
     kfree(file);
 }
 
-static int fat32_fill_stat(struct fs_file *file, struct stat *st) {
+int fat32_fill_stat(struct fs_file *file, struct stat *st) {
     if (!file || !st) return -1;
-    memset(st,0,sizeof(*st));
+    memset(st, 0, sizeof(*st));
     st->st_mode = (file->type == FS_TYPE_DIR) ? (S_IFDIR | 0755) : (S_IFREG | 0644);
     st->st_size = (off_t)file->size;
-    st->st_nlink = 1;
+    st->st_nlink = (file->type == FS_TYPE_DIR) ? 2 : 1;
+    return 0;
+}
+
+int fat32_statfs(struct statfs_k *out) {
+    if (!out || !g_fat) return -1;
+    memset(out, 0, sizeof(*out));
+    out->f_type = 0x4d44; /* MSDOS_SUPER_MAGIC */
+    out->f_bsize = (long)g_fat->sectors_per_cluster * 512L;
+    if (out->f_bsize <= 0) out->f_bsize = 512;
+    out->f_frsize = out->f_bsize;
+    out->f_blocks = g_fat->total_sectors ? (uint64_t)g_fat->total_sectors * 512u / (uint64_t)out->f_bsize : 0;
+    out->f_bfree = out->f_blocks / 2;
+    out->f_bavail = out->f_bfree;
+    out->f_files = 0;
+    out->f_ffree = 0;
+    out->f_namelen = 255;
     return 0;
 }
 

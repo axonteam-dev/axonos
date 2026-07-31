@@ -10,8 +10,7 @@ void console_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	if (cirrusfb_is_ready()) {
 		cirrusfb_putch_xy(x, y, ch, attr);
 	} else if (vbe_is_available()) {
-		vbefb_set_cursor(x, y);
-		vbefb_putchar(ch, attr);
+		vbefb_putch_xy(x, y, ch, attr);
 	} else {
 		vga_putch_xy(x, y, ch, attr);
 	}
@@ -214,6 +213,8 @@ void console_begin_tty_batch(void) {
 	g_tty_batch++;
 	if (cirrusfb_is_ready())
 		cirrusfb_begin_batch();
+	else if (vbe_is_available())
+		vbefb_begin_batch();
 }
 
 void console_end_tty_batch(void) {
@@ -233,6 +234,8 @@ void console_end_tty_batch(void) {
 	}
 	if (cirrusfb_is_ready())
 		cirrusfb_end_batch();
+	else if (vbe_is_available())
+		vbefb_end_batch();
 }
 
 void console_set_cursor(uint32_t x, uint32_t y) {

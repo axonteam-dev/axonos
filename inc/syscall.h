@@ -95,6 +95,19 @@ typedef struct syscall_frame {
 #define SYS_openat  257
 #define SYS_newfstatat 262
 #define SYS_statx 332
+/* Linux x86_64 extended attributes */
+#define SYS_setxattr 188
+#define SYS_lsetxattr 189
+#define SYS_fsetxattr 190
+#define SYS_getxattr 191
+#define SYS_lgetxattr 192
+#define SYS_fgetxattr 193
+#define SYS_listxattr 194
+#define SYS_llistxattr 195
+#define SYS_flistxattr 196
+#define SYS_removexattr 197
+#define SYS_lremovexattr 198
+#define SYS_fremovexattr 199
 #define SYS_tgkill  234
 #define SYS_sendfile 40
 #define SYS_shmdt   67

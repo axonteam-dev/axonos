@@ -354,7 +354,7 @@ static void fs_file_mark_opened(struct fs_file *file) {
         file->refcount = 1;
 }
 
-static struct fs_file *fs_open_no_resolve(const char *path) {
+struct fs_file *fs_open_nofollow(const char *path) {
     if (!path) return NULL;
     struct fs_driver *mount_drv = fs_match_mount(path);
     if (mount_drv && mount_drv->ops && mount_drv->ops->open) {
@@ -399,7 +399,7 @@ static struct fs_file *fs_open_no_resolve(const char *path) {
    Вызывающий должен освободить возвращенный путь через kfree. */
 static int fs_readlink_no_resolve(const char *path, char *out, size_t out_cap, size_t *out_len) {
     if (!path || !out || out_cap == 0) return -1;
-    struct fs_file *lf = fs_open_no_resolve(path);
+    struct fs_file *lf = fs_open_nofollow(path);
     if (!lf) return -1;
     struct stat st;
     int sr = vfs_fstat(lf, &st);
@@ -504,7 +504,7 @@ static char *fs_resolve_symlinks(const char *path) {
             memcpy(prefix, cur, prefix_len);
             prefix[prefix_len] = '\0';
 
-            struct fs_file *pf = fs_open_no_resolve(prefix);
+            struct fs_file *pf = fs_open_nofollow(prefix);
             if (!pf) {
                 /* prefix does not exist -> stop resolving and return current path */
                 kfree(prefix);
@@ -618,7 +618,7 @@ struct fs_file *fs_open(const char *path) {
     int dbg = 0;
 
     /* Fast path: most paths have no symlinks. Try direct open first. */
-    struct fs_file *f = fs_open_no_resolve(path);
+    struct fs_file *f = fs_open_nofollow(path);
     if (f) {
         /* Git's .git/ paths should never need symlink resolution; avoid heavy resolve path. */
         if (strstr(path, "/.git/") != NULL) {
@@ -905,11 +905,20 @@ int vfs_fstat(struct fs_file *file, struct stat *st) {
             if (squashfs_fill_stat(file, st) == 0) goto fix_mode;
         } else if (name && (strcmp(name, "overlay") == 0 || strcmp(name, "overlayfs") == 0)) {
             if (overlayfs_fill_stat(file, st) == 0) goto fix_mode;
+        } else if (name && strcmp(name, "fat32") == 0) {
+            if (fat32_fill_stat(file, st) == 0) goto fix_mode;
         }
         break;
     }
     /* fallback: fill from fs_file fields */
-    st->st_mode = (file->type == FS_TYPE_DIR) ? (S_IFDIR | 0755) : (S_IFREG | 0644);
+    if (file->type == FS_TYPE_DIR)
+        st->st_mode = S_IFDIR | 0755;
+    else if (file->type == FS_TYPE_PIPE)
+        st->st_mode = S_IFIFO | 0600;
+    else if (file->type == FS_TYPE_SOCKET)
+        st->st_mode = S_IFSOCK | 0666;
+    else
+        st->st_mode = S_IFREG | 0644;
 
     goto done;
 fix_mode:
@@ -918,7 +927,10 @@ fix_mode:
     {
         unsigned int have_type = (st->st_mode & 0170000u);
         if (have_type == 0) {
-            unsigned int want_type = (file->type == FS_TYPE_DIR) ? S_IFDIR : S_IFREG;
+            unsigned int want_type = S_IFREG;
+            if (file->type == FS_TYPE_DIR) want_type = S_IFDIR;
+            else if (file->type == FS_TYPE_PIPE) want_type = S_IFIFO;
+            else if (file->type == FS_TYPE_SOCKET) want_type = S_IFSOCK;
             st->st_mode = (st->st_mode & 07777u) | want_type;
         }
     }
@@ -970,7 +982,7 @@ int vfs_stat(const char *path, struct stat *st) {
 /* Like lstat(): do not follow the final symlink. */
 int vfs_lstat(const char *path, struct stat *st) {
     if (!path || !st) return -1;
-    struct fs_file *f = fs_open_no_resolve(path);
+    struct fs_file *f = fs_open_nofollow(path);
     if (!f) return -1;
     int r = vfs_fstat(f, st);
     fs_file_free(f);
@@ -980,7 +992,7 @@ int vfs_lstat(const char *path, struct stat *st) {
 /* Read symlink target into buf. Returns bytes copied (no NUL) or -1 on error. */
 ssize_t vfs_readlink(const char *path, char *buf, size_t bufsiz) {
     if (!path || !buf || bufsiz == 0) return -1;
-    struct fs_file *f = fs_open_no_resolve(path);
+    struct fs_file *f = fs_open_nofollow(path);
     if (!f) return -1;
     struct stat st;
     if (vfs_fstat(f, &st) != 0 || ((st.st_mode & S_IFLNK) != S_IFLNK)) {

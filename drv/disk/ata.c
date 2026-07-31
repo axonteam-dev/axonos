@@ -295,29 +295,6 @@ static int ata_pio_write(int device_id, uint32_t lba, const void *buf, uint32_t 
 	return 0;
 }
 
-static uint32_t ata_le32(const uint8_t *p) {
-	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static void ata_publish_mbr_partitions(int device_id, char letter, uint32_t disk_sectors) {
-	uint8_t mbr[512];
-	if (disk_read_sectors(device_id, 0, mbr, 1) != 0) return;
-	if (mbr[510] != 0x55 || mbr[511] != 0xAA) return;
-	for (int i = 0; i < 4; i++) {
-		const uint8_t *e = &mbr[446 + i * 16];
-		uint8_t part_type = e[4];
-		uint32_t start_lba = ata_le32(e + 8);
-		uint32_t part_sectors = ata_le32(e + 12);
-		if (part_type == 0 || part_sectors == 0) continue;
-		if (start_lba >= disk_sectors) continue;
-		if (start_lba + part_sectors < start_lba) continue; /* overflow */
-		if (start_lba + part_sectors > disk_sectors) part_sectors = disk_sectors - start_lba;
-		char ppath[32];
-		snprintf(ppath, sizeof(ppath), "/dev/sd%c%d", letter, i + 1);
-		devfs_create_block_node_lba(ppath, device_id, start_lba, part_sectors);
-	}
-}
-
 /* Register discovered ATA device into disk layer and remember mapping */
 static void ata_register_device(uint16_t io_base, uint16_t ctrl_base, int is_slave, const char *model, uint32_t sectors) {
 	disk_ops_t *ops = (disk_ops_t *)kmalloc(sizeof(disk_ops_t));
@@ -350,21 +327,12 @@ static void ata_register_device(uint16_t io_base, uint16_t ctrl_base, int is_sla
 	strncpy(ata_devices[id].model, model, sizeof(ata_devices[id].model)-1);
 	ata_devices[id].model[sizeof(ata_devices[id].model)-1] = '\0';
 	ata_device_count = id + 1;
-	/* concise output per user request */
+	/* Linux libata-style: disks are /dev/sdX, not legacy /dev/hdN. */
 	uint32_t size_mb = sectors / 2048; /* sectors * 512 / (1024*1024) */
-	char devpath[32];
-	snprintf(devpath, sizeof(devpath), "/dev/hd%d", id);
-	devfs_create_block_node(devpath, id, sectors);
-	if (id >= 0 && id < 26) {
-		char devpath2[32];
-		char letter = (char)('a' + id);
-		snprintf(devpath2, sizeof(devpath2), "/dev/sd%c", letter);
-		devfs_create_block_node(devpath2, id, sectors);
-		ata_publish_mbr_partitions(id, letter, sectors);
-	}
-	/* Do not auto-probe/auto-mount FAT32 here.
-	   Manual mount(2) should control which block device is attached as vfat. */
-	klogprintf("ATA: Found pio disk: \"%s\" model: \"%s\" size: %u mb\n", ata_devices[id].model, ata_devices[id].model, size_mb);
+	int sd = disk_publish_sd(id, sectors);
+	klogprintf("ATA: Found pio disk: \"%s\" size: %u mb → /dev/sd%c\n",
+	           ata_devices[id].model, size_mb,
+	           (sd >= 0 && sd < 26) ? (char)('a' + sd) : '?');
 	(void)scsi_register_disk_as_lun(id, sectors, "ATA    ", ata_devices[id].model, "1.0 ");
 }
 

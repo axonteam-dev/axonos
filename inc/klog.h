@@ -13,7 +13,11 @@ void klogprintf(const char *fmt, ...);
 void klog_user_write(const char *s, size_t n);
 /* Copy ring bytes into buf; returns bytes copied (Linux SYSLOG_ACTION_READ_ALL). */
 long klog_syslog_read_all(char *buf, size_t size);
+/* Byte-offset read of the linearized ring (for /dev/kmsg). */
+long klog_ring_read(char *buf, size_t size, size_t offset);
 size_t klog_syslog_buf_size(void);
+/* Materialize current ring into /var/log/kernel (bounded, replaces prior content). */
+void klog_sync_varlog(void);
 
 /* Calibrate TSC-based high-resolution timestamping (non-blocking if APIC not ready). */
 void klog_calibrate_tsc(void);

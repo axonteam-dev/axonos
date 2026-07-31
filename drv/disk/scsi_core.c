@@ -18,6 +18,7 @@ typedef struct scsi_lun {
 	int lun_id;
 	uint32_t sector_count;  /* от READ CAPACITY(10): последний LBA + 1 */
 	int disk_id;            /* id из disk_register */
+	int pdt;                /* SPC peripheral device type */
 	int in_use;
 	char vendor[SCSI_VENDOR_LEN + 1];
 	char product[SCSI_PRODUCT_LEN + 1];
@@ -95,14 +96,16 @@ static void inquiry_str_copy(char *dst, size_t dst_size, const uint8_t *src, siz
 	dst[cp] = '\0';
 }
 
-static int scsi_disk_read(int device_id, uint32_t lba, void *buf, uint32_t sectors) {
-	struct scsi_lun *lun = NULL;
-	for (int i = 0; i < g_lun_count; i++) {
-		if (g_luns[i].in_use && g_luns[i].disk_id == device_id) {
-			lun = &g_luns[i];
-			break;
-		}
+static scsi_lun_t *scsi_lun_by_disk_id(int device_id) {
+	for (int i = 0; i < SCSI_MAX_LUNS; i++) {
+		if (g_luns[i].in_use && g_luns[i].disk_id == device_id)
+			return &g_luns[i];
 	}
+	return NULL;
+}
+
+static int scsi_disk_read(int device_id, uint32_t lba, void *buf, uint32_t sectors) {
+	scsi_lun_t *lun = scsi_lun_by_disk_id(device_id);
 	if (!lun || !lun->ops || !lun->ops->execute_command) return -1;
 	if (sectors == 0) return 0;
 	if (lba + sectors > lun->sector_count) return -1;
@@ -113,7 +116,8 @@ static int scsi_disk_read(int device_id, uint32_t lba, void *buf, uint32_t secto
 
 	while (done < sectors) {
 		uint32_t chunk = sectors - done;
-		if (chunk > 0xFFFFu) chunk = 0xFFFFu;
+		/* Cap to 128 sectors (64 KiB): HBA bounce buffers and PRDT limits. */
+		if (chunk > 128u) chunk = 128u;
 		cdb_read_10(cdb, lba + done, chunk);
 		size_t len = (size_t)chunk * SCSI_SECTOR_SIZE;
 		int r = lun->ops->execute_command(lun->transport_priv, cdb, 10, p + (size_t)done * SCSI_SECTOR_SIZE, len, SCSI_DATA_IN);
@@ -124,13 +128,7 @@ static int scsi_disk_read(int device_id, uint32_t lba, void *buf, uint32_t secto
 }
 
 static int scsi_disk_write(int device_id, uint32_t lba, const void *buf, uint32_t sectors) {
-	struct scsi_lun *lun = NULL;
-	for (int i = 0; i < g_lun_count; i++) {
-		if (g_luns[i].in_use && g_luns[i].disk_id == device_id) {
-			lun = &g_luns[i];
-			break;
-		}
-	}
+	scsi_lun_t *lun = scsi_lun_by_disk_id(device_id);
 	if (!lun || !lun->ops || !lun->ops->execute_command) return -1;
 	if (sectors == 0) return 0;
 	if (lba + sectors > lun->sector_count) return -1;
@@ -141,7 +139,7 @@ static int scsi_disk_write(int device_id, uint32_t lba, const void *buf, uint32_
 
 	while (done < sectors) {
 		uint32_t chunk = sectors - done;
-		if (chunk > 0xFFFFu) chunk = 0xFFFFu;
+		if (chunk > 128u) chunk = 128u;
 		cdb_write_10(cdb, lba + done, chunk);
 		size_t len = (size_t)chunk * SCSI_SECTOR_SIZE;
 		int r = lun->ops->execute_command(lun->transport_priv, cdb, 10, (void *)(p + (size_t)done * SCSI_SECTOR_SIZE), len, SCSI_DATA_OUT);
@@ -151,24 +149,20 @@ static int scsi_disk_write(int device_id, uint32_t lba, const void *buf, uint32_
 	return 0;
 }
 
-/* Публикация партиций MBR для /dev/sdX (как в ATA). */
-static void scsi_publish_mbr_partitions(int device_id, char letter, uint32_t disk_sectors) {
-	uint8_t mbr[512];
-	if (disk_read_sectors(device_id, 0, mbr, 1) != 0) return;
-	if (mbr[510] != 0x55 || mbr[511] != 0xAA) return;
-	for (int i = 0; i < 4; i++) {
-		const uint8_t *e = &mbr[446 + i * 16];
-		uint8_t part_type = e[4];
-		uint32_t start_lba = (uint32_t)e[8] | ((uint32_t)e[9] << 8) | ((uint32_t)e[10] << 16) | ((uint32_t)e[11] << 24);
-		uint32_t part_sectors = (uint32_t)e[12] | ((uint32_t)e[13] << 8) | ((uint32_t)e[14] << 16) | ((uint32_t)e[15] << 24);
-		if (part_type == 0 || part_sectors == 0) continue;
-		if (start_lba >= disk_sectors) continue;
-		if (start_lba + part_sectors < start_lba) continue;
-		if (start_lba + part_sectors > disk_sectors) part_sectors = disk_sectors - start_lba;
-		char ppath[32];
-		snprintf(ppath, sizeof(ppath), "/dev/sd%c%d", letter, i + 1);
-		devfs_create_block_node_lba(ppath, device_id, start_lba, part_sectors);
+/* Clear UNIT ATTENTION / Not Ready, then retry TUR (common on first open). */
+static int scsi_tur_with_ua_retry(void *priv, const scsi_transport_ops_t *ops, int lun_id) {
+	uint8_t cdb[SCSI_CDB_MAX_LEN];
+	uint8_t sense[32];
+	(void)lun_id;
+	for (int attempt = 0; attempt < 3; attempt++) {
+		cdb_test_unit_ready(cdb);
+		if (ops->execute_command(priv, cdb, 6, NULL, 0, SCSI_DATA_NONE) == 0)
+			return 0;
+		memset(sense, 0, sizeof(sense));
+		cdb_request_sense(cdb, sizeof(sense));
+		(void)ops->execute_command(priv, cdb, 6, sense, sizeof(sense), SCSI_DATA_IN);
 	}
+	return -1;
 }
 
 int scsi_register_lun(void *transport_priv, const scsi_transport_ops_t *ops, int lun_id) {
@@ -185,27 +179,37 @@ int scsi_register_lun(void *transport_priv, const scsi_transport_ops_t *ops, int
 	lun->transport_priv = transport_priv;
 	lun->ops = ops;
 	lun->lun_id = lun_id;
+	lun->pdt = SCSI_PDT_UNKNOWN;
 
 	uint8_t cdb[SCSI_CDB_MAX_LEN];
 	uint8_t cap_buf[8];
 
-	cdb_test_unit_ready(cdb);
-	if (ops->execute_command(transport_priv, cdb, 6, NULL, 0, SCSI_DATA_NONE) != 0) {
+	if (scsi_tur_with_ua_retry(transport_priv, ops, lun_id) != 0) {
 		klogprintf("scsi: lun %d TEST UNIT READY failed\n", lun_id);
 		return -1;
 	}
 
-	/* INQUIRY: vendor (8), product (16), revision (4) — стандарт SPC-4
-	   Читаем стандартный INQUIRY (96 байт) для полной информации */
 	uint8_t inq_buf[96];
 	memset(inq_buf, 0, sizeof(inq_buf));
 	cdb_inquiry(cdb, sizeof(inq_buf));
 	if (ops->execute_command(transport_priv, cdb, 6, inq_buf, sizeof(inq_buf), SCSI_DATA_IN) == 0) {
+		lun->pdt = (int)(inq_buf[0] & 0x1fu);
 		inquiry_str_copy(lun->vendor, sizeof(lun->vendor), inq_buf + 8, 8);
 		inquiry_str_copy(lun->product, sizeof(lun->product), inq_buf + 16, 16);
 		inquiry_str_copy(lun->revision, sizeof(lun->revision), inq_buf + 32, 4);
 	} else {
 		lun->vendor[0] = lun->product[0] = lun->revision[0] = '\0';
+		lun->pdt = SCSI_PDT_DIRECT_ACCESS; /* assume disk if INQUIRY fails */
+	}
+
+	if (lun->pdt == SCSI_PDT_CDROM) {
+		/* Optical nodes are /dev/sr* from ATAPI; avoid a second broken sd* alias. */
+		klogprintf("scsi: lun %d PDT=CD-ROM — skipped (use /dev/sr* from ATAPI)\n", lun_id);
+		return -1;
+	}
+	if (lun->pdt != SCSI_PDT_DIRECT_ACCESS) {
+		klogprintf("scsi: lun %d PDT=0x%02x unsupported (want Direct-Access)\n", lun_id, lun->pdt);
+		return -1;
 	}
 
 	cdb_read_capacity_10(cdb);
@@ -224,8 +228,7 @@ int scsi_register_lun(void *transport_priv, const scsi_transport_ops_t *ops, int
 		klogprintf("scsi: lun %d block size %u unsupported, expect 512\n", lun_id, block_size);
 		return -1;
 	}
-	/* sector_count = last_lba + 1, cap to 32-bit for disk layer */
-	uint64_t sc = (uint64_t)last_lba + 1;
+	uint64_t sc = (uint64_t)last_lba + 1ull;
 	lun->sector_count = sc > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)sc;
 
 	disk_ops_t *dops = (disk_ops_t *)kmalloc(sizeof(disk_ops_t));
@@ -250,34 +253,17 @@ int scsi_register_lun(void *transport_priv, const scsi_transport_ops_t *ops, int
 	lun->in_use = 1;
 	g_lun_count++;
 
-	char devpath[32];
-	snprintf(devpath, sizeof(devpath), "/dev/hd%d", id);
-	devfs_create_block_node(devpath, id, lun->sector_count);
-
-	if (id >= 0 && id < 26) {
-		char letter = (char)('a' + id);
-		snprintf(devpath, sizeof(devpath), "/dev/sd%c", letter);
-		devfs_create_block_node(devpath, id, lun->sector_count);
-		scsi_publish_mbr_partitions(id, letter, lun->sector_count);
-	}
+	if (disk_publish_sd(id, lun->sector_count) < 0)
+		klogprintf("scsi: lun %d failed to publish /dev/sd*\n", lun_id);
 
 	uint32_t size_mb = lun->sector_count / 2048;
-	/* Выводим полную информацию из INQUIRY: vendor (8), product (16), revision (4)
-	   Используем полные данные из inq_buf для вывода без обрезания пробелов */
-	char vendor_full[9] = {0}, product_full[17] = {0}, revision_full[5] = {0};
-	/* Копируем без обрезки пробелов для полного вывода */
-	memcpy(vendor_full, inq_buf + 8, 8);
-	vendor_full[8] = '\0';
-	memcpy(product_full, inq_buf + 16, 16);
-	product_full[16] = '\0';
-	memcpy(revision_full, inq_buf + 32, 4);
-	revision_full[4] = '\0';
-	/* Выводим полную информацию о диске в читаемом формате */
-	klogprintf("scsi: %s disk_id=%d lun=%d\n", dops->name, id, lun_id);
-	klogprintf("  vendor=\"%.8s\" model=\"%.16s\" rev=\"%.4s\"\n", vendor_full, product_full, revision_full);
-	klogprintf("  sectors=%u (%u MiB) /dev/sd%c /dev/hd%d\n",
+	int sd = disk_sd_index(id);
+	klogprintf("scsi: %s disk_id=%d lun=%d PDT=0x%02x\n", dops->name, id, lun_id, lun->pdt);
+	klogprintf("  vendor=\"%.8s\" model=\"%.16s\" rev=\"%.4s\"\n",
+	           lun->vendor, lun->product, lun->revision);
+	klogprintf("  sectors=%u (%u MiB) /dev/sd%c\n",
 	           lun->sector_count, size_mb,
-	           (id < 26) ? ('a' + id) : '?', id);
+	           (sd >= 0 && sd < 26) ? (char)('a' + sd) : '?');
 
 	return id;
 }
@@ -288,7 +274,8 @@ int scsi_lun_count(void) {
 }
 
 int scsi_lun_get_info(int index, char *vendor, size_t vlen, char *product, size_t plen,
-                      char *revision, size_t rlen, uint32_t *out_sectors, int *out_disk_id, char *out_dev_letter) {
+                      char *revision, size_t rlen, uint32_t *out_sectors, int *out_disk_id,
+                      char *out_dev_name, size_t out_dev_name_len, int *out_pdt) {
 	if (index < 0 || index >= g_lun_count) return -1;
 	int slot = -1;
 	int n = 0;
@@ -304,16 +291,26 @@ int scsi_lun_get_info(int index, char *vendor, size_t vlen, char *product, size_
 	if (revision && rlen) { strncpy(revision, lun->revision, rlen - 1); revision[rlen - 1] = '\0'; }
 	if (out_sectors) *out_sectors = lun->sector_count;
 	if (out_disk_id) *out_disk_id = lun->disk_id;
-	if (out_dev_letter && lun->disk_id >= 0 && lun->disk_id < 26)
-		*out_dev_letter = (char)('a' + lun->disk_id);
-	else if (out_dev_letter)
-		*out_dev_letter = '?';
+	if (out_pdt) *out_pdt = lun->pdt;
+	if (out_dev_name && out_dev_name_len) {
+		int sd = disk_sd_index(lun->disk_id);
+		int sr = disk_sr_index(lun->disk_id);
+		if (sr >= 0)
+			snprintf(out_dev_name, out_dev_name_len, "sr%d", sr);
+		else if (sd >= 0 && sd < 26)
+			snprintf(out_dev_name, out_dev_name_len, "sd%c", (char)('a' + sd));
+		else
+			snprintf(out_dev_name, out_dev_name_len, "?");
+	}
 	return 0;
 }
 
 int scsi_register_disk_as_lun(int disk_id, uint32_t sectors,
                               const char *vendor, const char *product, const char *revision) {
 	if (disk_id < 0 || g_lun_count >= SCSI_MAX_LUNS) return -1;
+	/* Optical must not appear as Direct-Access in /proc/scsi/scsi. */
+	if (disk_sr_index(disk_id) >= 0)
+		return -1;
 	int slot = -1;
 	for (int i = 0; i < SCSI_MAX_LUNS; i++) {
 		if (!g_luns[i].in_use) { slot = i; break; }
@@ -322,17 +319,20 @@ int scsi_register_disk_as_lun(int disk_id, uint32_t sectors,
 	scsi_lun_t *lun = &g_luns[slot];
 	memset(lun, 0, sizeof(*lun));
 	lun->transport_priv = NULL;
-	lun->ops = NULL;  /* alias: I/O через disk layer, узел /dev/sdX уже есть */
+	lun->ops = NULL;  /* alias: I/O via disk layer; /dev/sdX already published */
 	lun->lun_id = disk_id;
 	lun->sector_count = sectors;
 	lun->disk_id = disk_id;
+	lun->pdt = SCSI_PDT_DIRECT_ACCESS;
 	lun->in_use = 1;
 	if (vendor) { strncpy(lun->vendor, vendor, SCSI_VENDOR_LEN); lun->vendor[SCSI_VENDOR_LEN] = '\0'; }
 	if (product) { strncpy(lun->product, product, SCSI_PRODUCT_LEN); lun->product[SCSI_PRODUCT_LEN] = '\0'; }
 	if (revision) { strncpy(lun->revision, revision, SCSI_REVISION_LEN); lun->revision[SCSI_REVISION_LEN] = '\0'; }
 	g_lun_count++;
-	klogprintf("scsi: disk %d registered as SCSI LUN (vendor=%s model=%s) /dev/sd%c\n",
-	           disk_id, lun->vendor, lun->product, (disk_id < 26) ? ('a' + disk_id) : '?');
+	int sd = disk_sd_index(disk_id);
+	klogprintf("scsi: disk %d aliased as SCSI LUN (vendor=%s model=%s) /dev/sd%c\n",
+	           disk_id, lun->vendor, lun->product,
+	           (sd >= 0 && sd < 26) ? (char)('a' + sd) : '?');
 	return 0;
 }
 

@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <fs.h>
 #include <ramfs.h>
+#include <heap.h>
 #include <spinlock.h>
 #include <string.h>
 #include <apic_timer.h>
@@ -142,6 +143,33 @@ static void klog_ring_append(const char *p, size_t n) {
 	}
 }
 
+void klog_sync_varlog(void) {
+	char *snap;
+	long n;
+	struct fs_file *f;
+
+	if (!klog_inited)
+		return;
+	snap = (char *)kmalloc(KLOG_RING_SZ);
+	if (!snap)
+		return;
+	n = klog_syslog_read_all(snap, KLOG_RING_SZ);
+	if (n < 0)
+		n = 0;
+	(void)ramfs_mkdir("/var");
+	(void)ramfs_mkdir("/var/log");
+	f = fs_open("/var/log/kernel");
+	if (!f)
+		f = fs_create_file("/var/log/kernel");
+	if (f) {
+		(void)vfs_ftruncate(f, 0);
+		if (n > 0)
+			(void)fs_write(f, snap, (size_t)n, 0);
+		fs_file_free(f);
+	}
+	kfree(snap);
+}
+
 void klog_init(void) {
 	unsigned long irqf;
 	acquire_irqsave(&klog_lock, &irqf);
@@ -151,19 +179,10 @@ void klog_init(void) {
 	}
 	(void)ramfs_mkdir("/var");
 	(void)ramfs_mkdir("/var/log");
-	/*
-	 * Optional empty placeholder for userspace that stats the path.
-	 * Do not seed or append the ring here — that was the OOM path.
-	 */
-	{
-		struct fs_file *f = fs_create_file("/var/log/kernel");
-		if (!f)
-			f = fs_open("/var/log/kernel");
-		if (f)
-			fs_file_free(f);
-	}
 	klog_inited = 1;
 	release_irqrestore(&klog_lock, irqf);
+	/* Seed from whatever early printk already put in the ring. */
+	klog_sync_varlog();
 }
 
 void klog_user_write(const char *s, size_t n) {
@@ -181,12 +200,21 @@ void klog_user_write(const char *s, size_t n) {
 }
 
 long klog_syslog_read_all(char *buf, size_t size) {
+	return klog_ring_read(buf, size, 0);
+}
+
+long klog_ring_read(char *buf, size_t size, size_t offset) {
 	unsigned long irqf;
-	size_t n, start, i;
+	size_t n, start, i, avail;
 	if (!buf || size == 0)
 		return 0;
 	acquire_irqsave(&klog_lock, &irqf);
-	n = klog_ring_len;
+	avail = klog_ring_len;
+	if (offset >= avail) {
+		release_irqrestore(&klog_lock, irqf);
+		return 0;
+	}
+	n = avail - offset;
 	if (n > size)
 		n = size;
 	if (klog_ring_len < KLOG_RING_SZ)
@@ -194,7 +222,7 @@ long klog_syslog_read_all(char *buf, size_t size) {
 	else
 		start = klog_ring_pos;
 	for (i = 0; i < n; i++)
-		buf[i] = klog_ring[(start + i) % KLOG_RING_SZ];
+		buf[i] = klog_ring[(start + offset + i) % KLOG_RING_SZ];
 	release_irqrestore(&klog_lock, irqf);
 	return (long)n;
 }

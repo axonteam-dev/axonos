@@ -19,6 +19,7 @@
 #include <rtc.h>
 #include <spinlock.h>
 #include <fat32.h>
+#include <disk.h>
 #include <e1000.h>
 #include <usb.h>
 #include <usbdevfs.h>
@@ -33,6 +34,7 @@
 #include <tmpfs.h>
 #include <squashfs.h>
 #include <overlayfs.h>
+#include <xattr.h>
 #include <dhcp.h>
 #include <debug.h>
 #include <klog.h>
@@ -54,6 +56,7 @@
 #include <user_mmap.h>
 #include <user_brk.h>
 #include <user_mm.h>
+#include <utsname_host.h>
 
 #define mark_user_identity_range_2m_sys user_map_mark_identity_2m
 
@@ -1810,6 +1813,12 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define EPROTONOSUPPORT 93
 #define ESOCKTNOSUPPORT 94
 #define EOPNOTSUPP 95
+#ifndef ENODATA
+#define ENODATA 61
+#endif
+#ifndef E2BIG
+#define E2BIG 7
+#endif
 #define EDESTADDRREQ 89
 #define ENETDOWN 100
 #define ENETUNREACH 101
@@ -8300,14 +8309,10 @@ static uint64_t do_linux_fork(thread_t *cur,
                 (unsigned long long)(child->tid ? child->tid : 1), 0);
             fork_dbg(cur, 9, "return pid",
                 (unsigned long long)process_pid(child), 0, 0);
-            if (cur->name[0] && (strstr(cur->name, "openrc") ||
-                                 strstr(cur->name, "/sh") ||
-                                 strstr(cur->name, "fstabinfo") ||
-                                 strstr(cur->name, "busybox")))
-                kprintf("fork-ret: parent=%s child_pid=%llu child_tid=%d\n",
-                    cur->name,
-                    (unsigned long long)process_pid(child),
-                    (int)(child->tid ? child->tid : 1));
+            devel_printf("fork-ret: parent=%s child_pid=%llu child_tid=%d\n",
+                cur->name[0] ? cur->name : "?",
+                (unsigned long long)process_pid(child),
+                (int)(child->tid ? child->tid : 1));
             return process_pid(child);
 }
 
@@ -10208,25 +10213,61 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
              * version /etc/os-release, not in sysname.
              */
             snprintf(u.sysname, sizeof(u.sysname), "Linux");
-            snprintf(u.nodename, sizeof(u.nodename), "axoniso");
+            snprintf(u.nodename, sizeof(u.nodename), "%s", uts_hostname_get());
             snprintf(u.release, sizeof(u.release), "%s-%s", OS_VERSION, OS_NAME);
             snprintf(u.version, sizeof(u.version), "#1 SMP %s %s", OS_NAME, OS_PREFIX);
             snprintf(u.machine, sizeof(u.machine), "x86_64");
-            snprintf(u.domainname, sizeof(u.domainname), "local");
+            snprintf(u.domainname, sizeof(u.domainname), "%s", uts_domainname_get());
             if (copy_to_user_safe(up, &u, sizeof(u)) != 0) return ret_err(EFAULT);
             return 0;
         }
-        case 170: { /* gethostname — BusyBox getty login prompt */
+        case 170: { /* gethostname */
             char *buf = (char *)(uintptr_t)a1;
             size_t len = (size_t)a2;
             if (!buf || len == 0) return ret_err(EINVAL);
-            static const char host[] = "axoniso";
-            size_t n = sizeof(host) - 1;
+            const char *host = uts_hostname_get();
+            size_t n = strlen(host);
             if (n >= len) n = len - 1;
-            char k[64];
+            char k[UTS_NODENAME_MAX];
             memcpy(k, host, n);
             k[n] = '\0';
             if (copy_to_user_safe(buf, k, n + 1) != 0) return ret_err(EFAULT);
+            return 0;
+        }
+        case 161: { /* sethostname (Linux x86_64) */
+            const char *ubuf = (const char *)(uintptr_t)a1;
+            size_t len = (size_t)a2;
+            char k[UTS_NODENAME_MAX];
+            size_t copied = 0;
+            void *tmp;
+            if (!cur || cur->euid != 0) return ret_err(EPERM);
+            if (!ubuf || len == 0 || len >= UTS_NODENAME_MAX) return ret_err(EINVAL);
+            tmp = copy_from_user_safe(ubuf, len, sizeof(k), &copied);
+            if (!tmp || copied != len) {
+                if (tmp) kfree(tmp);
+                return ret_err(EFAULT);
+            }
+            memcpy(k, tmp, len);
+            kfree(tmp);
+            if (uts_hostname_set(k, len) != 0) return ret_err(EINVAL);
+            return 0;
+        }
+        case 171: { /* setdomainname (Linux x86_64) */
+            const char *ubuf = (const char *)(uintptr_t)a1;
+            size_t len = (size_t)a2;
+            char k[UTS_NODENAME_MAX];
+            size_t copied = 0;
+            void *tmp;
+            if (!cur || cur->euid != 0) return ret_err(EPERM);
+            if (!ubuf || len == 0 || len >= UTS_NODENAME_MAX) return ret_err(EINVAL);
+            tmp = copy_from_user_safe(ubuf, len, sizeof(k), &copied);
+            if (!tmp || copied != len) {
+                if (tmp) kfree(tmp);
+                return ret_err(EFAULT);
+            }
+            memcpy(k, tmp, len);
+            kfree(tmp);
+            if (uts_domainname_set(k, len) != 0) return ret_err(EINVAL);
             return 0;
         }
         case SYS_getcwd: {
@@ -10447,10 +10488,17 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     ssize_t wr;
                     if (f->type == FS_TYPE_PIPE && fs_pipe_is_write_end(f) && f->driver_private) {
                         wr = pipe_write_bytes((pipe_t *)f->driver_private, tmp, copied, cur);
+                    } else if (f->type == FS_TYPE_PIPE) {
+                        kfree(tmp);
+                        return (total > 0) ? total : ret_err(EBADF);
                     } else {
                         wr = fs_write(f, tmp, copied, f->pos);
                     }
                     kfree(tmp);
+                    if (wr == -EPIPE && total == 0) {
+                        thread_set_pending_signal(cur, SIGPIPE);
+                        return ret_err(EPIPE);
+                    }
                     if (wr <= 0) return (total > 0) ? total : ret_err((int)(-wr ? -wr : EINVAL));
                     if (f->type != FS_TYPE_PIPE) f->pos += (size_t)wr;
                     total += (uint64_t)wr;
@@ -13519,11 +13567,207 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             return 0;
         }
         case 74: /* fsync(fd) */
-        case 75: { /* fdatasync(fd) - adduser syncs passwd before rename */
+        case 75: { /* fdatasync(fd) */
             int fd = (int)a1;
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
             if (!cur->fds[fd]) return ret_err(EBADF);
             return 0;
+        }
+        case 137: /* statfs */
+        case 138: { /* fstatfs */
+            struct statfs_k ksf;
+            memset(&ksf, 0, sizeof(ksf));
+            ksf.f_type = 0x01021994; /* TMPFS_MAGIC default */
+            ksf.f_bsize = 4096;
+            ksf.f_frsize = 4096;
+            ksf.f_blocks = 1024;
+            ksf.f_bfree = 512;
+            ksf.f_bavail = 512;
+            ksf.f_namelen = 255;
+
+            if (num == 137) {
+                const char *path_u = (const char *)(uintptr_t)a1;
+                void *buf_u = (void *)(uintptr_t)a2;
+                if (!path_u || !buf_u) return ret_err(EFAULT);
+                char *kpath = copy_user_cstr(path_u, 256);
+                if (!kpath) return ret_err(EFAULT);
+                char path[256];
+                resolve_kernel_path(cur, kpath, path, sizeof(path));
+                kfree(kpath);
+                struct fs_driver *md = fs_get_mount_driver(path);
+                if (md && md->ops && md->ops->name && strcmp(md->ops->name, "fat32") == 0) {
+                    if (fat32_statfs(&ksf) != 0) return ret_err(EIO);
+                } else if (md && md->ops && md->ops->name) {
+                    if (strcmp(md->ops->name, "proc") == 0 || strcmp(md->ops->name, "procfs") == 0)
+                        ksf.f_type = 0x9fa0;
+                    else if (strcmp(md->ops->name, "sysfs") == 0)
+                        ksf.f_type = 0x62656572;
+                    else if (strcmp(md->ops->name, "devfs") == 0 || strcmp(md->ops->name, "devtmpfs") == 0)
+                        ksf.f_type = 0x01021994;
+                    else if (strcmp(md->ops->name, "squashfs") == 0)
+                        ksf.f_type = 0x73717368;
+                    else if (strcmp(md->ops->name, "overlay") == 0 || strcmp(md->ops->name, "overlayfs") == 0)
+                        ksf.f_type = 0x794c7630;
+                }
+                if (copy_to_user_safe(buf_u, &ksf, sizeof(ksf)) != 0) return ret_err(EFAULT);
+                return 0;
+            }
+
+            int fd = (int)a1;
+            void *buf_u = (void *)(uintptr_t)a2;
+            if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
+            if (!buf_u) return ret_err(EFAULT);
+            struct fs_file *ff = cur->fds[fd];
+            if (!ff) return ret_err(EBADF);
+            if (ff->path) {
+                struct fs_driver *md = fs_get_mount_driver(ff->path);
+                if (md && md->ops && md->ops->name && strcmp(md->ops->name, "fat32") == 0) {
+                    if (fat32_statfs(&ksf) != 0) return ret_err(EIO);
+                }
+            }
+            if (copy_to_user_safe(buf_u, &ksf, sizeof(ksf)) != 0) return ret_err(EFAULT);
+            return 0;
+        }
+        case SYS_setxattr:
+        case SYS_lsetxattr:
+        case SYS_fsetxattr:
+        case SYS_getxattr:
+        case SYS_lgetxattr:
+        case SYS_fgetxattr:
+        case SYS_listxattr:
+        case SYS_llistxattr:
+        case SYS_flistxattr:
+        case SYS_removexattr:
+        case SYS_lremovexattr:
+        case SYS_fremovexattr: {
+            /* Linux x86_64 *xattr(2) family — real VFS/ramfs storage, not ENOSYS. */
+            int is_f = (num == SYS_fsetxattr || num == SYS_fgetxattr ||
+                        num == SYS_flistxattr || num == SYS_fremovexattr);
+            int is_l = (num == SYS_lsetxattr || num == SYS_lgetxattr ||
+                        num == SYS_llistxattr || num == SYS_lremovexattr);
+            int is_set = (num == SYS_setxattr || num == SYS_lsetxattr || num == SYS_fsetxattr);
+            int is_get = (num == SYS_getxattr || num == SYS_lgetxattr || num == SYS_fgetxattr);
+            int is_list = (num == SYS_listxattr || num == SYS_llistxattr || num == SYS_flistxattr);
+            int is_rm = (num == SYS_removexattr || num == SYS_lremovexattr || num == SYS_fremovexattr);
+            char path[512];
+            char *kname = NULL;
+            void *kbuf = NULL;
+            size_t size = 0;
+            int flags = 0;
+            int follow = is_l ? 0 : 1;
+            ssize_t vr = 0;
+            struct fs_file *ff = NULL;
+
+            if (is_f) {
+                int fd = (int)a1;
+                if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
+                ff = cur->fds[fd];
+                if (!ff) return ret_err(EBADF);
+            } else {
+                const char *path_u = (const char *)(uintptr_t)a1;
+                if (!path_u) return ret_err(EFAULT);
+                char *kp = copy_user_cstr(path_u, 4096);
+                if (!kp) return ret_err(EFAULT);
+                resolve_kernel_path(cur, kp, path, sizeof(path));
+                kfree(kp);
+            }
+
+            if (is_list) {
+                void *list_u = (void *)(uintptr_t)(is_f ? a2 : a2);
+                size = (size_t)(is_f ? a3 : a3);
+                if (size > XATTR_LIST_MAX) size = XATTR_LIST_MAX;
+                if (size && list_u) {
+                    kbuf = kmalloc(size ? size : 1);
+                    if (!kbuf) return ret_err(ENOMEM);
+                }
+                if (is_f)
+                    vr = vfs_flistxattr(ff, (char *)kbuf, size);
+                else
+                    vr = vfs_listxattr(path, (char *)kbuf, size, follow);
+                if (vr < 0) {
+                    if (kbuf) kfree(kbuf);
+                    return ret_err((int)-vr);
+                }
+                if (size && list_u && (size_t)vr > 0) {
+                    if (copy_to_user_safe(list_u, kbuf, (size_t)vr) != 0) {
+                        kfree(kbuf);
+                        return ret_err(EFAULT);
+                    }
+                }
+                if (kbuf) kfree(kbuf);
+                return (uint64_t)vr;
+            }
+
+            /* get / set / remove need attribute name */
+            {
+                const char *name_u = (const char *)(uintptr_t)(is_f ? a2 : a2);
+                if (!name_u) return ret_err(EFAULT);
+                kname = copy_user_cstr(name_u, XATTR_NAME_MAX + 1);
+                if (!kname) return ret_err(EFAULT);
+            }
+
+            if (is_rm) {
+                if (is_f)
+                    vr = vfs_fremovexattr(ff, kname);
+                else
+                    vr = vfs_removexattr(path, kname, follow);
+                kfree(kname);
+                return (vr < 0) ? ret_err((int)-vr) : 0;
+            }
+
+            if (is_get) {
+                void *val_u = (void *)(uintptr_t)(is_f ? a3 : a3);
+                size = (size_t)(is_f ? a4 : a4);
+                if (size > XATTR_SIZE_MAX) size = XATTR_SIZE_MAX;
+                if (size && val_u) {
+                    kbuf = kmalloc(size);
+                    if (!kbuf) { kfree(kname); return ret_err(ENOMEM); }
+                }
+                if (is_f)
+                    vr = vfs_fgetxattr(ff, kname, kbuf, size);
+                else
+                    vr = vfs_getxattr(path, kname, kbuf, size, follow);
+                kfree(kname);
+                if (vr < 0) {
+                    if (kbuf) kfree(kbuf);
+                    return ret_err((int)-vr);
+                }
+                if (size && val_u && (size_t)vr > 0) {
+                    if (copy_to_user_safe(val_u, kbuf, (size_t)vr) != 0) {
+                        kfree(kbuf);
+                        return ret_err(EFAULT);
+                    }
+                }
+                if (kbuf) kfree(kbuf);
+                return (uint64_t)vr;
+            }
+
+            if (is_set) {
+                const void *val_u = (const void *)(uintptr_t)(is_f ? a3 : a3);
+                size = (size_t)(is_f ? a4 : a4);
+                flags = (int)(is_f ? a5 : a5);
+                if (size > XATTR_SIZE_MAX) { kfree(kname); return ret_err(E2BIG); }
+                if (size) {
+                    if (!val_u) { kfree(kname); return ret_err(EFAULT); }
+                    kbuf = kmalloc(size);
+                    if (!kbuf) { kfree(kname); return ret_err(ENOMEM); }
+                    if (copy_from_user_raw(kbuf, val_u, size) != 0) {
+                        kfree(kbuf);
+                        kfree(kname);
+                        return ret_err(EFAULT);
+                    }
+                }
+                if (is_f)
+                    vr = vfs_fsetxattr(ff, kname, kbuf, size, flags);
+                else
+                    vr = vfs_setxattr(path, kname, kbuf, size, flags, follow);
+                if (kbuf) kfree(kbuf);
+                kfree(kname);
+                return (vr < 0) ? ret_err((int)-vr) : 0;
+            }
+
+            if (kname) kfree(kname);
+            return ret_err(ENOSYS);
         }
         case 162: { /* sync() — drain async block I/O before reboot (BusyBox calls this without -f). */
             iothread_drain();
@@ -14245,21 +14489,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         const char *pn = waiter->name[0] ? waiter->name : "";
                         const char *cn = (dead_thread && dead_thread->name[0])
                             ? dead_thread->name : "";
-                        if (strstr(pn, "fstabinfo") || strstr(pn, "openrc") ||
-                            strstr(pn, "/sh") || strstr(pn, "busybox") ||
-                            strstr(cn, "mount") || strstr(cn, "mountinfo") ||
-                            strstr(cn, "fstabinfo") ||
-                            (status != 0 && (strstr(pn, "busybox") || strstr(cn, "busybox"))))
-                            kprintf("wait4: parent=%s child=%s pid=%d status=0x%x "
-                                    "(exited=%d code=%d signaled=%d sig=%d) "
-                                    "wait_pid_arg=%d status_u=0x%llx\n",
-                                pn, cn, dead_pid, (unsigned)status,
-                                ((status) & 0x7f) == 0,
-                                ((status) >> 8) & 0xff,
-                                ((status) & 0x7f) != 0 && ((status) & 0x7f) != 0x7f,
-                                (status) & 0x7f,
-                                pid_arg,
-                                (unsigned long long)waiter->sc_a2);
+                        devel_printf("wait4: parent=%s child=%s pid=%d status=0x%x "
+                                     "wait_pid_arg=%d status_u=0x%llx\n",
+                            pn, cn, dead_pid, (unsigned)status,
+                            pid_arg,
+                            (unsigned long long)waiter->sc_a2);
                         if (waiter->sc_a2) {
                             if (wait4_copy_status(waiter, status) != 0) {
                                 kprintf("wait4: EFAULT status*=0x%llx parent=%s "
@@ -15681,8 +15915,15 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (!tmp) return ret_err(EFAULT);
                 ssize_t wr = pipe_write_bytes(p, tmp, copied, cur);
                 kfree(tmp);
+                /* Linux pipe_write: SIGPIPE + -EPIPE when no bytes written. */
+                if (wr == -EPIPE) {
+                    thread_set_pending_signal(cur, SIGPIPE);
+                    return ret_err(EPIPE);
+                }
                 return (wr >= 0) ? (uint64_t)wr : ret_err((int)-wr);
             }
+            if (f->type == FS_TYPE_PIPE)
+                return ret_err(EBADF);
             if (f->type == FS_TYPE_EVENTFD && f->driver_private) {
                 eventfd_t *e = (eventfd_t *)f->driver_private;
                 if (cnt < 8) return ret_err(EINVAL);
@@ -15704,7 +15945,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (!tmp) return (total > 0) ? (uint64_t)total : ret_err(EFAULT);
                 ssize_t wr = fs_write(f, tmp, copied, f->pos);
                 kfree(tmp);
-                if (wr <= 0) return (total > 0) ? (uint64_t)total : ret_err(EINVAL);
+                if (wr < 0) return (total > 0) ? (uint64_t)total : ret_read_err(wr);
+                if (wr == 0) return (total > 0) ? (uint64_t)total : ret_err(EIO);
                 f->pos += (size_t)wr;
                 total += (size_t)wr;
                 if ((size_t)wr < copied) break;
@@ -15928,7 +16170,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (!tmp) return (total > 0) ? total : ret_err(EFAULT);
                 ssize_t wr = fs_write(f, tmp, copied, cur_off);
                 kfree(tmp);
-                if (wr <= 0) return (total > 0) ? total : ret_err(EINVAL);
+                if (wr < 0) return (total > 0) ? total : ret_read_err(wr);
+                if (wr == 0) return (total > 0) ? total : ret_err(EIO);
                 total += (uint64_t)wr;
                 cur_off += (size_t)wr;
                 if ((size_t)wr < copied) return total;
@@ -15994,7 +16237,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         thread_fd_path(cur, fd) ? thread_fd_path(cur, fd) : "?");
                 return ret_err(EFAULT);
             }
-            size_t to_read = cnt < 4096 ? cnt : 4096;
+            /* Linux read(2) may return up to count; 64 KiB matches pipe chunk. */
+            size_t to_read = cnt < (size_t)PIPE_RW_CHUNK ? cnt : (size_t)PIPE_RW_CHUNK;
             void *tmp = kmalloc(to_read);
             if (!tmp) return ret_err(ENOMEM);
             off_t read_pos = f->pos;
@@ -16131,6 +16375,12 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             int out_is_sock = (fout->type == SYSCALL_FTYPE_SOCKET && fout->driver_private);
             ksock_net_t *outs = out_is_sock ? (ksock_net_t *)fout->driver_private : NULL;
+            int out_is_pipe = (fout->type == FS_TYPE_PIPE && fs_pipe_is_write_end(fout) &&
+                               fout->driver_private);
+            if (fout->type == FS_TYPE_PIPE && !out_is_pipe) {
+                kfree(tmp);
+                return ret_err(EBADF);
+            }
             while (tocopy > 0) {
                 size_t chunk = tocopy < bufcap ? tocopy : bufcap;
                 ssize_t rr;
@@ -16152,8 +16402,15 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (outs) {
                     /* nginx body: sendfile(socket, file). fs_write() cannot TX TCP. */
                     wr = net_sock_write_kbuf(outs, tmp, (size_t)rr);
+                } else if (out_is_pipe) {
+                    wr = pipe_write_bytes((pipe_t *)fout->driver_private, tmp, (size_t)rr, cur);
                 } else {
                     wr = fs_write(fout, tmp, (size_t)rr, fout->pos);
+                }
+                if (wr == -EPIPE && total == 0) {
+                    kfree(tmp);
+                    thread_set_pending_signal(cur, SIGPIPE);
+                    return ret_err(EPIPE);
                 }
                 if (wr <= 0) {
                     kfree(tmp);
@@ -16162,7 +16419,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return ret_err(EINVAL);
                 }
                 if (use_pos >= 0) use_pos += (off_t)rr; else fin->pos += (size_t)rr;
-                if (!outs) fout->pos += (size_t)wr;
+                if (!outs && !out_is_pipe) fout->pos += (size_t)wr;
                 total += (size_t)wr;
                 tocopy -= (size_t)rr;
                 if ((size_t)wr < (size_t)rr) break;
@@ -17710,7 +17967,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (rc != 0)
                         errno_out = EBUSY;
                 }
-            } else if (strcmp(k_type, "fat32") == 0 || strcmp(k_type, "vfat") == 0 || strcmp(k_type, "msdos") == 0 || strcmp(k_type, "auto") == 0) {
+            } else if (strcmp(k_type, "fat32") == 0 || strcmp(k_type, "vfat") == 0 ||
+                       strcmp(k_type, "msdos") == 0 || strcmp(k_type, "auto") == 0) {
                 if (!src_u) { kfree(k_type); return ret_err(EINVAL); }
                 char *k_src_raw = copy_user_cstr(src_u, 256);
                 if (!k_src_raw) { kfree(k_type); return ret_err(EFAULT); }
@@ -17722,14 +17980,41 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 int dev_id = devfs_get_device_id(source);
                 if (dev_id < 0) { kfree(k_type); return ret_err(ENOENT); }
 
+                if (thread_has_interrupt_signal(cur)) {
+                    kfree(k_type);
+                    return ret_err(EINTR);
+                }
                 /* Ensure FAT32 state is initialized for this device. */
-                if (fat32_probe_and_mount(dev_id) != 0) { kfree(k_type); return ret_err(EINVAL); }
+                {
+                    int pr = fat32_probe_and_mount(dev_id);
+                    if (pr != 0) {
+                        if (pr == -EINTR || thread_has_interrupt_signal(cur)) {
+                            kfree(k_type);
+                            return ret_err(EINTR);
+                        }
+                        errno_out = (pr == -EIO) ? EIO : EINVAL;
+                        /* printk-style: do not spam the VGA console mid-mount. */
+                        klogprintf("mount: fail type=%s source=%s target=%s rc=%d\n",
+                                   k_type, source, target, pr);
+                        kfree(k_type);
+                        return ret_err(errno_out);
+                    }
+                }
+                if (thread_has_interrupt_signal(cur)) {
+                    kfree(k_type);
+                    return ret_err(EINTR);
+                }
                 struct fs_driver *drv = fat32_get_driver();
                 if (!drv) { kfree(k_type); return ret_err(EINVAL); }
 
-                ramfs_mkdir(target);
+                (void)fs_mkdir(target);
                 rc = fs_mount(target, drv);
                 if (rc != 0) errno_out = EBUSY;
+            } else if (strcmp(k_type, "ext2") == 0 || strcmp(k_type, "ext3") == 0 ||
+                       strcmp(k_type, "ext4") == 0) {
+                /* No on-disk ext* yet (memory images only) — fail fast, no I/O. */
+                rc = -1;
+                errno_out = ENODEV;
             } else {
                 rc = -1;
                 errno_out = EINVAL;
@@ -18341,12 +18626,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 int ignore_sigchld = (user_sig_actions[SIGCHLD].handler == SIG_IGN) ||
                     ((user_sig_actions[SIGCHLD].flags & SA_NOCLDWAIT) != 0);
                 {
-                    const char *nm = cur->name[0] ? cur->name : "";
-                    if (strstr(nm, "mount") || strstr(nm, "fstabinfo") ||
-                        strstr(nm, "mountinfo") || strstr(nm, "busybox"))
-                        kprintf("exit_group: name=%s code=%d status=0x%x parent=%d\n",
-                            nm, (int)a1, (unsigned)((int)a1 & 0xFF) << 8,
-                            cur->parent_tid);
+                    devel_printf("exit_group: name=%s code=%d parent=%d\n",
+                        cur->name[0] ? cur->name : "?", (int)a1, cur->parent_tid);
                 }
                 devfs_tty_remove_waiter_from_all_ttys((int)(cur->tid ? cur->tid : 1));
                 exit_group_reap_peer_threads(cur);

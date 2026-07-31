@@ -51,15 +51,19 @@ typedef struct scsi_transport_ops {
 	                       int direction);
 } scsi_transport_ops_t;
 
+/* SCSI peripheral device types (SPC INQUIRY byte 0). */
+#define SCSI_PDT_DIRECT_ACCESS  0x00
+#define SCSI_PDT_CDROM          0x05
+#define SCSI_PDT_UNKNOWN        0x1f
+
 /*
- * scsi_register_lun — зарегистрировать SCSI LUN как блочное устройство.
- * Транспорт вызывает после обнаружения устройства (TEST UNIT READY, READ CAPACITY
- * выполняются внутри). Создаётся disk_ops_t и узлы в devfs (/dev/sdX, партиции).
+ * scsi_register_lun — register a SCSI LUN as a block device.
+ * Uses INQUIRY PDT: 0x00 → /dev/sdX (+ MBR parts), 0x05 → /dev/srN only.
  *
- * transport_priv — передаётся в ops->execute_command
- * ops          — операции транспорта
- * lun_id       — номер LUN (0..255), для логов и имён
- * Возврат: disk device_id (>=0) или -1 при ошибке.
+ * transport_priv — passed to ops->execute_command
+ * ops          — transport ops
+ * lun_id       — LUN number (0..255)
+ * Returns: disk device_id (>=0) or -1.
  */
 int scsi_register_lun(void *transport_priv,
                       const scsi_transport_ops_t *ops,
@@ -80,11 +84,10 @@ int scsi_register_disk_as_lun(int disk_id, uint32_t sectors,
                               const char *vendor, const char *product, const char *revision);
 
 /*
- * Информация о зарегистрированных SCSI дисках (для /proc/scsi/scsi и т.п.).
- * scsi_lun_count — число LUN.
- * scsi_lun_get_info — по индексу 0..count-1 заполняет vendor, product, revision,
- * out_sectors, out_disk_id; out_dev_letter = 'a'+disk_id для /dev/sdX (или '?').
+ * Registered SCSI LUN info for /proc/scsi/scsi.
+ * out_dev_name: "sda", "sr0", etc. (buf >= 8). out_pdt: peripheral device type.
  */
 int scsi_lun_count(void);
 int scsi_lun_get_info(int index, char *vendor, size_t vlen, char *product, size_t plen,
-                      char *revision, size_t rlen, uint32_t *out_sectors, int *out_disk_id, char *out_dev_letter);
+                      char *revision, size_t rlen, uint32_t *out_sectors, int *out_disk_id,
+                      char *out_dev_name, size_t out_dev_name_len, int *out_pdt);

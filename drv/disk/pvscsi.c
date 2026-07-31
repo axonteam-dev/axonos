@@ -144,11 +144,18 @@ static void pvscsi_kick_non_rw(void) {
 	pvscsi_write32(PVSCSI_REG_KICK_NON_RW_IO, 0);
 }
 
+typedef struct {
+	uint8_t target;
+} pvscsi_target_priv_t;
+
+static pvscsi_target_priv_t g_pvscsi_targets[16];
+
 static int pvscsi_execute_command(void *priv,
     const uint8_t *cdb, size_t cdb_len,
     void *data, size_t data_len, int direction)
 {
-	(void)priv;
+	pvscsi_target_priv_t *tp = (pvscsi_target_priv_t *)priv;
+	uint8_t target = tp ? tp->target : 0;
 	if (!g_pvscsi_ready || cdb_len > 16) return -1;
 
 	uint32_t req_idx = g_rings_state->reqProdIdx & g_req_mask;
@@ -165,7 +172,7 @@ static int pvscsi_execute_command(void *priv,
 	req->lun[1] = 0;
 	req->tag = 0x20; /* SIMPLE_QUEUE_TAG */
 	req->bus = 0;
-	req->target = 0;
+	req->target = target;
 
 	/* Memory barrier: убедиться, что запись в req_ring видна до обновления reqProdIdx */
 	__asm__ volatile("" ::: "memory");
@@ -204,12 +211,16 @@ static int pvscsi_execute_command(void *priv,
 		klogprintf("pvscsi: bad context %llu (expected 1)\n", (unsigned long long)cmp->context);
 		return -1;
 	}
-	if (cmp->hostStatus != BTSTAT_SUCCESS && cmp->hostStatus != BTSTAT_SELTIMEO) {
-		klogprintf("pvscsi: hostStatus=0x%x scsiStatus=0x%x\n", cmp->hostStatus, cmp->scsiStatus);
+	/* Selection timeout = no target; must not look like success. */
+	if (cmp->hostStatus != BTSTAT_SUCCESS) {
+		if (cmp->hostStatus != BTSTAT_SELTIMEO)
+			klogprintf("pvscsi: hostStatus=0x%x scsiStatus=0x%x target=%u\n",
+			           cmp->hostStatus, cmp->scsiStatus, (unsigned)target);
 		return -1;
 	}
 	if (cmp->scsiStatus != 0x00 && cmp->scsiStatus != 0x02) { /* GOOD / CHECK CONDITION */
-		klogprintf("pvscsi: scsiStatus=0x%x (hostStatus=0x%x)\n", cmp->scsiStatus, cmp->hostStatus);
+		klogprintf("pvscsi: scsiStatus=0x%x (hostStatus=0x%x) target=%u\n",
+		           cmp->scsiStatus, cmp->hostStatus, (unsigned)target);
 		return -1;
 	}
 	return 0;
@@ -230,7 +241,22 @@ int pvscsi_init(void) {
 			break;
 		}
 	}
-	if (!pdev) return 0;
+	if (!pdev) {
+		/* LSI Fusion-MPT (1000:0030 etc.) is handled by mptspi; only warn on other SCSI HBAs. */
+		for (int i = 0; i < count; i++) {
+			if (devs[i].class_code != 0x01 || devs[i].subclass != 0x00)
+				continue;
+			if (devs[i].vendor_id == 0x1000u &&
+			    (devs[i].device_id == 0x0030u ||
+			     devs[i].device_id == 0x0054u ||
+			     devs[i].device_id == 0x0058u))
+				continue;
+			klogprintf("pvscsi: no VMware PVSCSI (15AD:07C0); unused SCSI HBA %04x:%04x at %02x:%02x.%x\n",
+			           devs[i].vendor_id, devs[i].device_id,
+			           devs[i].bus, devs[i].device, devs[i].function);
+		}
+		return 0;
+	}
 
 	uint32_t cmd = pci_config_read_dword(pdev->bus, pdev->device, pdev->function, 0x04);
 	cmd |= (1u << 0) | (1u << 1) | (1u << 2);
@@ -326,11 +352,19 @@ int pvscsi_init(void) {
 	klogprintf("pvscsi: controller at %02x:%02x.%x initialized\n",
 	           pdev->bus, pdev->device, pdev->function);
 
-	int id = scsi_register_lun(g_pvscsi_mmio, &pvscsi_ops, 0);
-	if (id >= 0)
-		klogprintf("pvscsi: SCSI disk registered as /dev/sd%c (disk_id=%d)\n",
-		           (id < 26) ? ('a' + id) : '?', id);
-	else
-		klogprintf("pvscsi: no disk on target 0 lun 0 (TEST UNIT READY/INQUIRY failed)\n");
-	return (id >= 0) ? 1 : 0;
+	int found = 0;
+	/* VMware typically places virtual disks on low target IDs. */
+	for (int tgt = 0; tgt < 8; tgt++) {
+		g_pvscsi_targets[tgt].target = (uint8_t)tgt;
+		int id = scsi_register_lun(&g_pvscsi_targets[tgt], &pvscsi_ops, 0);
+		if (id < 0)
+			continue;
+		int sd = disk_sd_index(id);
+		klogprintf("pvscsi: target %d lun 0 → disk_id=%d /dev/sd%c\n",
+		           tgt, id, (sd >= 0 && sd < 26) ? (char)('a' + sd) : '?');
+		found++;
+	}
+	if (!found)
+		klogprintf("pvscsi: no disks on targets 0..7\n");
+	return found > 0 ? found : 0;
 }

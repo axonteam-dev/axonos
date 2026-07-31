@@ -10,6 +10,36 @@
 #include <vga.h>
 #include <spinlock.h>
 #include <klog.h>
+#include <xattr.h>
+
+#ifndef ENODATA
+#define ENODATA 61
+#endif
+#ifndef ENOENT
+#define ENOENT 2
+#endif
+#ifndef ENOMEM
+#define ENOMEM 12
+#endif
+#ifndef EINVAL
+#define EINVAL 22
+#endif
+#ifndef EEXIST
+#define EEXIST 17
+#endif
+#ifndef ERANGE
+#define ERANGE 34
+#endif
+#ifndef E2BIG
+#define E2BIG 7
+#endif
+
+struct ramfs_xattr {
+    char *name;
+    void *value;
+    size_t size;
+    struct ramfs_xattr *next;
+};
 
 struct ramfs_node {
     char *name;
@@ -28,6 +58,7 @@ struct ramfs_node {
     time_t atime;
     time_t mtime;
     time_t ctime;
+    struct ramfs_xattr *xattrs; /* inode-owned extended attributes */
     struct ramfs_node *parent;
     struct ramfs_node *children; /* linked list of children */
     struct ramfs_node *next; /* sibling */
@@ -201,10 +232,26 @@ static void ramfs_free_data_owned(struct ramfs_node *n) {
     n->capacity = 0;
 }
 
+static void ramfs_free_xattrs(struct ramfs_node *n) {
+    struct ramfs_xattr *x, *next;
+    if (!n)
+        return;
+    for (x = n->xattrs; x; x = next) {
+        next = x->next;
+        if (x->name)
+            kfree(x->name);
+        if (x->value)
+            kfree(x->value);
+        kfree(x);
+    }
+    n->xattrs = NULL;
+}
+
 static void ramfs_free_node_shallow(struct ramfs_node *n) {
     if (!n) return;
     if (n->name) kfree(n->name);
     ramfs_free_data_owned(n);
+    ramfs_free_xattrs(n);
     kfree(n);
 }
 
@@ -1069,6 +1116,7 @@ int ramfs_remove(const char *path) {
                 target->name = NULL;
             }
             ramfs_free_data_owned(target);
+            ramfs_free_xattrs(target);
             kfree(target);
         }
         return 0;
@@ -1093,12 +1141,210 @@ int ramfs_remove(const char *path) {
         }
         if (cur->name) kfree(cur->name);
         ramfs_free_data_owned(cur);
+        ramfs_free_xattrs(cur);
         kfree(cur);
     }
     return 0;
 }
 
 #define RAMFS_WHITEOUT_UID 0xffffu
+
+static struct ramfs_xattr *ramfs_xattr_find(struct ramfs_node *inode, const char *name) {
+    struct ramfs_xattr *x;
+    for (x = inode->xattrs; x; x = x->next) {
+        if (x->name && strcmp(x->name, name) == 0)
+            return x;
+    }
+    return NULL;
+}
+
+ssize_t ramfs_getxattr(const char *path, const char *name, void *value, size_t size) {
+    struct ramfs_node *n, *inode;
+    struct ramfs_xattr *x;
+    unsigned long flags;
+    ssize_t ret;
+    if (!path || !name)
+        return -EINVAL;
+    ramfs_tree_lock_acquire(&flags);
+    n = ramfs_lookup_nofollow(path);
+    if (!n) {
+        ramfs_tree_lock_release(flags);
+        return -ENOENT;
+    }
+    inode = ramfs_resolve_link(n);
+    x = ramfs_xattr_find(inode, name);
+    if (!x) {
+        ramfs_tree_lock_release(flags);
+        return -ENODATA;
+    }
+    if (size == 0) {
+        ret = (ssize_t)x->size;
+        ramfs_tree_lock_release(flags);
+        return ret;
+    }
+    if (size < x->size) {
+        ramfs_tree_lock_release(flags);
+        return -ERANGE;
+    }
+    if (x->size && value)
+        memcpy(value, x->value, x->size);
+    ret = (ssize_t)x->size;
+    ramfs_tree_lock_release(flags);
+    return ret;
+}
+
+ssize_t ramfs_listxattr(const char *path, char *list, size_t size) {
+    struct ramfs_node *n, *inode;
+    struct ramfs_xattr *x;
+    unsigned long flags;
+    size_t need = 0;
+    if (!path)
+        return -EINVAL;
+    ramfs_tree_lock_acquire(&flags);
+    n = ramfs_lookup_nofollow(path);
+    if (!n) {
+        ramfs_tree_lock_release(flags);
+        return -ENOENT;
+    }
+    inode = ramfs_resolve_link(n);
+    for (x = inode->xattrs; x; x = x->next) {
+        if (!x->name)
+            continue;
+        need += strlen(x->name) + 1;
+    }
+    if (need > XATTR_LIST_MAX) {
+        ramfs_tree_lock_release(flags);
+        return -E2BIG;
+    }
+    if (size == 0) {
+        ramfs_tree_lock_release(flags);
+        return (ssize_t)need;
+    }
+    if (size < need) {
+        ramfs_tree_lock_release(flags);
+        return -ERANGE;
+    }
+    if (need && list) {
+        size_t off = 0;
+        for (x = inode->xattrs; x; x = x->next) {
+            size_t nl;
+            if (!x->name)
+                continue;
+            nl = strlen(x->name) + 1;
+            memcpy(list + off, x->name, nl);
+            off += nl;
+        }
+    }
+    ramfs_tree_lock_release(flags);
+    return (ssize_t)need;
+}
+
+int ramfs_setxattr(const char *path, const char *name, const void *value, size_t size, int flags) {
+    struct ramfs_node *n, *inode;
+    struct ramfs_xattr *x;
+    unsigned long irqf;
+    char *nname = NULL;
+    void *nval = NULL;
+    size_t nlen;
+    if (!path || !name)
+        return -EINVAL;
+    if (size > XATTR_SIZE_MAX)
+        return -E2BIG;
+    if (value == NULL && size != 0)
+        return -EINVAL;
+    nlen = strlen(name);
+    if (nlen == 0 || nlen > XATTR_NAME_MAX)
+        return -EINVAL;
+
+    ramfs_tree_lock_acquire(&irqf);
+    n = ramfs_lookup_nofollow(path);
+    if (!n) {
+        ramfs_tree_lock_release(irqf);
+        return -ENOENT;
+    }
+    inode = ramfs_resolve_link(n);
+    x = ramfs_xattr_find(inode, name);
+    if (x) {
+        if (flags & XATTR_CREATE) {
+            ramfs_tree_lock_release(irqf);
+            return -EEXIST;
+        }
+    } else {
+        if (flags & XATTR_REPLACE) {
+            ramfs_tree_lock_release(irqf);
+            return -ENODATA;
+        }
+    }
+
+    if (size) {
+        nval = kmalloc(size);
+        if (!nval) {
+            ramfs_tree_lock_release(irqf);
+            return -ENOMEM;
+        }
+        memcpy(nval, value, size);
+    }
+    if (!x) {
+        nname = (char *)kmalloc(nlen + 1);
+        if (!nname) {
+            if (nval)
+                kfree(nval);
+            ramfs_tree_lock_release(irqf);
+            return -ENOMEM;
+        }
+        memcpy(nname, name, nlen + 1);
+        x = (struct ramfs_xattr *)kmalloc(sizeof(*x));
+        if (!x) {
+            kfree(nname);
+            if (nval)
+                kfree(nval);
+            ramfs_tree_lock_release(irqf);
+            return -ENOMEM;
+        }
+        memset(x, 0, sizeof(*x));
+        x->name = nname;
+        x->next = inode->xattrs;
+        inode->xattrs = x;
+    } else {
+        if (x->value)
+            kfree(x->value);
+    }
+    x->value = nval;
+    x->size = size;
+    inode->ctime = 0; /* wall-clock optional; keep field touched */
+    ramfs_tree_lock_release(irqf);
+    return 0;
+}
+
+int ramfs_removexattr(const char *path, const char *name) {
+    struct ramfs_node *n, *inode;
+    struct ramfs_xattr *x, **pp;
+    unsigned long flags;
+    if (!path || !name)
+        return -EINVAL;
+    ramfs_tree_lock_acquire(&flags);
+    n = ramfs_lookup_nofollow(path);
+    if (!n) {
+        ramfs_tree_lock_release(flags);
+        return -ENOENT;
+    }
+    inode = ramfs_resolve_link(n);
+    pp = &inode->xattrs;
+    for (x = inode->xattrs; x; pp = &x->next, x = x->next) {
+        if (x->name && strcmp(x->name, name) == 0) {
+            *pp = x->next;
+            if (x->name)
+                kfree(x->name);
+            if (x->value)
+                kfree(x->value);
+            kfree(x);
+            ramfs_tree_lock_release(flags);
+            return 0;
+        }
+    }
+    ramfs_tree_lock_release(flags);
+    return -ENODATA;
+}
 
 int ramfs_make_whiteout(const char *path) {
     struct fs_file *file = NULL;

@@ -16,6 +16,7 @@
 #include <smp.h>
 #include <usb.h>
 #include <scsi.h>
+#include <disk.h>
 #include <pci.h>
 #include <devfs.h>
 #include <vga.h>
@@ -24,6 +25,7 @@
 #include <exec.h>
 #include <user_vma.h>
 #include <syscall.h>
+#include <utsname_host.h>
 
 struct procfs_handle {
 	int kind; /* 1=root, 2=pid_dir, 3=pid_file, 4=symlink, 5=pid_fd_dir, 6=pid_fd_link, 7=plain, 8=proc_sys_dir, 9=proc_sys_file */
@@ -708,15 +710,31 @@ static ssize_t procfs_show_partitions(char *buf, size_t size, void *priv) {
 		int did = -1;
 		uint32_t sectors = 0;
 		if (devfs_block_get(i, name, sizeof(name), &did, &sectors) != 0) continue;
-		/* Show both SATA-like sdX and legacy IDE-like hdN nodes. */
-		int is_sd = (name[0] == 's' && name[1] == 'd');
-		int is_hd = (name[0] == 'h' && name[1] == 'd');
-		if (!is_sd && !is_hd) continue;
+		int is_sd = (name[0] == 's' && name[1] == 'd' && name[2] >= 'a' && name[2] <= 'z');
+		int is_sr = (name[0] == 's' && name[1] == 'r' && name[2] >= '0' && name[2] <= '9');
+		int is_nvme = (strncmp(name, "nvme", 4) == 0);
+		if (!is_sd && !is_sr && !is_nvme) continue;
 		/* blocks in 1K units like Linux: sectors * 512 / 1024 == sectors/2 */
 		uint32_t blocks = sectors / 2;
-		/* fake major/minor; enough for userland tools that just parse size+name */
-		int major = is_hd ? 3 : 8;
-		int minor = did >= 0 ? did * 16 : i * 16;
+		int major = 8;
+		int minor = 0;
+		if (is_sd) {
+			int disk = name[2] - 'a';
+			int part = 0;
+			if (name[3] >= '1' && name[3] <= '9')
+				part = name[3] - '0';
+			major = DISK_MAJOR_SD;
+			minor = disk * 16 + part;
+		} else if (is_sr) {
+			major = DISK_MAJOR_SR;
+			minor = 0;
+			for (int k = 2; name[k] >= '0' && name[k] <= '9'; k++)
+				minor = minor * 10 + (name[k] - '0');
+		} else {
+			/* NVMe: Linux uses major 259; minor encoding is complex — report 259:0+i. */
+			major = 259;
+			minor = i;
+		}
 		int written = snprintf(buf + w, (w < size) ? (size - w) : 0,
 							   "%5d %5d %8u %s\n", major, minor, (unsigned)blocks, name);
 		if (written < 0) break;
@@ -788,9 +806,9 @@ static ssize_t procfs_show_filesystems(char *buf, size_t size, void *priv) {
         "nodev\tdevtmpfs\n"
         "nodev\ttmpfs\n"
         "nodev\tramfs\n"
+        /* ext2 omitted: no on-disk mount yet (BusyBox auto-probe). */
         "\tvfat\n"
-        "\tmsdos\n"
-        "\text2\n";
+        "\tmsdos\n";
     size_t len = sizeof(text) - 1;
     if (len > size) len = size;
     memcpy(buf, text, len);
@@ -804,17 +822,18 @@ static ssize_t procfs_show_scsi(char *buf, size_t size, void *priv) {
 	size_t w = 0;
 	int n = scsi_lun_count();
 	for (int i = 0; i < n; i++) {
-		char vendor[32], product[32], revision[16];
+		char vendor[32], product[32], revision[16], devname[16];
 		uint32_t sectors;
-		int disk_id;
-		char dev_letter;
+		int disk_id, pdt = 0;
 		if (scsi_lun_get_info(i, vendor, sizeof(vendor), product, sizeof(product),
-		                      revision, sizeof(revision), &sectors, &disk_id, &dev_letter) != 0)
+		                      revision, sizeof(revision), &sectors, &disk_id,
+		                      devname, sizeof(devname), &pdt) != 0)
 			continue;
 		uint32_t size_mb = sectors / 2048;
+		const char *type = (pdt == SCSI_PDT_CDROM) ? "CD-ROM          " : "Direct-Access   ";
 		int written = snprintf(buf + w, (w < size) ? (size - w) : 0,
-			"Host: scsi Channel: 00 Id: %02d Lun: 00\n  Vendor: %-8s Model: %-16s Rev: %-4s\n  Type:   Direct-Access    ANSI SCSI revision: 05\n  /dev/sd%c: %u sectors (%u MiB)\n",
-			disk_id, vendor, product, revision, dev_letter, (unsigned)sectors, size_mb);
+			"Host: scsi Channel: 00 Id: %02d Lun: 00\n  Vendor: %-8s Model: %-16s Rev: %-4s\n  Type:   %s ANSI SCSI revision: 05\n  /dev/%s: %u sectors (%u MiB)\n",
+			disk_id, vendor, product, revision, type, devname, (unsigned)sectors, size_mb);
 		if (written < 0) break;
 		w += (size_t)written;
 		if (w >= size) { w = size; break; }
@@ -858,41 +877,68 @@ static ssize_t procfs_show_cpuinfo(char *buf, size_t size, void *priv) {
 	return (ssize_t)w;
 }
 
-/* Simple proc/sys storage: kernel.hostname */
-static char proc_hostname[64] = OS_NAME;
-static ssize_t procfs_show_hostname(char *buf, size_t size, void *priv) {
-	(void)priv;
-	if (!buf || size == 0) return 0;
-	size_t len = strlen(proc_hostname);
-	if (len > size) len = size;
-	memcpy(buf, proc_hostname, len);
-	if (len < size) buf[len++] = '\n';
-	return (ssize_t)len;
-}
+/* /proc/sys knobs backed by real kernel state (no dummy tunables). */
+enum {
+	SYSCTL_HOSTNAME = 20,
+	SYSCTL_DOMAINNAME = 21,
+	SYSCTL_OSTYPE = 22,
+	SYSCTL_OSRELEASE = 23,
+	SYSCTL_VERSION = 24,
+	SYSCTL_PID_MAX = 25,
+	SYSCTL_FILE_MAX = 30,
+};
 
-static ssize_t procfs_store_hostname(const char *buf, size_t size, void *priv) {
-	(void)priv;
-	if (!buf || size == 0) return -1;
-	/* copy up to capacity-1 and trim newline */
-	size_t copy_len = size;
-	if (copy_len >= sizeof(proc_hostname)) copy_len = sizeof(proc_hostname) - 1;
-	memcpy(proc_hostname, buf, copy_len);
-	proc_hostname[copy_len] = '\0';
-	/* trim trailing newline */
-	if (copy_len > 0 && proc_hostname[copy_len-1] == '\n') proc_hostname[copy_len-1] = '\0';
-	return (ssize_t)size;
+#define PROC_PID_MAX 512 /* matches cpu/thread/thread.c MAX_THREADS */
+
+static ssize_t procfs_sysctl_show(int file_id, char *buf, size_t size) {
+	char tmp[128];
+	size_t len = 0;
+	if (!buf || size == 0) return 0;
+	switch (file_id) {
+	case SYSCTL_HOSTNAME:
+		len = (size_t)snprintf(tmp, sizeof(tmp), "%s\n", uts_hostname_get());
+		break;
+	case SYSCTL_DOMAINNAME:
+		len = (size_t)snprintf(tmp, sizeof(tmp), "%s\n", uts_domainname_get());
+		break;
+	case SYSCTL_OSTYPE:
+		len = (size_t)snprintf(tmp, sizeof(tmp), "Linux\n");
+		break;
+	case SYSCTL_OSRELEASE:
+		len = (size_t)snprintf(tmp, sizeof(tmp), "%s-%s\n", OS_VERSION, OS_NAME);
+		break;
+	case SYSCTL_VERSION:
+		len = (size_t)snprintf(tmp, sizeof(tmp), "#1 SMP %s %s\n", OS_NAME, OS_PREFIX);
+		break;
+	case SYSCTL_PID_MAX:
+		len = (size_t)snprintf(tmp, sizeof(tmp), "%d\n", PROC_PID_MAX);
+		break;
+	case SYSCTL_FILE_MAX:
+		len = (size_t)snprintf(tmp, sizeof(tmp), "%d\n", PROCESS_MAX_FD);
+		break;
+	default:
+		return -1;
+	}
+	if (len > sizeof(tmp)) len = sizeof(tmp);
+	if (len > size) len = size;
+	memcpy(buf, tmp, len);
+	return (ssize_t)len;
 }
 
 static ssize_t procfs_write(struct fs_file *file, const void *buf, size_t size, size_t offset) {
 	if (!file || !file->driver_private || !buf) return -1;
 	struct procfs_handle *h = (struct procfs_handle*)file->driver_private;
 	if (!h) return -1;
-	if (h->kind == 9 && h->file_id == 20) {
-		/* permission: only root */
+	if (h->kind == 9 && (h->file_id == SYSCTL_HOSTNAME || h->file_id == SYSCTL_DOMAINNAME)) {
 		thread_t *ct = thread_current();
 		if (!ct || ct->euid != 0) return -1;
-		/* accept whole buffer (ignore offset semantics for simplicity) */
-		return procfs_store_hostname((const char*)buf, size, NULL);
+		(void)offset;
+		if (h->file_id == SYSCTL_HOSTNAME) {
+			if (uts_hostname_set((const char *)buf, size) != 0) return -1;
+		} else {
+			if (uts_domainname_set((const char *)buf, size) != 0) return -1;
+		}
+		return (ssize_t)size;
 	}
 	if (h->kind == 7 && h->file_id == 60) {
 		thread_t *ct = thread_current();
@@ -1035,30 +1081,50 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				*out_file = f;
 				return 0;
 			} else {
-				/* parse second component */
 				const char *q = slash + 1;
 				const char *slash2 = strchr(q, '/');
 				size_t qlen = slash2 ? (size_t)(slash2 - q) : strlen(q);
 				if (qlen == 0) { kfree(h); kfree(pp); kfree(f); return -1; }
-				/* only 'kernel' namespace supported */
 				if (qlen == 6 && strncmp(q, "kernel", 6) == 0) {
 					if (!slash2) {
-						/* /proc/sys/kernel */
 						h->kind = 8; h->file_id = 1; f->type = FS_TYPE_DIR; f->size = 0;
 						f->driver_private = h;
 						*out_file = f;
 						return 0;
-					} else {
-						/* /proc/sys/kernel/<name> */
-						const char *name = slash2 + 1;
-						if (strcmp(name, "hostname") == 0) {
-							h->kind = 9; h->file_id = 20; f->type = FS_TYPE_REG;
-							/* size = strlen + newline */
-							f->size = strlen(proc_hostname) + 1;
-							f->driver_private = h;
-							*out_file = f;
-							return 0;
-						}
+					}
+					const char *name = slash2 + 1;
+					int fid = -1;
+					if (strcmp(name, "hostname") == 0) fid = SYSCTL_HOSTNAME;
+					else if (strcmp(name, "domainname") == 0) fid = SYSCTL_DOMAINNAME;
+					else if (strcmp(name, "ostype") == 0) fid = SYSCTL_OSTYPE;
+					else if (strcmp(name, "osrelease") == 0) fid = SYSCTL_OSRELEASE;
+					else if (strcmp(name, "version") == 0) fid = SYSCTL_VERSION;
+					else if (strcmp(name, "pid_max") == 0) fid = SYSCTL_PID_MAX;
+					if (fid >= 0) {
+						char tmp[128];
+						ssize_t sl = procfs_sysctl_show(fid, tmp, sizeof(tmp));
+						h->kind = 9; h->file_id = fid; f->type = FS_TYPE_REG;
+						f->size = (sl > 0) ? (size_t)sl : 0;
+						f->driver_private = h;
+						*out_file = f;
+						return 0;
+					}
+				} else if (qlen == 2 && strncmp(q, "fs", 2) == 0) {
+					if (!slash2) {
+						h->kind = 8; h->file_id = 2; f->type = FS_TYPE_DIR; f->size = 0;
+						f->driver_private = h;
+						*out_file = f;
+						return 0;
+					}
+					const char *name = slash2 + 1;
+					if (strcmp(name, "file-max") == 0) {
+						char tmp[64];
+						ssize_t sl = procfs_sysctl_show(SYSCTL_FILE_MAX, tmp, sizeof(tmp));
+						h->kind = 9; h->file_id = SYSCTL_FILE_MAX; f->type = FS_TYPE_REG;
+						f->size = (sl > 0) ? (size_t)sl : 0;
+						f->driver_private = h;
+						*out_file = f;
+						return 0;
 					}
 				}
 				kfree(h); kfree(pp); kfree(f); return -1;
@@ -1552,30 +1618,47 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 
 	/* /proc/sys directory listing */
 	if (h->kind == 8) {
-        const char *names_root[] = { "kernel" };
-        const char *names_kernel[] = { "hostname" };
-        const char *const *names = (h->file_id == 1) ? names_kernel : names_root;
-        int ncount = 1;
+		const char *names_root[] = { "kernel", "fs" };
+		const char *names_kernel[] = {
+			"hostname", "domainname", "ostype", "osrelease", "version", "pid_max"
+		};
+		const char *names_fs[] = { "file-max" };
+		const char *const *names;
+		int ncount;
+		int is_file_dir;
+		if (h->file_id == 1) {
+			names = names_kernel;
+			ncount = (int)(sizeof(names_kernel) / sizeof(names_kernel[0]));
+			is_file_dir = 1;
+		} else if (h->file_id == 2) {
+			names = names_fs;
+			ncount = (int)(sizeof(names_fs) / sizeof(names_fs[0]));
+			is_file_dir = 1;
+		} else {
+			names = names_root;
+			ncount = (int)(sizeof(names_root) / sizeof(names_root[0]));
+			is_file_dir = 0;
+		}
 		size_t pos = 0;
 		size_t written = 0;
 		uint8_t *out = (uint8_t*)buf;
 		for (int idx = 0; idx < ncount; idx++) {
 			size_t namelen = strlen(names[idx]);
-            size_t rec_len = 8 + namelen;
-            rec_len = (rec_len + 3) & ~3u;
-            if (pos + rec_len <= offset) { pos += rec_len; continue; }
+			size_t rec_len = 8 + namelen;
+			rec_len = (rec_len + 3) & ~3u;
+			if (pos + rec_len <= offset) { pos += rec_len; continue; }
 			if (written >= size) break;
 			size_t entry_off = 0;
 			if ((size_t)offset > pos) entry_off = (size_t)offset - pos;
 			uint8_t tmp[256];
-            struct ext2_dir_entry de;
-            de.inode = (uint32_t)(2000 + idx);
-            de.rec_len = (uint16_t)rec_len;
-            de.name_len = (uint8_t)namelen;
-            de.file_type = (h->file_id == 1) ? EXT2_FT_REG_FILE : EXT2_FT_DIR;
-            for (size_t zi = 0; zi < sizeof(tmp); zi++) tmp[zi] = 0;
-            memcpy(tmp, &de, 8);
-            memcpy(tmp + 8, names[idx], namelen);
+			struct ext2_dir_entry de;
+			de.inode = (uint32_t)(2000 + idx);
+			de.rec_len = (uint16_t)rec_len;
+			de.name_len = (uint8_t)namelen;
+			de.file_type = is_file_dir ? EXT2_FT_REG_FILE : EXT2_FT_DIR;
+			for (size_t zi = 0; zi < sizeof(tmp); zi++) tmp[zi] = 0;
+			memcpy(tmp, &de, 8);
+			memcpy(tmp + 8, names[idx], namelen);
 			size_t avail = size - written;
 			size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
 			if (tocopy > avail) tocopy = avail;
@@ -1920,25 +2003,17 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         return (ssize_t)to_copy;
 	}
 
-	/* proc/sys files (hostname etc) */
+	/* /proc/sys/* files */
 	if (h->kind == 9) {
-		/* only hostname supported (file_id == 20) */
-		if (h->file_id == 20) {
-			size_t tcap = 256;
-			if (tcap < size + offset) tcap = size + offset;
-			char *tmpbuf = (char*)kmalloc(tcap);
-			if (!tmpbuf) return -1;
-			ssize_t full = procfs_show_hostname(tmpbuf, tcap, NULL);
-			if (full < 0) { kfree(tmpbuf); return -1; }
-			size_t len = (size_t)full;
-			if ((size_t)offset >= len) { kfree(tmpbuf); return 0; }
-			size_t tocopy = len - (size_t)offset;
-			if (tocopy > size) tocopy = size;
-			memcpy(buf, tmpbuf + offset, tocopy);
-			kfree(tmpbuf);
-			return (ssize_t)tocopy;
-		}
-		return -1;
+		char tmpbuf[256];
+		ssize_t full = procfs_sysctl_show(h->file_id, tmpbuf, sizeof(tmpbuf));
+		if (full < 0) return -1;
+		size_t len = (size_t)full;
+		if ((size_t)offset >= len) return 0;
+		size_t tocopy = len - (size_t)offset;
+		if (tocopy > size) tocopy = size;
+		memcpy(buf, tmpbuf + offset, tocopy);
+		return (ssize_t)tocopy;
 	}
 
     return -1;
@@ -1976,6 +2051,12 @@ int procfs_fill_stat(struct fs_file *file, struct stat *st) {
         /* fd links are symlinks */
         st->st_ino = 0;
         st->st_mode = S_IFLNK | 0777;
+        st->st_nlink = 1;
+        st->st_size = (off_t)file->size;
+    } else if (h->kind == 9) {
+        int rw = (h->file_id == SYSCTL_HOSTNAME || h->file_id == SYSCTL_DOMAINNAME);
+        st->st_ino = 0;
+        st->st_mode = S_IFREG | (rw ? 0644 : 0444);
         st->st_nlink = 1;
         st->st_size = (off_t)file->size;
     } else {

@@ -563,7 +563,7 @@ struct devfs_block {
     uint32_t sectors;
     spinlock_t io_lock; /* сериализация read/write для стабильности */
 };
-static struct devfs_block dev_blocks[16];
+static struct devfs_block dev_blocks[64];
 static int dev_block_count = 0;
 /* character device nodes (e.g., /dev/fb0) */
 struct devfs_char {
@@ -957,6 +957,10 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                     return (ssize_t)size;
                 case 9: /* /dev/ptmx — node present; real Unix98 pty not wired yet */
                     return -1;
+                case 10: { /* /dev/kmsg — printk ring (byte offset) */
+                    long n = klog_ring_read((char *)buf, size, offset);
+                    return (ssize_t)n;
+                }
                 default: break;
             }
         }
@@ -2026,6 +2030,36 @@ int devfs_fill_stat(struct fs_file *file, struct stat *st) {
         st->st_uid = 0;
         st->st_gid = 0;
         st->st_size = (off_t)file->size;
+        /* Linux majors: 8=sd, 11=sr, 259=nvme (simplified). */
+        {
+            const char *nm = strrchr(p, '/');
+            nm = nm ? nm + 1 : p;
+            unsigned major = 0, minor = 0;
+            if (nm[0] == 's' && nm[1] == 'd' && nm[2] >= 'a' && nm[2] <= 'z') {
+                int disk = nm[2] - 'a';
+                int part = 0;
+                if (nm[3] >= '1' && nm[3] <= '9')
+                    part = nm[3] - '0';
+                major = DISK_MAJOR_SD;
+                minor = (unsigned)(disk * 16 + part);
+            } else if ((nm[0] == 's' && nm[1] == 'r' && nm[2] >= '0' && nm[2] <= '9') ||
+                       strcmp(nm, "cdrom") == 0) {
+                major = DISK_MAJOR_SR;
+                if (strcmp(nm, "cdrom") == 0)
+                    minor = 0;
+                else {
+                    for (int k = 2; nm[k] >= '0' && nm[k] <= '9'; k++)
+                        minor = minor * 10u + (unsigned)(nm[k] - '0');
+                }
+            } else if (strncmp(nm, "nvme", 4) == 0) {
+                major = 259;
+                minor = (unsigned)did;
+            } else {
+                major = DISK_MAJOR_SD;
+                minor = (unsigned)did * 16u;
+            }
+            st->st_rdev = MKDEV(major, minor);
+        }
         return 0;
     }
 

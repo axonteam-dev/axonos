@@ -2408,15 +2408,9 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
             user_as_set_brk_after_load(cur_user, loaded_brk_end,
                 loaded_image_hi > 0 ? (uintptr_t)loaded_image_hi : 0);
         }
-        /* Linux execve: cwd stays; OpenRC helpers assume "/". Force root so
-         * relative etc/ paths and gendepends discovery cannot depend on a
-         * leftover posix_spawn/workdir. */
-        strncpy(cur_user->cwd, "/", sizeof(cur_user->cwd));
-        cur_user->cwd[sizeof(cur_user->cwd) - 1] = '\0';
-        if (cur_user->process) {
-            strncpy(cur_user->process->cwd, "/", sizeof(cur_user->process->cwd));
-            cur_user->process->cwd[sizeof(cur_user->process->cwd) - 1] = '\0';
-        }
+        /* Linux execve: preserve cwd. Forcing "/" here broke `cd /mnt/c; ls`
+         * — BusyBox /bin/ls fork+exec'd with cwd reset to root, so `ls .`
+         * listed `/` while absolute `ls /mnt/c` still hit the mount. */
     } else {
         /* Spawn a scheduled user thread and block caller until it exits.
            Create it only now (late), so earlier execve failures do not consume thread slots. */

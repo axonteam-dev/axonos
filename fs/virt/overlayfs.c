@@ -13,7 +13,21 @@
 #include <ramfs.h>
 #include <squashfs.h>
 #include <overlayfs.h>
+#include <xattr.h>
 #include <klog.h>
+
+#ifndef ENOENT
+#define ENOENT 2
+#endif
+#ifndef EOPNOTSUPP
+#define EOPNOTSUPP 95
+#endif
+#ifndef ENODATA
+#define ENODATA 61
+#endif
+#ifndef EINVAL
+#define EINVAL 22
+#endif
 
 enum {
     OV_LAYER_UPPER = 1,
@@ -78,6 +92,24 @@ static int ov_is_upper_file(struct fs_file *inner)
     return u && inner && inner->fs_private == u->driver_data;
 }
 
+/* True if path is a directory on squashfs lower (merged view without upper). */
+static int ov_lower_is_dir(const char *path)
+{
+    struct fs_file *lo = NULL;
+    struct stat st;
+    if (!path || squashfs_open_path(path, &lo) != 0)
+        return 0;
+    int ok = (squashfs_fill_stat(lo, &st) == 0) &&
+             ((st.st_mode & S_IFDIR) == S_IFDIR);
+    ov_release_inner(lo);
+    return ok;
+}
+
+/*
+ * Ensure every parent of `path` exists as a directory in the ramfs upper.
+ * Squashfs-only dirs (e.g. /mnt from the image) are materialized into upper so
+ * mkdir /mnt/c works — Linux overlay copy-up of the parent directory.
+ */
 static int ov_ensure_parent_upper(const char *path)
 {
     char tmp[512];
@@ -95,24 +127,36 @@ static int ov_ensure_parent_upper(const char *path)
     if (!slash)
         return -1;
     if (slash == tmp)
-        return 0;
+        return 0; /* parent is "/" */
     *slash = '\0';
+
     if (ov_upper_open(tmp, &chk) == 0) {
         int ok = (chk->type == FS_TYPE_DIR);
         ov_release_inner(chk);
         return ok ? 0 : -1;
     }
+
+    /* Recurse first so /a/b materializes /a before /a/b. */
     if (ov_ensure_parent_upper(tmp) != 0)
         return -1;
-    if (ramfs_mkdir(tmp) != 0) {
-        if (ov_upper_open(tmp, &chk) != 0)
-            return -1;
+
+    /* Materialize lower-only directory into upper (no whiteout). */
+    if (ramfs_path_is_whiteout(tmp))
+        return -1;
+    if (ramfs_mkdir(tmp) == 0)
+        return 0;
+    /* EEXIST / race: confirm upper dir now. */
+    if (ov_upper_open(tmp, &chk) == 0) {
         int ok = (chk->type == FS_TYPE_DIR);
         ov_release_inner(chk);
-        if (!ok)
-            return -1;
+        if (ok)
+            return 0;
+        return -1;
     }
-    return 0;
+    /* Parent missing on upper but present on lower — create empty upper dir. */
+    if (ov_lower_is_dir(tmp) && ramfs_mkdir(tmp) == 0)
+        return 0;
+    return -1;
 }
 
 /*
@@ -544,11 +588,34 @@ static int overlay_create(const char *path, struct fs_file **out_file)
 
 static int overlay_mkdir(const char *path)
 {
+    int r;
     if (!overlay_active || !path)
         return -1;
+    if (ramfs_path_is_whiteout(path)) {
+        if (ramfs_remove(path) != 0)
+            return -1;
+    }
+    /* Already a directory in the merged view → EEXIST (Linux). */
+    {
+        struct fs_file *chk = NULL;
+        if (ov_upper_open(path, &chk) == 0) {
+            int is_dir = (chk->type == FS_TYPE_DIR);
+            ov_release_inner(chk);
+            return is_dir ? -4 : -3; /* EEXIST / ENOTDIR */
+        }
+        if (ov_lower_is_dir(path))
+            return -4;
+    }
     if (ov_ensure_parent_upper(path) != 0)
-        return -1;
-    return ramfs_mkdir(path);
+        return -2; /* ENOENT — parent missing in merged view */
+    r = ramfs_mkdir(path);
+    if (r == -4)
+        return -4; /* EEXIST */
+    if (r == -2)
+        return -2;
+    if (r == -3)
+        return -3;
+    return r;
 }
 
 static ssize_t overlay_read(struct fs_file *file, void *buf, size_t size, size_t offset)
@@ -696,6 +763,93 @@ static int overlay_unlink(const char *path)
         return ramfs_make_whiteout(path);
     }
     return -1;
+}
+
+/*
+ * Linux overlay: xattrs live on the layer that owns the inode.
+ * Lower (squashfs) has no xattr reader yet → -EOPNOTSUPP.
+ * set/remove always copy-up then operate on upper (ramfs).
+ */
+ssize_t overlayfs_getxattr(const char *path, const char *name, void *value, size_t size)
+{
+    struct fs_file *up = NULL;
+    struct fs_file *lo = NULL;
+    if (!overlay_active || !path || !name)
+        return -EINVAL;
+    if (ramfs_path_is_whiteout(path))
+        return -ENOENT;
+    if (ov_upper_open(path, &up) == 0) {
+        ov_release_inner(up);
+        return ramfs_getxattr(path, name, value, size);
+    }
+    if (squashfs_open_path(path, &lo) == 0) {
+        ov_release_inner(lo);
+        /* SquashFS may store xattrs on disk; we do not decode them yet. */
+        return -EOPNOTSUPP;
+    }
+    return -ENOENT;
+}
+
+ssize_t overlayfs_listxattr(const char *path, char *list, size_t size)
+{
+    struct fs_file *up = NULL;
+    struct fs_file *lo = NULL;
+    if (!overlay_active || !path)
+        return -EINVAL;
+    if (ramfs_path_is_whiteout(path))
+        return -ENOENT;
+    if (ov_upper_open(path, &up) == 0) {
+        ov_release_inner(up);
+        return ramfs_listxattr(path, list, size);
+    }
+    if (squashfs_open_path(path, &lo) == 0) {
+        ov_release_inner(lo);
+        return -EOPNOTSUPP;
+    }
+    return -ENOENT;
+}
+
+int overlayfs_setxattr(const char *path, const char *name, const void *value, size_t size, int flags)
+{
+    struct fs_file *up = NULL;
+    struct fs_file *lo = NULL;
+    if (!overlay_active || !path || !name)
+        return -EINVAL;
+    if (ramfs_path_is_whiteout(path))
+        return -ENOENT;
+    if (ov_upper_open(path, &up) == 0) {
+        ov_release_inner(up);
+        return ramfs_setxattr(path, name, value, size, flags);
+    }
+    if (squashfs_open_path(path, &lo) != 0)
+        return -ENOENT;
+    ov_release_inner(lo);
+    /* Linux: copy-up the inode, then set xattr on upper. */
+    if (ov_copy_up(path) != 0)
+        return -ENOENT;
+    return ramfs_setxattr(path, name, value, size, flags);
+}
+
+int overlayfs_removexattr(const char *path, const char *name)
+{
+    struct fs_file *up = NULL;
+    if (!overlay_active || !path || !name)
+        return -EINVAL;
+    if (ramfs_path_is_whiteout(path))
+        return -ENOENT;
+    if (ov_upper_open(path, &up) == 0) {
+        ov_release_inner(up);
+        return ramfs_removexattr(path, name);
+    }
+    /* Attr only on lower → unsupported until squashfs xattrs are decoded. */
+    {
+        struct fs_file *lo = NULL;
+        if (squashfs_open_path(path, &lo) == 0) {
+            ov_release_inner(lo);
+            return -EOPNOTSUPP;
+        }
+    }
+    return -ENOENT;
 }
 
 int overlayfs_fill_stat(struct fs_file *file, struct stat *st)

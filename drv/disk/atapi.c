@@ -7,7 +7,6 @@
 #include <keyboard.h>
 #include <heap.h>
 #include <vga.h>
-#include <scsi.h>
 #include <klog.h>
 
 #define ATA_REG_DATA(base)      (base + 0)
@@ -327,24 +326,19 @@ static int atapi_register_device(uint16_t io_base, uint16_t ctrl_base, int is_sl
 	strncpy(dev->model, model, sizeof(dev->model) - 1);
 	dev->model[sizeof(dev->model) - 1] = '\0';
 
-	char path[32];
-	snprintf(path, sizeof(path), "/dev/hd%d", id);
-	devfs_create_block_node(path, id, sectors);
-	if (id >= 0 && id < 26) {
-		char letter = (char)('a' + id);
-		snprintf(path, sizeof(path), "/dev/sd%c", letter);
-		devfs_create_block_node(path, id, sectors);
+	/*
+	 * Linux: ATAPI/optical → /dev/srN (+ /dev/cdrom), never /dev/sd* or /dev/hd*.
+	 * Naming CD as sd* made isohybrid type 0xCD show up as sda1 in fdisk.
+	 */
+	if (disk_publish_sr(id, sectors) < 0) {
+		klogprintf("atapi: failed to publish /dev/sr* for disk_id=%d\n", id);
+		return -1;
 	}
-
-	snprintf(path, sizeof(path), "/dev/sr%d", g_atapi_cd_count);
-	devfs_create_block_node(path, id, sectors);
-	if (g_atapi_cd_count == 0) devfs_create_block_node("/dev/cdrom", id, sectors);
 	g_atapi_cd_count++;
 
 	uint32_t size_mb = sectors / 2048u;
-	klogprintf("ATAPI: Found packet device: \"%s\" size: %u mb block=%u bytes blocks=%u\n",
-	           dev->model, size_mb, block_size, block_count);
-	(void)scsi_register_disk_as_lun(id, sectors, "ATAPI  ", dev->model, "1.0 ");
+	klogprintf("ATAPI: optical \"%s\" size: %u mb block=%u bytes blocks=%u → /dev/sr%d\n",
+	           dev->model, size_mb, block_size, block_count, disk_sr_index(id));
 	return 0;
 }
 

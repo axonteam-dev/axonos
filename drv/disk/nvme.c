@@ -446,19 +446,10 @@ static int nvme_register_namespace(nvme_dev_t *dev, int ctrl_index) {
 	char path[32];
 	snprintf(path, sizeof(path), "/dev/nvme%dn%u", ctrl_index, (unsigned)dev->nsid);
 	(void)devfs_create_block_node(path, id, g_nvme[id].sectors);
+	/* Linux: NVMe is /dev/nvmeXnY only — do not alias as sd*. */
 
-	if (id >= 0 && id < 26) {
-		char sd[16];
-		snprintf(sd, sizeof(sd), "/dev/sd%c", (char)('a' + id));
-		(void)devfs_create_block_node(sd, id, g_nvme[id].sectors);
-	}
-
-	(void)scsi_register_disk_as_lun(id, g_nvme[id].sectors, "NVME   ",
-	                                g_nvme[id].model[0] ? g_nvme[id].model : "NVMe Disk",
-	                                "1.0 ");
-
-	klogprintf("nvme: registered /dev/%s sectors=%u model=\"%s\"\n",
-	           namebuf, g_nvme[id].sectors,
+	klogprintf("nvme: registered %s sectors=%u model=\"%s\"\n",
+	           path, g_nvme[id].sectors,
 	           g_nvme[id].model[0] ? g_nvme[id].model : "unknown");
 	return 0;
 }

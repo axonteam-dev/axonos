@@ -42,6 +42,8 @@ static uint64_t cursor_blink_last_phase = 0;
 
 static int g_vbe_dirty = 0;
 static uint32_t g_vbe_dx0 = 0, g_vbe_dy0 = 0, g_vbe_dx1 = 0, g_vbe_dy1 = 0;
+/* Nestable tty write batch: defer per-glyph vbe_flush_region (VMware SVGA cost). */
+static int g_vbe_batch = 0;
 
 void draw_cursor(void);
 void erase_cursor(void);
@@ -67,14 +69,27 @@ static void vbe_dirty_mark(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 }
 
 static void vbefb_flush_dirty(void) {
-	if (!g_vbe_dirty || !vbe_get_backbuffer()) {
-		g_vbe_dirty = 0;
+	if (!g_vbe_dirty)
 		return;
-	}
+	if (g_vbe_batch > 0)
+		return; /* accumulate until vbefb_end_batch */
 	uint32_t w = g_vbe_dx1 - g_vbe_dx0 + 1;
 	uint32_t h = g_vbe_dy1 - g_vbe_dy0 + 1;
+	/* Frontbuffer paint + SVGA damage notify (backbuffer path same). */
 	vbe_flush_region(g_vbe_dx0, g_vbe_dy0, w, h);
 	g_vbe_dirty = 0;
+}
+
+void vbefb_begin_batch(void) {
+	g_vbe_batch++;
+}
+
+void vbefb_end_batch(void) {
+	if (g_vbe_batch <= 0)
+		return;
+	g_vbe_batch--;
+	if (g_vbe_batch == 0)
+		vbefb_flush_dirty();
 }
 
 static uint32_t vga_palette[16] = {
@@ -132,9 +147,8 @@ void vbefb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	textbuf[y * cols + x].ch = ch;
 	textbuf[y * cols + x].attr = attr;
 	draw_cell_to_framebuffer(x, y);
+	/* One flush per tty write() via vbefb_begin/end_batch — not per glyph. */
 	vbefb_flush_dirty();
-	if (!vbe_get_backbuffer())
-		vbe_flush_region(x * font_w, y * font_h, font_w, font_h);
 }
 
 static void vbefb_erase_cells(uint32_t x0, uint32_t x1, uint32_t y) {

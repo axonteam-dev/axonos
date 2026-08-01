@@ -46,6 +46,11 @@ int user_vma_allows_write(thread_t *runner, uintptr_t va);
 /* True if tid has any VMA covering va (ELF/mmap). Used by fork to not skip
  * identity-mapped image pages that lack Soft_OWNED. */
 int user_vma_covers_page(uint64_t tid, uintptr_t va);
+/*
+ * True if va is in a file-backed MMAP_LAZY / ELF_LOAD VMA.  Fork must not
+ * memcpy identity phys there — those bytes are not the file image.
+ */
+int user_vma_is_lazy_file_page(uint64_t tid, uintptr_t va);
 
 int user_vma_add(uint64_t tid, uintptr_t addr, size_t len, int prot, int kind);
 int user_vma_add_mm(mm_t *mm, uintptr_t addr, size_t len, int prot, int kind);

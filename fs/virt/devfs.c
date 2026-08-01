@@ -21,6 +21,7 @@
 #include <cirrusfb.h>
 #include <mouse.h>
 #include <klog.h>
+#include <pty.h>
 
 #define DEVFS_TTY_COUNT 6
 
@@ -598,7 +599,8 @@ static const int devfs_subdir_count =
 enum {
     DEVFS_DIR_ROOT = 1,
     DEVFS_DIR_INPUT = 2,
-    DEVFS_DIR_EMPTY = 3, /* pts / shm / fd / net stubs: only . and .. */
+    DEVFS_DIR_EMPTY = 3, /* shm / fd / net stubs: only . and .. */
+    DEVFS_DIR_PTS = 4,   /* /dev/pts — allocated slave names */
 };
 typedef struct {
     int is_dir;
@@ -721,8 +723,12 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
             devfs_dir_t *h = kmalloc(sizeof(*h));
             if (!h) { kfree((void*)f->path); kfree(f); return -1; }
             h->is_dir = 1;
-            h->kind = (strcmp(devfs_subdir_names[di], "input") == 0)
-                ? DEVFS_DIR_INPUT : DEVFS_DIR_EMPTY;
+            if (strcmp(devfs_subdir_names[di], "input") == 0)
+                h->kind = DEVFS_DIR_INPUT;
+            else if (strcmp(devfs_subdir_names[di], "pts") == 0)
+                h->kind = DEVFS_DIR_PTS;
+            else
+                h->kind = DEVFS_DIR_EMPTY;
             h->dir_count = (h->kind == DEVFS_DIR_INPUT) ? 1 : 0;
             f->driver_private = (void*)h;
             f->type = FS_TYPE_DIR;
@@ -826,9 +832,23 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
             f->type = FS_TYPE_REG;
             f->size = 0;
             f->refcount = 1;
+            /* /dev/ptmx — real Unix98 master (si==9). */
+            if (si == 9) {
+                kfree(f->driver_private);
+                kfree((void *)f->path);
+                kfree(f);
+                return pty_open_ptmx(out_file);
+            }
             *out_file = f;
             return 0;
         }
+    }
+    /* /dev/pts/N — Unix98 slave */
+    if (strncmp(path, "/dev/pts/", 9) == 0 && path[9] >= '0' && path[9] <= '9') {
+        int n = 0;
+        for (const char *p = path + 9; *p >= '0' && *p <= '9'; p++)
+            n = n * 10 + (*p - '0');
+        return pty_open_slave(n, out_file);
     }
     int tty = devfs_path_to_tty(path);
     if (tty < 0) return -1;
@@ -845,6 +865,10 @@ struct fs_file *devfs_open_direct(const char *path) {
 }
 
 static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t offset) {
+    if (pty_is_file(file)) {
+        (void)offset;
+        return pty_read(file, buf, size);
+    }
     if (!file || !buf) return -1;
     if (file->path && strcmp(file->path, "/dev/input/mice") == 0) {
         (void)offset;
@@ -955,8 +979,6 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 case 8: /* /dev/full reads identically to /dev/zero */
                     memset(buf, 0, size);
                     return (ssize_t)size;
-                case 9: /* /dev/ptmx — node present; real Unix98 pty not wired yet */
-                    return -1;
                 case 10: { /* /dev/kmsg — printk ring (byte offset) */
                     long n = klog_ring_read((char *)buf, size, offset);
                     return (ssize_t)n;
@@ -1043,13 +1065,18 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             return (ssize_t)written;
         }
 
-        if (dh->kind == DEVFS_DIR_EMPTY) {
+        if (dh->kind == DEVFS_DIR_EMPTY || dh->kind == DEVFS_DIR_PTS) {
             uint8_t *out = (uint8_t*)buf;
             size_t pos = 0;
             size_t written = 0;
-            static const char *const names[] = { ".", ".." };
-            for (int i = 0; i < 2; i++) {
-                const char *nm = names[i];
+            char slave_names[PTY_MAX][16];
+            int nslaves = 0;
+            int total;
+            if (dh->kind == DEVFS_DIR_PTS)
+                nslaves = pty_list_slaves(slave_names, PTY_MAX);
+            total = 2 + nslaves;
+            for (int i = 0; i < total; i++) {
+                const char *nm = (i == 0) ? "." : (i == 1) ? ".." : slave_names[i - 2];
                 size_t namelen = strlen(nm);
                 size_t rec_len = 8 + namelen;
                 rec_len = (rec_len + 3) & ~3u;
@@ -1063,7 +1090,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 de.inode = (uint32_t)(200 + i);
                 de.rec_len = (uint16_t)rec_len;
                 de.name_len = (uint8_t)namelen;
-                de.file_type = EXT2_FT_DIR;
+                de.file_type = (i < 2) ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
                 memcpy(tmp, &de, 8);
                 memcpy(tmp + 8, nm, namelen);
                 size_t entry_off = ((size_t)offset > pos) ? (size_t)offset - pos : 0;
@@ -1254,6 +1281,10 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
 }
 
 static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, size_t offset) {
+    if (pty_is_file(file)) {
+        (void)offset;
+        return pty_write(file, buf, size);
+    }
     if (!file || !buf) return -1;
     if (file->path && strcmp(file->path, "/dev/input/mice") == 0) {
         (void)offset;
@@ -1299,8 +1330,6 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                     }
                     case 8: /* /dev/full: Linux returns ENOSPC for every write */
                         return -28;
-                    case 9: /* /dev/ptmx stub */
-                        return -1;
                     case 10: /* /dev/kmsg — userspace printk inject */
                         klog_user_write((const char *)buf, size);
                         return (ssize_t)size;
@@ -1965,6 +1994,12 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
 
 static void devfs_release(struct fs_file *file) {
     if (!file) return;
+    if (pty_is_file(file)) {
+        pty_release_handle(file);
+        if (file->path) kfree((void *)file->path);
+        kfree(file);
+        return;
+    }
     // free driver_private if it was allocated for special device markers
     if (file->driver_private) {
         uintptr_t dp = (uintptr_t)file->driver_private;
@@ -2007,6 +2042,8 @@ int devfs_block_get(int index, char *out_name, size_t out_cap, int *out_device_i
 
 int devfs_fill_stat(struct fs_file *file, struct stat *st) {
     if (!file || !st) return -1;
+    if (pty_is_file(file))
+        return pty_fill_stat(file, st);
     memset(st, 0, sizeof(*st));
 
     const char *p = file->path ? file->path : "";
@@ -2651,6 +2688,7 @@ int devfs_tty_attach_thread(struct fs_file *file, thread_t *th) {
 
 int devfs_is_tty_file(struct fs_file *file) {
     if (!file) return 0;
+    if (pty_is_file(file)) return 1;
     /* Fast path by path name: treat console/stdin/stdout/stderr/tty as tty-like. */
     if (file->path) {
         if (strcmp(file->path, "/dev/console") == 0) return 1;

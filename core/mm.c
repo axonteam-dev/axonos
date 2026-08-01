@@ -1642,6 +1642,40 @@ static int mm_cow_mark_user_readonly_child_only_l4(mm_t *child, uint64_t *parent
     return 0;
 }
 
+/*
+ * Brk heap is not a VMA — fork must still duplicate it.
+ * Exec also materializes a TLS/bootstrap window above brk_current without
+ * raising the break; musl malloc then lives there (tmux ~0x801xxx).  Treat
+ * that committed window as part of the brk slab for fork COW.
+ */
+static uint64_t mm_brk_fork_hi(const mm_t *mm) {
+    uint64_t lo, hi, win;
+    if (!mm || !mm->brk_base)
+        return 0;
+    lo = (uint64_t)mm->brk_base;
+    hi = (uint64_t)mm->brk_current;
+    if (hi < lo)
+        hi = lo;
+    /* Match user_as_set_brk_after_load tls_window, with headroom for early malloc. */
+    win = lo + (256ull << 10);
+    if (win > hi)
+        hi = win;
+    if (hi > (uint64_t)MMIO_IDENTITY_LIMIT)
+        hi = (uint64_t)MMIO_IDENTITY_LIMIT;
+    return hi;
+}
+
+static int mm_va_in_brk(const mm_t *mm, uint64_t va) {
+    uint64_t lo, hi;
+    if (!mm || !mm->brk_base)
+        return 0;
+    lo = (uint64_t)mm->brk_base;
+    hi = mm_brk_fork_hi(mm);
+    if (hi <= lo)
+        return 0;
+    return (va >= lo && va < hi) ? 1 : 0;
+}
+
 static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
                                   uint64_t *parent_l4, uint64_t owner_tid,
                                   uint64_t va, uint64_t parent_pa,
@@ -1670,7 +1704,8 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
      * mappings (MAP_SHARED/SysV SHM) shared; duplicate everything else.
      */
     if (!shared) {
-        if ((parent_pa & PG_ADDR_MASK) >= (uint64_t)MMIO_IDENTITY_LIMIT)
+        uint64_t src_pa = parent_pa & PG_ADDR_MASK;
+        if (src_pa >= (uint64_t)MMIO_IDENTITY_LIMIT)
             return -1;
         private_copy = mm_user_frame_alloc(0);
         if (!private_copy) {
@@ -1679,8 +1714,21 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
                     (unsigned long long)parent_pte);
             return -1;
         }
-        memcpy(private_copy, (void *)(uintptr_t)(parent_pa & PG_ADDR_MASK),
-               (size_t)PAGE_SIZE_4K);
+        /*
+         * Identity PA==VA may be a hole / demoted leaf under swapper while the
+         * parent process CR3 still has live heap bytes.  Seed like
+         * mm_privatize_identity_range: copy under the parent L4.
+         */
+        if (src_pa == (va & ~0xFFFULL) && parent_l4) {
+            uint64_t parent_cr3 = (parent && parent->cr3) ? parent->cr3
+                : ((uint64_t)(uintptr_t)parent_l4);
+            uint64_t saved = paging_read_cr3();
+            paging_write_cr3(parent_cr3);
+            memcpy(private_copy, (void *)(uintptr_t)va, (size_t)PAGE_SIZE_4K);
+            paging_write_cr3(saved);
+        } else {
+            memcpy(private_copy, (void *)(uintptr_t)src_pa, (size_t)PAGE_SIZE_4K);
+        }
         child_pa = (uint64_t)(uintptr_t)private_copy;
         flags &= ~(PG_SOFT_COW | PG_SOFT_OWNED);
         /* A Soft_COW parent leaf represents an originally writable private
@@ -1780,7 +1828,20 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                         (user_vma_is_shared_page_mm(parent_for_vma, (uintptr_t)va_l2) ||
                          user_vma_is_shared_page(owner_tid, (uintptr_t)va_l2));
                     int vma_backed = user_vma_covers_page(owner_tid, (uintptr_t)va_l2);
-                    if (leaf2 == va_l2 && !(e2 & PG_SOFT_OWNED) && !shared_2m && !vma_backed)
+                    int brk_2m = parent_for_vma && mm_va_in_brk(parent_for_vma, va_l2);
+                    int lazy_file_2m = user_vma_is_lazy_file_page(owner_tid, (uintptr_t)va_l2);
+                    /*
+                     * File-backed MMAP_LAZY: only Soft_OWNED leaves hold real
+                     * file bytes.  Identity PG_US leftovers (or 2MiB siblings
+                     * after a 4K split) are physical RAM, not libc.so — copying
+                     * them made grub-install's fork children execute junk at
+                     * ~0x808xxxx (add [rsi],al → #PF cr2=0) then the parent
+                     * continued after two SIGSEGVs.
+                     */
+                    if (lazy_file_2m && !(e2 & PG_SOFT_OWNED) && leaf2 == va_l2)
+                        continue;
+                    if (leaf2 == va_l2 && !(e2 & PG_SOFT_OWNED) && !shared_2m &&
+                        !vma_backed && !brk_2m)
                         continue;
                     uint64_t chunk_end = va_l2 + PAGE_SIZE_2M;
                     if (chunk_end > limit)
@@ -1792,7 +1853,14 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                              (user_vma_is_shared_page_mm(parent_for_vma, (uintptr_t)va) ||
                               user_vma_is_shared_page(owner_tid, (uintptr_t)va)));
                         int page_vma = vma_backed || user_vma_covers_page(owner_tid, (uintptr_t)va);
-                        if (pa == (va & ~0xFFFULL) && !(e2 & PG_SOFT_OWNED) && !shared_pg && !page_vma)
+                        int in_brk = parent_for_vma && mm_va_in_brk(parent_for_vma, va);
+                        int lazy_file = lazy_file_2m ||
+                            user_vma_is_lazy_file_page(owner_tid, (uintptr_t)va);
+                        if (lazy_file && !(e2 & PG_SOFT_OWNED) &&
+                            pa == (va & ~0xFFFULL))
+                            continue;
+                        if (pa == (va & ~0xFFFULL) && !(e2 & PG_SOFT_OWNED) &&
+                            !shared_pg && !page_vma && !in_brk)
                             continue;
                         if (mm_fork_copy_user_leaf(child, parent_for_vma,
                                 parent_l4, owner_tid, va, pa, e2,
@@ -1815,13 +1883,19 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                     uint64_t pa = e1 & PG_ADDR_MASK;
                     if (pa >= (uint64_t)MMIO_IDENTITY_LIMIT || !pt_page_pa_ok(e1))
                         continue;
-                    /* Skip bare identity leaves unless MAP_SHARED (nginx shm)
-                     * or a tracked VMA covers the page (ELF_LOAD / mmap). */
+                    /* Skip bare identity leaves unless MAP_SHARED (nginx shm),
+                     * a tracked VMA (ELF_LOAD / mmap), or the brk heap. */
                     int shared_4k = parent_for_vma &&
                         (user_vma_is_shared_page_mm(parent_for_vma, (uintptr_t)va) ||
                          user_vma_is_shared_page(owner_tid, (uintptr_t)va));
                     int page_vma = user_vma_covers_page(owner_tid, (uintptr_t)va);
-                    if (pa == (va & ~0xFFFULL) && !(e1 & PG_SOFT_OWNED) && !shared_4k && !page_vma)
+                    int in_brk = parent_for_vma && mm_va_in_brk(parent_for_vma, va);
+                    int lazy_file = user_vma_is_lazy_file_page(owner_tid, (uintptr_t)va);
+                    if (lazy_file && !(e1 & PG_SOFT_OWNED) &&
+                        pa == (va & ~0xFFFULL))
+                        continue;
+                    if (pa == (va & ~0xFFFULL) && !(e1 & PG_SOFT_OWNED) &&
+                        !shared_4k && !page_vma && !in_brk)
                         continue;
                     if (mm_fork_copy_user_leaf(child, parent_for_vma,
                             parent_l4, owner_tid, va, pa, e1,
@@ -1852,6 +1926,58 @@ int mm_cow_mark_all_user_writable_child_l4(mm_t *child, uint64_t *parent_l4,
     return mm_cow_mark_all_user_writable_walk(child, NULL, parent_l4, owner_tid, 0);
 }
 
+/*
+ * Fail-closed second pass: every present user leaf in the parent's brk range
+ * must exist as Soft_OWNED in the child.  The main walker can still miss a page
+ * if Soft_OWNED was dropped by a 2M split; blank-filling that hole later
+ * destroys musl malloc metadata (tmux server a_crash/hlt @ ~0x801xxx).
+ */
+static int mm_dup_ensure_brk_copied(mm_t *child, mm_t *parent, uint64_t owner_tid)
+{
+	uintptr_t lo, hi;
+	mm_dm_ctx_t dm;
+
+	if (!child || !parent || !parent->pml4)
+		return -1;
+	lo = parent->brk_base;
+	hi = (uintptr_t)mm_brk_fork_hi(parent);
+	if (!lo || hi <= lo)
+		return 0;
+	lo &= ~((uintptr_t)0xFFFULL);
+	hi = (hi + 0xFFFULL) & ~((uintptr_t)0xFFFULL);
+	if (hi > (uintptr_t)MMIO_IDENTITY_LIMIT)
+		hi = (uintptr_t)MMIO_IDENTITY_LIMIT;
+
+	dm = mm_enter_direct_map();
+	for (uintptr_t va = lo; va < hi; va += 0x1000ULL) {
+		uint64_t parent_pte = 0;
+		uint64_t child_pte = 0;
+		uint64_t pa;
+
+		if (mm_va_leaf_entry_direct(parent, (uint64_t)va, &parent_pte) != 0)
+			continue;
+		if ((parent_pte & (PG_PRESENT | PG_US)) != (PG_PRESENT | PG_US))
+			continue;
+		pa = parent_pte & PG_ADDR_MASK;
+		if (pa >= (uint64_t)MMIO_IDENTITY_LIMIT || !pt_page_pa_ok(parent_pte))
+			continue;
+
+		if (mm_va_leaf_entry_direct(child, (uint64_t)va, &child_pte) == 0 &&
+		    (child_pte & (PG_PRESENT | PG_US | PG_SOFT_OWNED)) ==
+			    (PG_PRESENT | PG_US | PG_SOFT_OWNED) &&
+		    (child_pte & PG_ADDR_MASK) != ((uint64_t)va & ~0xFFFULL))
+			continue;
+
+		if (mm_fork_copy_user_leaf(child, parent, parent->pml4, owner_tid,
+					   (uint64_t)va, pa, parent_pte, 0) != 0) {
+			mm_leave_direct_map(dm);
+			return -1;
+		}
+	}
+	mm_leave_direct_map(dm);
+	return 0;
+}
+
 mm_t *mm_dup_user(mm_t *parent, uint64_t owner_tid)
 {
 	mm_t *child;
@@ -1868,6 +1994,9 @@ mm_t *mm_dup_user(mm_t *parent, uint64_t owner_tid)
 
 	if (mm_cow_mark_all_user_writable_walk(child, parent, parent->pml4,
 					       owner_tid, 0))
+		goto fail;
+
+	if (mm_dup_ensure_brk_copied(child, parent, owner_tid))
 		goto fail;
 
 	child->brk_base = parent->brk_base;
@@ -2648,26 +2777,26 @@ static int mm_ensure_soft_owned_writable(mm_t *mm, mm_t *share_cmp_mm,
         return -1;
     }
     /*
-     * Demand-fill (lazy mmap / not-yet-touched malloc arena). Same as
-     * user_vma_fault_nonpresent for private anon — one Soft_OWNED zero page.
-     * Only when a VMA/brk already permits the write (do not invent mappings).
+     * Demand-fill lazy mmap / not-yet-touched anon VMA with a zero page.
+     * Never invent zero pages inside an already-committed brk range: a hole
+     * there means fork/COW missed the parent's heap, and blank-fill corrupts
+     * musl malloc (a_crash → hlt → #GP in tmux: server @ ~0x801xxx).
      */
     {
         thread_t *t = thread_get_current_user();
         if (!t)
             t = thread_current();
-        int allowed = 0;
         if (t && t->mm == mm) {
             uintptr_t brk_base = t->mm->brk_base ? t->mm->brk_base : t->user_brk_base;
             uintptr_t brk_cur = t->mm->brk_current ? t->mm->brk_current
                                                    : t->user_brk_cur;
             if (brk_base && page >= (uint64_t)brk_base && page < (uint64_t)brk_cur)
-                allowed = 1;
-            else if (user_vma_allows_write(t, (uintptr_t)page))
-                allowed = 1;
-        }
-        if (!allowed)
+                return -1;
+            if (!user_vma_allows_write(t, (uintptr_t)page))
+                return -1;
+        } else {
             return -1;
+        }
     }
     if (mm_privatize_identity_range_blank(mm, page, page + 0x1000ULL) != 0)
         return -1;

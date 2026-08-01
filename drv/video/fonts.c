@@ -81,11 +81,15 @@ void font_try_embedded_pf2(void) {
 }
 
 void font_try_load_console_pf2(void) {
+	/*
+	 * Only an explicit console font.  Do NOT load /usr/share/grub/*.pf2:
+	 * grub-install drops ascii.pf2/euro.pf2 with MAXW=16 half-width glyphs;
+	 * using them as fbcon cell metrics leaves a full glyph of empty space
+	 * between every character ("s p a c e d" text) after the initfs grows.
+	 */
 	static const char *const paths[] = {
 		"/etc/fonts/console.pf2",
 		"/lib/fonts/console.pf2",
-		"/usr/share/grub/ascii.pf2",
-		"/usr/share/grub/euro.pf2",
 		NULL
 	};
 	for (int i = 0; paths[i]; i++) {

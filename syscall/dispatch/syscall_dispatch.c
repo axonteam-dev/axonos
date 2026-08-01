@@ -20,6 +20,7 @@
 #include <spinlock.h>
 #include <fat32.h>
 #include <minix.h>
+#include <pty.h>
 #include <disk.h>
 #include <e1000.h>
 #include <usb.h>
@@ -6418,19 +6419,24 @@ static thread_t *find_terminated_child(thread_t *t) {
     return NULL;
 }
 
-/* Returns 1 if path contains . or .. components that need normalization. */
+/* Returns 1 if path contains ., .., or trailing/duplicate slashes. */
 static int path_needs_normalize(const char *p) {
+    size_t n;
     if (!p) return 0;
+    n = strlen(p);
+    /* Linux: "/tmp/" must resolve like "/tmp" (tmux realpath / TMUX_SOCK). */
+    if (n > 1 && p[n - 1] == '/') return 1;
     if (p[0] == '.' && (p[1] == '\0' || p[1] == '/')) return 1;
     if (p[0] == '.' && p[1] == '.' && (p[2] == '\0' || p[2] == '/')) return 1;
     for (; *p; p++) {
+        if (*p == '/' && p[1] == '/') return 1;
         if (*p == '/' && p[1] == '.' && (p[2] == '\0' || p[2] == '/')) return 1;
         if (*p == '/' && p[1] == '.' && p[2] == '.' && (p[3] == '\0' || p[3] == '/')) return 1;
     }
     return 0;
 }
 
-/* Normalize path by resolving . and .. components. Modifies buf in place. */
+/* Normalize path by resolving . and .. and stripping trailing slashes. */
 static void normalize_path(char *buf, size_t cap) {
     if (!buf || cap == 0) return;
     char tmp[512];
@@ -6489,7 +6495,12 @@ static void resolve_kernel_path(thread_t *cur, const char *path,
     if (path[0] == '/') {
         strncpy(out, path, out_cap);
         out[out_cap - 1] = '\0';
+        /* Always collapse trailing slashes (except "/") — Linux path walk. */
         if (path_needs_normalize(out)) normalize_path(out, out_cap);
+        else {
+            size_t ol = strlen(out);
+            while (ol > 1 && out[ol - 1] == '/') out[--ol] = '\0';
+        }
         map_tty_alias_path(out, out_cap);
         return;
     }
@@ -6518,13 +6529,17 @@ static void resolve_kernel_path(thread_t *cur, const char *path,
         }
         return;
     }
-    /* Build full path and normalize (handles ./run, a/./b, a/../b, etc.) */
+    /* Build full path and normalize (handles ./run, a/./b, a/../b, trailing /). */
     if (strcmp(cwd, "/") == 0) {
         snprintf(out, out_cap, "/%s", path);
     } else {
         snprintf(out, out_cap, "%s/%s", cwd, path);
     }
     if (path_needs_normalize(out)) normalize_path(out, out_cap);
+    else {
+        size_t ol = strlen(out);
+        while (ol > 1 && out[ol - 1] == '/') out[--ol] = '\0';
+    }
     map_tty_alias_path(out, out_cap);
 }
 
@@ -6642,6 +6657,10 @@ static int resolve_user_path_at(thread_t *cur, int dirfd, const char *path_u, ch
     }
     out[out_cap - 1] = '\0';
     if (path_needs_normalize(out)) normalize_path(out, out_cap);
+    else {
+        size_t ol = strlen(out);
+        while (ol > 1 && out[ol - 1] == '/') out[--ol] = '\0';
+    }
     return 0;
 }
 
@@ -7096,6 +7115,11 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
     if (fd >= THREAD_MAX_FD) return POLLNVAL_K;
     struct fs_file *f = syscall_fd_get(thr, fd);
     if (!f) return POLLNVAL_K;
+    if (pty_is_file(f)) {
+        if ((events & POLLIN_K) && pty_available(f) > 0) revents |= POLLIN_K;
+        if (events & POLLOUT_K) revents |= POLLOUT_K;
+        return revents;
+    }
     if (devfs_is_tty_file(f)) {
         int tidx = devfs_get_tty_index_from_file(f);
         if (tidx < 0) tidx = devfs_get_active();
@@ -8188,6 +8212,21 @@ static uint64_t do_linux_fork(thread_t *cur,
                  * lifetime and from the parent sleeping until exec/_exit.
                  */
             } else {
+                /*
+                 * Linux: mm->brk is authoritative for copy_process.  Keep
+                 * thread and mm brk in sync before/after dup so musl heap
+                 * pages above the published break (TLS window / early malloc)
+                 * are not skipped as bare identity leaves.
+                 */
+                if (parent_mm && parent_mm != mm_kernel()) {
+                    if (cur->user_brk_base) {
+                        if (!parent_mm->brk_base ||
+                            parent_mm->brk_base > cur->user_brk_base)
+                            parent_mm->brk_base = cur->user_brk_base;
+                    }
+                    if (cur->user_brk_cur > parent_mm->brk_current)
+                        parent_mm->brk_current = cur->user_brk_cur;
+                }
                 if (child->mm)
                     mm_release(child->mm);
                 child->mm = mm_dup_user(parent_mm,
@@ -8203,6 +8242,12 @@ static uint64_t do_linux_fork(thread_t *cur,
                 child->user_fs_base = cur->user_fs_base;
                 child->user_brk_base = cur->user_brk_base;
                 child->user_brk_cur = cur->user_brk_cur;
+                if (child->mm) {
+                    if (child->user_brk_base)
+                        child->mm->brk_base = child->user_brk_base;
+                    if (child->user_brk_cur > child->mm->brk_current)
+                        child->mm->brk_current = child->user_brk_cur;
+                }
                 child->user_mmap_next = cur->user_mmap_next;
                 child->user_mmap_hi = cur->user_mmap_hi;
                 child->user_stack_base = cur->user_stack_base ?
@@ -9936,12 +9981,17 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (path[0] == '\0') return ret_err(EINVAL);
             /* root "/" always exists; rpm may do mkdir -p / and fail with EPERM otherwise */
             if (path[0] == '/' && path[1] == '\0') return 0;
-            int r = fs_mkdir(path);
-            if (r == 0) {
-                (void)fs_chmod(path, (mode & 07777u) | S_IFDIR);
-                return 0;
+            {
+                mode_t um = cur ? (mode_t)(cur->umask & 07777u) : (mode_t)0022;
+                mode_t applied = (mode & ~um) & 07777u;
+                int r = fs_mkdir(path);
+                if (r == 0) {
+                    /* Linux mkdir: mode & ~umask; tmux needs 0700 so (mode&07)==0. */
+                    (void)fs_chmod(path, applied | S_IFDIR);
+                    return 0;
+                }
+                return ret_err(fs_mkdir_errno(r));
             }
-            return ret_err(fs_mkdir_errno(r));
         }
         case 258: { /* mkdirat(dirfd, pathname, mode) */
             int dirfd = (int)a1;
@@ -9953,12 +10003,16 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (rc != 0) return ret_err(-rc);
             if (path[0] == '\0') return ret_err(EINVAL);
             if (path[0] == '/' && path[1] == '\0') return 0;
-            int r = fs_mkdir(path);
-            if (r == 0) {
-                (void)fs_chmod(path, (mode & 07777u) | S_IFDIR);
-                return 0;
+            {
+                mode_t um = cur ? (mode_t)(cur->umask & 07777u) : (mode_t)0022;
+                mode_t applied = (mode & ~um) & 07777u;
+                int r = fs_mkdir(path);
+                if (r == 0) {
+                    (void)fs_chmod(path, applied | S_IFDIR);
+                    return 0;
+                }
+                return ret_err(fs_mkdir_errno(r));
             }
-            return ret_err(fs_mkdir_errno(r));
         }
         case SYS_chmod: {
             /* chmod(path, mode) */
@@ -14924,6 +14978,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 TIOCMGET  = 0x5415,
                 TIOCMBIS  = 0x5416,
                 TIOCMBIC  = 0x5417,
+                TIOCGPTN  = 0x80045430, /* ptsname: get slave index */
+                TIOCSPTLCK= 0x40045431, /* unlockpt / lockpt */
                 /* Linux block ioctls commonly used by mkfs/mount utilities */
                 BLKGETSIZE   = 0x1260,       /* get device size in 512-byte sectors (unsigned long*) */
                 BLKSSZGET    = 0x1268,       /* get logical sector size (int*) */
@@ -14933,6 +14989,139 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 FIONBIO   = 0x5421,
                 FIOASYNC  = 0x5452, /* set/clear O_ASYNC (nginx worker channel) */
             };
+
+            /* Unix98 PTY ioctls — must run before VC tty paths. */
+            if (pty_is_file(f)) {
+                if (req == TIOCGPTN) {
+                    unsigned int n;
+                    if (!pty_is_master(f) || !argp) return ret_err(ENOTTY);
+                    n = (unsigned int)pty_get_index(f);
+                    if (copy_to_user_safe(argp, &n, sizeof(n)) != 0) return ret_err(EFAULT);
+                    return 0;
+                }
+                if (req == TIOCSPTLCK) {
+                    int lock = 0;
+                    if (!pty_is_master(f) || !argp) return ret_err(ENOTTY);
+                    if (copy_from_user_raw(&lock, argp, sizeof(lock)) != 0) return ret_err(EFAULT);
+                    if (pty_set_locked(f, lock != 0) != 0) return ret_err(ENOTTY);
+                    return 0;
+                }
+                if (req == TIOCGWINSZ) {
+                    struct winsize { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; } ws;
+                    uint16_t row = 24, col = 80;
+                    if (!argp) return ret_err(EFAULT);
+                    pty_get_winsize(f, &row, &col);
+                    ws.ws_row = row; ws.ws_col = col; ws.ws_xpixel = 0; ws.ws_ypixel = 0;
+                    if (copy_to_user_safe(argp, &ws, sizeof(ws)) != 0) return ret_err(EFAULT);
+                    return 0;
+                }
+                if (req == TIOCSWINSZ) {
+                    struct winsize { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; } ws;
+                    if (!argp) return ret_err(EFAULT);
+                    if (copy_from_user_raw(&ws, argp, sizeof(ws)) != 0) return ret_err(EFAULT);
+                    pty_set_winsize(f, ws.ws_row, ws.ws_col);
+                    return 0;
+                }
+                if (req == TCGETS) {
+                    struct termios_k {
+                        uint32_t c_iflag, c_oflag, c_cflag, c_lflag;
+                        uint8_t c_line, c_cc[19];
+                        uint32_t c_ispeed, c_ospeed;
+                    } tio;
+                    if (!argp) return ret_err(EFAULT);
+                    memset(&tio, 0, sizeof(tio));
+                    tio.c_iflag = 0x00000100u;
+                    tio.c_oflag = 0x00000001u;
+                    tio.c_cflag = 0x00000CB7u;
+                    tio.c_lflag = pty_get_lflag(f);
+                    {
+                        /* VTIME/VMIN via set path only — defaults ok for isatty */
+                        tio.c_cc[6] = 1;
+                    }
+                    tio.c_ispeed = 9600;
+                    tio.c_ospeed = 9600;
+                    if (copy_to_user_safe(argp, &tio, 32) != 0) return ret_err(EFAULT);
+                    return 0;
+                }
+                if (req == TCSETS || req == TCSETSW || req == TCSETSF) {
+                    struct termios_k {
+                        uint32_t c_iflag, c_oflag, c_cflag, c_lflag;
+                        uint8_t c_line, c_cc[19];
+                    } tio;
+                    if (!argp) return ret_err(EFAULT);
+                    if (copy_from_user_raw(&tio, argp, 24) != 0) return ret_err(EFAULT);
+                    pty_set_termios(f, tio.c_lflag, tio.c_cc[5], tio.c_cc[6]);
+                    if (req == TCSETSF)
+                        pty_flush_input(f);
+                    return 0;
+                }
+                if (req == FIONREAD) {
+                    uint32_t nb;
+                    if (!argp) return ret_err(EFAULT);
+                    nb = (uint32_t)pty_available(f);
+                    if (copy_to_user_safe(argp, &nb, sizeof(nb)) != 0) return ret_err(EFAULT);
+                    return 0;
+                }
+                if (req == TCFLSH) {
+                    int queue = (int)(uintptr_t)argp;
+                    if (queue != 0 && queue != 1 && queue != 2) return ret_err(EINVAL);
+                    if (queue == 0 || queue == 2)
+                        pty_flush_input(f);
+                    return 0;
+                }
+                if (req == TIOCSPGRP) {
+                    uint32_t p = 0;
+                    if (!argp) return ret_err(EFAULT);
+                    if (copy_from_user_raw(&p, argp, sizeof(p)) != 0) return ret_err(EFAULT);
+                    if (p == 0) return ret_err(EINVAL);
+                    if (pty_set_fg_pgrp(f, (int)p) != 0) return ret_err(ENOTTY);
+                    return 0;
+                }
+                if (req == TIOCGPGRP) {
+                    int pgrp = pty_get_fg_pgrp(f);
+                    uint32_t pu;
+                    if (!argp) return ret_err(EFAULT);
+                    if (pgrp < 0) {
+                        pgrp = cur && cur->process ? (int)cur->process->pgid : (cur ? cur->pgid : 0);
+                        if (pgrp > 0)
+                            (void)pty_set_fg_pgrp(f, pgrp);
+                    }
+                    pu = (uint32_t)pgrp;
+                    if (copy_to_user_safe(argp, &pu, sizeof(pu)) != 0) return ret_err(EFAULT);
+                    return 0;
+                }
+                if (req == TIOCSCTTY) {
+                    int sid = cur && cur->process ? cur->process->sid : (cur ? cur->sid : -1);
+                    int pgid = cur && cur->process ? (int)cur->process->pgid : (cur ? cur->pgid : -1);
+                    if (sid > 0)
+                        pty_set_controlling_sid(f, sid);
+                    if (pgid > 0)
+                        (void)pty_set_fg_pgrp(f, pgid);
+                    return 0;
+                }
+                if (req == TIOCNOTTY) {
+                    pty_set_controlling_sid(f, -1);
+                    return 0;
+                }
+                if (req == TIOCGSID) {
+                    int sid = pty_get_controlling_sid(f);
+                    if (!argp) return ret_err(EFAULT);
+                    if (sid < 0)
+                        sid = cur && cur->sid >= 0 ? cur->sid : 0;
+                    if (copy_to_user_safe(argp, &sid, sizeof(sid)) != 0) return ret_err(EFAULT);
+                    return 0;
+                }
+                if (req == TIOCMGET) {
+                    int bits = (int)(0x40u | 0x100u | 0x04u);
+                    if (!argp) return ret_err(EFAULT);
+                    if (copy_to_user_safe(argp, &bits, sizeof(bits)) != 0) return ret_err(EFAULT);
+                    return 0;
+                }
+                if (req == TIOCMBIS || req == TIOCMBIC || req == FIONBIO || req == FIOASYNC)
+                    return 0;
+                /* Font/kbd console ioctls are VC-only. */
+                return ret_err(ENOTTY);
+            }
 
             /* no ioctl tracing in release builds */
 

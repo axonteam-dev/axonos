@@ -127,7 +127,12 @@ int font_load_pf2(const void *data, size_t len) {
 	if (asce == 0)
 		asce = maxh > desc ? (uint16_t)(maxh - desc) : maxh;
 
-	/* First pass: device widths — ascii.pf2 is half-width (dwidth=8) in MAXW=16. */
+	/*
+	 * First pass: device widths for printable ASCII only.
+	 * GRUB ascii.pf2 advertises MAXW=16 but Latin glyphs use dwidth=8;
+	 * taking max(dwidth) over the whole CHIX (or MAXW) made every fbcon
+	 * cell 16px wide while bitmaps stayed ~8px → huge inter-character gaps.
+	 */
 	uint32_t cell_w = 0;
 	if ((chix_len % 9u) != 0)
 		return -1;
@@ -136,6 +141,8 @@ int font_load_pf2(const void *data, size_t len) {
 		const uint8_t *e = chix + i * 9u;
 		uint32_t code = be32(e);
 		uint32_t goff = be32(e + 5);
+		if (code < 0x20u || code > 0x7Eu)
+			continue;
 		if (code >= FONT_GLYPH_CACHE || goff + 10 > len)
 			continue;
 		const uint8_t *g = p + goff;
@@ -144,8 +151,23 @@ int font_load_pf2(const void *data, size_t len) {
 		if (dw > cell_w)
 			cell_w = dw;
 	}
+	if (cell_w == 0) {
+		/* Fallback: any glyph, still capped — never trust MAXW alone. */
+		for (uint32_t i = 0; i < nent; i++) {
+			const uint8_t *e = chix + i * 9u;
+			uint32_t code = be32(e);
+			uint32_t goff = be32(e + 5);
+			if (code >= FONT_GLYPH_CACHE || goff + 10 > len)
+				continue;
+			const uint8_t *g = p + goff;
+			int16_t dwidth = (int16_t)be16(g + 8);
+			uint32_t dw = dwidth > 0 ? (uint32_t)dwidth : 0;
+			if (dw > 0 && dw <= 8 && dw > cell_w)
+				cell_w = dw;
+		}
+	}
 	if (cell_w == 0 || cell_w > maxw)
-		cell_w = maxw;
+		cell_w = (maxw >= 8 && maxw <= 16) ? 8 : maxw;
 
 	uint32_t stride = (cell_w + 7u) / 8u;
 	uint32_t glyph_bytes = stride * maxh;
@@ -207,9 +229,9 @@ int font_load_pf2(const void *data, size_t len) {
 		kfree(bits);
 		return -1;
 	}
-	klogprintf("font: loaded pf2 \"%s\" cell=%ux%u ascent=%u glyphs<=%u\n",
-		   f.name, (unsigned)maxw, (unsigned)maxh, (unsigned)asce,
-		   (unsigned)FONT_GLYPH_CACHE);
+	klogprintf("font: loaded pf2 \"%s\" cell=%ux%u (maxw=%u) ascent=%u\n",
+		   f.name, (unsigned)cell_w, (unsigned)maxh, (unsigned)maxw,
+		   (unsigned)asce);
 	font_notify_changed();
 	return 0;
 }

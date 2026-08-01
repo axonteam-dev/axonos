@@ -772,6 +772,31 @@ int user_vma_covers_page(uint64_t tid, uintptr_t va) {
     return hit;
 }
 
+int user_vma_is_lazy_file_page(uint64_t tid, uintptr_t va) {
+    if (va < 0x200000u || va >= (uintptr_t)MMIO_IDENTITY_LIMIT)
+        return 0;
+    unsigned long fl = 0;
+    int hit = 0;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (!g_user_vmas[i].used || g_user_vmas[i].tid != tid)
+            continue;
+        if (!g_user_vmas[i].file)
+            continue;
+        if (g_user_vmas[i].kind != USER_VMA_KIND_MMAP_LAZY &&
+            g_user_vmas[i].kind != USER_VMA_KIND_ELF_LOAD)
+            continue;
+        uintptr_t a = g_user_vmas[i].addr;
+        uintptr_t e = a + g_user_vmas[i].len;
+        if (va >= a && va < e) {
+            hit = 1;
+            break;
+        }
+    }
+    release_irqrestore(&g_user_vma_lock, fl);
+    return hit;
+}
+
 int user_vma_is_shared_page(uint64_t tid, uintptr_t va) {
     unsigned long fl = 0;
     int shared = 0;
@@ -970,6 +995,7 @@ int user_vma_fault_lazy_anon(uint64_t cr2) {
         }
         /* else: past EOF — page already zero from privatize blank */
     }
+    (void)user_map_mprotect_range(lo, hi, hit_copy.prot);
     return 1;
 }
 
@@ -1064,6 +1090,8 @@ int user_vma_fault_nonpresent(uint64_t cr2, uint64_t err) {
                                0x1000u - (size_t)nr);
                 }
             }
+            /* Apply VMA prot (PROT_EXEC clears NX for libc text pages). */
+            (void)user_map_mprotect_range(lo, hi, hit_copy.prot);
             return 1;
         }
     }

@@ -1856,8 +1856,8 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                         int in_brk = parent_for_vma && mm_va_in_brk(parent_for_vma, va);
                         int lazy_file = lazy_file_2m ||
                             user_vma_is_lazy_file_page(owner_tid, (uintptr_t)va);
-                        if (lazy_file && !(e2 & PG_SOFT_OWNED) &&
-                            pa == (va & ~0xFFFULL))
+                        if (lazy_file &&
+                            (!(e2 & PG_SOFT_OWNED) || pa == (va & ~0xFFFULL)))
                             continue;
                         if (pa == (va & ~0xFFFULL) && !(e2 & PG_SOFT_OWNED) &&
                             !shared_pg && !page_vma && !in_brk)
@@ -1891,8 +1891,9 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                     int page_vma = user_vma_covers_page(owner_tid, (uintptr_t)va);
                     int in_brk = parent_for_vma && mm_va_in_brk(parent_for_vma, va);
                     int lazy_file = user_vma_is_lazy_file_page(owner_tid, (uintptr_t)va);
-                    if (lazy_file && !(e1 & PG_SOFT_OWNED) &&
-                        pa == (va & ~0xFFFULL))
+                    /* Unpopulated or bogus Soft_OWNED-on-identity: skip. */
+                    if (lazy_file &&
+                        (!(e1 & PG_SOFT_OWNED) || pa == (va & ~0xFFFULL)))
                         continue;
                     if (pa == (va & ~0xFFFULL) && !(e1 & PG_SOFT_OWNED) &&
                         !shared_4k && !page_vma && !in_brk)
@@ -1997,6 +1998,15 @@ mm_t *mm_dup_user(mm_t *parent, uint64_t owner_tid)
 		goto fail;
 
 	if (mm_dup_ensure_brk_copied(child, parent, owner_tid))
+		goto fail;
+
+	/*
+	 * Punch holes for lazy libc.so/etc. pages that were not private
+	 * Soft_OWNED frames.  mm_alloc leaves demoted identity (~US); skipping
+	 * the copy without unmap makes user I-fetch a protection fault that
+	 * never reaches filemap_fault.
+	 */
+	if (user_vma_fork_scrub_lazy_file(child, owner_tid))
 		goto fail;
 
 	child->brk_base = parent->brk_base;

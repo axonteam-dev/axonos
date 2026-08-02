@@ -51,6 +51,13 @@ int user_vma_covers_page(uint64_t tid, uintptr_t va);
  * memcpy identity phys there — those bytes are not the file image.
  */
 int user_vma_is_lazy_file_page(uint64_t tid, uintptr_t va);
+/*
+ * After copy_page_range: punch holes in child for lazy-file pages that were
+ * not Soft_OWNED private frames in the parent.  Leaving demoted ~US identity
+ * makes user access a protection #PF (err.P=1) that skips filemap_fault —
+ * grub-install's fork children then execute junk / #GP at libc text.
+ */
+int user_vma_fork_scrub_lazy_file(mm_t *child_mm, uint64_t from_tid);
 
 int user_vma_add(uint64_t tid, uintptr_t addr, size_t len, int prot, int kind);
 int user_vma_add_mm(mm_t *mm, uintptr_t addr, size_t len, int prot, int kind);

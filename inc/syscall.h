@@ -33,6 +33,7 @@ typedef struct syscall_frame {
 #define SYS_uname   63
 #define SYS_getcwd  79
 #define SYS_chdir   80
+#define SYS_fchdir  81
 #define SYS_readlink 89
 #define SYS_readlinkat 267
 #define SYS_set_tid_address 218

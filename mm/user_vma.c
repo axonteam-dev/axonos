@@ -797,6 +797,59 @@ int user_vma_is_lazy_file_page(uint64_t tid, uintptr_t va) {
     return hit;
 }
 
+int user_vma_fork_scrub_lazy_file(mm_t *child_mm, uint64_t from_tid) {
+    mm_t *k;
+    uint64_t *share_l4;
+    unsigned long fl = 0;
+    int rc = 0;
+
+    if (!child_mm || !child_mm->pml4)
+        return -1;
+    k = mm_kernel();
+    if (!k || !k->pml4)
+        return -1;
+    share_l4 = k->pml4;
+
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        uintptr_t a, e, va;
+        if (!g_user_vmas[i].used || g_user_vmas[i].tid != from_tid)
+            continue;
+        if (!g_user_vmas[i].file)
+            continue;
+        if (g_user_vmas[i].kind != USER_VMA_KIND_MMAP_LAZY &&
+            g_user_vmas[i].kind != USER_VMA_KIND_ELF_LOAD)
+            continue;
+        a = g_user_vmas[i].addr;
+        e = a + g_user_vmas[i].len;
+        if (e <= a || a < 0x200000u)
+            continue;
+        if (e > (uintptr_t)MMIO_IDENTITY_LIMIT)
+            e = (uintptr_t)MMIO_IDENTITY_LIMIT;
+        /* Drop the lock across unmap (may allocate PT pages). */
+        release_irqrestore(&g_user_vma_lock, fl);
+        for (va = a & ~((uintptr_t)0xFFFu); va < e; va += 0x1000u) {
+            uint64_t pa = 0;
+            if (mm_va_leaf_pa(child_mm, (uint64_t)va, &pa) != 0)
+                continue;
+            /* Private Soft_OWNED frames have pa != va — keep those. */
+            if ((pa & ~0xFFFULL) != ((uint64_t)va & ~0xFFFULL))
+                continue;
+            /* Identity leftover: punch a hole so filemap_fault can run. */
+            if (mm_unmap_user_range(child_mm, share_l4, (uint64_t)va,
+                                    (uint64_t)va + 0x1000ULL) != 0) {
+                rc = -1;
+                break;
+            }
+        }
+        acquire_irqsave(&g_user_vma_lock, &fl);
+        if (rc != 0)
+            break;
+    }
+    release_irqrestore(&g_user_vma_lock, fl);
+    return rc;
+}
+
 int user_vma_is_shared_page(uint64_t tid, uintptr_t va) {
     unsigned long fl = 0;
     int shared = 0;

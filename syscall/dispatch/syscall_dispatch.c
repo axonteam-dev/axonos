@@ -10332,9 +10332,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 cur->process->cwd : ((cur && cur->cwd[0]) ? cur->cwd : "/");
             size_t need = strlen(cwd) + 1;
             if (!bufp) return ret_err(EFAULT);
-            if (size < need) return ret_err(EINVAL);
+            /* Linux getcwd(2): ERANGE if buffer is too small. */
+            if (size < need) return ret_err(ERANGE);
             if ((uintptr_t)bufp + need > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            memcpy(bufp, cwd, need);
+            if (copy_to_user_safe(bufp, cwd, need) != 0)
+                return ret_err(EFAULT);
             return (uint64_t)need;
         }
         case SYS_chdir: {
@@ -10354,7 +10356,34 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 is_dir = (f->type == FS_TYPE_DIR);
             }
             fs_file_free(f);
-            if (!is_dir) return ret_err(EINVAL);
+            if (!is_dir) return ret_err(ENOTDIR);
+            size_t n = strlen(path);
+            while (n > 1 && path[n - 1] == '/') path[--n] = '\0';
+            strncpy(cur->cwd, path, sizeof(cur->cwd));
+            cur->cwd[sizeof(cur->cwd) - 1] = '\0';
+            if (cur->process) {
+                strncpy(cur->process->cwd, path, sizeof(cur->process->cwd));
+                cur->process->cwd[sizeof(cur->process->cwd) - 1] = '\0';
+            }
+            return 0;
+        }
+        case SYS_fchdir: {
+            /* Linux fchdir(fd) — gnulib save_cwd/restore_cwd (grub-install). */
+            int fd = (int)a1;
+            struct fs_file *f = syscall_fd_get(cur, fd);
+            if (!f) return ret_err(EBADF);
+            struct stat st;
+            int is_dir = 0;
+            if (vfs_fstat(f, &st) == 0)
+                is_dir = ((st.st_mode & S_IFDIR) == S_IFDIR);
+            else
+                is_dir = (f->type == FS_TYPE_DIR);
+            if (!is_dir) return ret_err(ENOTDIR);
+            if (!f->path || !f->path[0] || f->path[0] != '/')
+                return ret_err(ENOENT);
+            char path[256];
+            strncpy(path, f->path, sizeof(path) - 1);
+            path[sizeof(path) - 1] = '\0';
             size_t n = strlen(path);
             while (n > 1 && path[n - 1] == '/') path[--n] = '\0';
             strncpy(cur->cwd, path, sizeof(cur->cwd));

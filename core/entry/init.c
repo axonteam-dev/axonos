@@ -970,17 +970,21 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         } else {
                 klogprintf("devfs: failed to register\n");
         }
-
+#ifdef DRIVER_VMWGFX
         /* Fbcon before long PCI/disk logs: otherwise klog uses VGA 80x25 and lines wrap ~66 chars with timestamps. */
         if (vmwgfx_kernel_init() == 0) {
                 devfs_tty_realloc_for_console();
                 boot_logo_show();
                 klogprintf("video: vmwgfx fbcon enabled early (wide console)\n");
-        } else if (cirrus_kernel_init() == 0) {
+        } 
+#endif
+#ifdef DRIVER_VBOXGFX
+        if (cirrus_kernel_init() == 0) {
                 devfs_tty_realloc_for_console();
                 boot_logo_show();
                 klogprintf("video: cirrus fbcon enabled early\n");
         }
+#endif
 
         /* /etc/passwd and /etc/group so whoami/id/groups/adduser work.
            Use static buffers to avoid heap overflow. Seed a normal user so
@@ -988,7 +992,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         (void)ramfs_mkdir("/etc");
         (void)ramfs_mkdir("/root");
         (void)ramfs_mkdir("/home");
-        (void)ramfs_mkdir("/home/miha");
         static const char root_passwd_line[] =
                 "root:x:0:0:root:/root:/bin/sh\n"
                 "miha:x:1000:1000:miha:/home/miha:/bin/sh\n";
@@ -1003,7 +1006,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         /* Member lists required: BusyBox id(1) getgrouplist fails on "root:x:0:".
          * Include Linux base groups OpenRC checkpath expects (uucp for /run/lock). */
         static const char root_group_line[] =
-                "root:x:0:root,miha\n"
+                "root:x:0:root\n"
                 "daemon:x:1:\n"
                 "bin:x:2:\n"
                 "sys:x:3:\n"
@@ -1037,12 +1040,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 "video:x:44:\n"
                 "sasl:x:45:\n"
                 "plugdev:x:46:\n"
-                "staff:x:50:\n"
-                "games:x:60:\n"
-                "users:x:100:miha\n"
                 "messagebus:x:101:\n"
-                "nogroup:x:65534:\n"
-                "miha:x:1000:miha\n";
+                "nogroup:x:65534:\n";
         const size_t root_group_len = sizeof(root_group_line) - 1;
         struct fs_file *gf = fs_create_file("/etc/group");
         if (!gf) gf = fs_open("/etc/group");
@@ -1055,8 +1054,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         {
                 /* empty password field = login with Enter */
                 static const char root_shadow[] =
-                        "root::0:0:99999:7:::\n"
-                        "miha::0:0:99999:7:::\n";
+                        "root::0:0:99999:7:::\n";
                 struct fs_file *sf = fs_create_file("/etc/shadow");
                 if (!sf) sf = fs_open("/etc/shadow");
                 if (sf) {

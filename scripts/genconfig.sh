@@ -65,6 +65,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 	fi
 
 	[[ "$line" == \#* ]] && continue
+	[[ "$line" == "["* ]] && continue
 
 	if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
 		key="${BASH_REMATCH[1]}"

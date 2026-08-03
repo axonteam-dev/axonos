@@ -970,22 +970,20 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         } else {
                 klogprintf("devfs: failed to register\n");
         }
-#ifdef DRIVER_VMWGFX
         /* Fbcon before long PCI/disk logs: otherwise klog uses VGA 80x25 and lines wrap ~66 chars with timestamps. */
         if (vmwgfx_kernel_init() == 0) {
                 devfs_tty_realloc_for_console();
                 boot_logo_show();
                 klogprintf("video: vmwgfx fbcon enabled early (wide console)\n");
         } 
-#endif
-#ifdef DRIVER_VBOXGFX
+#ifdef DRIVER_CIRRUS
         if (cirrus_kernel_init() == 0) {
                 devfs_tty_realloc_for_console();
                 boot_logo_show();
                 klogprintf("video: cirrus fbcon enabled early\n");
         }
 #endif
-
+        devfs_tty_realloc_for_console();
         /* /etc/passwd and /etc/group so whoami/id/groups/adduser work.
            Use static buffers to avoid heap overflow. Seed a normal user so
            `adduser miha root` (BusyBox: add existing user to group) is meaningful. */

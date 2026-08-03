@@ -47,6 +47,7 @@
 #include <stdio.h>
 #include <user_vma.h>
 #include <user_as.h>
+#include <keyring.h>
 
 /* Opt-in TCP connect/RX console traces (VGA paint is expensive under VMware). */
 #ifndef NET_TCP_TRACE
@@ -5357,10 +5358,12 @@ ssize_t procfs_net_store_dhcp(const char *buf, size_t size) {
                    command[len - 1] == ' '))
         command[--len] = '\0';
 
-    if (!strcmp(command, "renew") || !strcmp(command, "start")) {
+    if (!strcmp(command, "renew") || !strcmp(command, "start") ||
+        !strcmp(command, "1") || !strcmp(command, "true") || !strcmp(command, "on")) {
         if (net_set_if_up(1) != 0 || net_run_dhcp() != 0)
             return -1;
-    } else if (!strcmp(command, "release") || !strcmp(command, "stop")) {
+    } else if (!strcmp(command, "release") || !strcmp(command, "stop") ||
+               !strcmp(command, "0") || !strcmp(command, "false") || !strcmp(command, "off")) {
         if (net_apply_ipv4(0, 0, 0, 0, 0) != 0)
             return -1;
     } else {
@@ -10171,6 +10174,64 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             (void)a3;
             return 0;
+        }
+        case SYS_add_key: {
+            /* add_key(type, description, payload, plen, keyring) */
+            char *type = copy_user_cstr((const char *)(uintptr_t)a1, 32);
+            char *desc = copy_user_cstr((const char *)(uintptr_t)a2, 96);
+            int ttype = 0;
+            if (type) {
+                if (!strcmp(type, "keyring")) ttype = KEY_TYPE_KEYRING;
+                else if (!strcmp(type, "asymmetric")) ttype = KEY_TYPE_ASYMMETRIC;
+                else if (!strcmp(type, "user")) ttype = KEY_TYPE_USER;
+            }
+            if (!ttype) { kfree(type); kfree(desc); return ret_err(EINVAL); }
+            const uint8_t *payload = (const uint8_t *)(uintptr_t)a3;
+            size_t plen = (size_t)a4;
+            int ringid = (int)a5;
+            uint8_t *kpayload = NULL;
+            if (plen > 0 && payload) {
+                if (!user_range_ok(payload, plen)) { kfree(type); kfree(desc); return ret_err(EFAULT); }
+                kpayload = kmalloc(plen);
+                if (!kpayload || copy_from_user_raw(kpayload, payload, plen) != 0) {
+                    kfree(kpayload); kfree(type); kfree(desc); return ret_err(EFAULT);
+                }
+            }
+            long serial = keyring_add_key(ttype, desc,
+                 kpayload ? kpayload : NULL, kpayload ? plen : 0,
+                 ringid);
+            kfree(kpayload); kfree(type); kfree(desc);
+            if (serial < 0) return (uint64_t)serial;
+            return (uint64_t)serial;
+        }
+        case SYS_request_key: {
+            /* request_key(type, description, callout_info, dest_keyring) */
+            char *type = copy_user_cstr((const char *)(uintptr_t)a1, 32);
+            char *desc = copy_user_cstr((const char *)(uintptr_t)a2, 96);
+            char *callout = NULL;
+            if (a3)
+                callout = copy_user_cstr((const char *)(uintptr_t)a3, 96);
+            int ttype = 0;
+            if (type) {
+                if (!strcmp(type, "keyring")) ttype = KEY_TYPE_KEYRING;
+                else if (!strcmp(type, "asymmetric")) ttype = KEY_TYPE_ASYMMETRIC;
+                else if (!strcmp(type, "user")) ttype = KEY_TYPE_USER;
+            }
+            int ringid = (int)a4;
+            long serial = -1;
+            if (ttype && desc)
+                serial = keyring_request_key(ttype, desc,
+                    callout ? callout : "", ringid);
+            kfree(type); kfree(desc); kfree(callout);
+            if (serial < 0) return (uint64_t)serial;
+            return (uint64_t)serial;
+        }
+        case SYS_keyctl: {
+            /* keyctl(cmd, arg2, arg3, arg4, arg5) */
+            int cmd = (int)a1;
+            long res = keyctl_do(cmd, a2, a3, a4, a5);
+            if (res < 0) return (uint64_t)res;
+            return (uint64_t)res;
         }
         case SYS_reboot: {
             /* Linux reboot(magic1, magic2, cmd, arg) — BusyBox reboot/halt/poweroff. */
@@ -19585,6 +19646,7 @@ void isr_syscall(cpu_registers_t* regs) {
 void syscall_init(void) {
     /* register handler on vector 0x80 */
     idt_set_handler(0x80, isr_syscall);
+    keyring_init();
 
     /* Enable x86_64 SYSCALL instruction for userland. */
     uint64_t efer = msr_read_u64(MSR_EFER);

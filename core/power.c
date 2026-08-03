@@ -49,7 +49,6 @@ void power_poll(void) {
 	const char *why = g_power_reason ? g_power_reason : "unspecified";
 	if (act == POWER_ACT_SHUTDOWN) {
 		klogprintf("power: shutdown requested (%s)\n", why);
-		kprintf("\n[power] shutdown requested (%s)\n", why);
 
 		/* Give the operator time to see the message and allow klog file appends. */
 		apic_timer_sleep_ms(1500);
@@ -57,7 +56,6 @@ void power_poll(void) {
 		acpi_try_power_off();
 	} else if (act == POWER_ACT_REBOOT) {
 		klogprintf("power: reboot requested (%s)\n", why);
-		kprintf("\n[power] reboot requested (%s)\n", why);
 		reboot_system();
 	}
 }

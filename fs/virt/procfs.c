@@ -26,6 +26,7 @@
 #include <user_vma.h>
 #include <syscall.h>
 #include <utsname_host.h>
+#include <keyring.h>
 
 struct procfs_handle {
 	int kind; /* 1=root, 2=pid_dir, 3=pid_file, 4=symlink, 5=pid_fd_dir, 6=pid_fd_link, 7=plain, 8=proc_sys_dir, 9=proc_sys_file */
@@ -138,7 +139,8 @@ static int procfs_build_root_dir(struct procfs_handle *h) {
     size_t len = 0, cap = 0;
     static const char *top[] = {
         "meminfo", "cpuinfo", "uptime", "loadavg", "mounts", "filesystems",
-        "stat", "partitions", "cmdline", "sys", "bus", "tty", "ttydebug", "net", "scsi"
+        "stat", "partitions", "cmdline", "sys", "bus", "tty", "ttydebug", "net", "scsi",
+        "keys"
     };
     for (size_t ti = 0; ti < sizeof(top) / sizeof(top[0]); ti++) {
         const char *name = top[ti];
@@ -949,6 +951,36 @@ static ssize_t procfs_write(struct fs_file *file, const void *buf, size_t size, 
 	return -1;
 }
 
+/* /proc/keys — Linux-style listing of keyring keys. */
+struct keys_buf { char *buf; size_t cap; size_t used; };
+static struct keys_buf g_keys_buf;
+
+static void keys_walk_cb(uint32_t serial, int type, uint32_t uid, uint32_t gid,
+                         uint32_t perms, const char *desc, size_t desc_len) {
+    struct keys_buf *kb = &g_keys_buf;
+    if (!kb->buf) return;
+    const char *tn = (type == KEY_TYPE_KEYRING) ? "keyring" :
+                     (type == KEY_TYPE_ASYMMETRIC) ? "asymmetric" : "user";
+    /* format similar to /proc/keys */
+    int n = snprintf(kb->buf + kb->used,
+                     (kb->used < kb->cap) ? (kb->cap - kb->used) : 0,
+                     "%08x %d %s %d %d %08x %.*s\n",
+                     serial, 1, tn, uid, gid, perms, (int)desc_len, desc);
+    if (n > 0) kb->used += (size_t)n;
+    if (kb->used > kb->cap) kb->used = kb->cap;
+}
+static struct keys_buf g_keys_buf;
+
+ssize_t procfs_show_keys(char *buf, size_t size) {
+    if (!buf || size == 0) return 0;
+    g_keys_buf.buf = buf;
+    g_keys_buf.cap = size;
+    g_keys_buf.used = 0;
+    keyring_walk(keys_walk_cb);
+    g_keys_buf.buf = NULL;
+    return (ssize_t)g_keys_buf.used;
+}
+
 /* Generate /proc plain-file body for file_id (meminfo/stat/mounts/...). */
 static ssize_t procfs_generate_plain(int file_id, char *buf, size_t cap) {
 	if (!buf || cap == 0) return 0;
@@ -983,6 +1015,7 @@ static ssize_t procfs_generate_plain(int file_id, char *buf, size_t cap) {
 	if (file_id == 58) return procfs_net_snap_dev(buf, cap);
 	if (file_id == 59) return procfs_net_snap_route(buf, cap);
 	if (file_id == 60) return procfs_net_snap_dhcp(buf, cap);
+	if (file_id == 61) return procfs_show_keys(buf, cap);
 	return 0;
 }
 
@@ -1231,6 +1264,15 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
                 *out_file = f;
                 return 0;
             }
+			if (first_len == 4 && strncmp(p, "keys", 4) == 0) {
+				h->kind = 7; f->type = FS_TYPE_REG;
+				f->size = 0;
+				f->driver_private = h;
+				h->file_id = 61; /* keys */
+				procfs_fill_kind7_cache(h, f);
+				*out_file = f;
+				return 0;
+			}
 			if (first_len == 7 && strncmp(p, "cmdline", 7) == 0) {
 				h->kind = 7; f->type = FS_TYPE_REG;
 				f->size = 0;

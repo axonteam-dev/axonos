@@ -24,4 +24,7 @@ ssize_t procfs_net_snap_route(char *buf, size_t size);
 ssize_t procfs_net_snap_dhcp(char *buf, size_t size);
 ssize_t procfs_net_store_dhcp(const char *buf, size_t size);
 
+/* /proc/keys (keyring listing). */
+ssize_t procfs_show_keys(char *buf, size_t size);
+
 

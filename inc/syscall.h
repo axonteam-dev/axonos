@@ -91,6 +91,9 @@ typedef struct syscall_frame {
 #define SYS_fork    57
 #define SYS_clone   56
 #define SYS_clone3  435
+#define SYS_add_key 248
+#define SYS_request_key 249
+#define SYS_keyctl  250
 #define SYS_wait4   61
 #define SYS_exit_group 231
 #define SYS_openat  257

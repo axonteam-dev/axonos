@@ -284,7 +284,7 @@ static void kputchar_vga_text_nolock(uint8_t character, uint8_t attribute_byte)
                         }
                         uint16_t last_line = (MAX_COLS*MAX_ROWS*2) - MAX_COLS*2;
                         for (uint32_t ii = 0; ii < MAX_COLS; ii++) {
-                                write_nolock('\0', WHITE_ON_BLACK, (uint16_t)(last_line + ii * 2));
+                                write_nolock(' ', WHITE_ON_BLACK, (uint16_t)(last_line + ii * 2));
                         }
                         set_cursor_nolock(last_line);
                 }
@@ -348,7 +348,7 @@ static void kputchar_vga_text_nolock(uint8_t character, uint8_t attribute_byte)
                         }
                         uint16_t last_line = (MAX_COLS*MAX_ROWS*2) - MAX_COLS*2;
                         for (uint32_t ii = 0; ii < MAX_COLS; ii++) {
-                                write_nolock('\0', WHITE_ON_BLACK, (uint16_t)(last_line + ii * 2));
+                                write_nolock(' ', WHITE_ON_BLACK, (uint16_t)(last_line + ii * 2));
                         }
                         /* reset offset to start of last line */
                         offset = (MAX_ROWS - 1) * MAX_COLS * 2;
@@ -368,7 +368,7 @@ static void kputchar_vga_text_nolock(uint8_t character, uint8_t attribute_byte)
                         }
                         uint16_t last_line = (MAX_COLS*MAX_ROWS*2) - MAX_COLS*2;
                         for (uint32_t ii = 0; ii < MAX_COLS; ii++) {
-                                write_nolock('\0', WHITE_ON_BLACK, (uint16_t)(last_line + ii * 2));
+                                write_nolock(' ', WHITE_ON_BLACK, (uint16_t)(last_line + ii * 2));
                         }
                         set_cursor_nolock((uint16_t)((MAX_ROWS - 1) * MAX_COLS * 2));
                 } else {

@@ -243,11 +243,11 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg archive
 	@if [ -f /usr/share/grub/unicode.pf2 ]; then cp /usr/share/grub/unicode.pf2 $(GRUB_DIR)/fonts/; fi
 	@if [ -f /usr/share/grub/euro.pf2 ]; then cp /usr/share/grub/euro.pf2 $(GRUB_DIR)/fonts/; fi
 	@grub-mkrescue -o $(ISO_IMAGE) $(ISO_DIR) 2>/dev/null || { \
-		@echo "grub-mkrescue failed: try installing grub-pc-bin or xorriso" >&2; exit 1; \
+		echo "grub-mkrescue failed: try installing grub-pc-bin or xorriso" >&2; exit 1; \
 	}
 
 run: archive iso
-	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 2048M -smp 2 -serial stdio -boot d -hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0 -vga vmware
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 2048M -smp 2 -serial stdio -boot d -hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0 -vga vmware -enable-kvm -cpu host -smp 4
 
 test-boot:
 	@tools/headless-openrc-boot.sh

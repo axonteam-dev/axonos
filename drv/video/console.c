@@ -62,12 +62,12 @@ void console_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t c
 		return;
 	}
 	if (vbe_is_available()) {
+		vbefb_begin_batch();
 		for (uint32_t ry = 0; ry < h; ry++) {
-			for (uint32_t rx = 0; rx < w; rx++) {
-				vbefb_set_cursor(x + rx, y + ry);
-				vbefb_putchar(ch, attr);
-			}
+			for (uint32_t rx = 0; rx < w; rx++)
+				vbefb_putch_xy(x + rx, y + ry, ch, attr);
 		}
+		vbefb_end_batch();
 	} else {
 		for (uint32_t ry = 0; ry < h; ry++) {
 			for (uint32_t rx = 0; rx < w; rx++) {
@@ -293,13 +293,26 @@ void console_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t at
 	}
 	if (vbe_is_available()) {
 		if (x0 > x1) return;
-		for (uint32_t x = x0; x <= x1; x++) {
-			vbefb_set_cursor(x, y);
-			vbefb_putchar(' ', attr);
-		}
+		vbefb_begin_batch();
+		for (uint32_t x = x0; x <= x1; x++)
+			vbefb_putch_xy(x, y, ' ', attr);
+		vbefb_end_batch();
 		return;
 	}
 	vga_clear_line_segment(x0, x1, y, attr);
+}
+
+void console_scroll_region_up(uint32_t top, uint32_t bottom, uint8_t attr)
+{
+	if (cirrusfb_is_ready()) {
+		cirrusfb_scroll_region(top, bottom);
+		return;
+	}
+	if (vbe_is_available()) {
+		vbefb_scroll_region(top, bottom, attr);
+		return;
+	}
+	vga_scroll_region(top, bottom, attr);
 }
 
 uint8_t console_get_cell_attr(uint32_t x, uint32_t y) {

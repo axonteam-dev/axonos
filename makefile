@@ -84,7 +84,7 @@ ASCII_PF2 := $(BUILD_DIR)/fonts/ascii.pf2
 ASCII_PF2_BLOB_OBJ := $(BUILD_DIR)/fonts/ascii_pf2_blob.o
 ASCII_PF2_SRC := $(firstword $(wildcard /usr/share/grub/ascii.pf2 /boot/grub/fonts/ascii.pf2))
 
-.PHONY: all kernel iso clean run for-production config oldconfig
+.PHONY: all kernel iso clean run run-uefi for-production config oldconfig
 
 all: iso
 
@@ -242,12 +242,39 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg archive
 	@if [ -f /usr/share/grub/ascii.pf2 ]; then cp /usr/share/grub/ascii.pf2 $(GRUB_DIR)/fonts/; fi
 	@if [ -f /usr/share/grub/unicode.pf2 ]; then cp /usr/share/grub/unicode.pf2 $(GRUB_DIR)/fonts/; fi
 	@if [ -f /usr/share/grub/euro.pf2 ]; then cp /usr/share/grub/euro.pf2 $(GRUB_DIR)/fonts/; fi
-	@grub-mkrescue -o $(ISO_IMAGE) $(ISO_DIR) 2>/dev/null || { \
-		echo "grub-mkrescue failed: try installing grub-pc-bin or xorriso" >&2; exit 1; \
+	@grub-mkrescue -o $(ISO_IMAGE) $(ISO_DIR) || { \
+		echo "grub-mkrescue failed. Need xorriso, grub-pc-bin; for UEFI also grub-efi-amd64-bin and mtools" >&2; \
+		exit 1; \
 	}
 
 run: archive iso
 	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 2048M -smp 2 -serial stdio -boot d -hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0 -vga vmware -enable-kvm -cpu host -smp 4
+
+# UEFI (OVMF). Same machine as `run`. Needs ovmf; hybrid ISO needs grub-efi-amd64-bin.
+OVMF_CODE ?= $(firstword $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd))
+OVMF_VARS_SRC ?= $(firstword $(wildcard /usr/share/OVMF/OVMF_VARS_4M.fd))
+OVMF_VARS := $(BUILD_DIR)/OVMF_VARS.fd
+
+run-uefi: archive iso
+	@test -n "$(OVMF_CODE)" || { echo "run-uefi: OVMF not found (apt install ovmf)" >&2; exit 1; }
+	@if [ ! -d /usr/lib/grub/x86_64-efi ]; then \
+		echo "run-uefi: ISO is BIOS-only. apt install grub-efi-amd64-bin && make iso" >&2; \
+	fi
+	@mkdir -p $(BUILD_DIR)
+	@if [ -n "$(OVMF_VARS_SRC)" ]; then \
+		cp -f "$(OVMF_VARS_SRC)" "$(OVMF_VARS)"; \
+		qemu-system-x86_64 \
+			-drive if=pflash,format=raw,readonly=on,file="$(OVMF_CODE)" \
+			-drive if=pflash,format=raw,file="$(OVMF_VARS)" \
+			-cdrom $(ISO_IMAGE) -m 2048M -smp 4 -serial stdio -boot d \
+			-hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0 \
+			-enable-kvm -cpu host; \
+	else \
+		qemu-system-x86_64 -bios "$(OVMF_CODE)" \
+			-cdrom $(ISO_IMAGE) -m 2048M -smp 4 -serial stdio -boot d \
+			-hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0 \
+			-enable-kvm -cpu host; \
+	fi
 
 test-boot:
 	@tools/headless-openrc-boot.sh
@@ -278,23 +305,23 @@ disk:
 MKINITFS_SQUASH := tools/mkinitfs-squashfs.sh
 
 archive:
-	@if [ ! -f iso/boot/initfs.squashfs ]; then \
-		if [ -f initfs.squashfs ]; then \
-			cp -f initfs.squashfs iso/boot/initfs.squashfs; \
+	@if [ ! -f iso/boot/initfs.sfs ]; then \
+		if [ -f initfs.sfs ]; then \
+			cp -f initfs.sfs iso/boot/initfs.sfs; \
 		elif [ -f initfs.cpio ]; then \
-			$(MKINITFS_SQUASH) initfs.cpio iso/boot/initfs.squashfs; \
+			$(MKINITFS_SQUASH) initfs.cpio iso/boot/initfs.sfs; \
 		elif [ -f iso/boot/initfs.cpio ]; then \
-			$(MKINITFS_SQUASH) iso/boot/initfs.cpio iso/boot/initfs.squashfs; \
+			$(MKINITFS_SQUASH) iso/boot/initfs.cpio iso/boot/initfs.sfs; \
 		else \
 			wget -P build apm.axont.ru/Packages/initfs.tar.xz; \
 			tar -xf build/initfs.tar.xz -C iso/boot/; \
 			rm -f build/initfs.tar.xz; \
 			if [ -f iso/boot/initfs.cpio ]; then \
-				$(MKINITFS_SQUASH) iso/boot/initfs.cpio iso/boot/initfs.squashfs; \
+				$(MKINITFS_SQUASH) iso/boot/initfs.cpio iso/boot/initfs.sfs; \
 			fi; \
 		fi; \
 	fi
-	@test -f iso/boot/initfs.squashfs
+	@test -f iso/boot/initfs.sfs
 
 clean:
 	@rm -rf $(BUILD_DIR)

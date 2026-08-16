@@ -484,7 +484,14 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
             struct fs_file *f = tcur ? tcur->fds[fd] : cur->fds[fd];
             if (!f) f = cur->fds[fd];
             if (f && f->type == FS_TYPE_REG && f->size > 0 &&
-                !fbdev_is_fb0_file(f)) {
+                !fbdev_is_fb0_file(f) &&
+                /*
+                 * Entware's glibc loader remaps PT_LOAD ranges and changes
+                 * protections before touching every page. Keep /opt runtime
+                 * objects eager until lazy file VMAs preserve backing data
+                 * across all of those split/remap operations.
+                 */
+                !(f->path && strncmp(f->path, "/opt/", 5) == 0)) {
                 file_lazy = 1;
                 file_lazy_f = f;
                 file_lazy_off = (uint64_t)file_off;

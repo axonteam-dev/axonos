@@ -84,9 +84,6 @@ void pit_handler(cpu_registers_t* regs) {
         if (cirrusfb_is_ready()) {
                 cirrusfb_update_cursor();
         } else {
-                /* Match APIC: avoid full framebuffer blit on every timer IRQ. */
-                if ((pit_ticks % 25u) == 0u)
-                        vbe_flush_full();
                 vbefb_update_cursor();
         }
 }

@@ -749,7 +749,9 @@ static ssize_t procfs_show_partitions(char *buf, size_t size, void *priv) {
 /* Map internal driver names to Linux /proc/mounts fstype strings. */
 static const char *procfs_mount_fstype(const char *drv_name, int is_root) {
     if (is_root)
-        return "rootfs";
+        return (drv_name && (strcmp(drv_name, "overlay") == 0 ||
+                            strcmp(drv_name, "overlayfs") == 0))
+            ? "overlay" : (drv_name ? drv_name : "rootfs");
     if (!drv_name)
         return "unknown";
     if (strcmp(drv_name, "procfs") == 0)
@@ -779,7 +781,13 @@ static ssize_t procfs_show_mounts(char *buf, size_t size, void *priv) {
             have_root = 1;
         const char *fstype = procfs_mount_fstype(drv, is_root);
         /* Linux: source mountpoint fstype options dump pass */
-        const char *src = is_root ? "rootfs" : fstype;
+        /*
+         * Do not call the actual root mount "rootfs". BusyBox intentionally
+         * skips Linux's transient rootfs entry, then cannot resolve "/" or
+         * any of its subdirectories for df(1). The AxonOS root is the real
+         * overlay mount, so expose it as such.
+         */
+        const char *src = fstype;
         int wr = snprintf(buf + w, (w < size) ? (size - w) : 0,
                           "%s %s %s rw,relatime 0 0\n",
                           src, mpath, fstype);
@@ -789,7 +797,7 @@ static ssize_t procfs_show_mounts(char *buf, size_t size, void *priv) {
     }
     /* BusyBox mount(1) requires a "/" line in /proc/mounts. */
     if (!have_root && w < size) {
-        int wr = snprintf(buf + w, size - w, "rootfs / rootfs rw 0 0\n");
+        int wr = snprintf(buf + w, size - w, "overlay / overlay rw,relatime 0 0\n");
         if (wr > 0)
             w += (size_t)wr;
     }

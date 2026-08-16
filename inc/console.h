@@ -27,6 +27,7 @@ int console_max_cols(void);
 
 void console_clear_screen_attr(uint8_t attr);
 void console_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr);
+void console_scroll_region_up(uint32_t top, uint32_t bottom, uint8_t attr);
 uint8_t console_get_cell_attr(uint32_t x, uint32_t y);
 
 /* Write one TTY cell from devfs: framebuffer path skips kernel ANSI state machines. */

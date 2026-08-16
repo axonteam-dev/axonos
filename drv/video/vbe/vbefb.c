@@ -12,7 +12,7 @@
 extern int vbe_is_available(void);
 extern void vbe_flush_full(void);
 extern void vbe_flush_region(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
-extern void *vbe_get_backbuffer(void);
+extern void *vbe_get_drawbuffer(void);
 extern uint32_t vbe_get_pitch(void);
 extern uint32_t vbe_get_bpp(void);
 extern uint32_t vbe_get_width(void);
@@ -38,6 +38,8 @@ static int esc_mode = 0;
 static char esc_buf[32];
 static int esc_len = 0;
 static int cursor_visible = 1; /* cursor blink state */
+static int cursor_drawn = 0;
+static int cursor_frozen = 0;
 static uint64_t cursor_blink_last_phase = 0;
 
 static int g_vbe_dirty = 0;
@@ -47,6 +49,14 @@ static int g_vbe_batch = 0;
 
 void draw_cursor(void);
 void erase_cursor(void);
+
+static uint64_t cursor_blink_phase(void)
+{
+	uint32_t hz = timer_frequency ? timer_frequency : 250u;
+	uint32_t half_period = (hz + 1u) / 2u;
+
+	return timer_ticks / half_period;
+}
 
 static void vbe_dirty_mark(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 	if (w == 0 || h == 0) return;
@@ -81,15 +91,27 @@ static void vbefb_flush_dirty(void) {
 }
 
 void vbefb_begin_batch(void) {
-	g_vbe_batch++;
+	if (g_vbe_batch > 0) {
+		g_vbe_batch++;
+		return;
+	}
+	g_vbe_batch = 1;
+	cursor_frozen = 1;
+	if (cursor_drawn)
+		erase_cursor();
 }
 
 void vbefb_end_batch(void) {
 	if (g_vbe_batch <= 0)
 		return;
 	g_vbe_batch--;
-	if (g_vbe_batch == 0)
+	if (g_vbe_batch == 0) {
 		vbefb_flush_dirty();
+		cursor_frozen = 0;
+		if (cursor_visible)
+			draw_cursor();
+		vbefb_flush_dirty();
+	}
 }
 
 static uint32_t vga_palette[16] = {
@@ -122,8 +144,8 @@ static void draw_cell_to_framebuffer(uint32_t cx, uint32_t cy) {
 	uint32_t fg_pix = vbe_pack_pixel((uint8_t)(fg_rgb >> 16), (uint8_t)(fg_rgb >> 8), (uint8_t)fg_rgb);
 	uint32_t bg_pix = vbe_pack_pixel((uint8_t)(bg_rgb >> 16), (uint8_t)(bg_rgb >> 8), (uint8_t)bg_rgb);
 
-	uint8_t *front = (uint8_t *)vbe_get_frontbuffer();
-	if (!front) return;
+	uint8_t *drawbuf = vbe_get_drawbuffer();
+	if (!drawbuf) return;
 
 	font_w = font_cell_width();
 	font_h = font_cell_height();
@@ -131,7 +153,9 @@ static void draw_cell_to_framebuffer(uint32_t cx, uint32_t cy) {
 	uint32_t py = cy * font_h;
 	uint32_t pitch = vbe_get_pitch();
 	uint32_t bytespp = (vbe_get_bpp() + 7) / 8;
-	font_blit_glyph(front, pitch, bytespp, px, py, ch, fg_pix, bg_pix);
+	font_blit_glyph(drawbuf, pitch, bytespp, px, py, ch, fg_pix, bg_pix);
+	if (cursor_drawn && cx == cursor_x && cy == cursor_y)
+		cursor_drawn = 0;
 	vbe_dirty_mark(px, py, font_w, font_h);
 }
 
@@ -149,6 +173,11 @@ void vbefb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	draw_cell_to_framebuffer(x, y);
 	/* One flush per tty write() via vbefb_begin/end_batch — not per glyph. */
 	vbefb_flush_dirty();
+	if (g_vbe_batch == 0 && !cursor_frozen && cursor_visible &&
+	    x == cursor_x && y == cursor_y) {
+		draw_cursor();
+		vbefb_flush_dirty();
+	}
 }
 
 static void vbefb_erase_cells(uint32_t x0, uint32_t x1, uint32_t y) {
@@ -191,13 +220,8 @@ static void vbefb_emit_tty_char(uint8_t ch) {
 	} else if (ch == '\r') {
 		cursor_x = 0;
 	} else if (ch == '\t') {
-		uint32_t newx = (cursor_x + 8) & ~(8 - 1);
-		if (newx >= cols) { newx = 0; cursor_y++; }
-		for (uint32_t tx = ox; tx != newx; tx = (tx + 1) % cols) {
-			textbuf[oy * cols + tx].ch = ' ';
-			textbuf[oy * cols + tx].attr = current_attr;
-		}
-		cursor_x = newx;
+		uint32_t next = (cursor_x + 8u) & ~7u;
+		cursor_x = next < cols ? next : cols - 1;
 	} else if (ch == '\b') {
 		if (cursor_x > 0) cursor_x--;
 		textbuf[cursor_y * cols + cursor_x].ch = ' ';
@@ -345,10 +369,11 @@ void vbefb_putchar_literal(uint8_t ch, uint8_t attr) {
 
 void draw_cursor(void) {
 	if (!vbe_is_available() || !textbuf) return;
+	if (cursor_frozen || cursor_drawn || !cursor_visible) return;
 	if (cursor_x >= cols || cursor_y >= rows) return;
 
-	uint8_t *front = (uint8_t*)vbe_get_frontbuffer();
-	if (!front) return;
+	uint8_t *drawbuf = vbe_get_drawbuffer();
+	if (!drawbuf) return;
 
 	uint32_t px = cursor_x * font_w;
 	uint32_t py = cursor_y * font_h;
@@ -361,7 +386,7 @@ void draw_cursor(void) {
 
 	uint32_t cursor_start_row = font_h - 2;
 	for (uint32_t row = cursor_start_row; row < font_h; row++) {
-		uint8_t *line = front + (size_t)( (py + row) * pitch + px * bytespp );
+		uint8_t *line = drawbuf + (size_t)( (py + row) * pitch + px * bytespp );
 		for (uint32_t bit = 0; bit < font_w; bit++) {
 			/* draw cursor with foreground color (visible on dark background) */
 			uint32_t r = (fg >> 16) & 0xFF;
@@ -380,31 +405,34 @@ void draw_cursor(void) {
 			}
 		}
 	}
+	cursor_drawn = 1;
 	vbe_dirty_mark(px, py + cursor_start_row, font_w, font_h - cursor_start_row);
 }
 
 void erase_cursor(void) {
 	if (!vbe_is_available() || !textbuf) return;
+	if (!cursor_drawn) return;
 	if (cursor_x >= cols || cursor_y >= rows) return;
 	/* redraw cell normally (restores original appearance) */
 	draw_cell_to_framebuffer(cursor_x, cursor_y);
+	cursor_drawn = 0;
 	vbefb_flush_dirty();
 }
 
 void vbefb_update_cursor(void) {
 	if (!vbe_is_available()) return;
-	/* Blink based on absolute monotonic time so it remains stable even if
-	   timer IRQs are delayed by load/exception handling (catch-up on next tick). */
-	const uint64_t period_ticks = 2; /* ~500ms when timer_ticks is 1ms */
-	uint64_t phase = (period_ticks != 0) ? (timer_ticks / period_ticks) : 0;
+	if (cursor_frozen) return;
+	uint64_t phase = cursor_blink_phase();
 	if (phase == cursor_blink_last_phase) return;
 	cursor_blink_last_phase = phase;
 	/* even phase => visible; odd => hidden */
 	int want_visible = ((phase & 1ULL) == 0ULL) ? 1 : 0;
 	if (want_visible == cursor_visible) return;
 	cursor_visible = want_visible;
-	if (cursor_visible) draw_cursor();
-	else erase_cursor();
+	if (cursor_visible)
+		draw_cursor();
+	else
+		erase_cursor();
 	vbefb_flush_dirty();
 }
 
@@ -420,14 +448,22 @@ void vbefb_get_cursor(uint32_t *x, uint32_t *y) {
 void vbefb_set_cursor(uint32_t x, uint32_t y) {
 	if (x >= cols) x = cols - 1;
 	if (y >= rows) y = rows - 1;
-	if (cursor_visible) erase_cursor();
+	if (g_vbe_batch > 0 || cursor_frozen) {
+		cursor_x = x;
+		cursor_y = y;
+		return;
+	}
+	if (cursor_drawn)
+		erase_cursor();
 	cursor_x = x; cursor_y = y;
-	if (cursor_visible) draw_cursor();
+	if (cursor_visible)
+		draw_cursor();
 	vbefb_flush_dirty();
 }
 
 void vbefb_clear(uint8_t attr) {
 	if (!vbe_is_available() || !textbuf) return;
+	vbefb_begin_batch();
 	current_attr = attr;
 	for (uint32_t i = 0; i < (uint32_t)(cols * rows); i++) {
 		textbuf[i].ch = ' ';
@@ -437,8 +473,44 @@ void vbefb_clear(uint8_t attr) {
 		draw_text_row(ry);
 	g_vbe_dirty = 0;
 	vbe_dirty_mark(0, 0, fb_width, fb_height);
-	vbefb_flush_dirty();
 	vbefb_set_cursor(0, 0);
+	vbefb_end_batch();
+}
+
+void vbefb_scroll_region(uint32_t top, uint32_t bottom, uint8_t attr)
+{
+	if (!vbe_is_available() || !textbuf || cols == 0 || rows == 0)
+		return;
+	if (top >= rows)
+		top = rows - 1;
+	if (bottom >= rows)
+		bottom = rows - 1;
+	if (top >= bottom)
+		return;
+
+	size_t row_bytes = (size_t)cols * sizeof(cell_t);
+	memmove(textbuf + top * cols, textbuf + (top + 1) * cols,
+		row_bytes * (bottom - top));
+	for (uint32_t x = 0; x < cols; x++) {
+		textbuf[bottom * cols + x].ch = ' ';
+		textbuf[bottom * cols + x].attr = attr;
+	}
+
+	uint8_t *drawbuf = vbe_get_drawbuffer();
+	if (!drawbuf)
+		return;
+	vbefb_begin_batch();
+	uint32_t y0 = top * font_h;
+	uint32_t src_y = (top + 1) * font_h;
+	uint32_t bottom_y = bottom * font_h;
+	size_t move_bytes = (size_t)fb_pitch * (bottom - top) * font_h;
+
+	memmove(drawbuf + (size_t)y0 * fb_pitch,
+		drawbuf + (size_t)src_y * fb_pitch, move_bytes);
+	vbe_clear_region(0, bottom_y, fb_width, font_h,
+		vga_attr_bg_to_pixel(attr));
+	vbe_dirty_mark(0, y0, fb_width, (bottom - top + 1) * font_h);
+	vbefb_end_batch();
 }
 
 void vbefb_snapshot_screen(uint8_t *out, size_t max_bytes) {
@@ -451,7 +523,7 @@ void vbefb_snapshot_screen(uint8_t *out, size_t max_bytes) {
 void vbefb_restore_screen(const uint8_t *src, uint32_t src_cols, uint32_t src_rows) {
 	if (!vbe_is_available() || !textbuf || !src) return;
 	if (src_cols != cols || src_rows != rows) return;
-	if (cursor_visible) erase_cursor();
+	vbefb_begin_batch();
 	for (uint32_t y = 0; y < rows; y++) {
 		for (uint32_t x = 0; x < cols; x++) {
 			size_t off = ((size_t)y * cols + x) * 2u;
@@ -464,7 +536,7 @@ void vbefb_restore_screen(const uint8_t *src, uint32_t src_cols, uint32_t src_ro
 	}
 	g_vbe_dirty = 0;
 	vbe_dirty_mark(0, 0, fb_width, fb_height);
-	vbefb_flush_dirty();
+	vbefb_end_batch();
 }
 
 /* Initialize console state after vbe init; called externally if needed */
@@ -485,7 +557,9 @@ int vbefb_init(uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp) {
 	memset(textbuf, 0, (size_t)cols * rows * sizeof(cell_t));
 	cursor_x = 0; cursor_y = 0;
 	cursor_visible = 1;
-	cursor_blink_last_phase = 0;
+	cursor_drawn = 0;
+	cursor_frozen = 0;
+	cursor_blink_last_phase = cursor_blink_phase();
 	g_vbe_dirty = 0;
 	current_attr = 0x07;
 	esc_mode = 0;

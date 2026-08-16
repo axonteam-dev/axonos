@@ -21,6 +21,11 @@ static uint8_t g_bpos = 0, g_bsize = 8;
 
 int vbe_is_available(void) { return g_enabled; }
 
+static void *vbe_drawbuffer(void)
+{
+	return g_backbuf ? g_backbuf : g_frontbuf;
+}
+
 int vbe_attach_framebuffer(void *frontbuf, uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp) {
 	if (!frontbuf || width == 0 || height == 0 || pitch == 0 || bpp == 0) {
 		return -1;
@@ -61,7 +66,7 @@ static void vbe_flush_region_internal(uint32_t x, uint32_t y, uint32_t w, uint32
 	if (x + w > g_width) w = g_width - x;
 	if (y + h > g_height) h = g_height - y;
 
-	uint32_t bytes_per_pixel = g_bpp / 8;
+	uint32_t bytes_per_pixel = (g_bpp + 7) / 8;
 	for (uint32_t row = 0; row < h; row++) {
 		uint8_t *src = (uint8_t*)g_backbuf + (size_t)( (y + row) * g_pitch + x * bytes_per_pixel );
 		uint8_t *dst = (uint8_t*)g_frontbuf + (size_t)( (y + row) * g_pitch + x * bytes_per_pixel );
@@ -80,6 +85,7 @@ void vbe_flush_region(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 }
 
 void *vbe_get_backbuffer(void) { return g_backbuf; }
+void *vbe_get_drawbuffer(void) { return vbe_drawbuffer(); }
 void *vbe_get_frontbuffer(void) { return g_frontbuf; }
 uint32_t vbe_get_pitch(void) { return g_pitch; }
 uint32_t vbe_get_bpp(void) { return g_bpp; }
@@ -100,11 +106,12 @@ uint32_t vbe_pack_pixel(uint8_t r, uint8_t g, uint8_t b) {
 
 /* Scroll framebuffer up by given pixel rows (fast memmove). */
 void vbe_scroll_up_pixels(uint32_t pixels) {
-	if (!g_enabled || !g_frontbuf || pixels == 0 || pixels >= g_height) return;
+	uint8_t *fb = vbe_drawbuffer();
+
+	if (!g_enabled || !fb || pixels == 0 || pixels >= g_height) return;
 	uint32_t bytes_per_pixel = (g_bpp + 7) / 8;
 	size_t row_bytes = (size_t)g_pitch;
 	size_t move_bytes = row_bytes * (size_t)(g_height - pixels);
-	uint8_t *fb = (uint8_t*)g_frontbuf;
 	/* memmove handles overlap */
 	memmove(fb, fb + (size_t)pixels * row_bytes, move_bytes);
 	/* clear bottom area */
@@ -136,10 +143,11 @@ void vbe_scroll_up_pixels(uint32_t pixels) {
 
 /* Clear pixel region in front buffer using packed pixel value. */
 void vbe_clear_region(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t packed_pixel) {
-	if (!g_enabled || !g_frontbuf) return;
+	uint8_t *fb = vbe_drawbuffer();
+
+	if (!g_enabled || !fb) return;
 	uint32_t bpp = g_bpp;
 	uint32_t bytespp = (bpp + 7) / 8;
-	uint8_t *fb = (uint8_t*)g_frontbuf;
 	if (x >= g_width || y >= g_height) return;
 	if (x + w > g_width) w = g_width - x;
 	if (y + h > g_height) h = g_height - y;
@@ -206,16 +214,33 @@ int vbe_init_from_multiboot(uint32_t multiboot_magic, uint64_t multiboot_info) {
 				continue;
 			}
 
-			if (fb_addr == 0 || width == 0 || height == 0 || bpp == 0) {
+			if (fb_addr == 0 || width < 320 || height < 200) {
 				klogprintf("vbe: invalid fb fields, skipping\n");
 				off += (tag_size + 7) & ~7u;
 				continue;
 			}
 
+			if (ftype != 1 || (bpp != 15 && bpp != 16 && bpp != 24 && bpp != 32)) {
+				klogprintf("vbe: unsupported framebuffer type=%u bpp=%u\n",
+					(unsigned)ftype, (unsigned)bpp);
+				off += (tag_size + 7) & ~7u;
+				continue;
+			}
+
+			size_t bytes_per_pixel = ((size_t)bpp + 7) / 8;
+			if (width > (size_t)-1 / bytes_per_pixel ||
+			    pitch < (size_t)width * bytes_per_pixel ||
+			    height > (size_t)-1 / pitch) {
+				klogprintf("vbe: invalid framebuffer geometry\n");
+				off += (tag_size + 7) & ~7u;
+				continue;
+			}
+
 			size_t fb_size = (size_t)pitch * (size_t)height;
-			void *fb_va = mmio_map_phys(fb_addr, fb_size);
+			void *fb_va = mmio_map_framebuffer(fb_addr, fb_size);
 			if (!fb_va) {
-				klogprintf("vbe: mmio_map_phys failed for addr=0x%016llx size=%u\n", (unsigned long long)fb_addr, (unsigned)fb_size);
+				klogprintf("vbe: framebuffer map failed for addr=0x%016llx size=%u\n",
+					(unsigned long long)fb_addr, (unsigned)fb_size);
 				off += (tag_size + 7) & ~7u;
 				continue;
 			}
@@ -236,24 +261,16 @@ int vbe_init_from_multiboot(uint32_t multiboot_magic, uint64_t multiboot_info) {
 					(unsigned)g_rpos, (unsigned)g_rsize, (unsigned)g_gpos, (unsigned)g_gsize, (unsigned)g_bpos, (unsigned)g_bsize);
 			}
 
-			if (width < 320 || height < 200 || bpp < 15) {
-				// klogprintf("vbe: framebuffer looks like text mode (%ux%u bpp=%u) - skipping\n",
-				// 	(unsigned)width, (unsigned)height, (unsigned)bpp);
-				off += (tag_size + 7) & ~7u;
-				continue;
-			}
-
-			/* avoid large backbuffer allocation to reduce heap pressure;
-			   render directly into front buffer when possible */
 			g_frontbuf = fb_va;
-			g_backbuf = NULL;
+			g_backbuf = kcalloc(1, fb_size);
 			g_width = width;
 			g_height = height;
 			g_pitch = pitch;
 			g_bpp = bpp;
 			g_enabled = 1;
-			klogprintf("vbe: framebuffer at %p %ux%u bpp=%u pitch=%u (backbuf %p)\n",
-				(void*)(uintptr_t)fb_addr, width, height, (unsigned)g_bpp, (unsigned)g_pitch, g_backbuf);
+			klogprintf("vbe: framebuffer at %p %ux%u bpp=%u pitch=%u shadow=%s\n",
+				(void *)(uintptr_t)fb_addr, width, height, (unsigned)g_bpp,
+				(unsigned)g_pitch, g_backbuf ? "yes" : "no");
 			qemu_debug_printf("vbe: mapped fb_phys=%p -> fb_va=%p backbuf=%p width=%u height=%u bpp=%u pitch=%u\n",
 				(void*)(uintptr_t)fb_addr, fb_va, g_backbuf, (unsigned)width, (unsigned)height, (unsigned)bpp, (unsigned)pitch);
 			/* Do not scribble test pattern into the front buffer: on some hosts

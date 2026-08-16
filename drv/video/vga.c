@@ -443,6 +443,33 @@ void        scroll_line()
         release_irqrestore(&vga_lock_spin, fl);
 }
 
+void vga_scroll_region(uint32_t top, uint32_t bottom, uint8_t attr)
+{
+	if (top >= MAX_ROWS)
+		top = MAX_ROWS - 1;
+	if (bottom >= MAX_ROWS)
+		bottom = MAX_ROWS - 1;
+	if (top >= bottom)
+		return;
+
+	unsigned long flags;
+	acquire_irqsave(&vga_lock_spin, &flags);
+	for (uint32_t y = top; y < bottom; y++) {
+		for (uint32_t x = 0; x < MAX_COLS; x++) {
+			uint16_t dst = (uint16_t)((y * MAX_COLS + x) * 2);
+			uint16_t src = (uint16_t)(((y + 1) * MAX_COLS + x) * 2);
+			uint8_t ch = *(volatile uint8_t *)(VIDEO_ADDRESS + src);
+			uint8_t cell_attr = *(volatile uint8_t *)(VIDEO_ADDRESS + src + 1);
+			write_nolock(ch, cell_attr, dst);
+		}
+	}
+	for (uint32_t x = 0; x < MAX_COLS; x++) {
+		uint16_t offset = (uint16_t)((bottom * MAX_COLS + x) * 2);
+		write_nolock(' ', attr, offset);
+	}
+	release_irqrestore(&vga_lock_spin, flags);
+}
+
 void        kclear()
 {
         if (cirrusfb_is_ready()) {

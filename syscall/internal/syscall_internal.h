@@ -101,7 +101,9 @@ static inline void msr_write_u64(uint32_t msr,uint64_t v){uint32_t lo=(uint32_t)
 #define EACCES 13
 #define EBUSY 16
 #define ENOTDIR 20
+#define EISDIR 21
 #define ENOSPC 28
+#define ENOTEMPTY 39
 #define EIDRM 43
 #define EAFNOSUPPORT 97
 #define EPROTONOSUPPORT 93

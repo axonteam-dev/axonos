@@ -359,10 +359,6 @@ void apic_timer_handler(cpu_registers_t* regs) {
     if (cirrusfb_is_ready()) {
         cirrusfb_update_cursor();
     } else {
-        /* Full FB blit every few ms froze interactive work during kernel syscalls
-         * (connect/poll). Throttle to ~10 Hz; dirty regions flush on putchar. */
-        if ((apic_timer_ticks % 25u) == 0u)
-            vbe_flush_full();
         vbefb_update_cursor();
     }
     apic_eoi();

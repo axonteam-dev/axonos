@@ -56,6 +56,7 @@ struct devfs_tty {
        - SI (0x0F) / SO (0x0E) shift in/out (ncurses uses this) */
     uint8_t g0_is_acs;
     uint8_t acs_mode; /* active shift state (SO=1, SI=0) */
+    uint8_t need_wrap;
     /* ANSI IRM (CSI 4h / CSI 4l): insert vs replace on printable write.
      * terminfo mir/smir/rmir; ncurses uses this with ich/dch/ech for meters. */
     uint8_t insert_mode;

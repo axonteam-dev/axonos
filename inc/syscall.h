@@ -161,7 +161,10 @@ typedef struct syscall_frame {
 #define SYS_reboot 169
 #define SYS_access 21
 #define SYS_link   86
+#define SYS_symlink 88
+#define SYS_symlinkat 266
 #define SYS_mkdir  83
+#define SYS_rmdir  84
 #define SYS_mknod  133
 #define SYS_mknodat 259
 #define SYS_rename 82

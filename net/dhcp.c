@@ -496,11 +496,6 @@ got_ack:
     g_cached_lease_valid = 1;
     if (offered_ip != dhcp_last_logged_ip) {
         dhcp_last_logged_ip = offered_ip;
-        klogprintf("dhcp: ACK! ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
-            (out_lease->ip_be >> 24) & 0xFF, (out_lease->ip_be >> 16) & 0xFF,
-            (out_lease->ip_be >> 8) & 0xFF, out_lease->ip_be & 0xFF,
-            (out_lease->gw_be >> 24) & 0xFF, (out_lease->gw_be >> 16) & 0xFF,
-            (out_lease->gw_be >> 8) & 0xFF, out_lease->gw_be & 0xFF);
     }
     kfree(frame);
     return 0;

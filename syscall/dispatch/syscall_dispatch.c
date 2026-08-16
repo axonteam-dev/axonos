@@ -1810,6 +1810,7 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define EACCES  13
 #define EBUSY   16
 #define ENOTDIR 20
+#define ENOTEMPTY 39
 #define ENOSPC  28
 #define EIDRM   43
 #define EAFNOSUPPORT 97
@@ -4636,14 +4637,14 @@ static int net_set_if_up(int up) {
 }
 
 static void net_announce_ipv4(const char *how) {
-    klogprintf("net: eth0 %s ip=%u.%u.%u.%u mask=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
-               how ? how : "configured",
-               (unsigned)((g_net.ip_be >> 24) & 0xFF), (unsigned)((g_net.ip_be >> 16) & 0xFF),
-               (unsigned)((g_net.ip_be >> 8) & 0xFF), (unsigned)(g_net.ip_be & 0xFF),
-               (unsigned)((g_net.mask_be >> 24) & 0xFF), (unsigned)((g_net.mask_be >> 16) & 0xFF),
-               (unsigned)((g_net.mask_be >> 8) & 0xFF), (unsigned)(g_net.mask_be & 0xFF),
-               (unsigned)((g_net.gw_be >> 24) & 0xFF), (unsigned)((g_net.gw_be >> 16) & 0xFF),
-               (unsigned)((g_net.gw_be >> 8) & 0xFF), (unsigned)(g_net.gw_be & 0xFF));
+    // klogprintf("net: eth0 %s ip=%u.%u.%u.%u mask=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
+    //            how ? how : "configured",
+    //            (unsigned)((g_net.ip_be >> 24) & 0xFF), (unsigned)((g_net.ip_be >> 16) & 0xFF),
+    //            (unsigned)((g_net.ip_be >> 8) & 0xFF), (unsigned)(g_net.ip_be & 0xFF),
+    //            (unsigned)((g_net.mask_be >> 24) & 0xFF), (unsigned)((g_net.mask_be >> 16) & 0xFF),
+    //            (unsigned)((g_net.mask_be >> 8) & 0xFF), (unsigned)(g_net.mask_be & 0xFF),
+    //            (unsigned)((g_net.gw_be >> 24) & 0xFF), (unsigned)((g_net.gw_be >> 16) & 0xFF),
+    //            (unsigned)((g_net.gw_be >> 8) & 0xFF), (unsigned)(g_net.gw_be & 0xFF));
 }
 
 static void net_write_resolv_from_dns(uint32_t dns_be) {
@@ -8341,6 +8342,27 @@ static uint64_t do_linux_fork(thread_t *cur,
                 rebuild_syscall_frame(cur);
             fork_assign_child_return_rip(cur, child);
             /*
+             * musl vfork() removes its return address from the shared user
+             * stack before SYSCALL and carries it in %rdx:
+             *
+             *     pop %rdx; syscall; push %rdx
+             *
+             * A normal fork child wants rdx=0 for glibc's _Fork wrapper, but
+             * a vfork child must restore this register or the wrapper pushes
+             * garbage and returns to a low address (observed as RIP=0x3 when
+             * opkg spawned BusyBox wget).
+             */
+            if (args->flags & CLONE_VFORK) {
+                uint64_t return_address = cur->saved_user_rdx;
+                if (cur->saved_syscall_frame)
+                    return_address = cur->saved_syscall_frame[12];
+                else if (cur->syscall_frame_kbuf)
+                    return_address = cur->syscall_frame_kbuf[12];
+                child->saved_user_rdx = return_address;
+                child->fork_gpr_snap[12] = return_address;
+                child->clone_preserve_rdx = 1;
+            }
+            /*
              * fork_child_user_rip arms Soft_COW/_Fork identity fixes. Linux
              * vfork already shares mm — leave the marker cleared so
              * syscall-fork-child-wins does not fire on every pre-exec syscall.
@@ -9860,6 +9882,63 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (r == 0) return 0;
             return ret_err(r < 0 ? -r : EIO);
         }
+        case SYS_symlink: {
+            const char *target_u = (const char *)(uintptr_t)a1;
+            const char *linkpath_u = (const char *)(uintptr_t)a2;
+            char target[4096];
+            char linkpath[512];
+            size_t target_len;
+            int r;
+
+            if (!target_u || !linkpath_u ||
+                !user_range_ok(target_u, 1) ||
+                !user_range_ok(linkpath_u, 1))
+                return ret_err(EFAULT);
+            target_len = user_strnlen_bounded(target_u, sizeof(target));
+            if (target_len == 0)
+                return ret_err(ENOENT);
+            if (target_len >= sizeof(target))
+                return ret_err(ENAMETOOLONG);
+            if (copy_from_user_raw(target, target_u, target_len + 1) != 0)
+                return ret_err(EFAULT);
+            resolve_user_path(cur, linkpath_u, linkpath, sizeof(linkpath));
+            if (!linkpath[0])
+                return ret_err(ENOENT);
+            r = overlayfs_symlink(linkpath, target);
+            if (r == 0)
+                return 0;
+            return ret_err(EIO);
+        }
+        case SYS_symlinkat: {
+            const char *target_u = (const char *)(uintptr_t)a1;
+            int newdirfd = (int)a2;
+            const char *linkpath_u = (const char *)(uintptr_t)a3;
+            char target[4096];
+            char linkpath[512];
+            size_t target_len;
+            int rc;
+            int r;
+
+            if (!target_u || !linkpath_u ||
+                !user_range_ok(target_u, 1) ||
+                !user_range_ok(linkpath_u, 1))
+                return ret_err(EFAULT);
+            target_len = user_strnlen_bounded(target_u, sizeof(target));
+            if (target_len == 0)
+                return ret_err(ENOENT);
+            if (target_len >= sizeof(target))
+                return ret_err(ENAMETOOLONG);
+            if (copy_from_user_raw(target, target_u, target_len + 1) != 0)
+                return ret_err(EFAULT);
+            rc = resolve_user_path_at(cur, newdirfd, linkpath_u,
+                                      linkpath, sizeof(linkpath));
+            if (rc != 0)
+                return ret_err(-rc);
+            r = overlayfs_symlink(linkpath, target);
+            if (r == 0)
+                return 0;
+            return ret_err(EIO);
+        }
         case 87: { /* unlink(path) */
             const char *path_u = (const char*)(uintptr_t)a1;
             if (!path_u) return ret_err(EFAULT);
@@ -9994,6 +10073,69 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return 0;
                 }
                 return ret_err(fs_mkdir_errno(r));
+            }
+        }
+        case SYS_rmdir: {
+            const char *path_u = (const char *)(uintptr_t)a1;
+            char path[256];
+            struct stat st;
+            struct fs_file *dir;
+            uint8_t entries[4096];
+            ssize_t nr;
+            size_t off;
+
+            if (!path_u ||
+                (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT)
+                return ret_err(EFAULT);
+            resolve_user_path(cur, path_u, path, sizeof(path));
+            if (path[0] == '\0')
+                return ret_err(ENOENT);
+            if (strcmp(path, "/") == 0)
+                return ret_err(EBUSY);
+            if (vfs_lstat(path, &st) != 0)
+                return ret_err(ENOENT);
+            if ((st.st_mode & S_IFDIR) != S_IFDIR)
+                return ret_err(ENOTDIR);
+
+            /*
+             * ramfs_remove() is also the overlay unlink primitive and removes
+             * directories recursively. Keep Linux rmdir(2) semantics here:
+             * inspect the ext2-like directory stream and reject anything
+             * except "." and "..".
+             */
+            dir = fs_open(path);
+            if (!dir)
+                return ret_err(ENOENT);
+            nr = fs_read(dir, entries, sizeof(entries), 0);
+            fs_file_free(dir);
+            if (nr < 0)
+                return ret_err(EIO);
+            off = 0;
+            while (off + sizeof(struct ext2_dir_entry) <= (size_t)nr) {
+                struct ext2_dir_entry *de =
+                    (struct ext2_dir_entry *)(entries + off);
+                const char *name = (const char *)(entries + off + 8);
+                size_t name_room;
+
+                if (de->rec_len < 8 || off + de->rec_len > (size_t)nr)
+                    return ret_err(EIO);
+                name_room = (size_t)de->rec_len - 8;
+                if (de->name_len > name_room)
+                    return ret_err(EIO);
+                if (de->inode != 0 &&
+                    !(de->name_len == 1 && name[0] == '.') &&
+                    !(de->name_len == 2 && name[0] == '.' && name[1] == '.'))
+                    return ret_err(ENOTEMPTY);
+                off += de->rec_len;
+            }
+
+            {
+                int r = fs_unlink(path);
+                if (r == 0)
+                    return 0;
+                if (r == -3)
+                    return ret_err(ENOENT);
+                return ret_err(EIO);
             }
         }
         case 258: { /* mkdirat(dirfd, pathname, mode) */
@@ -11752,13 +11894,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (s->sock_domain == AF_INET_LOCAL) {
                 sockaddr_in_k sa;
                 int pr = user_sockaddr_to_ipv4_peer(addr_u, addrlen, &sa);
-                if (pr != 0) {
-                    static int bind_fail_left = 8;
-                    if (bind_fail_left-- > 0)
-                        klogprintf("net: bind peer-parse err=%d tid=%d\n", pr,
-                                   t ? (int)t->tid : -1);
-                    return ret_err(pr);
-                }
+                if (pr != 0) return ret_err(pr);
+
                 uint16_t port = be16(sa.sin_port);
                 if (port == 0) port = net_alloc_ephemeral_port();
                 if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
@@ -13721,13 +13858,36 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         case 137: /* statfs */
         case 138: { /* fstatfs */
             struct statfs_k ksf;
+            uint64_t total_bytes;
+            uint64_t free_bytes;
+            uint64_t avail_bytes;
+            const uint64_t block_size = 4096;
+            const uint64_t kernel_reserve = 16ULL * 1024ULL * 1024ULL;
+
             memset(&ksf, 0, sizeof(ksf));
             ksf.f_type = 0x01021994; /* TMPFS_MAGIC default */
-            ksf.f_bsize = 4096;
-            ksf.f_frsize = 4096;
-            ksf.f_blocks = 1024;
-            ksf.f_bfree = 512;
-            ksf.f_bavail = 512;
+            ksf.f_bsize = (long)block_size;
+            ksf.f_frsize = (long)block_size;
+            /*
+             * The overlay upper and tmpfs store file payloads in kmalloc.
+             * Linux statfs reports the allocator backing the writable mount;
+             * expose that arena instead of the old fixed 4 MiB/2 MiB stub.
+             * Keep a reserve so package extraction cannot consume memory
+             * needed by the scheduler, networking, and filesystem metadata.
+             */
+            total_bytes = (uint64_t)heap_total_bytes();
+            free_bytes = (uint64_t)heap_free_bytes();
+            if (total_bytes < block_size)
+                total_bytes = block_size;
+            if (free_bytes > total_bytes)
+                free_bytes = total_bytes;
+            avail_bytes = free_bytes > kernel_reserve
+                ? free_bytes - kernel_reserve : 0;
+            ksf.f_blocks = total_bytes / block_size;
+            ksf.f_bfree = free_bytes / block_size;
+            ksf.f_bavail = avail_bytes / block_size;
+            ksf.f_files = total_bytes / 256u;
+            ksf.f_ffree = free_bytes / 256u;
             ksf.f_namelen = 255;
 
             if (num == 137) {
@@ -13743,15 +13903,19 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (md && md->ops && md->ops->name && strcmp(md->ops->name, "fat32") == 0) {
                     if (fat32_statfs(&ksf) != 0) return ret_err(EIO);
                 } else if (md && md->ops && md->ops->name) {
-                    if (strcmp(md->ops->name, "proc") == 0 || strcmp(md->ops->name, "procfs") == 0)
+                    if (strcmp(md->ops->name, "proc") == 0 || strcmp(md->ops->name, "procfs") == 0) {
                         ksf.f_type = 0x9fa0;
-                    else if (strcmp(md->ops->name, "sysfs") == 0)
+                        ksf.f_blocks = ksf.f_bfree = ksf.f_bavail = 0;
+                    } else if (strcmp(md->ops->name, "sysfs") == 0) {
                         ksf.f_type = 0x62656572;
-                    else if (strcmp(md->ops->name, "devfs") == 0 || strcmp(md->ops->name, "devtmpfs") == 0)
+                        ksf.f_blocks = ksf.f_bfree = ksf.f_bavail = 0;
+                    } else if (strcmp(md->ops->name, "devfs") == 0 || strcmp(md->ops->name, "devtmpfs") == 0)
                         ksf.f_type = 0x01021994;
-                    else if (strcmp(md->ops->name, "squashfs") == 0)
+                    else if (strcmp(md->ops->name, "squashfs") == 0) {
                         ksf.f_type = 0x73717368;
-                    else if (strcmp(md->ops->name, "overlay") == 0 || strcmp(md->ops->name, "overlayfs") == 0)
+                        ksf.f_bfree = ksf.f_bavail = 0;
+                        ksf.f_flags |= 1; /* ST_RDONLY */
+                    } else if (strcmp(md->ops->name, "overlay") == 0 || strcmp(md->ops->name, "overlayfs") == 0)
                         ksf.f_type = 0x794c7630;
                 }
                 if (copy_to_user_safe(buf_u, &ksf, sizeof(ksf)) != 0) return ret_err(EFAULT);
@@ -13768,6 +13932,22 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 struct fs_driver *md = fs_get_mount_driver(ff->path);
                 if (md && md->ops && md->ops->name && strcmp(md->ops->name, "fat32") == 0) {
                     if (fat32_statfs(&ksf) != 0) return ret_err(EIO);
+                } else if (md && md->ops && md->ops->name) {
+                    if (strcmp(md->ops->name, "proc") == 0 ||
+                        strcmp(md->ops->name, "procfs") == 0) {
+                        ksf.f_type = 0x9fa0;
+                        ksf.f_blocks = ksf.f_bfree = ksf.f_bavail = 0;
+                    } else if (strcmp(md->ops->name, "sysfs") == 0) {
+                        ksf.f_type = 0x62656572;
+                        ksf.f_blocks = ksf.f_bfree = ksf.f_bavail = 0;
+                    } else if (strcmp(md->ops->name, "squashfs") == 0) {
+                        ksf.f_type = 0x73717368;
+                        ksf.f_bfree = ksf.f_bavail = 0;
+                        ksf.f_flags |= 1;
+                    } else if (strcmp(md->ops->name, "overlay") == 0 ||
+                               strcmp(md->ops->name, "overlayfs") == 0) {
+                        ksf.f_type = 0x794c7630;
+                    }
                 }
             }
             if (copy_to_user_safe(buf_u, &ksf, sizeof(ksf)) != 0) return ret_err(EFAULT);
@@ -16939,7 +17119,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         case SYS_open: {
             const char *path_u = (const char*)(uintptr_t)a1;
             int flags = (int)a2;
-            (void)a3;
+            mode_t create_mode = (mode_t)a3;
+            int created = 0;
             if (!path_u || (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             char *path = kmalloc(256);
             if (!path) return ret_err(ENOMEM);
@@ -16973,6 +17154,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (flags & O_CREAT_MASK) {
                     f = fs_create_file(path);
                     if (!f) { kfree(path); return ret_err(ENOENT); }
+                    created = 1;
                 } else {
                     kfree(path);
                     return ret_err(ENOENT);
@@ -16983,6 +17165,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     kfree(path);
                     return ret_err(EEXIST);
                 }
+            }
+            if (created) {
+                mode_t um = cur ? (mode_t)(cur->umask & 07777u) : (mode_t)0022;
+                (void)fs_chmod(path, (create_mode & ~um) & 07777u);
             }
             const int O_TRUNC_MASK = 0x200;
             const int O_APPEND_MASK = 0x400;
@@ -17020,7 +17206,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             int dirfd = (int)a1;
             const char *path_u = (const char*)(uintptr_t)a2;
             int flags = (int)a3;
-            (void)a4;
+            mode_t create_mode = (mode_t)a4;
+            int created = 0;
             if (!path_u || (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             char path[4096];
             int rc = resolve_user_path_at(cur, dirfd, path_u, path, sizeof(path));
@@ -17072,6 +17259,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             devel_printf("pid1 openat ENOENT create path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
                         return ret_err(ENOENT);
                     }
+                    created = 1;
                 } else {
                     //klogprintf("openat() returned ENOENT for %s\n", path);
                     if (is_init_user(cur) || (cur && cur->name[0] &&
@@ -17087,6 +17275,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     fs_file_free(f);
                     return ret_err(EEXIST);
                 }
+            }
+            if (created) {
+                mode_t um = cur ? (mode_t)(cur->umask & 07777u) : (mode_t)0022;
+                (void)fs_chmod(path, (create_mode & ~um) & 07777u);
             }
             const int O_TRUNC_MASK = 0x200;
             const int O_APPEND_MASK = 0x400;

@@ -58,10 +58,6 @@ static int ps2_kbd_send_ack(uint8_t byte) {
         }
         return -1;
 }
-
-// Размер буфера клавиатуры
-#define KEYBOARD_BUFFER_SIZE 256
-
 // Буфер для хранения символов
 // We no longer maintain a separate global keyboard buffer; input is routed into devfs tty buffers.
 

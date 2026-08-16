@@ -80,6 +80,14 @@ static void swcursor_draw_at(uint32_t cx, uint32_t cy);
 extern volatile uint64_t timer_ticks;
 extern volatile uint32_t timer_frequency;
 
+static uint64_t cursor_blink_phase(void)
+{
+	uint32_t hz = timer_frequency ? timer_frequency : 250u;
+	uint32_t half_period = (hz + 1u) / 2u;
+
+	return timer_ticks / half_period;
+}
+
 static void fb_dirty_mark(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 	if (w == 0 || h == 0) return;
 	uint32_t x1 = x + w - 1;
@@ -607,7 +615,7 @@ int cirrusfb_init(void *fb, uint32_t width, uint32_t height, uint32_t pitch, uin
 	g_cursor_y = 0;
 	g_current_attr = 0x07;
 	g_swcursor_visible = 1;
-	g_swcursor_last_phase = 0;
+	g_swcursor_last_phase = cursor_blink_phase();
 	g_fb_dirty = 0;
 	g_fb_sync_pending = 0;
 	g_last_sync_ticks = 0;
@@ -1227,10 +1235,7 @@ void cirrusfb_update_cursor(void) {
 	}
 	if (g_swcursor_frozen)
 		return;
-	/* Blink based on absolute monotonic time so it remains stable even if
-	   timer IRQs are delayed by load/exception handling (catch-up on next tick). */
-	const uint64_t period_ticks = 500; /* ~500ms when timer_ticks is 1ms */
-	uint64_t phase = (period_ticks != 0) ? (timer_ticks / period_ticks) : 0;
+	uint64_t phase = cursor_blink_phase();
 	if (phase == g_swcursor_last_phase) return;
 	g_swcursor_last_phase = phase;
 	int want_visible = ((phase & 1ULL) == 0ULL) ? 1 : 0;

@@ -1149,6 +1149,19 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 kprintf("boot: tmpfs mounted on /run\n");
         (void)ramfs_mkdir("/run/lock");
         (void)ramfs_mkdir("/run/openrc");
+        /* opkg state must live on a writable upper/tmpfs. Keeping it below
+         * squashfs /var made libarchive fail creating control/list files. */
+        (void)ramfs_mkdir("/run/opkg");
+        (void)ramfs_mkdir("/run/opkg/lists");
+        (void)ramfs_mkdir("/run/opkg/info");
+        (void)ramfs_mkdir("/run/opkg/cache");
+        {
+                struct fs_file *status = fs_create_file("/run/opkg/status");
+                if (!status)
+                        status = fs_open("/run/opkg/status");
+                if (status)
+                        fs_file_free(status);
+        }
         {
                 struct stat st;
                 if (vfs_lstat("/var/run", &st) != 0)
@@ -1257,7 +1270,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         /* /etc/profile: login shells (getty→login→sh -l). */
         {
                 static const char profile[] =
-                        "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
+                        "export PATH=/opt/bin:/opt/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
                         "export TERM=linux\n"
                         "export USER=root\n"
                         "export LOGNAME=root\n"

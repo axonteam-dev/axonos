@@ -765,6 +765,19 @@ static int overlay_unlink(const char *path)
     return -1;
 }
 
+int overlayfs_symlink(const char *path, const char *target)
+{
+    if (!overlay_active || !path || !target)
+        return -1;
+    if (ramfs_path_is_whiteout(path)) {
+        if (ramfs_remove(path) != 0)
+            return -1;
+    }
+    if (ov_ensure_parent_upper(path) != 0)
+        return -1;
+    return ramfs_symlink(path, target);
+}
+
 /*
  * Linux overlay: xattrs live on the layer that owns the inode.
  * Lower (squashfs) has no xattr reader yet → -EOPNOTSUPP.
@@ -855,6 +868,7 @@ int overlayfs_removexattr(const char *path, const char *name)
 int overlayfs_fill_stat(struct fs_file *file, struct stat *st)
 {
     struct overlay_file_handle *fh;
+    int rc;
     if (!file || !st || !file->driver_private)
         return -1;
     fh = (struct overlay_file_handle *)file->driver_private;
@@ -869,8 +883,17 @@ int overlayfs_fill_stat(struct fs_file *file, struct stat *st)
     if (!fh->inner)
         return -1;
     if (fh->layer == OV_LAYER_UPPER)
-        return ramfs_fill_stat(fh->inner, st);
-    return squashfs_fill_stat(fh->inner, st);
+        rc = ramfs_fill_stat(fh->inner, st);
+    else
+        rc = squashfs_fill_stat(fh->inner, st);
+    /*
+     * Linux overlayfs exposes one filesystem device ID regardless of which
+     * backing layer supplied an inode. Leaking squashfs st_dev here prevents
+     * findmnt/df from recognizing lower-layer paths as part of the root mount.
+     */
+    if (rc == 0)
+        st->st_dev = 1;
+    return rc;
 }
 
 int overlayfs_ftruncate(struct fs_file *file, off_t length)

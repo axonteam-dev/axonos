@@ -807,7 +807,8 @@ int ramfs_chmod(const char *path, mode_t mode) {
     thread_t* ct = thread_current();
     uid_t uid = ct ? ct->euid : 0;
     if (uid != 0 && uid != n->uid) return -1;
-    n->mode = mode;
+    /* chmod changes permission/special bits, never the inode file type. */
+    n->mode = (n->mode & 0170000u) | (mode & 07777u);
     return 0;
 }
 

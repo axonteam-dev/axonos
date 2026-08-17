@@ -38,9 +38,12 @@ static void rand_seed_once(void) {
     uint64_t ms = pit_get_time_ms();
     memcpy(pool + n, &ms, sizeof(ms)); n += sizeof(ms);
 
-    rtc_datetime_t dt;
-    rtc_read_datetime(&dt);
-    memcpy(pool + n, &dt, sizeof(dt)); n += sizeof(dt);
+    {
+        rtc_datetime_t dt;
+        rtc_read_datetime(&dt);
+        memcpy(pool + n, &dt, sizeof(dt));
+        n += sizeof(dt);
+    }
 
     {
         static int local_dummy;

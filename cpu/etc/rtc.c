@@ -8,26 +8,25 @@
 #include <pic.h>
 #include <klog.h>
 #include <debug.h>
+#include <spinlock.h>
 
 // Глобальный счетчик тиков RTC
 volatile uint64_t rtc_ticks = 0;
+static spinlock_t rtc_cmos_lock;
 
-// Функция для чтения регистра RTC
+/* Index port bit7 disables NMI for the access (Linux CMOS). */
 static uint8_t rtc_read_register(uint8_t reg) {
-    outb(RTC_COMMAND_PORT, reg);
+    outb(RTC_COMMAND_PORT, (uint8_t)(reg | 0x80u));
     return inb(RTC_DATA_PORT);
 }
 
-// Функция для записи в регистр RTC
 static void rtc_write_register(uint8_t reg, uint8_t value) {
-    outb(RTC_COMMAND_PORT, reg);
+    outb(RTC_COMMAND_PORT, (uint8_t)(reg | 0x80u));
     outb(RTC_DATA_PORT, value);
 }
 
-// Проверка, идет ли обновление RTC (флаг UIP - Update in Progress)
-static int is_update_in_progress() {
-    outb(RTC_COMMAND_PORT, RTC_REG_STATUS_A);
-    return (inb(RTC_DATA_PORT) & 0x80);
+static int is_update_in_progress(void) {
+    return (rtc_read_register(RTC_REG_STATUS_A) & 0x80) != 0;
 }
 
 // Конвертация из BCD в бинарный формат
@@ -35,10 +34,20 @@ static uint8_t bcd_to_binary(uint8_t bcd) {
     return (bcd & 0x0F) + ((bcd >> 4) * 10);
 }
 
-// Чтение текущей даты и времени из RTC
 void rtc_read_datetime(rtc_datetime_t* dt) {
-    // Ждем, пока не завершится обновление
-    while (is_update_in_progress());
+    unsigned long irqf;
+    int i;
+    uint8_t reg_b;
+
+    if (!dt)
+        return;
+    /* Linux rtc_cmos: never spin forever on UIP (0xFF CMOS looks like UIP). */
+    acquire_irqsave(&rtc_cmos_lock, &irqf);
+    for (i = 0; i < 10000; i++) {
+        if (!is_update_in_progress())
+            break;
+        asm volatile("pause" ::: "memory");
+    }
 
     dt->second = rtc_read_register(RTC_REG_SECONDS);
     dt->minute = rtc_read_register(RTC_REG_MINUTES);
@@ -46,11 +55,8 @@ void rtc_read_datetime(rtc_datetime_t* dt) {
     dt->day = rtc_read_register(RTC_REG_DAY);
     dt->month = rtc_read_register(RTC_REG_MONTH);
     dt->year = rtc_read_register(RTC_REG_YEAR);
+    reg_b = rtc_read_register(RTC_REG_STATUS_B);
 
-    // Проверяем регистр B, чтобы узнать формат данных
-    uint8_t reg_b = rtc_read_register(RTC_REG_STATUS_B);
-
-    // Конвертируем из BCD, если нужно
     if (!(reg_b & 0x04)) {
         dt->second = bcd_to_binary(dt->second);
         dt->minute = bcd_to_binary(dt->minute);
@@ -59,14 +65,20 @@ void rtc_read_datetime(rtc_datetime_t* dt) {
         dt->month = bcd_to_binary(dt->month);
         dt->year = bcd_to_binary(dt->year);
     }
+    if (!(reg_b & 0x02) && (dt->hour & 0x80))
+        dt->hour = (uint8_t)(((dt->hour & 0x7Fu) + 12u) % 24u);
 
-    // Обработка 12-часового формата, если он включен
-    if (!(reg_b & 0x02) && (dt->hour & 0x80)) {
-        dt->hour = ((dt->hour & 0x7F) + 12) % 24;
+    dt->year = (uint16_t)(dt->year + 2000);
+    if (dt->month < 1 || dt->month > 12 || dt->day < 1 || dt->day > 31 ||
+        dt->hour > 23 || dt->minute > 59 || dt->second > 59) {
+        dt->second = 0;
+        dt->minute = 0;
+        dt->hour = 0;
+        dt->day = 1;
+        dt->month = 1;
+        dt->year = 2026;
     }
-
-    // Для простоты считаем 21 век
-    dt->year += 2000;
+    release_irqrestore(&rtc_cmos_lock, irqf);
 }
 
 // Обработчик прерывания от RTC (IRQ 8)

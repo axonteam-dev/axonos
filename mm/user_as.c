@@ -34,8 +34,6 @@ static int user_as_ensure_range_for_exec(thread_t *tcur, uintptr_t lo, uintptr_t
     if (user_as_has_private_mm(tcur)) {
         /* Linux do_brk_flags: identity→anon zero; share baseline = oldmm. */
         mm_t *share = tcur->mm_ptemplate ? tcur->mm_ptemplate : mm_kernel();
-        if (mm_privatize_identity_range_blank(tcur->mm, (uint64_t)lo, (uint64_t)hi) != 0)
-            return -1;
         if (mm_make_private_range(tcur->mm, (uint64_t)lo, (uint64_t)hi, 0, share) != 0)
             return -1;
         return 0;

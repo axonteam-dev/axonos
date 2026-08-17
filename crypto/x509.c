@@ -114,3 +114,50 @@ int x509_generate(const x509_req_t *req, uint8_t *out, size_t cap,
     if (out_len) *out_len = der_w_size(&cert);
     return 0;
 }
+
+int x509_der_to_pem(const uint8_t *der, size_t der_len, char *out, size_t cap,
+                    size_t *out_len)
+{
+    static const char hdr[] = "-----BEGIN CERTIFICATE-----\n";
+    static const char ftr[] = "-----END CERTIFICATE-----\n";
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i, n = 0, col = 0;
+    size_t b64_len, lines, need;
+
+    if (!der || !out || der_len == 0)
+        return -1;
+    b64_len = ((der_len + 2) / 3) * 4;
+    lines = (b64_len + 63) / 64;
+    need = (sizeof(hdr) - 1) + b64_len + lines + (sizeof(ftr) - 1);
+    if (cap < need + 1)
+        return -1;
+
+    memcpy(out + n, hdr, sizeof(hdr) - 1);
+    n += sizeof(hdr) - 1;
+    for (i = 0; i < der_len; i += 3) {
+        unsigned nleft = (unsigned)(der_len - i);
+        uint32_t v = ((uint32_t)der[i]) << 16;
+        if (nleft > 1)
+            v |= ((uint32_t)der[i + 1]) << 8;
+        if (nleft > 2)
+            v |= (uint32_t)der[i + 2];
+        out[n++] = b64[(v >> 18) & 63];
+        out[n++] = b64[(v >> 12) & 63];
+        out[n++] = (nleft > 1) ? b64[(v >> 6) & 63] : '=';
+        out[n++] = (nleft > 2) ? b64[v & 63] : '=';
+        col += 4;
+        if (col >= 64) {
+            out[n++] = '\n';
+            col = 0;
+        }
+    }
+    if (col)
+        out[n++] = '\n';
+    memcpy(out + n, ftr, sizeof(ftr) - 1);
+    n += sizeof(ftr) - 1;
+    out[n] = '\0';
+    if (out_len)
+        *out_len = n;
+    return 0;
+}

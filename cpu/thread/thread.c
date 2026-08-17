@@ -56,17 +56,15 @@ static inline int thread_time_after_eq32(uint32_t now, uint32_t deadline) {
         return (int32_t)(now - deadline) >= 0;
 }
 
-static uint32_t thread_ms_to_timer_ticks(uint32_t ms) {
-        uint32_t freq = (uint32_t)pit_get_frequency();
-        if (freq == 0) freq = 1000u;
-        uint64_t ticks64 = ((uint64_t)ms * (uint64_t)freq + 999u) / 1000u;
-        if (ticks64 == 0) ticks64 = 1;
-        if (ticks64 > 0x7FFFFFFFULL) ticks64 = 0x7FFFFFFFULL;
-        return (uint32_t)ticks64;
+static uint32_t thread_deadline_ms(uint32_t delay_ms) {
+        uint32_t now = (uint32_t)pit_get_time_ms();
+        if (delay_ms == 0) delay_ms = 1;
+        if (delay_ms > 0x7FFFFFFFu) delay_ms = 0x7FFFFFFFu;
+        return now + delay_ms;
 }
 
 void thread_wake_expired_timeouts(void) {
-        uint32_t now = (uint32_t)timer_ticks;
+        uint32_t now = (uint32_t)pit_get_time_ms();
         unsigned long irqf;
         acquire_irqsave(&sched_lock, &irqf);
         for (int i = 0; i < thread_count; ++i) {
@@ -694,6 +692,8 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         }
         strncpy(t->cwd, "/", sizeof(t->cwd));
         t->cwd[sizeof(t->cwd) - 1] = '\0';
+        strncpy(t->fs_root, "/", sizeof(t->fs_root));
+        t->fs_root[sizeof(t->fs_root) - 1] = '\0';
         /* Use next free slot and tid so we never overwrite an existing thread. */
         {
                 unsigned long irqf;
@@ -791,6 +791,8 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                 t->attached_tty = tc->attached_tty >= 0 ? tc->attached_tty : devfs_get_active();
                 strncpy(t->cwd, tc->cwd[0] ? tc->cwd : "/", sizeof(t->cwd));
                 t->cwd[sizeof(t->cwd) - 1] = '\0';
+                strncpy(t->fs_root, tc->fs_root[0] ? tc->fs_root : "/", sizeof(t->fs_root));
+                t->fs_root[sizeof(t->fs_root) - 1] = '\0';
         } else {
                 t->uid = t->euid = t->suid = 0;
                 t->gid = t->egid = t->sgid = 0;
@@ -799,6 +801,7 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                 t->attached_tty = devfs_get_active();
         }
         if (!t->cwd[0]) { strncpy(t->cwd, "/", sizeof(t->cwd)); t->cwd[sizeof(t->cwd)-1] = '\0'; }
+        if (!t->fs_root[0]) { strncpy(t->fs_root, "/", sizeof(t->fs_root)); t->fs_root[sizeof(t->fs_root)-1] = '\0'; }
         t->user_brk_base = 0;
         t->user_brk_cur = 0;
         t->user_mmap_next = 0;
@@ -1156,8 +1159,7 @@ int thread_block_current_atomic(void) {
 }
 
 void thread_block_with_timeout(int pid, uint32_t timeout_ms) {
-        uint32_t now = (uint32_t)timer_ticks;
-        uint32_t deadline = timeout_ms ? now + thread_ms_to_timer_ticks(timeout_ms) : 0xFFFFFFFFu;
+        uint32_t deadline = timeout_ms ? thread_deadline_ms(timeout_ms) : 0;
         unsigned long irqf;
         acquire_irqsave(&sched_lock, &irqf);
         for (int i = 0; i < thread_count; ++i) {
@@ -1180,7 +1182,7 @@ void thread_sleep(uint32_t ms) {
                 return;
         unsigned long irqf;
         acquire_irqsave(&sched_lock, &irqf);
-        c->sleep_until = (uint32_t)timer_ticks + thread_ms_to_timer_ticks(ms);
+        c->sleep_until = thread_deadline_ms(ms);
         c->state = THREAD_SLEEPING;
         release_irqrestore(&sched_lock, irqf);
         thread_yield();
@@ -1210,7 +1212,7 @@ void thread_schedule() {
                 i = 0;
         }
 
-        uint32_t now = (uint32_t)timer_ticks;
+        uint32_t now = (uint32_t)pit_get_time_ms();
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->state == THREAD_SLEEPING) {
                         if (thread_time_after_eq32(now, threads[i]->sleep_until)) {

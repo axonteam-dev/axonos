@@ -31,8 +31,6 @@ static int user_brk_ensure_range(thread_t *tcur, uintptr_t lo, uintptr_t hi) {
     if (tcur && tcur->mm && k && tcur->mm->pml4 && k->pml4 &&
         tcur->mm->pml4 != k->pml4) {
         mm_t *share = tcur->mm_ptemplate ? tcur->mm_ptemplate : k;
-        if (mm_privatize_identity_range_blank(tcur->mm, (uint64_t)lo, (uint64_t)hi) != 0)
-            return -1;
         return mm_make_private_range(tcur->mm, (uint64_t)lo, (uint64_t)hi, 0, share);
     }
     return user_map_ensure_present_us_2m((uint64_t)lo, (uint64_t)hi);

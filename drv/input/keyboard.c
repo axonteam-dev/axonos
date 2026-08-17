@@ -14,16 +14,18 @@
 // Вспомогательные функции для ожидания статусов контроллера PS/2
 static int ps2_wait_input_empty(void) {
         // Wait until input buffer (bit1) is clear => we can write to 0x60/0x64
-        for (int i = 0; i < 100000; i++) {
+        for (int i = 0; i < 10000; i++) {
                 if ((inb(0x64) & 0x02) == 0) return 1;
+                asm volatile("pause" ::: "memory");
         }
         return 0;
 }
 
 static int ps2_wait_output_full(void) {
         // Wait until output buffer (bit0) is set => data available at 0x60
-        for (int i = 0; i < 100000; i++) {
+        for (int i = 0; i < 10000; i++) {
                 if ((inb(0x64) & 0x01) != 0) return 1;
+                asm volatile("pause" ::: "memory");
         }
         return 0;
 }

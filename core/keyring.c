@@ -47,6 +47,11 @@ static spinlock_t g_kr_lock;
 static kr_slot_t g_keys[KEYRING_MAX];
 static uint32_t g_next_serial = 1;
 static uint32_t g_session_serial;
+static uint32_t g_builtin_serial;
+static uint32_t g_secondary_serial;
+static const uint8_t *g_system_der;
+static size_t g_system_der_len;
+static int g_system_certs_loaded;
 static int g_kr_inited = 0;
 
 static kr_slot_t *slot_by_serial(uint32_t serial) {
@@ -74,6 +79,50 @@ static int ring_resolve(int ring_id) {
     return (int)g_session_serial;
 }
 
+static int ring_link_locked(kr_slot_t *ring_slot, uint32_t serial)
+{
+    uint32_t *pl;
+    size_t cnt;
+    uint32_t *np;
+    size_t j;
+
+    if (!ring_slot || ring_slot->type != KEY_TYPE_KEYRING)
+        return -1;
+    pl = (uint32_t *)ring_slot->payload;
+    cnt = ring_slot->payload_len / 4;
+    for (j = 0; j < cnt; j++)
+        if (pl[j] == serial)
+            return 0;
+    if (cnt >= 64)
+        return -1;
+    np = kmalloc((cnt + 1) * 4);
+    if (!np)
+        return -1;
+    if (cnt)
+        memcpy(np, pl, cnt * 4);
+    np[cnt] = serial;
+    kfree(pl);
+    ring_slot->payload = (uint8_t *)np;
+    ring_slot->payload_len = (cnt + 1) * 4;
+    return 0;
+}
+
+static kr_slot_t *alloc_named_keyring(const char *name)
+{
+    kr_slot_t *s = slot_alloc();
+    if (!s)
+        return NULL;
+    s->type = KEY_TYPE_KEYRING;
+    strncpy(s->description, name, KEY_DESC_MAX - 1);
+    s->description[KEY_DESC_MAX - 1] = 0;
+    strncpy(s->subject, name, KEY_SUBJ_MAX - 1);
+    s->subject[KEY_SUBJ_MAX - 1] = 0;
+    s->uid = 0;
+    s->gid = 0;
+    s->perms = 0x3f3f0000;
+    return s;
+}
+
 /* Format "YYMMDDHHMMSSZ" from RTC fields; clamp to [1950, 2049] for UTCTime. */
 static void fmt_utctime(uint8_t out[13], const rtc_datetime_t *dt) {
     int year = dt->year;
@@ -94,35 +143,42 @@ static void fmt_utctime(uint8_t out[13], const rtc_datetime_t *dt) {
     out[12] = 'Z';
 }
 
-static int slot_gen_cert(kr_slot_t *s) {
-    if (s->generated)
-        return 0;
+static int make_selfsigned(const char *subject, uint8_t *out, size_t cap,
+                           size_t *out_len)
+{
     x509_req_t req;
+    rtc_datetime_t dt;
+    uint16_t save;
+
     memset(&req, 0, sizeof req);
-    strncpy(req.subject, s->subject, X509_CN_MAX);
+    strncpy(req.subject, subject ? subject : "AxonOS System CA", X509_CN_MAX);
     req.subject[X509_CN_MAX] = 0;
     if (req.subject[0] == 0)
-        strcpy(req.subject, "AxonOS");
+        strcpy(req.subject, "AxonOS System CA");
     crypto_rand_bytes(req.serial, 20);
-    req.serial[0] &= 0x7f; /* keep positive */
-    if (req.serial[0] == 0) req.serial[0] = 0x01;
+    req.serial[0] &= 0x7f;
+    if (req.serial[0] == 0)
+        req.serial[0] = 0x01;
     req.serial_len = 20;
-    rtc_datetime_t dt;
     rtc_read_datetime(&dt);
     fmt_utctime(req.not_before, &dt);
-    uint16_t save = dt.year;
+    save = dt.year;
     dt.year = (save < 2049) ? (uint16_t)(save + 10) : (uint16_t)2049;
     fmt_utctime(req.not_after, &dt);
     if (ecc_keygen(&req.key) != 0)
         return -1;
-    uint8_t *der = kmalloc(2048);
-    if (!der)
+    if (x509_generate(&req, out, cap, out_len) != 0)
         return -1;
-    size_t len = 0;
-    if (x509_generate(&req, der, 2048, &len) != 0) {
-        kfree(der);
+    /* Linux asymmetric keys expose only the certificate; drop the private key. */
+    memset(&req.key, 0, sizeof req.key);
+    return 0;
+}
+
+static int slot_attach_cert(kr_slot_t *s, uint8_t *der, size_t len)
+{
+    if (!s)
         return -1;
-    }
+    kfree(s->cert);
     s->cert = der;
     s->cert_len = len;
     s->generated = 1;
@@ -134,17 +190,89 @@ int keyring_init(void) {
         return 0;
     acquire(&g_kr_lock);
     if (!g_kr_inited) {
-        kr_slot_t *s = slot_alloc();
-        if (s) {
-            s->type = KEY_TYPE_KEYRING;
-            strcpy(s->description, "session");
-            strcpy(s->subject, "session");
-            g_session_serial = s->serial;
-        }
+        kr_slot_t *session = alloc_named_keyring("session");
+        kr_slot_t *builtin = alloc_named_keyring(".builtin_trusted_keys");
+        kr_slot_t *secondary = alloc_named_keyring(".secondary_trusted_keys");
+        if (session)
+            g_session_serial = session->serial;
+        if (builtin)
+            g_builtin_serial = builtin->serial;
+        if (secondary)
+            g_secondary_serial = secondary->serial;
+        /* Linux: secondary restricts linkage to builtin (and later machine). */
+        if (builtin && secondary)
+            (void)ring_link_locked(secondary, builtin->serial);
         g_kr_inited = 1;
     }
     release(&g_kr_lock);
     return g_session_serial ? 0 : -1;
+}
+
+int keyring_load_system_certs(void)
+{
+    /* Linux load_system_certificate_list() copies compiled-in certs.
+     * Runtime ECDSA P-256 keygen on the boot CPU hung the machine; the
+     * built-in PEM is installed from the payload in boot_load_system_certs(). */
+    return keyring_init();
+}
+
+int keyring_install_system_ca(const void *pem, size_t len)
+{
+    uint8_t *copy;
+    kr_slot_t *s;
+    kr_slot_t *builtin;
+
+    if (keyring_init() != 0)
+        return -1;
+    if (!pem || len == 0)
+        return 0;
+    if (g_system_certs_loaded && g_system_der && g_system_der_len)
+        return 0;
+
+    copy = kmalloc(len);
+    if (!copy)
+        return -12;
+
+    memcpy(copy, pem, len);
+    acquire(&g_kr_lock);
+    if (g_system_certs_loaded) {
+        release(&g_kr_lock);
+        kfree(copy);
+        return 0;
+    }
+    s = slot_alloc();
+    if (!s) {
+        release(&g_kr_lock);
+        kfree(copy);
+        return -28;
+    }
+    s->type = KEY_TYPE_USER;
+    strcpy(s->description, "AxonOS System CA");
+    strcpy(s->subject, "AxonOS System CA");
+    s->uid = 0;
+    s->gid = 0;
+    s->perms = 0x3f3f0000;
+    s->payload = copy;
+    s->payload_len = len;
+    builtin = slot_by_serial(g_builtin_serial);
+    if (builtin)
+        (void)ring_link_locked(builtin, s->serial);
+    g_system_der = copy;
+    g_system_der_len = len;
+    g_system_certs_loaded = 1;
+    release(&g_kr_lock);
+    return 0;
+}
+
+int keyring_system_cert_der(const uint8_t **der, size_t *len)
+{
+    if (!der || !len)
+        return -1;
+    if (!g_system_certs_loaded || !g_system_der || g_system_der_len == 0)
+        return -1;
+    *der = g_system_der;
+    *len = g_system_der_len;
+    return 0;
 }
 
 long keyring_add_key(int type, const char *description, const void *payload,
@@ -197,20 +325,8 @@ long keyring_add_key(int type, const char *description, const void *payload,
 
     /* link into destination ring (append serial) */
     kr_slot_t *ring_slot = slot_by_serial((uint32_t)ring);
-    if (ring_slot && ring_slot->type == KEY_TYPE_KEYRING) {
-        uint32_t *pl = (uint32_t *)ring_slot->payload;
-        size_t cnt = ring_slot->payload_len / 4;
-        if (cnt < 64) {
-            uint32_t *np = kmalloc((cnt + 1) * 4);
-            if (np) {
-                if (cnt) memcpy(np, pl, cnt * 4);
-                np[cnt] = s->serial;
-                kfree(pl);
-                ring_slot->payload = (uint8_t *)np;
-                ring_slot->payload_len = (cnt + 1) * 4;
-            }
-        }
-    }
+    if (ring_slot)
+        (void)ring_link_locked(ring_slot, s->serial);
     uint32_t serial = s->serial;
     release(&g_kr_lock);
     return (long)serial;
@@ -290,17 +406,37 @@ long keyctl_do(int cmd, long a2, long a3, long a4, long a5) {
         kr_slot_t *s = slot_by_serial(serial);
         if (!s) { release(&g_kr_lock); return -126; }
         if (s->type == KEY_TYPE_ASYMMETRIC) {
-            /* update = regenerate certificate */
-            kfree(s->cert);
-            s->cert = NULL; s->cert_len = 0; s->generated = 0;
+            char subj[KEY_SUBJ_MAX];
+            uint8_t *der;
+            size_t clen = 0;
             if (payload && plen > 0) {
                 size_t n = plen < KEY_SUBJ_MAX - 1 ? plen : KEY_SUBJ_MAX - 1;
                 memcpy(s->subject, payload, n);
                 s->subject[n] = 0;
             }
-            int r = slot_gen_cert(s);
+            memcpy(subj, s->subject, KEY_SUBJ_MAX);
+            kfree(s->cert);
+            s->cert = NULL;
+            s->cert_len = 0;
+            s->generated = 0;
             release(&g_kr_lock);
-            return r;
+            der = kmalloc(2048);
+            if (!der)
+                return -12;
+            if (make_selfsigned(subj, der, 2048, &clen) != 0) {
+                kfree(der);
+                return -5;
+            }
+            acquire(&g_kr_lock);
+            s = slot_by_serial(serial);
+            if (!s) {
+                release(&g_kr_lock);
+                kfree(der);
+                return -126;
+            }
+            (void)slot_attach_cert(s, der, clen);
+            release(&g_kr_lock);
+            return 0;
         }
         if (s->type == KEY_TYPE_USER) {
             kfree(s->payload);
@@ -359,20 +495,7 @@ long keyctl_do(int cmd, long a2, long a3, long a4, long a5) {
         kr_slot_t *k = slot_by_serial(keyid);
         kr_slot_t *r = slot_by_serial(ringid);
         if (!k || !r || r->type != KEY_TYPE_KEYRING) { release(&g_kr_lock); return -22; }
-        uint32_t *pl = (uint32_t *)r->payload;
-        size_t cnt = r->payload_len / 4;
-        for (size_t j = 0; j < cnt; j++)
-            if (pl[j] == keyid) { release(&g_kr_lock); return 0; } /* already linked */
-        if (cnt < 64) {
-            uint32_t *np = kmalloc((cnt + 1) * 4);
-            if (np) {
-                if (cnt) memcpy(np, pl, cnt * 4);
-                np[cnt] = keyid;
-                kfree(pl);
-                r->payload = (uint8_t *)np;
-                r->payload_len = (cnt + 1) * 4;
-            }
-        }
+        (void)ring_link_locked(r, keyid);
         release(&g_kr_lock);
         return 0;
     }
@@ -412,10 +535,36 @@ long keyctl_do(int cmd, long a2, long a3, long a4, long a5) {
         acquire(&g_kr_lock);
         kr_slot_t *s = slot_by_serial(serial);
         if (!s) { release(&g_kr_lock); return -126; }
+        if (s->type == KEY_TYPE_ASYMMETRIC && !s->generated) {
+            char subj[KEY_SUBJ_MAX];
+            uint8_t *der;
+            size_t clen = 0;
+            memcpy(subj, s->subject, KEY_SUBJ_MAX);
+            release(&g_kr_lock);
+            der = kmalloc(2048);
+            if (!der)
+                return -12;
+            if (make_selfsigned(subj, der, 2048, &clen) != 0) {
+                kfree(der);
+                return -5;
+            }
+            acquire(&g_kr_lock);
+            s = slot_by_serial(serial);
+            if (!s) {
+                release(&g_kr_lock);
+                kfree(der);
+                return -126;
+            }
+            if (!s->generated)
+                (void)slot_attach_cert(s, der, clen);
+            else
+                kfree(der);
+        }
+        if (!s) { release(&g_kr_lock); return -126; }
         size_t total;
         const uint8_t *src;
         if (s->type == KEY_TYPE_ASYMMETRIC) {
-            if (slot_gen_cert(s) != 0) { release(&g_kr_lock); return -5; }
+            if (!s->generated || !s->cert) { release(&g_kr_lock); return -5; }
             src = s->cert;
             total = s->cert_len;
         } else if (s->type == KEY_TYPE_USER) {

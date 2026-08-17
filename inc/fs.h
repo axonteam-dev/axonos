@@ -17,6 +17,9 @@ struct fs_file {
     off_t pos;
     int type;                 /* FS_TYPE_* (set by driver) */
     int refcount;             /* VFS reference count for this handle */
+    /* Stable page-cache key. 0 means this handle is not cacheable. */
+    uint64_t backing_id;
+    uint64_t backing_gen;
 };
 
 /* Filesystem driver operations (minimal set) */

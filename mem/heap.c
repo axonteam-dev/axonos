@@ -28,6 +28,9 @@ typedef struct heap_block_header {
 static uint8_t* heap_base = 0;
 static size_t   heap_capacity = 0;
 static heap_block_header_t* head = 0;
+/* Next-fit cursor. Starting every allocation at head makes short-lived VFS
+ * allocations O(number of all historical heap blocks) after boot. */
+static heap_block_header_t* alloc_rover = 0;
 
 static size_t heap_used_now = 0;
 static size_t heap_peak     = 0;
@@ -87,6 +90,7 @@ void heap_init(uintptr_t heap_start, size_t heap_size) {
     head->magic = HEAP_MAGIC_FREE;
     head->req_size = 0;
     head->alloc_caller = 0;
+    alloc_rover = head;
 
     heap_used_now = 0;
     heap_peak = 0;
@@ -111,12 +115,14 @@ static void split_block(heap_block_header_t* blk, size_t size) {
 static void coalesce(heap_block_header_t* blk) {
     // merge with next
     if (blk->next && blk->next->free) {
+        if (alloc_rover == blk->next) alloc_rover = blk;
         blk->size += sizeof(heap_block_header_t) + blk->next->size;
         blk->next = blk->next->next;
         if (blk->next) blk->next->prev = blk;
     }
     // merge with prev
     if (blk->prev && blk->prev->free) {
+        if (alloc_rover == blk) alloc_rover = blk->prev;
         blk->prev->size += sizeof(heap_block_header_t) + blk->size;
         blk->prev->next = blk->next;
         if (blk->next) blk->next->prev = blk->prev;
@@ -139,8 +145,10 @@ static void* kmalloc_nolock(size_t size) {
 #else
     size = ALIGN16(req);
 #endif
-    heap_block_header_t* cur = head;
-    while (cur) {
+    heap_block_header_t* cur = alloc_rover ? alloc_rover : head;
+    heap_block_header_t* start = cur;
+    if (!cur) return 0;
+    do {
         if (cur->free && cur->size >= size) {
             split_block(cur, size);
             cur->free = 0;
@@ -156,10 +164,11 @@ static void* kmalloc_nolock(size_t size) {
             uint64_t v = (uint64_t)HEAP_CANARY_QWORD;
             memcpy(p + req, &v, sizeof(v));
 #endif
+            alloc_rover = cur->next ? cur->next : head;
             return p;
         }
-        cur = cur->next;
-    }
+        cur = cur->next ? cur->next : head;
+    } while (cur && cur != start);
     /* OOM: do not kprintf here — kmalloc() holds heap_lock and kprintf may kmalloc → deadlock. */
     return 0; /* out of memory */
 }
@@ -264,6 +273,7 @@ static void* krealloc_nolock(void* ptr, size_t new_size) {
         while (scan && scan->free) {
             /* defensive check: ensure header looks like a free block */
             if (scan->magic != HEAP_MAGIC_FREE) break;
+            if (alloc_rover == scan) alloc_rover = blk;
             accumulated += sizeof(heap_block_header_t) + scan->size;
             last_absorbed = scan;
             if (accumulated >= new_size) break;

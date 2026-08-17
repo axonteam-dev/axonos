@@ -69,7 +69,9 @@ static int tcp_seq_in_window(uint32_t seq, uint32_t rcv_nxt, uint32_t wnd) {
 static void tcp_apply_ack(net_tcp_conn_t *c, uint32_t ack) {
     if (ack == 0)
         return;
-    if (tcp_seq_after(ack, c->snd_una))
+    /* RFC 793: an ACK beyond SND.NXT is unacceptable and must never advance
+     * SND.UNA. Accept only cumulative ACKs in (SND.UNA, SND.NXT]. */
+    if (tcp_seq_after(ack, c->snd_una) && !tcp_seq_after(ack, c->snd_nxt))
         c->snd_una = ack;
 }
 
@@ -579,14 +581,29 @@ int net_tcp_server_reply_syn(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32
 
 int net_tcp_server_complete_ack(net_tcp_conn_t *c, uint32_t ack) {
     if (!c || !c->used || c->established) return -1;
-    /* Client ACK must confirm our SYN (ISN+1). Allow retransmit ACKs in [snd_una+1, snd_nxt]. */
-    if (ack < c->syn_isn + 1u || ack > c->snd_nxt) return -1;
+    /* SYN consumes exactly one sequence number. No TCP option or Ethernet
+     * padding contributes to sequence space. */
+    if (ack != c->syn_isn + 1u || ack != c->snd_nxt) return -1;
     c->snd_una = ack;
-    if (ack > c->snd_nxt)
-        c->snd_nxt = ack;
     c->established = 1;
     c->connect_pending = 0;
     return 0;
+}
+
+int net_tcp_send_ack(net_tcp_conn_t *c, const net_tcp_ops_t *ops) {
+    if (!c || !ops || !c->used) return -1;
+    return tcp_send_seg(c, ops, 0x10u, NULL, 0);
+}
+
+int net_tcp_reject_ack(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t ack) {
+    if (!c || !ops) return -1;
+    /* RFC 793 SYN-RECEIVED: unacceptable ACK is answered with
+     * <SEQ=SEG.ACK><CTL=RST>. Do not mutate the half-open state. */
+    uint32_t saved = c->snd_nxt;
+    c->snd_nxt = ack;
+    int rc = tcp_send_seg(c, ops, 0x04u, NULL, 0);
+    c->snd_nxt = saved;
+    return rc;
 }
 
 int net_tcp_server_resend_synack(net_tcp_conn_t *c, const net_tcp_ops_t *ops) {
@@ -684,7 +701,8 @@ int net_tcp_send(net_tcp_conn_t *c, const net_tcp_ops_t *ops, const uint8_t *dat
     size_t off = 0;
     while (off < len) {
         size_t chunk = len - off;
-        if (chunk > 1200) chunk = 1200;
+        /* Ethernet/IPv4/TCP MSS: 1500 - 20 - 20 = 1460. */
+        if (chunk > 1460) chunk = 1460;
         uint32_t seq0 = c->snd_nxt;
         if (tcp_send_seg(c, ops, 0x18u, data + off, chunk) != 0) return (off > 0) ? (int)off : -1;
         c->snd_nxt += (uint32_t)chunk;

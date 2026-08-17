@@ -30,6 +30,8 @@ void set_cursor_x(uint16_t x);
 void set_cursor_y(uint16_t y);
 void vga_set_cursor(uint32_t x, uint32_t y);
 void vga_get_cursor(uint32_t* x, uint32_t* y);
+/* Toggle the text-mode hardware cursor on a 250 ms timer phase. */
+void vga_update_cursor(void);
 
 /* Set hardware cursor scanline start/end (0-31). */
 void set_cursor_shape(uint8_t start, uint8_t end);
@@ -53,5 +55,7 @@ uint8_t vga_get_cell_attr(uint32_t x, uint32_t y);
 void vga_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr);
 void vga_clear_screen_attr(uint8_t attr);
 void vga_scroll_region(uint32_t top, uint32_t bottom, uint8_t attr);
+/* Copy packed character/attribute cells from a RAM TTY backing buffer. */
+void vga_blit_cells(const uint8_t *cells, uint32_t top, uint32_t bottom);
 void vga_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr);
 void vga_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t ch, uint8_t attr);

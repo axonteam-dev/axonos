@@ -102,8 +102,13 @@ static int looks_cpio_newc(const uint8_t *p, size_t n) {
                p[3] == '7' && p[4] == '0' && (p[5] == '1' || p[5] == '2');
 }
 
-/* Highest usable RAM byte from MB2 mmap (type=1), or 0 if unknown. */
-static uint64_t mb2_ram_top(const uint8_t *mb, uint32_t total_size) {
+/*
+ * Highest usable RAM byte reachable by the bootstrap identity map.
+ * MB2 may report remapped RAM above 4 GiB, but module tags are 32-bit and the
+ * decompressor has no high direct map yet.
+ */
+static uint64_t mb2_identity_ram_top(const uint8_t *mb, uint32_t total_size) {
+        const uint64_t identity_limit = 0x100000000ull;
         uint32_t off = 8;
         uint64_t top = 0;
         while (off + 8u <= total_size) {
@@ -123,8 +128,10 @@ static uint64_t mb2_ram_top(const uint8_t *mb, uint32_t total_size) {
                                         uint64_t base = rd64(mb + eoff);
                                         uint64_t len = rd64(mb + eoff + 8);
                                         uint32_t typ = rd32(mb + eoff + 16);
-                                        if (typ == 1u && len > 0 && base + len > base) {
+                                        if (typ == 1u && len > 0 && base < identity_limit &&
+                                            base + len > base) {
                                                 uint64_t end = base + len;
+                                                if (end > identity_limit) end = identity_limit;
                                                 if (end > top) top = end;
                                         }
                                         eoff += entry_size;
@@ -194,7 +201,7 @@ static void salvage_initfs_module(uint8_t *mb) {
                         if (!looks_hsqs(src, (size_t)sz) && !looks_cpio_newc(src, (size_t)sz)) {
                                 boot_line("KZIP: BAD initfs magic at GRUB address\n");
                                 /* Last-ditch: scan high RAM for hsqs (2MiB steps). */
-                                uint64_t ram_top = mb2_ram_top(mb, total_size);
+                                uint64_t ram_top = mb2_identity_ram_top(mb, total_size);
                                 if (ram_top < (uint64_t)sz + (32ull << 20))
                                         panic_msg("KZIP: initfs magic missing");
                                 uint64_t scan = (ram_top - (uint64_t)sz) & ~((uint64_t)0x1FFFFFu);
@@ -228,11 +235,12 @@ static void salvage_initfs_module(uint8_t *mb) {
                         }
 
                         /* Park under top of RAM, clear of stub/decomp/MB2. */
-                        uint64_t ram_top = mb2_ram_top(mb, total_size);
+                        uint64_t ram_top = mb2_identity_ram_top(mb, total_size);
                         if (ram_top < (uint64_t)sz + (64ull << 20))
                                 ram_top = 0x80000000ull; /* assume 2GiB if mmap missing */
                         uint64_t park = (ram_top - (16ull << 20) - (uint64_t)sz) & ~((uint64_t)0x1FFFFFu);
-                        if (park < 0x10000000ull) {
+                        if (park < 0x10000000ull || park + sz > ram_top ||
+                            park + sz > 0x100000000ull) {
                                 boot_line("KZIP: park address too low\n");
                                 return;
                         }

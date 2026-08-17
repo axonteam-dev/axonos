@@ -83,9 +83,11 @@ extern volatile uint32_t timer_frequency;
 static uint64_t cursor_blink_phase(void)
 {
 	uint32_t hz = timer_frequency ? timer_frequency : 250u;
-	uint32_t half_period = (hz + 1u) / 2u;
+	uint32_t quarter_period = (hz + 3u) / 4u;
 
-	return timer_ticks / half_period;
+	if (quarter_period < 1u)
+		quarter_period = 1u;
+	return timer_ticks / quarter_period;
 }
 
 static void fb_dirty_mark(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
@@ -249,12 +251,12 @@ void cirrusfb_end_batch(void) {
 	 * then made "byte 0" stick until setfont/clear).  Draw the cursor only
 	 * after the text rect is in VRAM.
 	 */
-	cirrusfb_flush_dirty();
+	cirrusfb_flush_dirty_if_small();
 	if (g_ready && !g_hwcursor_ok) {
 		g_swcursor_frozen = 0;
 		if (g_swcursor_visible)
 			swcursor_draw_at(g_cursor_x, g_cursor_y);
-		cirrusfb_flush_dirty();
+		cirrusfb_flush_dirty_if_small();
 	}
 }
 
@@ -1229,18 +1231,18 @@ void cirrusfb_update_cursor(void) {
 	/* Drain a deferred SVGA SYNC from a prior flush (rate-limit gap). */
 	if (g_fb_sync_pending)
 		cirrusfb_kick_sync_rate_limited();
-	if (g_hwcursor_ok) {
-		/* Hardware cursor blinks automatically. */
-		return;
-	}
-	if (g_swcursor_frozen)
-		return;
 	uint64_t phase = cursor_blink_phase();
 	if (phase == g_swcursor_last_phase) return;
 	g_swcursor_last_phase = phase;
 	int want_visible = ((phase & 1ULL) == 0ULL) ? 1 : 0;
 	if (want_visible == g_swcursor_visible) return;
 	g_swcursor_visible = want_visible;
+	if (g_hwcursor_ok) {
+		hwcursor_enable(g_swcursor_visible);
+		return;
+	}
+	if (g_swcursor_frozen)
+		return;
 	if (g_swcursor_visible) swcursor_draw_at(g_cursor_x, g_cursor_y);
 	else swcursor_erase_at(g_cursor_x, g_cursor_y);
 	cirrusfb_flush_dirty();

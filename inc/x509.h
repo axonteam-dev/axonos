@@ -24,4 +24,8 @@ typedef struct {
 int x509_generate(const x509_req_t *req, uint8_t *out, size_t cap,
                   size_t *out_len);
 
+/* PEM-encode a DER certificate (BEGIN/END CERTIFICATE, 64-col). */
+int x509_der_to_pem(const uint8_t *der, size_t der_len, char *out, size_t cap,
+                    size_t *out_len);
+
 #endif /* X509_H */

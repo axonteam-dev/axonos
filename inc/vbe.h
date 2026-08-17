@@ -40,6 +40,9 @@ uint32_t vbe_pack_pixel(uint8_t r, uint8_t g, uint8_t b);
 void *vbe_get_frontbuffer(void);
 /* Scroll framebuffer up by given pixel rows (fast memmove). */
 void vbe_scroll_up_pixels(uint32_t pixels);
+/* Scroll one vertical pixel band and clear its newly exposed bottom rows. */
+void vbe_scroll_band_pixels(uint32_t y, uint32_t band_h, uint32_t pixels,
+                            uint32_t packed_clear);
 /* Clear pixel region in front buffer using packed pixel value. */
 void vbe_clear_region(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t packed_pixel);
 /* Update blinking cursor (call from timer interrupt). */

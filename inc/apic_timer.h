@@ -39,6 +39,7 @@ uint64_t apic_timer_get_time_us(void);
 uint32_t apic_timer_get_frequency(void);
 bool apic_timer_is_running(void);
 bool apic_timer_is_calibrated(void);
+bool apic_timer_uses_tsc_deadline(void);
 
 void apic_timer_calibrate(void);
 /* Measure real IRQ rate and rescale initial-count toward target_hz. */

@@ -3044,10 +3044,7 @@ static int net_packet_send_frame(ksock_net_t *s, const uint8_t dst_mac[6],
         memcpy(frame + sizeof(eth_hdr_t), payload, payload_len);
     }
     int r = e1000_send_frame(frame, frame_len);
-    if (g_net_l2_trace_budget-- > 0) {
-        klogprintf("net-l2: tx proto=0x%04x len=%u rc=%d\n",
-                   (unsigned)s->packet_proto_host, (unsigned)frame_len, r);
-    }
+
     kfree(frame);
     return (r < 0) ? -1 : 0;
 }
@@ -3067,10 +3064,14 @@ static uint16_t ip_checksum16(const void *data, size_t len);
 static void ip_be_to_bytes(uint32_t ip_be, uint8_t out[4]);
 static int net_send_eth_ipv4(const uint8_t dst_mac[6], uint32_t dst_ip_be, uint8_t proto, const void *l4, size_t l4_len);
 
-#define NET_RXQ_SLOTS  128
+#define NET_RXQ_SLOTS  512
+#define NET_RXQ_FALLBACK_SLOTS 128
 #define NET_RXQ_BUF    2048
-static uint8_t g_net_rxq[NET_RXQ_SLOTS][NET_RXQ_BUF];
-static uint16_t g_net_rxq_len[NET_RXQ_SLOTS];
+static uint8_t g_net_rxq_fallback[NET_RXQ_FALLBACK_SLOTS][NET_RXQ_BUF];
+static uint16_t g_net_rxq_len_fallback[NET_RXQ_FALLBACK_SLOTS];
+static uint8_t (*g_net_rxq)[NET_RXQ_BUF] = g_net_rxq_fallback;
+static uint16_t *g_net_rxq_len = g_net_rxq_len_fallback;
+static uint32_t g_net_rxq_slots = NET_RXQ_FALLBACK_SLOTS;
 static uint32_t g_net_rxq_head = 0, g_net_rxq_tail = 0, g_net_rxq_count = 0;
 static spinlock_t g_net_rxq_lock = { 0 };
 static spinlock_t g_net_nic_lock = { 0 };
@@ -3085,13 +3086,13 @@ static int net_rxq_push(const uint8_t *frame, size_t n) {
     if (n > NET_RXQ_BUF) n = NET_RXQ_BUF;
     unsigned long irqf = 0;
     acquire_irqsave(&g_net_rxq_lock, &irqf);
-    if (g_net_rxq_count >= NET_RXQ_SLOTS) {
+    if (g_net_rxq_count >= g_net_rxq_slots) {
         release_irqrestore(&g_net_rxq_lock, irqf);
         return -2;
     }
     memcpy(g_net_rxq[g_net_rxq_tail], frame, n);
     g_net_rxq_len[g_net_rxq_tail] = (uint16_t)n;
-    g_net_rxq_tail = (g_net_rxq_tail + 1) % NET_RXQ_SLOTS;
+    g_net_rxq_tail = (g_net_rxq_tail + 1) % g_net_rxq_slots;
     g_net_rxq_count++;
     release_irqrestore(&g_net_rxq_lock, irqf);
     return 0;
@@ -3108,7 +3109,7 @@ static int net_rxq_pop(void *out, size_t cap) {
     uint32_t idx = g_net_rxq_head;
     uint16_t n = g_net_rxq_len[idx];
     g_net_rxq_len[idx] = 0;
-    g_net_rxq_head = (idx + 1) % NET_RXQ_SLOTS;
+    g_net_rxq_head = (idx + 1) % g_net_rxq_slots;
     g_net_rxq_count--;
     release_irqrestore(&g_net_rxq_lock, irqf);
     size_t copy_len = (n > cap) ? cap : (size_t)n;
@@ -3188,12 +3189,7 @@ static int net_reply_icmp_echo_if_needed(const uint8_t *frame, size_t n) {
 
 static int net_process_incoming_or_queue(const uint8_t *frame, size_t n) {
     if (!frame || n == 0) return 0;
-    if (g_net_l2_trace_budget-- > 0 && n >= sizeof(eth_hdr_t)) {
-        const eth_hdr_t *eth = (const eth_hdr_t *)frame;
 
-        klogprintf("net-l2: rx proto=0x%04x len=%u\n",
-                   (unsigned)be16(eth->ethertype), (unsigned)n);
-    }
     /* Learn ARP before demux so resolve/send do not race the RX pump. */
     net_arp_observe_frame(frame, n);
     (void)net_packet_deliver(frame, n);
@@ -3265,11 +3261,9 @@ static void net_nic_drain_to_rxq(int budget) {
         if (n <= 0) break;
         if (net_reply_arp_if_needed(frame, (size_t)n)) continue;
         if (net_reply_icmp_echo_if_needed(frame, (size_t)n)) continue;
-        if (net_rxq_push(frame, (size_t)n) != 0) {
-            uint8_t drop[NET_RXQ_BUF];
-            (void)net_rxq_pop(drop, sizeof(drop));
-            (void)net_rxq_push(frame, (size_t)n);
-        }
+        /* Preserve ordering. TCP retransmits an unacknowledged newest frame;
+         * evicting the oldest creates a permanent head-of-line gap. */
+        (void)net_rxq_push(frame, (size_t)n);
     }
 }
 
@@ -3455,12 +3449,16 @@ static void net_rx_pump_thread(void) {
             continue;
         }
         /* Always drain L2 RX: ARP + AF_PACKET (udhcpc) before IPv4 is configured. */
-        for (int i = 0; i < 32; i++) {
+        int drained = 0;
+        for (int i = 0; i < 256; i++) {
             int n = net_nic_pull_frame(buf, sizeof(buf));
             if (n <= 0) break;
             (void)net_process_incoming_or_queue(buf, (size_t)n);
+            drained++;
         }
-        thread_sleep(1);
+        /* Keep draining a non-empty RX ring; sleep only after catching up. */
+        if (drained < 256)
+            thread_sleep(1);
     }
 }
 
@@ -3725,8 +3723,9 @@ static int net_resolve_mac(uint32_t ip_be, uint8_t out_mac[6], uint32_t timeout_
 static int net_send_eth_ipv4(const uint8_t dst_mac[6], uint32_t dst_ip_be, uint8_t proto, const void *l4, size_t l4_len) {
     if (!g_net.ready || !dst_mac || !l4 || l4_len > 1500) return -1;
     size_t frame_len = sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + l4_len;
-    uint8_t *frame = (uint8_t *)kmalloc(frame_len);
-    if (!frame) return -1;
+    /* e1000_send_frame copies into its DMA ring synchronously. A stack packet
+     * avoids two heap operations for every TCP segment. */
+    uint8_t frame[sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + 1500];
 
     eth_hdr_t *eth = (eth_hdr_t *)frame;
     memcpy(eth->dst, dst_mac, 6);
@@ -3752,9 +3751,6 @@ static int net_send_eth_ipv4(const uint8_t dst_mac[6], uint32_t dst_ip_be, uint8
 
     memcpy(frame + sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t), l4, l4_len);
     int r = e1000_send_frame(frame, frame_len);
-    e1000_poll();
-    e1000_poll();
-    kfree(frame);
     return (r < 0) ? -1 : 0;
 }
 
@@ -3974,11 +3970,7 @@ static void net_yield_cb(void *context) {
 
 static void net_tcp_return_frame_cb(const void *frame, size_t n) {
     if (!frame || n == 0) return;
-    if (net_rxq_push((const uint8_t *)frame, n) != 0) {
-        uint8_t drop[NET_RXQ_BUF];
-        (void)net_rxq_pop(drop, sizeof(drop));
-        (void)net_rxq_push((const uint8_t *)frame, n);
-    }
+    (void)net_rxq_push((const uint8_t *)frame, n);
 }
 
 static void net_make_tcp_ops(net_tcp_ops_t *ops, net_tcp_conn_t *match) {
@@ -4033,7 +4025,6 @@ static void ksock_drop(ksock_net_t *s) {
             net_make_tcp_ops(&ops, &s->tcp);
             (void)net_tcp_close(&s->tcp, &ops, 1000);
         }
-        net_rxq_flush();
     }
     kfree(s);
 }
@@ -4219,8 +4210,8 @@ static int lo_tcp_stream_connect(ksock_net_t *client, uint32_t dst_ip_be, uint16
 static ksock_net_t *net_tcp_match_established_sock(uint16_t lport, uint32_t rip, uint16_t rport, ksock_net_t *s) {
     if (!s || s->unix_domain_stub || s->dns_tcp_udp_bridge) return NULL;
     if (s->type_base != SOCK_STREAM_LOCAL || s->protocol != IPPROTO_TCP_LOCAL) return NULL;
-    if (!s->tcp.used || !s->tcp.established) return NULL;
-    if (s->tcp.peer_fin || s->tcp.peer_rst) return NULL;
+    if (!s->tcp.used || s->tcp.peer_rst) return NULL;
+    if (!s->tcp.established && !s->tcp.peer_fin_pending && !s->tcp.peer_fin) return NULL;
     if (s->local_port != lport || s->peer_ip_be != rip || s->peer_port != rport) return NULL;
     return s;
 }
@@ -4314,33 +4305,51 @@ static struct fs_file *net_tcp_make_accepted_file(ksock_net_t *listener, const n
 }
 
 static int net_tcp_syn_wait_take_slot(tcp_syn_wait_t **out) {
-    tcp_syn_wait_t *fresh = (tcp_syn_wait_t *)kmalloc(sizeof(*fresh));
-    if (fresh)
-        memset(fresh, 0, sizeof(*fresh));
-
+    if (!out) return -1;
+    *out = NULL;
+    extern volatile uint64_t timer_ticks;
+    extern volatile uint32_t timer_frequency;
+    uint32_t now = (uint32_t)timer_ticks;
+    uint32_t stale_after = (timer_frequency ? timer_frequency : 250u) * 60u;
     unsigned long fl = 0;
     acquire_irqsave(&g_tcp_syn_wait_lock, &fl);
+    /* Reuse an inactive or expired request socket without allocating another
+     * ~100 KiB net_tcp_conn_t on every incoming connection. */
     for (int i = 0; i < TCP_SYN_WAIT_SLOTS; i++) {
         tcp_syn_wait_t *w = g_tcp_syn_wait[i];
-        if (!w && fresh) {
-            g_tcp_syn_wait[i] = fresh;
-            w = fresh;
-            fresh = NULL;
-        }
+        if (w && w->active && w->last_synack_tick &&
+            (uint32_t)(now - w->last_synack_tick) >= stale_after)
+            memset(w, 0, sizeof(*w));
         if (w && !w->active) {
             memset(w, 0, sizeof(*w));
             w->active = 1;
             *out = w;
             release_irqrestore(&g_tcp_syn_wait_lock, fl);
-            if (fresh)
-                kfree(fresh);
             return 0;
         }
     }
+    int empty = -1;
+    for (int i = 0; i < TCP_SYN_WAIT_SLOTS; i++) {
+        if (!g_tcp_syn_wait[i]) { empty = i; break; }
+    }
     release_irqrestore(&g_tcp_syn_wait_lock, fl);
-    if (fresh)
-        kfree(fresh);
-    return -1;
+    if (empty < 0) return -1;
+
+    tcp_syn_wait_t *fresh = (tcp_syn_wait_t *)kmalloc(sizeof(*fresh));
+    if (!fresh) return -1;
+    memset(fresh, 0, sizeof(*fresh));
+    fresh->active = 1;
+
+    acquire_irqsave(&g_tcp_syn_wait_lock, &fl);
+    if (!g_tcp_syn_wait[empty]) {
+        g_tcp_syn_wait[empty] = fresh;
+        *out = fresh;
+        release_irqrestore(&g_tcp_syn_wait_lock, fl);
+        return 0;
+    }
+    release_irqrestore(&g_tcp_syn_wait_lock, fl);
+    kfree(fresh);
+    return net_tcp_syn_wait_take_slot(out);
 }
 
 static tcp_syn_wait_t *net_tcp_syn_wait_find(uint16_t lport, uint32_t rip, uint16_t rport) {
@@ -4417,19 +4426,13 @@ static int net_tcp_dispatch_incoming(const uint8_t *frame, size_t n) {
             if (wait)
                 wait->last_synack_tick = now;
         }
-        int first_syn = !tc->used;
         net_tcp_ops_t ops;
         net_make_tcp_ops(&ops, tc);
         if (tc->used)
             (void)net_tcp_server_resend_synack(tc, &ops);
         else
             (void)net_tcp_server_reply_syn(tc, &ops, seq);
-        if (first_syn) {
-            klogprintf("tcp: server syn-ack port=%u from %u.%u.%u.%u:%u\n",
-                (unsigned)dport,
-                (unsigned)((rip >> 24) & 0xFF), (unsigned)((rip >> 16) & 0xFF),
-                (unsigned)((rip >> 8) & 0xFF), (unsigned)(rip & 0xFF), (unsigned)sport);
-        }
+
         {
             uint8_t drain[NET_RXQ_BUF];
             for (int di = 0; di < 4; di++) {
@@ -4441,12 +4444,26 @@ static int net_tcp_dispatch_incoming(const uint8_t *frame, size_t n) {
         return 1;
     }
 
+    /*
+     * Linux TCP demux resolves an established 4-tuple before a request socket.
+     * A stale SYN wait must never consume ACK/data for an accepted connection.
+     */
+    ksock_net_t *est = net_tcp_find_established(dport, rip, sport);
+    if (est) {
+        (void)net_rxq_push(frame, n);
+        return 1;
+    }
+
     if ((flags & 0x10u) && !(flags & 0x02u)) {
         tcp_syn_wait_t *wait = net_tcp_syn_wait_find(dport, rip, sport);
         if (wait && wait->listener) {
             if (net_tcp_server_complete_ack(&wait->tcp, ack) == 0) {
-                if (payload_len > 0)
+                if (payload_len > 0) {
                     net_tcp_push_payload(&wait->tcp, seq, payload, payload_len);
+                    net_tcp_ops_t ops;
+                    net_make_tcp_ops(&ops, &wait->tcp);
+                    (void)net_tcp_send_ack(&wait->tcp, &ops);
+                }
                 struct fs_file *af = net_tcp_make_accepted_file(wait->listener, &wait->tcp, rip, sport, wait->peer_mac);
                 if (!af) {
                     net_tcp_syn_wait_release(wait);
@@ -4454,31 +4471,15 @@ static int net_tcp_dispatch_incoming(const uint8_t *frame, size_t n) {
                 }
                 if (unix_acceptq_push(wait->listener, af) != 0) {
                     net_fs_file_destroy(af);
-                } else {
-                    klogprintf("tcp: server accept port=%u from %u.%u.%u.%u:%u\n",
-                        (unsigned)dport,
-                        (unsigned)((rip >> 24) & 0xFF), (unsigned)((rip >> 16) & 0xFF),
-                        (unsigned)((rip >> 8) & 0xFF), (unsigned)(rip & 0xFF), (unsigned)sport);
                 }
                 net_tcp_syn_wait_release(wait);
                 return 1;
             }
-            klogprintf("tcp: server ack mismatch port=%u ack=%u want=%u\n",
-                (unsigned)dport, (unsigned)ack, (unsigned)(wait->tcp.syn_isn + 1u));
+            net_tcp_ops_t ops;
+            net_make_tcp_ops(&ops, &wait->tcp);
+            (void)net_tcp_reject_ack(&wait->tcp, &ops, ack);
             return 1;
         }
-    }
-
-    ksock_net_t *est = net_tcp_find_established(dport, rip, sport);
-    if (est) {
-        if (net_rxq_push(frame, n) != 0) {
-            uint8_t drop[NET_RXQ_BUF];
-            (void)net_rxq_pop(drop, sizeof(drop));
-            (void)net_rxq_push(frame, n);
-        }
-        /* Queue only. Calling service here re-entered recv_frame -> dispatch
-         * recursively and multiplied work across every active connection. */
-        return 1;
     }
     return 0;
 }
@@ -4650,8 +4651,10 @@ static void net_announce_ipv4(const char *how) {
 static void net_write_resolv_from_dns(uint32_t dns_be) {
 #ifdef AUTO_CONFIGURE_DNS
     if (!dns_be) return;
-    char line[96];
-    int n = snprintf(line, sizeof(line), "nameserver %u.%u.%u.%u\n",
+    char line[192];
+    int n = snprintf(line, sizeof(line),
+                     "options timeout:2 attempts:5 single-request-reopen\n"
+                     "nameserver %u.%u.%u.%u\n",
                      (unsigned)((dns_be >> 24) & 0xFFu), (unsigned)((dns_be >> 16) & 0xFFu),
                      (unsigned)((dns_be >> 8) & 0xFFu), (unsigned)(dns_be & 0xFFu));
     if (n <= 0 || (size_t)n >= sizeof(line)) return;
@@ -6015,10 +6018,6 @@ static inline uint64_t ret_err(int e) {
     if (e == EPERM && !keep_eperm && t && (t->ring == 3 || is_init_user(t))) {
         g_dl_eperm_count++;
         if (!g_dl_first_eperm_sc) g_dl_first_eperm_sc = last_syscall_debug;
-        kprintf("user-remap EPERM syscall=%llu tid=%llu name=%s -> ENOENT\n",
-            (unsigned long long)last_syscall_debug,
-            (unsigned long long)(t->tid ? t->tid : 1),
-            t->name[0] ? t->name : "?");
         e = ENOENT;
     }
     if (t && t->name[0]) {
@@ -6488,6 +6487,21 @@ static void map_tty_alias_path(char *buf, size_t cap) {
     }
 }
 
+static const char *task_fs_root(thread_t *cur) {
+    if (cur && cur->process && cur->process->fs_root[0])
+        return cur->process->fs_root;
+    if (cur && cur->fs_root[0])
+        return cur->fs_root;
+    return "/";
+}
+
+static int path_is_beneath_root(const char *path, const char *root) {
+    if (!path || !root) return 0;
+    if (strcmp(root, "/") == 0) return path[0] == '/';
+    size_t n = strlen(root);
+    return strncmp(path, root, n) == 0 && (path[n] == '\0' || path[n] == '/');
+}
+
 static void resolve_kernel_path(thread_t *cur, const char *path,
                                 char *out, size_t out_cap) {
     if (!out || out_cap == 0) return;
@@ -6495,17 +6509,21 @@ static void resolve_kernel_path(thread_t *cur, const char *path,
     if (!path || !path[0]) {
         return;
     }
-    const char *cwd = (cur && cur->cwd[0]) ? cur->cwd : "/";
+    const char *root = task_fs_root(cur);
+    const char *cwd = (cur && cur->cwd[0]) ? cur->cwd : root;
     if (path[0] == '/') {
-        strncpy(out, path, out_cap);
-        out[out_cap - 1] = '\0';
-        /* Always collapse trailing slashes (except "/") — Linux path walk. */
-        if (path_needs_normalize(out)) normalize_path(out, out_cap);
-        else {
-            size_t ol = strlen(out);
-            while (ol > 1 && out[ol - 1] == '/') out[--ol] = '\0';
-        }
-        map_tty_alias_path(out, out_cap);
+        char virt[512];
+        strncpy(virt, path, sizeof(virt) - 1);
+        virt[sizeof(virt) - 1] = '\0';
+        if (path_needs_normalize(virt)) normalize_path(virt, sizeof(virt));
+        if (strcmp(root, "/") == 0)
+            snprintf(out, out_cap, "%s", virt);
+        else if (strcmp(virt, "/") == 0)
+            snprintf(out, out_cap, "%s", root);
+        else
+            snprintf(out, out_cap, "%s%s", root, virt);
+        if (strcmp(root, "/") == 0)
+            map_tty_alias_path(out, out_cap);
         return;
     }
     /* "." means current directory. */
@@ -6516,8 +6534,8 @@ static void resolve_kernel_path(thread_t *cur, const char *path,
     }
     /* ".." means parent directory. */
     if (strcmp(path, "..") == 0) {
-        if (strcmp(cwd, "/") == 0) {
-            strncpy(out, "/", out_cap);
+        if (strcmp(cwd, root) == 0) {
+            strncpy(out, root, out_cap);
             out[out_cap - 1] = '\0';
         } else {
             const char *slash = strrchr(cwd, '/');
@@ -6527,7 +6545,7 @@ static void resolve_kernel_path(thread_t *cur, const char *path,
                 memcpy(out, cwd, len);
                 out[len] = '\0';
             } else {
-                strncpy(out, "/", out_cap);
+                strncpy(out, root, out_cap);
                 out[out_cap - 1] = '\0';
             }
         }
@@ -6544,7 +6562,12 @@ static void resolve_kernel_path(thread_t *cur, const char *path,
         size_t ol = strlen(out);
         while (ol > 1 && out[ol - 1] == '/') out[--ol] = '\0';
     }
-    map_tty_alias_path(out, out_cap);
+    if (!path_is_beneath_root(out, root)) {
+        strncpy(out, root, out_cap - 1);
+        out[out_cap - 1] = '\0';
+    }
+    if (strcmp(root, "/") == 0)
+        map_tty_alias_path(out, out_cap);
 }
 
 static void resolve_user_path(thread_t *cur, const char *path_u,
@@ -7383,29 +7406,25 @@ static ssize_t net_sock_read_userspace(thread_t *cur, ksock_net_t *s, void *bufp
             return (ssize_t)n;
         }
         if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return -EFAULT;
-        if (s->tcp.rx_len == 0 && s->tcp.peer_fin) return 0;
         if (!s->tcp.established && s->tcp.connect_pending) {
             net_tcp_ops_t cops;
             net_make_tcp_ops(&cops, &s->tcp);
-            e1000_poll();
             if (net_tcp_connect_poll(&s->tcp, &cops, 0) == 0)
                 s->connected = 1;
         }
-        if (!s->connected || (!s->tcp.established && !s->tcp.peer_rst)) {
-            if (s->tcp.rx_len == 0 && s->tcp.peer_fin) return 0;
+        if (!s->connected || (!s->tcp.established && !s->tcp.peer_rst && !s->tcp.peer_fin)) {
             if (s->tcp.rx_len == 0) return -ENOTCONN;
         }
         net_tcp_ops_t ops;
         net_make_tcp_ops(&ops, &s->tcp);
         size_t chunk = cnt;
-        if (chunk > 16384) chunk = 16384;
+        if (chunk > 65536) chunk = 65536;
         uint8_t *tmp = (uint8_t *)kmalloc(chunk);
         if (!tmp) return -ENOMEM;
         size_t total = 0;
         for (;;) {
             for (int pump = 0; pump < 2; pump++) {
-                e1000_poll();
-                (void)net_tcp_service(&s->tcp, &ops, 8);
+                (void)net_tcp_service(&s->tcp, &ops, 32);
                 if (s->tcp.rx_len > 0)
                     break;
                 if (s->tcp.peer_rst)
@@ -7420,8 +7439,7 @@ static ssize_t net_sock_read_userspace(thread_t *cur, ksock_net_t *s, void *bufp
                 if (total >= chunk || rr < (int)(chunk - total))
                     break;
                 for (int pump = 0; pump < 2; pump++) {
-                    e1000_poll();
-                    (void)net_tcp_service(&s->tcp, &ops, 8);
+                    (void)net_tcp_service(&s->tcp, &ops, 32);
                 }
                 continue;
             }
@@ -8335,6 +8353,8 @@ static uint64_t do_linux_fork(thread_t *cur,
             child->pgid = cur->pgid;
             strncpy(child->cwd, cur->cwd, sizeof(child->cwd) - 1);
             child->cwd[sizeof(child->cwd) - 1] = '\0';
+            strncpy(child->fs_root, cur->fs_root[0] ? cur->fs_root : "/", sizeof(child->fs_root) - 1);
+            child->fs_root[sizeof(child->fs_root) - 1] = '\0';
             fork_inherit_fd_table(child, cur);
             process_sync_from_thread(child->process, child);
             thread_proc_env_inherit(child, cur);
@@ -8595,7 +8615,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
     /* Uncomment if there is some syscall issue — floods the console and
      * hides the shell prompt (ash setjobctl alone is getpgrp/kill/ioctl). */
-    /* if (num != 1) kprintf("syscall: num=%llu\n", (unsigned long long)num); */
+    //if (num != 1) kprintf("syscall: num=%llu\n", (unsigned long long)num);
 
     switch (num) {
         case SYS_clone: {
@@ -8792,6 +8812,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 strncpy(child->cwd, cur->cwd, sizeof(child->cwd) - 1);
                 child->cwd[sizeof(child->cwd) - 1] = '\0';
+                strncpy(child->fs_root, cur->fs_root[0] ? cur->fs_root : "/", sizeof(child->fs_root) - 1);
+                child->fs_root[sizeof(child->fs_root) - 1] = '\0';
                 /*
                  * CLONE_THREAD: do NOT process_sync_from_thread(leader) here.
                  * That copied leader->fds over the shared process table and
@@ -9084,6 +9106,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 strncpy(child->cwd, cur->cwd, sizeof(child->cwd)-1);
                 child->cwd[sizeof(child->cwd)-1] = '\0';
+                strncpy(child->fs_root, cur->fs_root[0] ? cur->fs_root : "/", sizeof(child->fs_root)-1);
+                child->fs_root[sizeof(child->fs_root)-1] = '\0';
                 /* See clone(): never sync leader→process on CLONE_THREAD. */
                 fork_inherit_fd_table(child, cur);
                 if (!(flags & CLONE3_CLONE_THREAD))
@@ -9466,6 +9490,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             child->attached_tty = p->attached_tty;
             strncpy(child->cwd, p->cwd, sizeof(child->cwd) - 1);
             child->cwd[sizeof(child->cwd) - 1] = '\0';
+            strncpy(child->fs_root, p->fs_root[0] ? p->fs_root : "/", sizeof(child->fs_root) - 1);
+            child->fs_root[sizeof(child->fs_root) - 1] = '\0';
             qemu_debug_printf("vfork: parent=%llu child=%llu saved_rcx=0x%llx saved_rsp=0x%llx\n",
                 (unsigned long long)(p->tid ? p->tid : 1),
                 (unsigned long long)(child->tid ? child->tid : 1),
@@ -10191,8 +10217,15 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             return ret_err(EPERM);
         }
         case SYS_chown: {
-            /* chown(path, uid, gid) - syscall 92; rpm may set ownership; stub success */
-            (void)a1; (void)a2; (void)a3;
+            const char *path_u = (const char *)(uintptr_t)a1;
+            if (!path_u || (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT)
+                return ret_err(EFAULT);
+            char path[512];
+            struct stat st;
+            resolve_user_path(cur, path_u, path, sizeof(path));
+            if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
+            if (overlayfs_chown(path, (uid_t)a2, (gid_t)a3) != 0)
+                return ret_err(EPERM);
             return 0;
         }
         case 91: { /* fchmod(fd, mode) */
@@ -10206,10 +10239,42 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             return 0;
         }
-        case 93:  /* fchown(fd, uid, gid) */
-        case 94:  /* lchown(path, uid, gid) */
-        case 260: /* fchownat(dirfd, pathname, uid, gid, flags) */
+        case 93: { /* fchown(fd, uid, gid) */
+            int fd = (int)a1;
+            if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
+            struct fs_file *f = cur ? cur->fds[fd] : NULL;
+            if (!f) return ret_err(EBADF);
+            if (!f->path) return ret_err(EINVAL);
+            if (overlayfs_chown(f->path, (uid_t)a2, (gid_t)a3) != 0)
+                return ret_err(EPERM);
             return 0;
+        }
+        case 94: { /* lchown(path, uid, gid) */
+            const char *path_u = (const char *)(uintptr_t)a1;
+            if (!path_u || (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT)
+                return ret_err(EFAULT);
+            char path[512];
+            resolve_user_path(cur, path_u, path, sizeof(path));
+            if (overlayfs_lchown(path, (uid_t)a2, (gid_t)a3) != 0)
+                return ret_err(EPERM);
+            return 0;
+        }
+        case 260: { /* fchownat(dirfd, pathname, uid, gid, flags) */
+            int dirfd = (int)a1;
+            const char *path_u = (const char *)(uintptr_t)a2;
+            if (!path_u || (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT)
+                return ret_err(EFAULT);
+            char path[512];
+            int rc = resolve_user_path_at(cur, dirfd, path_u, path, sizeof(path));
+            if (rc != 0) return ret_err(-rc);
+            int flags = (int)a5;
+            int cr = (flags & 0x100) /* AT_SYMLINK_NOFOLLOW */
+                ? overlayfs_lchown(path, (uid_t)a3, (gid_t)a4)
+                : overlayfs_chown(path, (uid_t)a3, (gid_t)a4);
+            if (cr != 0)
+                return ret_err(EPERM);
+            return 0;
+        }
         case SYS_utimensat: {
             /* utimensat(dirfd, path, times, flags) - syscall 280; rpm may set mtime; stub success */
             (void)a1; (void)a2; (void)a3; (void)a4;
@@ -10479,20 +10544,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (copy_to_user_safe(up, &u, sizeof(u)) != 0) return ret_err(EFAULT);
             return 0;
         }
-        case 170: { /* gethostname */
-            char *buf = (char *)(uintptr_t)a1;
-            size_t len = (size_t)a2;
-            if (!buf || len == 0) return ret_err(EINVAL);
-            const char *host = uts_hostname_get();
-            size_t n = strlen(host);
-            if (n >= len) n = len - 1;
-            char k[UTS_NODENAME_MAX];
-            memcpy(k, host, n);
-            k[n] = '\0';
-            if (copy_to_user_safe(buf, k, n + 1) != 0) return ret_err(EFAULT);
-            return 0;
-        }
-        case 161: { /* sethostname (Linux x86_64) */
+        case 170: { /* sethostname (Linux x86_64) */
             const char *ubuf = (const char *)(uintptr_t)a1;
             size_t len = (size_t)a2;
             char k[UTS_NODENAME_MAX];
@@ -10508,6 +10560,30 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             memcpy(k, tmp, len);
             kfree(tmp);
             if (uts_hostname_set(k, len) != 0) return ret_err(EINVAL);
+            return 0;
+        }
+        case 161: { /* chroot(path) */
+            const char *path_u = (const char *)(uintptr_t)a1;
+            if (!cur || cur->euid != 0) return ret_err(EPERM);
+            if (!path_u) return ret_err(EFAULT);
+            char path[256];
+            resolve_user_path(cur, path_u, path, sizeof(path));
+            if (!path[0]) return ret_err(EFAULT);
+            struct stat st;
+            if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
+            if ((st.st_mode & S_IFDIR) != S_IFDIR) return ret_err(ENOTDIR);
+            size_t n = strlen(path);
+            while (n > 1 && path[n - 1] == '/') path[--n] = '\0';
+            strncpy(cur->fs_root, path, sizeof(cur->fs_root) - 1);
+            cur->fs_root[sizeof(cur->fs_root) - 1] = '\0';
+            strncpy(cur->cwd, path, sizeof(cur->cwd) - 1);
+            cur->cwd[sizeof(cur->cwd) - 1] = '\0';
+            if (cur->process) {
+                strncpy(cur->process->fs_root, path, sizeof(cur->process->fs_root) - 1);
+                cur->process->fs_root[sizeof(cur->process->fs_root) - 1] = '\0';
+                strncpy(cur->process->cwd, path, sizeof(cur->process->cwd) - 1);
+                cur->process->cwd[sizeof(cur->process->cwd) - 1] = '\0';
+            }
             return 0;
         }
         case 171: { /* setdomainname (Linux x86_64) */
@@ -10533,12 +10609,18 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             size_t size = (size_t)a2;
             const char *cwd = (cur && cur->process && cur->process->cwd[0]) ?
                 cur->process->cwd : ((cur && cur->cwd[0]) ? cur->cwd : "/");
-            size_t need = strlen(cwd) + 1;
+            const char *root = task_fs_root(cur);
+            const char *visible = cwd;
+            if (strcmp(root, "/") != 0 && path_is_beneath_root(cwd, root)) {
+                visible = cwd + strlen(root);
+                if (!visible[0]) visible = "/";
+            }
+            size_t need = strlen(visible) + 1;
             if (!bufp) return ret_err(EFAULT);
             /* Linux getcwd(2): ERANGE if buffer is too small. */
             if (size < need) return ret_err(ERANGE);
             if ((uintptr_t)bufp + need > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            if (copy_to_user_safe(bufp, cwd, need) != 0)
+            if (copy_to_user_safe(bufp, visible, need) != 0)
                 return ret_err(EFAULT);
             return (uint64_t)need;
         }
@@ -11013,6 +11095,70 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (cur->process)
                 cur->process->gid = cur->process->egid =
                     cur->process->sgid = gid;
+            return 0;
+        }
+        case 117: { /* setresuid(ruid, euid, suid) */
+            int64_t rv = (int64_t)(int32_t)a1;
+            int64_t ev = (int64_t)(int32_t)a2;
+            int64_t sv = (int64_t)(int32_t)a3;
+            uid_t old_r = cur->uid, old_e = cur->euid, old_s = cur->suid;
+            if (old_e != 0) {
+                if ((rv != -1 && (uid_t)rv != old_r && (uid_t)rv != old_e && (uid_t)rv != old_s) ||
+                    (ev != -1 && (uid_t)ev != old_r && (uid_t)ev != old_e && (uid_t)ev != old_s) ||
+                    (sv != -1 && (uid_t)sv != old_r && (uid_t)sv != old_e && (uid_t)sv != old_s))
+                    return ret_err(EPERM);
+            }
+            if (rv != -1) cur->uid = (uid_t)rv;
+            if (ev != -1) cur->euid = (uid_t)ev;
+            if (sv != -1) cur->suid = (uid_t)sv;
+            if (cur->process) {
+                cur->process->uid = cur->uid;
+                cur->process->euid = cur->euid;
+                cur->process->suid = cur->suid;
+            }
+            return 0;
+        }
+        case 118: { /* getresuid(ruid, euid, suid) */
+            uid_t ids[3] = { cur->uid, cur->euid, cur->suid };
+            void *up[3] = {
+                (void *)(uintptr_t)a1, (void *)(uintptr_t)a2, (void *)(uintptr_t)a3
+            };
+            for (int i = 0; i < 3; i++) {
+                if (!up[i] || copy_to_user_safe(up[i], &ids[i], sizeof(ids[i])) != 0)
+                    return ret_err(EFAULT);
+            }
+            return 0;
+        }
+        case 119: { /* setresgid(rgid, egid, sgid) */
+            int64_t rv = (int64_t)(int32_t)a1;
+            int64_t ev = (int64_t)(int32_t)a2;
+            int64_t sv = (int64_t)(int32_t)a3;
+            gid_t old_r = cur->gid, old_e = cur->egid, old_s = cur->sgid;
+            if (cur->euid != 0) {
+                if ((rv != -1 && (gid_t)rv != old_r && (gid_t)rv != old_e && (gid_t)rv != old_s) ||
+                    (ev != -1 && (gid_t)ev != old_r && (gid_t)ev != old_e && (gid_t)ev != old_s) ||
+                    (sv != -1 && (gid_t)sv != old_r && (gid_t)sv != old_e && (gid_t)sv != old_s))
+                    return ret_err(EPERM);
+            }
+            if (rv != -1) cur->gid = (gid_t)rv;
+            if (ev != -1) cur->egid = (gid_t)ev;
+            if (sv != -1) cur->sgid = (gid_t)sv;
+            if (cur->process) {
+                cur->process->gid = cur->gid;
+                cur->process->egid = cur->egid;
+                cur->process->sgid = cur->sgid;
+            }
+            return 0;
+        }
+        case 120: { /* getresgid(rgid, egid, sgid) */
+            gid_t ids[3] = { cur->gid, cur->egid, cur->sgid };
+            void *up[3] = {
+                (void *)(uintptr_t)a1, (void *)(uintptr_t)a2, (void *)(uintptr_t)a3
+            };
+            for (int i = 0; i < 3; i++) {
+                if (!up[i] || copy_to_user_safe(up[i], &ids[i], sizeof(ids[i])) != 0)
+                    return ret_err(EFAULT);
+            }
             return 0;
         }
         case SYS_setreuid: {
@@ -12210,7 +12356,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 memset(&s->tcp, 0, sizeof(s->tcp));
                 s->dns_tcp_udp_bridge = 0;
                 s->connected = 0;
-                net_rxq_flush();
                 s->peer_ip_be = dst_ip_be;
                 s->peer_port = dport;
                 /* Fresh local port on redirect/reconnect (avoids TIME_WAIT / NAT confusion). */
@@ -12233,8 +12378,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     g_tcp_xmit_mac_valid = 1;
                     net_tcp_stage_peer_mac(&s->tcp, nh_mac);
                 }
-                /* ARP wait may have filled RXQ with unrelated frames — clear before SYN. */
-                net_rxq_flush();
                 net_nic_drain_connect_priority(&s->tcp, 16);
 #if NET_TCP_TRACE
                 klogprintf("tcp: connect2 dst=%u.%u.%u.%u:%u sport=%u nb=%d gwmac=%d nh=%02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -12296,10 +12439,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     s->connected = 0;
                     return ret_err(EIO);
                 }
-                klogprintf("tcp: connected dst=%u.%u.%u.%u:%u\n",
-                    (unsigned)((s->peer_ip_be >> 24) & 0xFF), (unsigned)((s->peer_ip_be >> 16) & 0xFF),
-                    (unsigned)((s->peer_ip_be >> 8) & 0xFF), (unsigned)(s->peer_ip_be & 0xFF),
-                    (unsigned)dport);
                 s->connected = 1;
                 return 0;
             }
@@ -12801,8 +12940,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (rr < 0) return ret_read_err(rr);
                     return (uint64_t)rr;
                 }
-                if (s->tcp.rx_len == 0 && s->tcp.peer_fin) return 0;
-                if ((!s->connected || (!s->tcp.established && !s->tcp.peer_rst)) && s->tcp.rx_len == 0) return ret_err(ENOTCONN);
+                if ((!s->connected || (!s->tcp.established && !s->tcp.peer_rst && !s->tcp.peer_fin)) &&
+                    s->tcp.rx_len == 0) return ret_err(ENOTCONN);
                 ssize_t rr = net_sock_read_userspace(t, s, buf_u, len);
                 if (rr < 0) return ret_read_err(rr);
                 if (rr == 0) return 0;
@@ -18322,6 +18461,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         }
         case SYS_mount: {
             /* mount(source, target, fstype, flags, data) */
+            uint64_t mount_prof_start = time_monotonic_us();
             const char *src_u = (const char*)(uintptr_t)a1;
             const char *tgt_u = (const char*)(uintptr_t)a2;
             const char *type_u = (const char*)(uintptr_t)a3;
@@ -18340,6 +18480,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (mnt_flags & MS_REMOUNT_LOCAL) {
                 devel_printf("mount: remount flags=0x%llx target=%s (no-op ok)\n",
                     (unsigned long long)mnt_flags, target);
+                klogprintf("mount-prof: type=remount target=%s total=%lluus rc=0\n",
+                           target,
+                           (unsigned long long)(time_monotonic_us() - mount_prof_start));
                 return 0;
             }
 
@@ -18389,7 +18532,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 /* OpenRC init.sh / fstabinfo: mount -t tmpfs … /run
                  * Exact mountpoint check (not longest-prefix): "/" overlay must
                  * not count as an existing tmpfs on "/run". */
-                kprintf("mount: tmpfs request target=%s\n", target);
                 ramfs_mkdir(target);
                 {
                     struct fs_driver *md = fs_get_mount_driver_exact(target);
@@ -18399,7 +18541,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         /* Linux mount(8): already mounted same type → success for
                          * our virtual mounts (OpenRC remounts are no-ops). */
                         rc = 0;
-                        kprintf("mount: tmpfs already on %s (ok)\n", target);
                     } else if (md) {
                         errno_out = EBUSY;
                         kprintf("mount: tmpfs EBUSY on %s have=%s\n", target,
@@ -18408,8 +18549,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         rc = tmpfs_mount(target);
                         if (rc != 0)
                             errno_out = EBUSY;
-                        else
-                            kprintf("mount: tmpfs mounted %s\n", target);
                     }
                 }
             } else if (strcmp(k_type, "squashfs") == 0) {
@@ -18535,6 +18674,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (rc != 0)
                 kprintf("mount: fail type=%s target=%s errno=%d\n",
                         k_type, target, errno_out);
+            {
+                static int mount_profile_left = 64;
+                if (mount_profile_left-- > 0)
+                    klogprintf("mount-prof: type=%s target=%s total=%lluus rc=%d\n",
+                               k_type, target,
+                               (unsigned long long)(time_monotonic_us() - mount_prof_start),
+                               rc == 0 ? 0 : -errno_out);
+            }
             kfree(k_type);
             return (rc == 0) ? 0 : ret_err(errno_out);
         }
@@ -19474,6 +19621,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 }
 
 uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
+    uint64_t syscall_prof_begin = time_monotonic_us();
     thread_t *trace_t = syscall_resolve_thread();
     if (!trace_t)
         trace_t = thread_get_current_user();
@@ -19656,6 +19804,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             (unsigned long long)a6);
     }
     uint64_t ret = syscall_do_inner(num, a1, a2, a3, a4, a5, a6);
+    uint64_t syscall_prof_inner_done = time_monotonic_us();
     if (trace_t && trace_t->fork_child_user_rip && trace_t->name[0] &&
         strstr(trace_t->name, "linuxrc")) {
         static int linuxrc_child_done_left = 48;
@@ -19781,6 +19930,23 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             (unsigned long long)(trace_t->tid ? trace_t->tid : 1));
     {
         uint64_t out = syscall_sanitize_user_ret(ret);
+        uint64_t syscall_prof_done = time_monotonic_us();
+        uint64_t syscall_prof_total = syscall_prof_done - syscall_prof_begin;
+        if (syscall_prof_total >= 100000ULL &&
+            (num == SYS_execve || num == SYS_socket ||
+             num == SYS_openat || num == SYS_access)) {
+            static int syscall_slow_profile_left = 256;
+            if (syscall_slow_profile_left-- > 0) {
+                klogprintf("syscall-slow: n=%llu inner=%lluus tail=%lluus total=%lluus ret=0x%llx\n",
+                           (unsigned long long)num,
+                           (unsigned long long)(syscall_prof_inner_done -
+                                                syscall_prof_begin),
+                           (unsigned long long)(syscall_prof_done -
+                                                syscall_prof_inner_done),
+                           (unsigned long long)syscall_prof_total,
+                           (unsigned long long)out);
+            }
+        }
         if (trace_t && trace_t->fork_child_user_rip && trace_t->name[0] &&
             strstr(trace_t->name, "linuxrc") &&
             (num == SYS_getpid || num == SYS_ioctl || num == SYS_execve ||
@@ -19839,6 +20005,19 @@ void syscall_init(void) {
     /* register handler on vector 0x80 */
     idt_set_handler(0x80, isr_syscall);
     keyring_init();
+
+    size_t rx_frames_bytes = (size_t)NET_RXQ_SLOTS * NET_RXQ_BUF;
+    size_t rx_lengths_bytes = (size_t)NET_RXQ_SLOTS * sizeof(uint16_t);
+    uint8_t *rx_storage = (uint8_t *)kmalloc(rx_frames_bytes + rx_lengths_bytes);
+    if (rx_storage) {
+        g_net_rxq = (uint8_t (*)[NET_RXQ_BUF])rx_storage;
+        g_net_rxq_len = (uint16_t *)(void *)(rx_storage + rx_frames_bytes);
+        memset(g_net_rxq_len, 0, rx_lengths_bytes);
+        g_net_rxq_slots = NET_RXQ_SLOTS;
+    } else {
+        klogprintf("net: RX queue allocation failed, using %u slots\n",
+                   (unsigned)NET_RXQ_FALLBACK_SLOTS);
+    }
 
     /* Enable x86_64 SYSCALL instruction for userland. */
     uint64_t efer = msr_read_u64(MSR_EFER);

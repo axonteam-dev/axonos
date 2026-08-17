@@ -464,6 +464,10 @@ static struct fs_file *ov_wrap(const char *path, struct fs_file *inner, int laye
     f->type = inner ? inner->type : FS_TYPE_DIR;
     f->fs_private = (void *)&overlay_driver;
     f->driver_private = fh;
+    if (inner) {
+        f->backing_id = inner->backing_id;
+        f->backing_gen = inner->backing_gen;
+    }
     return f;
 }
 
@@ -542,14 +546,16 @@ static int overlay_open(const char *path, struct fs_file **out_file)
         }
         memset(fh, 0, sizeof(*fh));
         fh->layer = OV_LAYER_MERGED_DIR;
-        if (ov_merge_readdir(path, &fh->dir_blob, &fh->dir_blob_len) != 0) {
-            kfree(fh);
-            kfree(pp);
-            kfree(f);
-            return -2;
-        }
+        /*
+         * Linux open/stat of a directory does not enumerate it. Build the
+         * merged upper+lower dirent stream lazily on the first getdents/read.
+         * Eager merging made every prefix probe in symlink resolution scan
+         * whole directories, turning ordinary ENOENT lookups into seconds.
+         */
+        fh->dir_blob = NULL;
+        fh->dir_blob_len = 0;
         f->path = pp;
-        f->size = (off_t)fh->dir_blob_len;
+        f->size = 0;
         f->type = FS_TYPE_DIR;
         f->fs_private = (void *)&overlay_driver;
         f->driver_private = fh;
@@ -625,8 +631,12 @@ static ssize_t overlay_read(struct fs_file *file, void *buf, size_t size, size_t
         return -1;
     fh = (struct overlay_file_handle *)file->driver_private;
     if (fh->layer == OV_LAYER_MERGED_DIR) {
-        if (!fh->dir_blob)
-            return -1;
+        if (!fh->dir_blob) {
+            if (ov_merge_readdir(file->path, &fh->dir_blob,
+                                 &fh->dir_blob_len) != 0)
+                return -1;
+            file->size = (off_t)fh->dir_blob_len;
+        }
         if (offset >= fh->dir_blob_len)
             return 0;
         if (offset + size > fh->dir_blob_len)
@@ -660,6 +670,8 @@ static int overlay_promote_for_write(struct fs_file *file)
     fh->inner = neu;
     fh->layer = OV_LAYER_UPPER;
     file->size = neu->size;
+    file->backing_id = neu->backing_id;
+    file->backing_gen = neu->backing_gen;
     return 0;
 }
 
@@ -676,8 +688,11 @@ static ssize_t overlay_write(struct fs_file *file, const void *buf, size_t size,
         return -1;
     fh = (struct overlay_file_handle *)file->driver_private;
     nw = ov_upper()->ops->write(fh->inner, buf, size, offset);
-    if (nw >= 0 && fh->inner)
+    if (nw >= 0 && fh->inner) {
         file->size = fh->inner->size;
+        file->backing_id = fh->inner->backing_id;
+        file->backing_gen = fh->inner->backing_gen;
+    }
     return nw;
 }
 
@@ -711,6 +726,30 @@ static int overlay_chmod(const char *path, mode_t mode)
     return ramfs_chmod(path, mode);
 }
 
+int overlayfs_chown(const char *path, uid_t uid, gid_t gid)
+{
+    if (!overlay_active || !path)
+        return -1;
+    if (ov_copy_up(path) != 0) {
+        if (ov_ensure_parent_upper(path) != 0)
+            return -1;
+    }
+    return ramfs_chown(path, uid, gid);
+}
+
+int overlayfs_lchown(const char *path, uid_t uid, gid_t gid)
+{
+    if (!overlay_active || !path)
+        return -1;
+    /* Upper symlinks must be handled without following their target. */
+    if (ramfs_lchown(path, uid, gid) == 0)
+        return 0;
+    /* Materialize a lower inode/symlink, then update the upper dentry. */
+    if (ov_copy_up(path) != 0)
+        return -1;
+    return ramfs_lchown(path, uid, gid);
+}
+
 static int overlay_link(const char *oldpath, const char *newpath)
 {
     if (!overlay_active)
@@ -718,6 +757,13 @@ static int overlay_link(const char *oldpath, const char *newpath)
     if (ov_copy_up(oldpath) != 0)
         return -1;
     if (ov_ensure_parent_upper(newpath) != 0)
+        return -1;
+    /*
+     * unlinking a lower-layer backup leaves a whiteout at newpath. Linux
+     * link(2) may create a new dentry there after the unlink; the whiteout is
+     * an overlay implementation detail and must not surface as EEXIST.
+     */
+    if (ramfs_path_is_whiteout(newpath) && ramfs_remove(newpath) != 0)
         return -1;
     return ramfs_link(oldpath, newpath);
 }
@@ -919,13 +965,23 @@ int overlayfs_ftruncate(struct fs_file *file, off_t length)
         fh->inner = neu;
         fh->layer = OV_LAYER_UPPER;
         file->size = neu->size;
+        file->backing_id = neu->backing_id;
+        file->backing_gen = neu->backing_gen;
     } else if (fh->layer != OV_LAYER_UPPER) {
         return -30;
     }
     fh = (struct overlay_file_handle *)file->driver_private;
     if (!fh || !fh->inner)
         return -30;
-    return ramfs_ftruncate(fh->inner, length);
+    {
+        int trc = ramfs_ftruncate(fh->inner, length);
+        if (trc == 0) {
+            file->size = fh->inner->size;
+            file->backing_id = fh->inner->backing_id;
+            file->backing_gen = fh->inner->backing_gen;
+        }
+        return trc;
+    }
 }
 
 int overlayfs_mount_root(void)

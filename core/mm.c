@@ -2152,8 +2152,10 @@ static int mm_cow_private_writable_impl(mm_t *mm, uint64_t *share_l4, uint64_t v
         if (!newp) return -1;
         memcpy(newp, (void *)(uintptr_t)(old_pa & ~0xFFFULL),
                (size_t)PAGE_SIZE_4K);
-        if (mm_map_4k_sharedaware(mm, share_l4, va, (uint64_t)(uintptr_t)newp,
-                                  PG_RW | PG_US | PG_SOFT_OWNED) != 0) {
+        /* The whole range already runs under the direct-map CR3. Avoid a
+         * nested pushfq/cli/CR3 check for every 4 KiB page. */
+        if (mm_map_4k_sharedaware_body(mm, share_l4, va, (uint64_t)(uintptr_t)newp,
+                                      PG_RW | PG_US | PG_SOFT_OWNED) != 0) {
             mm_user_frame_put(newp);
             return -1;
         }
@@ -3078,8 +3080,15 @@ static int mm_make_private_range_impl(mm_t *mm, uint64_t va_begin, uint64_t va_e
             memcpy(newp, (void *)(uintptr_t)spa, (size_t)PAGE_SIZE_4K);
         }
         (void)source_cr3;
-        if (mm_map_4k_sharedaware(mm, share_l4, va, (uint64_t)(uintptr_t)newp,
-                                  PG_RW | PG_US | PG_SOFT_OWNED) != 0) {
+        /*
+         * The whole range is already processed under one direct-map context.
+         * Calling the public wrapper here would switch CR3 and restore the
+         * interrupt state once per 4K page, making exec PT_LOAD construction
+         * take seconds on bare metal.
+         */
+        if (mm_map_4k_sharedaware_body(mm, share_l4, va,
+                                      (uint64_t)(uintptr_t)newp,
+                                      PG_RW | PG_US | PG_SOFT_OWNED) != 0) {
             mm_user_frame_put(newp);
             goto out;
         }
@@ -3158,8 +3167,8 @@ static int mm_make_private_range_bulk_zero_ex(mm_t *mm, uint64_t va_begin, uint6
             mm_user_frame_put(page);
             goto out;
         }
-        if (mm_map_4k_sharedaware(mm, share_l4, pg, want,
-                                  PG_RW | PG_US | PG_SOFT_OWNED) != 0) {
+        if (mm_map_4k_sharedaware_body(mm, share_l4, pg, want,
+                                      PG_RW | PG_US | PG_SOFT_OWNED) != 0) {
             mm_user_frame_put(page);
             goto out;
         }

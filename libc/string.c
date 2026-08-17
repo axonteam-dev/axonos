@@ -177,11 +177,23 @@ void *memmove(void *dest, const void *src, size_t n)
     const uint8_t *s = (const uint8_t *)src;
 
     if (d < s) {
-        for (size_t i = 0; i < n; i++)
-            d[i] = s[i];
+        /*
+         * Forward overlap is safe with memcpy's forward ERMS copy. This is
+         * the hot direction for framebuffer and tty scrolling.
+         */
+        return memcpy(dest, src, n);
     } else if (d > s) {
-        for (size_t i = n; i > 0; i--)
-            d[i - 1] = s[i - 1];
+        /* Copy backwards using native words; unaligned accesses are valid on
+         * x86-64 and avoid a byte loop for insert-line/down-scroll paths. */
+        while (n >= sizeof(uint64_t)) {
+            n -= sizeof(uint64_t);
+            *(uint64_t *)(void *)(d + n) =
+                *(const uint64_t *)(const void *)(s + n);
+        }
+        while (n > 0) {
+            n--;
+            d[n] = s[n];
+        }
     }
     return dest;
 }
@@ -190,6 +202,19 @@ void *memset(void *ptr, int value, size_t n)
 {
     uint8_t *p = (uint8_t *)ptr;
 
+#if defined(__x86_64__)
+    if (n >= 128) {
+        size_t cnt = n;
+        uint8_t val = (uint8_t)value;
+        __asm__ __volatile__(
+            "rep stosb"
+            : "+D"(p), "+c"(cnt)
+            : "a"(val)
+            : "memory"
+        );
+        return ptr;
+    }
+#endif
     for (size_t i = 0; i < n; i++)
         p[i] = (uint8_t)value;
     return ptr;

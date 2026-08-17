@@ -26,6 +26,8 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
 #include <vga.h>
 #include <debug.h>
 #include <syscall.h>
+#include <pit.h>
+#include <klog.h>
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
 
@@ -1533,6 +1535,7 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
              * A hole mid-image leaves IFUNC/CRT reading zeros and planting
              * anon mmap addresses into GOT → user RIP=0xec00000.
              */
+#ifdef ELF_DEBUG_VERIFY_PRIVATE_IMAGE
             for (int pi = 0; pi < (int)eh.e_phnum; pi++) {
                 Elf64_Phdr *ph = &phdrs[pi];
                 uint64_t va, end, foff;
@@ -1573,6 +1576,7 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
                     }
                 }
             }
+#endif
         }
     }
 
@@ -1780,7 +1784,8 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
             sp64[ax + 8] = (uint64_t)AT_ENTRY;  sp64[ax + 9] = aux_entry;
             sp64[ax +10] = (uint64_t)AT_PAGESZ; sp64[ax +11] = 4096ULL;
             sp64[ax +12] = (uint64_t)AT_RANDOM; sp64[ax +13] = (uint64_t)random_addr;
-            sp64[ax +14] = (uint64_t)AT_CLKTCK; sp64[ax +15] = 100ULL;
+            sp64[ax +14] = (uint64_t)AT_CLKTCK;
+            sp64[ax +15] = (uint64_t)pit_get_frequency();
             sp64[ax +16] = (uint64_t)AT_NULL;   sp64[ax +17] = 0;
             *(uint64_t *)base = (uint64_t)argc;
         }
@@ -2280,7 +2285,8 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         sp64[ax + 8] = (uint64_t)AT_ENTRY;  sp64[ax + 9] = aux_entry;
         sp64[ax +10] = (uint64_t)AT_PAGESZ; sp64[ax +11] = 4096ULL;
         sp64[ax +12] = (uint64_t)AT_RANDOM; sp64[ax +13] = (uint64_t)random_addr;
-        sp64[ax +14] = (uint64_t)AT_CLKTCK; sp64[ax +15] = 100ULL;
+        sp64[ax +14] = (uint64_t)AT_CLKTCK;
+        sp64[ax +15] = (uint64_t)pit_get_frequency();
         sp64[ax +16] = (uint64_t)AT_NULL;   sp64[ax +17] = 0;
         *(uint64_t *)base = (uint64_t)argc;
     }
@@ -2494,6 +2500,8 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
             ut->attached_tty = caller->attached_tty;
             strncpy(ut->cwd, caller->cwd[0] ? caller->cwd : "/", sizeof(ut->cwd));
             ut->cwd[sizeof(ut->cwd) - 1] = '\0';
+            strncpy(ut->fs_root, caller->fs_root[0] ? caller->fs_root : "/", sizeof(ut->fs_root));
+            ut->fs_root[sizeof(ut->fs_root) - 1] = '\0';
             for (int i = 0; i < THREAD_MAX_FD; i++) {
                 ut->fds[i] = caller->fds[i];
                 if (ut->fds[i]) {

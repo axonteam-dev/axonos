@@ -63,6 +63,7 @@
 #include <acpi_powerbtn.h>
 #include <nvme.h>
 #include <e1000.h>
+#include <keyring.h>
 void ata_dma_init(void);
 void scsi_init(void);
 int pvscsi_init(void);
@@ -87,6 +88,8 @@ extern const char nss_dns_so_blob_end[];
  */
 extern const char nss_files_so_blob_start[];
 extern const char nss_files_so_blob_end[];
+extern const char axonos_system_ca_pem_start[];
+extern const char axonos_system_ca_pem_end[];
 
 static int ramfs_mkdir_p(const char *path)
 {
@@ -169,34 +172,121 @@ static int ramfs_write_blob(const char *path, const void *blob, size_t len)
 
         {
                 struct fs_file *vf = fs_open(path);
-                char *got;
-                ssize_t n;
+                struct stat st;
                 if (!vf) {
                         kprintf("blob: vfs re-open failed %s\n", path);
                         return -1;
                 }
-                got = (char *)kmalloc(len + 1);
-                if (!got) {
+                /* Borrowed upper is the blob itself — do not memcpy the whole
+                 * DSO back through overlay (that stalled boot after NSS). */
+                if (vfs_fstat(vf, &st) != 0 || (size_t)st.st_size != len) {
+                        kprintf("blob: verify size mismatch %s size=%lld want=%zu\n",
+                                path, (long long)st.st_size, len);
                         fs_file_free(vf);
                         return -1;
                 }
-                n = fs_read(vf, got, len, 0);
+                if (strstr(path, "gendepends")) {
+                        char *got = (char *)kmalloc(len + 1);
+                        ssize_t n;
+                        if (!got) {
+                                fs_file_free(vf);
+                                return -1;
+                        }
+                        n = fs_read(vf, got, len, 0);
+                        if (n != (ssize_t)len || !strstr(got, "\n/etc/init.d")) {
+                                kprintf("blob: missing /etc/init.d marker %s\n", path);
+                                kfree(got);
+                                fs_file_free(vf);
+                                return -1;
+                        }
+                        kfree(got);
+                }
                 fs_file_free(vf);
-                if (n != (ssize_t)len || memcmp(got, blob, len) != 0) {
-                        kprintf("blob: verify mismatch %s n=%zd\n", path, n);
-                        kfree(got);
-                        return -1;
-                }
-                got[len] = '\0';
-                if (strstr(path, "gendepends") && !strstr(got, "\n/etc/init.d")) {
-                        kprintf("blob: missing /etc/init.d marker %s\n", path);
-                        kfree(got);
-                        return -1;
-                }
-                kfree(got);
         }
         (void)ramfs_chmod(path, S_IFREG | 0755);
         return 0;
+}
+
+static int boot_write_bytes(const char *path, const void *data, size_t len)
+{
+        char parent[512];
+        char *slash;
+        size_t plen;
+        struct fs_file *f;
+
+        if (!path || path[0] != '/')
+                return -1;
+        plen = strlen(path);
+        if (plen >= sizeof(parent))
+                return -1;
+        memcpy(parent, path, plen + 1);
+        slash = strrchr(parent, '/');
+        if (slash && slash != parent) {
+                *slash = '\0';
+                if (ramfs_mkdir_p(parent) != 0)
+                        return -1;
+        }
+        f = fs_create_file(path);
+        if (!f)
+                f = fs_open(path);
+        if (!f)
+                return -1;
+        (void)vfs_ftruncate(f, 0);
+        if (data && len)
+                (void)fs_write(f, data, len, 0);
+        fs_file_free(f);
+        return 0;
+}
+
+/*
+ * Linux kernel_init: late_initcall(load_system_certificate_list) then
+ * integrity_load_keys(), still before run_init_process. Export the same
+ * trust anchor as /etc/ssl so OpenSSL follows the usual distro layout.
+ */
+static void boot_load_system_certs(void)
+{
+        const char *pem = axonos_system_ca_pem_start;
+        size_t pem_len = (size_t)(axonos_system_ca_pem_end - axonos_system_ca_pem_start);
+        static const char openssl_cnf[] =
+                "# System-wide OpenSSL configuration (kernel-generated)\n"
+                "HOME = /root\n"
+                "RANDFILE = /dev/urandom\n"
+                "\n"
+                "[ req ]\n"
+                "default_bits = 2048\n"
+                "default_md = sha256\n"
+                "string_mask = utf8only\n"
+                "distinguished_name = req_distinguished_name\n"
+                "\n"
+                "[ req_distinguished_name ]\n";
+
+        /* Linux: late_initcall(load_system_certificate_list) copies
+         * CONFIG_SYSTEM_TRUSTED_KEYS into .builtin_trusted_keys. It does
+         * not run ECDSA keygen on the boot CPU. */
+        kprintf("certs: installing built-in system CA (Linux load_system_certificate_list)\n");
+        if (keyring_load_system_certs() != 0)
+                kprintf("certs: keyring init failed\n");
+        if (keyring_install_system_ca(pem, pem_len) != 0)
+                kprintf("certs: warning: cannot cache CA on .builtin_trusted_keys\n");
+        (void)ramfs_mkdir_p("/etc/ssl/certs");
+        (void)ramfs_mkdir_p("/etc/ssl/private");
+        if (boot_write_bytes("/etc/ssl/openssl.cnf", openssl_cnf,
+                             sizeof(openssl_cnf) - 1) != 0)
+                kprintf("certs: warning: cannot write /etc/ssl/openssl.cnf\n");
+        if (pem_len == 0) {
+                kprintf("certs: built-in CA PEM empty (host openssl missing at build)\n");
+                return;
+        }
+        if (boot_write_bytes("/etc/ssl/certs/ca-certificates.crt", pem, pem_len) != 0)
+                kprintf("certs: warning: cannot write ca-certificates.crt\n");
+        if (boot_write_bytes("/etc/ssl/certs/axonos-system-ca.pem", pem, pem_len) != 0)
+                kprintf("certs: warning: cannot write axonos-system-ca.pem\n");
+        (void)fs_unlink("/etc/ssl/cert.pem");
+        if (overlayfs_symlink("/etc/ssl/cert.pem",
+                              "/etc/ssl/certs/ca-certificates.crt") != 0)
+                (void)boot_write_bytes("/etc/ssl/cert.pem", pem, pem_len);
+        kprintf("certs: system CA ready (%zu bytes PEM) in .builtin_trusted_keys\n",
+                pem_len);
 }
 
 static void ramfs_install_libnss_dns(void)
@@ -517,11 +607,17 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                                                 magic_ok ? "(ok)" : "(BAD magic — image may be corrupted)");
                         }
 
-                        uint64_t ram_bytes = (uint64_t)sysinfo_ram_mb() * 1024ULL * 1024ULL;
+                        uint64_t identity_end = sysinfo_identity_usable_end(multiboot_info);
+                        if (identity_end == 0) {
+                                int reported_mb = sysinfo_ram_mb();
+                                uint64_t reported = reported_mb > 0
+                                        ? (uint64_t)reported_mb * 1024ULL * 1024ULL : 0x80000000ULL;
+                                identity_end = reported < 0x80000000ULL ? reported : 0x80000000ULL;
+                        }
                         uintptr_t safe_start = 0;
-                        if (ram_bytes > (uint64_t)rd_size + (64ull * 1024ull * 1024ull)) {
-                                /* Top of RAM, 2MiB-aligned, leave 16MiB cushion under MMIO/PCI. */
-                                uint64_t top = ram_bytes - (16ull * 1024ull * 1024ull);
+                        if (identity_end > (uint64_t)rd_size + (64ull * 1024ull * 1024ull)) {
+                                /* Top of identity-mapped usable RAM, with a 16 MiB guard. */
+                                uint64_t top = identity_end - (16ull * 1024ull * 1024ull);
                                 uint64_t cand64 = (top - (uint64_t)rd_size) & ~((uint64_t)(2u * 1024u * 1024u) - 1ull);
                                 /* Stay above user mmap window + 64MiB so heap has room below. */
                                 uint64_t floor = (uint64_t)USER_STACK_TOP + (64ull * 1024ull * 1024ull);
@@ -548,7 +644,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                                         uintptr_t cand_end = 0;
                                         if (__builtin_add_overflow(cand, rd_size, &cand_end))
                                                 continue;
-                                        if ((uint64_t)cand_end + (16ull * 1024ull * 1024ull) > ram_bytes)
+                                        if ((uint64_t)cand_end + (16ull * 1024ull * 1024ull) > identity_end)
                                                 continue;
                                         if (cand < (uintptr_t)USER_STACK_TOP + (64u * 1024u * 1024u))
                                                 continue;
@@ -612,6 +708,12 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 const uintptr_t HEAP_ABOVE_USER =
                         (uintptr_t)USER_STACK_TOP + (16u * 1024u * 1024u);
                 int ram_mb = sysinfo_ram_mb();
+                uint64_t identity_end = sysinfo_identity_usable_end(multiboot_info);
+                if (identity_end == 0) {
+                        uint64_t reported = ram_mb > 0
+                                ? (uint64_t)ram_mb * 1024ULL * 1024ULL : 0x80000000ULL;
+                        identity_end = reported < 0x80000000ULL ? reported : 0x80000000ULL;
+                }
 
                 if (!initrd_high) {
                         /* Legacy: heap starts after a low/mid initrd. */
@@ -639,9 +741,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 size_t heap_size = 0;
                 {
                         int raise_ok = 1;
-                        if (ram_mb > 0) {
-                                uint64_t ram_bytes = (uint64_t)ram_mb * 1024ULL * 1024ULL;
-                                if (ram_bytes < (uint64_t)HEAP_ABOVE_USER + (256ULL * 1024ULL * 1024ULL))
+                        if (identity_end > 0) {
+                                if (identity_end < (uint64_t)HEAP_ABOVE_USER + (256ULL * 1024ULL * 1024ULL))
                                         raise_ok = 0;
                         }
                         if (raise_ok && !initrd_high) {
@@ -658,19 +759,15 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 /* Size the arena: never enter the initrd or past RAM/MMIO. */
                 {
                         uint64_t hs = (uint64_t)heap_start;
-                        uint64_t max_heap_end = (uint64_t)MMIO_IDENTITY_LIMIT;
-                        if (ram_mb > 0) {
-                                uint64_t ram_bytes = (uint64_t)ram_mb * 1024ULL * 1024ULL;
-                                const uint64_t guard = 4ULL * 1024ULL * 1024ULL;
-                                if (ram_bytes > guard && ram_bytes - guard < max_heap_end)
-                                        max_heap_end = ram_bytes - guard;
-                        }
+                        const uint64_t guard = 4ULL * 1024ULL * 1024ULL;
+                        uint64_t max_heap_end = identity_end;
+                        if (max_heap_end > (uint64_t)MMIO_IDENTITY_LIMIT)
+                                max_heap_end = (uint64_t)MMIO_IDENTITY_LIMIT;
+                        if (max_heap_end > guard)
+                                max_heap_end -= guard;
                         if (initrd_high && rd_st > 0 && (uint64_t)rd_st < max_heap_end)
                                 max_heap_end = (uint64_t)rd_st;
-                        if (hs >= (uint64_t)USER_STACK_TOP) {
-                                if (max_heap_end > 0xE0000000ULL)
-                                        max_heap_end = 0xE0000000ULL;
-                        } else {
+                        if (hs < (uint64_t)USER_STACK_TOP) {
                                 if (max_heap_end > 0x80000000ULL)
                                         max_heap_end = 0x80000000ULL;
                         }
@@ -704,10 +801,27 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                  */
                 {
                         uintptr_t arena_hi = heap_start + heap_size;
-                        const size_t OBJECT_HEAP = 128ULL * 1024ULL * 1024ULL;
-                        const size_t PMM_MIN = 64ULL * 1024ULL * 1024ULL;
-                        if (heap_size > OBJECT_HEAP + PMM_MIN) {
-                                heap_size = OBJECT_HEAP;
+                        /*
+                         * ramfs/tmpfs file payloads currently use kmalloc, so
+                         * the object arena is also the writable-root backing
+                         * store. Keep a substantial PMM reserve for user pages,
+                         * but do not arbitrarily cap the overlay at 128 MiB.
+                         */
+                        const size_t OBJECT_HEAP_MAX = 1024ULL * 1024ULL * 1024ULL;
+                        /*
+                         * Dynamic toolchains map many DSOs concurrently.
+                         * Reserving only 64 MiB let opkg unpack GCC but left ld
+                         * unable to map libstdc++. Keep Linux-like separation
+                         * between filesystem cache/object memory and user pages.
+                         */
+                        const size_t PMM_MIN = (heap_size > (1024ULL * 1024ULL * 1024ULL))
+                                ? (384ULL * 1024ULL * 1024ULL)
+                                : (192ULL * 1024ULL * 1024ULL);
+                        if (heap_size > PMM_MIN + (128ULL * 1024ULL * 1024ULL)) {
+                                size_t object_heap = heap_size - PMM_MIN;
+                                if (object_heap > OBJECT_HEAP_MAX)
+                                        object_heap = OBJECT_HEAP_MAX;
+                                heap_size = object_heap;
                                 heap_init(heap_start, heap_size);
                                 pmm_init(heap_start + heap_size, arena_hi);
                         } else {
@@ -819,12 +933,15 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
            Real hardware can hang or run at wildly wrong rate with bad APIC calibration. */
         /*
          * Bring up LAPIC timekeeping against the still-running PIT, refine the
-         * period so wall time is accurate, then switch off IRQ0. Prefer 500 Hz
-         * (2 ms) for snappier sleeps; 1 kHz can livelock under VMware.
+         * period so wall time is accurate, then switch off IRQ0. Linux commonly
+         * uses HZ=250; higher rates only amplify our still-heavy IRQ handler.
          */
-        const uint32_t apic_hz = 500u;
+        const uint32_t apic_hz = 250u;
         apic_timer_start(apic_hz);
-        {
+        if (!sysinfo_is_hypervisor() && !apic_timer_uses_tsc_deadline()) {
+                kprintf("APIC: no usable TSC-deadline on bare metal; keeping PIT at 250 Hz\n");
+                apic_timer_stop();
+        } else {
                 uint32_t measured = apic_timer_refine(apic_hz, 200u);
                 int apic_ok = (measured >= apic_hz / 4u && measured <= apic_hz * 4u);
                 if (apic_ok) {
@@ -856,11 +973,17 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                                 pic_unmask_irq(0);
                                 pit_init();
                         } else {
-                                /* Last rescale vs TSC, then publish *measured* Hz as the time base. */
-                                (void)apic_timer_refine(apic_hz, 150u);
-                                measured = apic_timer_commit_measured(150u);
+                                /*
+                                 * Linux keeps clockevent programming separate
+                                 * from the clocksource. The count was already
+                                 * converged against PIT; never rescale it again
+                                 * from TSC after IRQ0 has been disabled.
+                                 */
+                                apic_timer_state.frequency = apic_hz;
+                                timer_frequency = apic_hz;
                                 klog_reanchor_tsc();
-                                kprintf("APIC: timekeeping live at %u Hz\n", measured);
+                                kprintf("APIC: clockevent live at %u Hz; TSC clocksource active\n",
+                                        apic_hz);
                         }
                 } else {
                         kprintf("APIC: unstable (measured %u Hz), using PIT\n", measured);
@@ -983,7 +1106,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 klogprintf("video: cirrus fbcon enabled early\n");
         }
 #endif
-        devfs_tty_realloc_for_console();
+        /* Linux device_initcall: i8042/input before userspace /etc synthesis. */
+        ps2_keyboard_init();
+        ps2_mouse_init();
         /* /etc/passwd and /etc/group so whoami/id/groups/adduser work.
            Use static buffers to avoid heap overflow. Seed a normal user so
            `adduser miha root` (BusyBox: add existing user to group) is meaningful. */
@@ -991,8 +1116,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         (void)ramfs_mkdir("/root");
         (void)ramfs_mkdir("/home");
         static const char root_passwd_line[] =
-                "root:x:0:0:root:/root:/bin/sh\n"
-                "miha:x:1000:1000:miha:/home/miha:/bin/sh\n";
+                "root:x:0:0:root:/root:/bin/sh\n";
         const size_t root_passwd_len = sizeof(root_passwd_line) - 1;
         struct fs_file *pf = fs_create_file("/etc/passwd");
         if (!pf) pf = fs_open("/etc/passwd");
@@ -1024,7 +1148,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 "cdrom:x:24:\n"
                 "floppy:x:25:\n"
                 "tape:x:26:\n"
-                "sudo:x:27:miha\n"
+                "sudo:x:27:\n"
                 "audio:x:29:\n"
                 "dip:x:30:\n"
                 "www-data:x:33:\n"
@@ -1238,6 +1362,68 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 }
         }
 #endif
+        /*
+         * Resolver files must exist before the first opkg/wget invocation.
+         * 10.0.2.3 is QEMU user-net's DNS proxy; a later DHCP bound/renew
+         * atomically replaces this fallback with lease-provided servers.
+         */
+        {
+                struct stat st;
+                if (vfs_stat("/etc/resolv.conf", &st) != 0) {
+                        static const char resolv_fallback[] =
+                                "options timeout:2 attempts:5 single-request-reopen\n"
+                                "nameserver 10.0.2.3\n"
+                                "nameserver 1.1.1.1\n";
+                        struct fs_file *rf = fs_create_file("/etc/resolv.conf");
+                        if (!rf) rf = fs_open("/etc/resolv.conf");
+                        if (rf) {
+                                (void)vfs_ftruncate(rf, 0);
+                                fs_write(rf, resolv_fallback, sizeof(resolv_fallback) - 1, 0);
+                                fs_file_free(rf);
+                        }
+                }
+        }
+        /*
+         * Entware glibc is configured with /opt/etc as sysconfdir, while
+         * native AxonOS/BusyBox follows Linux's /etc. Share the authoritative
+         * NSS databases so both libcs resolve exactly the same users/groups.
+         */
+        {
+                static const struct {
+                        const char *compat;
+                        const char *native;
+                } nss_compat[] = {
+                        { "/opt/etc/passwd",       "/etc/passwd" },
+                        { "/opt/etc/group",        "/etc/group" },
+                        { "/opt/etc/shadow",       "/etc/shadow" },
+                        { "/opt/etc/gshadow",      "/etc/gshadow" },
+                        { "/opt/etc/hosts",         "/etc/hosts" },
+                        { "/opt/etc/resolv.conf",   "/etc/resolv.conf" },
+                };
+                for (size_t i = 0; i < sizeof(nss_compat) / sizeof(nss_compat[0]); i++) {
+                        (void)fs_unlink(nss_compat[i].compat);
+                        if (overlayfs_symlink(nss_compat[i].compat, nss_compat[i].native) != 0)
+                                kprintf("boot: warning: cannot create NSS compatibility link %s\n",
+                                        nss_compat[i].compat);
+                }
+        }
+        {
+                static const char entware_nsswitch[] =
+                        "passwd: files\n"
+                        "shadow: files\n"
+                        "group: files\n"
+                        "hosts: files dns\n"
+                        "networks: files\n"
+                        "protocols: files\n"
+                        "services: files\n";
+                struct fs_file *nf = fs_create_file("/opt/etc/nsswitch.conf");
+                if (!nf) nf = fs_open("/opt/etc/nsswitch.conf");
+                if (nf) {
+                        (void)vfs_ftruncate(nf, 0);
+                        fs_write(nf, entware_nsswitch, sizeof(entware_nsswitch) - 1, 0);
+                        fs_file_free(nf);
+                }
+        }
         {
                 static const char hosts_min[] = "127.0.0.1\tlocalhost\n";
                 (void)fs_unlink("/etc/hosts");
@@ -1261,6 +1447,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         }
         syscall_net_ensure_resolv();
         ramfs_install_libnss_dns();
+        /* Linux: load_system_certificate_list + integrity_load_keys before PID 1. */
+        boot_load_system_certs();
 
         /* Programs (mount, sh) open /etc/localtime; create so open doesn't fail. */
         {
@@ -1367,6 +1555,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         "\t\tdone\n"
                         "\tfi\n"
                         "\techo -n > \"$RESOLV_CONF\"\n"
+                        "\techo \"options timeout:2 attempts:5 single-request-reopen\" >> \"$RESOLV_CONF\"\n"
                         "\t[ -n \"$domain\" ] && echo \"search $domain\" >> \"$RESOLV_CONF\"\n"
                         "\tfor i in $dns; do\n"
                         "\t\techo \"nameserver $i\" >> \"$RESOLV_CONF\"\n"
@@ -1429,8 +1618,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         }
                 }
         }
-        ps2_keyboard_init();
-        ps2_mouse_init();
         boot_logo_dismiss();
 
         /* OpenRC rc_sys() reads /proc before init.sh mounts it; provide proc early.

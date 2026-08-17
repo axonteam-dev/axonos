@@ -18,6 +18,7 @@
 #include <string.h>
 #include <apic_timer.h>
 #include <pit.h>
+#include <sysinfo.h>
 #include <devfs.h>
 #include <stddef.h>
 
@@ -74,14 +75,25 @@ void klog_calibrate_tsc(void) {
 	/* Align to a tick edge so the window is clean. */
 	uint64_t edge = pit_get_ticks();
 	uint32_t spins = 0;
-	while (pit_get_ticks() == edge && ++spins < 50000000u)
+	uint64_t hint_hz = sysinfo_tsc_hz_hint();
+	uint64_t edge_deadline = hint_hz ? klog_rdtsc() + hint_hz / 2ull : 0;
+	while (pit_get_ticks() == edge && ++spins < 10000000u) {
+		if (edge_deadline && klog_rdtsc() >= edge_deadline)
+			break;
 		asm volatile("pause" ::: "memory");
+	}
+	if (pit_get_ticks() == edge)
+		return;
 	edge = pit_get_ticks();
 	uint64_t tsc0 = klog_rdtsc();
 	uint64_t target = edge + sample_ticks;
+	uint64_t sample_deadline = hint_hz ? tsc0 + hint_hz / 2ull : 0;
 	spins = 0;
-	while (pit_get_ticks() < target && ++spins < 200000000u)
+	while (pit_get_ticks() < target && ++spins < 20000000u) {
+		if (sample_deadline && klog_rdtsc() >= sample_deadline)
+			break;
 		asm volatile("pause" ::: "memory");
+	}
 	uint64_t tsc1 = klog_rdtsc();
 	uint64_t got = pit_get_ticks() - edge;
 	if (got < 5ull || tsc1 <= tsc0)

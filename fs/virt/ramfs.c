@@ -4,6 +4,7 @@
 #include <fs.h>
 #include <ext2.h>
 #include <ramfs.h>
+#include <pagecache.h>
 #include <heap.h>
 #include <stat.h>
 #include <thread.h>
@@ -63,6 +64,7 @@ struct ramfs_node {
     struct ramfs_node *children; /* linked list of children */
     struct ramfs_node *next; /* sibling */
     struct ramfs_node *link_target; /* if set, this is a hard link to that node */
+    uint64_t generation;
 };
 
 /* forward declarations for functions used before definitions */
@@ -107,6 +109,7 @@ static struct ramfs_node *ramfs_alloc_node(const char *name, int is_dir) {
     n->gid = 0;
     n->nlink = is_dir ? 2u : 1u;
     n->size = 0;
+    n->generation = 1;
     n->atime = n->mtime = n->ctime = 0;
     return n;
 }
@@ -220,6 +223,22 @@ int ramfs_link(const char *oldpath, const char *newpath) {
 
 static struct ramfs_node *ramfs_resolve_link(struct ramfs_node *n) {
     return (n && n->link_target) ? n->link_target : n;
+}
+
+static void ramfs_file_set_backing(struct fs_file *f, struct ramfs_node *n)
+{
+    if (!f || !n)
+        return;
+    f->backing_id = PAGECACHE_ID_RAMFS(n->ino);
+    f->backing_gen = n->generation;
+}
+
+static void ramfs_inode_changed(struct ramfs_node *n)
+{
+    if (!n)
+        return;
+    n->generation++;
+    pagecache_invalidate(PAGECACHE_ID_RAMFS(n->ino));
 }
 
 static void ramfs_free_data_owned(struct ramfs_node *n) {
@@ -439,7 +458,12 @@ static struct ramfs_node *ramfs_lookup_nofollow(const char *path) {
         }
         if (!restarted) {
             kfree(curpath);
-            return ramfs_resolve_link(cur);
+            /*
+             * Return the final dentry unchanged. Callers that access inode
+             * contents explicitly resolve hard links; unlink/rename/lchown
+             * must operate on the named dentry itself.
+             */
+            return cur;
         }
     }
     kfree(curpath);
@@ -609,6 +633,7 @@ static int ramfs_create(const char *path, struct fs_file **out_file) {
     }
     fh->node = n;
     f->driver_private = fh;
+    ramfs_file_set_backing(f, n);
     if (out_file) *out_file = f;
     kfree(tmp);
     return 0;
@@ -648,6 +673,8 @@ int ramfs_create_borrowed_file(const char *path, const void *data, size_t size) 
     }
     f->size = (off_t)n->size;
     release_irqrestore(&n->io_lock, irqf);
+    ramfs_inode_changed(n);
+    f->backing_gen = n->generation;
     ramfs_release(f);
     return 0;
 }
@@ -674,6 +701,7 @@ static int ramfs_open(const char *path, struct fs_file **out_file) {
     if (!fh) { kfree(pp); kfree(f); return -2; }
     fh->node = n;
     f->driver_private = fh;
+    ramfs_file_set_backing(f, n);
     if (out_file) *out_file = f;
     return 0;
 }
@@ -812,6 +840,33 @@ int ramfs_chmod(const char *path, mode_t mode) {
     return 0;
 }
 
+int ramfs_chown(const char *path, uid_t uid, gid_t gid) {
+    if (!path) return -1;
+    struct ramfs_node *n = ramfs_lookup(path);
+    if (!n) return -1;
+    thread_t *ct = thread_current();
+    if (ct && ct->euid != 0) return -1;
+    /* Linux chown(2): (uid_t)-1 / (gid_t)-1 means leave unchanged. */
+    if (uid != (uid_t)-1) n->uid = uid;
+    if (gid != (gid_t)-1) n->gid = gid;
+    /* Clear set-id bits when ownership changes. */
+    n->mode &= ~(mode_t)06000;
+    return 0;
+}
+
+int ramfs_lchown(const char *path, uid_t uid, gid_t gid) {
+    if (!path) return -1;
+    /* lchown(2) operates on the final symlink dentry itself. */
+    struct ramfs_node *n = ramfs_lookup_nofollow(path);
+    if (!n) return -1;
+    thread_t *ct = thread_current();
+    if (ct && ct->euid != 0) return -1;
+    if (uid != (uid_t)-1) n->uid = uid;
+    if (gid != (gid_t)-1) n->gid = gid;
+    n->mode &= ~(mode_t)06000;
+    return 0;
+}
+
 int ramfs_ftruncate(struct fs_file *file, off_t length) {
     if (!file || !file->driver_private) return -22; /* EINVAL */
     if (length < 0) return -22;
@@ -832,6 +887,8 @@ int ramfs_ftruncate(struct fs_file *file, off_t length) {
         ramfs_free_data_owned(n);
         n->size = 0;
         file->size = 0;
+        ramfs_inode_changed(n);
+        file->backing_gen = n->generation;
         release_irqrestore(&n->io_lock, irqf);
         return 0;
     }
@@ -849,6 +906,8 @@ int ramfs_ftruncate(struct fs_file *file, off_t length) {
         n->size = newsize;
         n->capacity = newsize;
         file->size = (off_t)n->size;
+        ramfs_inode_changed(n);
+        file->backing_gen = n->generation;
         release_irqrestore(&n->io_lock, irqf);
         return 0;
     }
@@ -870,6 +929,8 @@ int ramfs_ftruncate(struct fs_file *file, off_t length) {
     n->size = newsize;
     n->capacity = newsize;
     file->size = (off_t)n->size;
+    ramfs_inode_changed(n);
+    file->backing_gen = n->generation;
     release_irqrestore(&n->io_lock, irqf);
     return 0;
 }
@@ -977,6 +1038,8 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
      * (klog and others append using offset = f->size; a bug or race that reused a stale offset
      * previously chopped the file and left krealloc gaps full of garbage.) */
     file->size = (off_t)n->size; /* keep handle in sync for stat/read */
+    ramfs_inode_changed(n);
+    file->backing_gen = n->generation;
     release(&n->io_lock);
     return (ssize_t)size;
 }
@@ -1028,7 +1091,12 @@ static void ramfs_unlink_from_parent(struct ramfs_node *n) {
     /* Guard against list corruption (cycles). */
     int guard = 0;
     while (*pp && guard++ < 65536) {
-        if (*pp == n) { *pp = n->next; n->next = NULL; break; }
+        if (*pp == n) {
+            *pp = n->next;
+            n->next = NULL;
+            n->parent = NULL;
+            break;
+        }
         pp = &(*pp)->next;
     }
     ramfs_tree_lock_release(irqf);
@@ -1039,9 +1107,8 @@ int ramfs_rename(const char *oldpath, const char *newpath) {
     if (!oldpath || oldpath[0] != '/' || !newpath || newpath[0] != '/') return -1;
     if (strcmp(oldpath, newpath) == 0) return 0;
     int dbg = 0;
-    struct ramfs_node *old_node = ramfs_lookup(oldpath);
+    struct ramfs_node *old_node = ramfs_lookup_nofollow(oldpath);
     if (!old_node) return -2; /* ENOENT */
-    if (old_node->link_target) old_node = old_node->link_target; /* resolve symlink target for move */
 
     /* parse newpath into parent + basename */
     size_t new_len = strlen(newpath);
@@ -1116,6 +1183,7 @@ int ramfs_remove(const char *path) {
                 kfree(target->name);
                 target->name = NULL;
             }
+            pagecache_invalidate(PAGECACHE_ID_RAMFS(target->ino));
             ramfs_free_data_owned(target);
             ramfs_free_xattrs(target);
             kfree(target);
@@ -1141,6 +1209,8 @@ int ramfs_remove(const char *path) {
             if (sp < 64) stack[sp++] = c;
         }
         if (cur->name) kfree(cur->name);
+        if (!cur->is_dir && !cur->link_target)
+            pagecache_invalidate(PAGECACHE_ID_RAMFS(cur->ino));
         ramfs_free_data_owned(cur);
         ramfs_free_xattrs(cur);
         kfree(cur);

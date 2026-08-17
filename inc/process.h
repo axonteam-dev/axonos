@@ -44,6 +44,7 @@ typedef struct process {
     struct fs_file *fds[PROCESS_MAX_FD];
     uint8_t fd_cloexec[PROCESS_MAX_FD];
     char cwd[256];
+    char fs_root[256];
     uid_t uid, euid, suid;
     gid_t gid, egid, sgid;
     /* Supplementary groups (getgroups/setgroups). ngroups==0 means empty list. */

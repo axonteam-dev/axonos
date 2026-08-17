@@ -42,13 +42,15 @@ typedef struct thread {
         /* POSIX-ish job control identifiers */
         int pgid;                      // process group id
         int sid;                       // session id
-        uint32_t sleep_until;          // sleep until (in timer ticks)
+        uint32_t sleep_until;          // monotonic-millisecond deadline
         uint64_t clear_child_tid;      // clear child tid
         struct fs_file* fds[THREAD_MAX_FD];
 
         /* current working directory for userland syscalls (POSIX-like).
            For kernel threads this is ignored; for user processes it's used to resolve relative paths. */
         char cwd[256];
+        /* Host-visible path of this task's filesystem root (chroot). */
+        char fs_root[256];
         /* POSIX credentials (real, effective, saved for setuid) */
         uid_t uid;
         uid_t euid;

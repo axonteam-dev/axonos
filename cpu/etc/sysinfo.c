@@ -125,6 +125,40 @@ static int mb2_total_ram_mb(uint64_t multiboot_info_ptr) {
     return -1;
 }
 
+uint64_t sysinfo_identity_usable_end(uint64_t multiboot_info_ptr) {
+    const uint64_t identity_limit = 0x100000000ULL;
+    if (multiboot_info_ptr == 0) return 0;
+    uint8_t *p = (uint8_t *)(uintptr_t)multiboot_info_ptr;
+    uint32_t total_size = *(uint32_t *)p;
+    if (total_size < 16 || total_size > (64u * 1024u * 1024u)) return 0;
+
+    uint32_t off = 8;
+    while (off + 8 <= total_size) {
+        uint32_t tag_type = *(uint32_t *)(p + off);
+        uint32_t tag_size = *(uint32_t *)(p + off + 4);
+        if (tag_size < 8 || (uint64_t)off + tag_size > total_size) break;
+        if (tag_type == 0) break;
+        if (tag_type == 6 && tag_size >= 16) {
+            uint32_t entry_size = *(uint32_t *)(p + off + 8);
+            if (entry_size < sizeof(mb2_mmap_entry_t)) return 0;
+            uint64_t best = 0;
+            for (uint32_t eoff = off + 16;
+                 eoff + entry_size <= off + tag_size; eoff += entry_size) {
+                mb2_mmap_entry_t *e = (mb2_mmap_entry_t *)(p + eoff);
+                if (e->type != 1 || e->len == 0 || e->addr >= identity_limit)
+                    continue;
+                uint64_t end = e->addr + e->len;
+                if (end <= e->addr) continue;
+                if (end > identity_limit) end = identity_limit;
+                if (end > best) best = end;
+            }
+            return best;
+        }
+        off += (tag_size + 7u) & ~7u;
+    }
+    return 0;
+}
+
 static int mb2_has_efi_tag(uint64_t multiboot_info_ptr) {
     if (multiboot_info_ptr == 0) return 0;
     uint8_t *p = (uint8_t*)(uintptr_t)multiboot_info_ptr;

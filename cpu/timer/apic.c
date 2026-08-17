@@ -1,10 +1,12 @@
 #include <apic.h>
 #include <vga.h>
 #include <klog.h>
+#include <mmio.h>
 #include <stdint.h>
 
 /* Volatile: AP may call apic_local_enable later; avoid C11 data races / stale loads of the pointer. */
 static volatile uintptr_t lapic_base_va;
+static volatile bool lapic_x2apic;
 static bool apic_initialized = false;
 
 static uint64_t msr_read(uint32_t msr) {
@@ -23,6 +25,7 @@ static void msr_write(uint32_t msr, uint64_t value) {
 #define MSR_IA32_X2APIC_ID 0x802u
 #define MSR_X2APIC_ICR 0x830u
 #define MSR_X2APIC_EOI 0x80Bu
+#define MSR_X2APIC_REG_BASE 0x800u
 #define APIC_BASE_EXTD (1ULL << 10)
 #define LAPIC_ICR_DEST_EXCLUDE_SELF (3u << 18)
 
@@ -34,7 +37,13 @@ static uint32_t apic_local_enable(void) {
     apic_base_msr = msr_read(0x1B);
 
     uintptr_t base_addr = (uintptr_t)(apic_base_msr & 0xFFFFF000ULL);
-    lapic_base_va = base_addr;
+    lapic_x2apic = (apic_base_msr & APIC_BASE_EXTD) != 0;
+    if (lapic_x2apic) {
+        lapic_base_va = base_addr;
+    } else {
+        void *mapped = mmio_map_phys((uint64_t)base_addr, 0x1000u);
+        lapic_base_va = mapped ? (uintptr_t)mapped : base_addr;
+    }
 
     uint32_t svr = apic_read(LAPIC_SVR_REG);
     apic_write(LAPIC_SVR_REG, svr | LAPIC_SVR_ENABLE | APIC_SPURIOUS_VECTOR);
@@ -57,6 +66,8 @@ void apic_ap_enable_local(void) {
 }
 
 uint32_t apic_read(uint32_t reg) {
+    if (lapic_x2apic)
+        return (uint32_t)msr_read(MSR_X2APIC_REG_BASE + (reg >> 4));
     uintptr_t b = lapic_base_va;
     if (!b)
         return 0;
@@ -64,6 +75,10 @@ uint32_t apic_read(uint32_t reg) {
 }
 
 void apic_write(uint32_t reg, uint32_t value) {
+    if (lapic_x2apic) {
+        msr_write(MSR_X2APIC_REG_BASE + (reg >> 4), value);
+        return;
+    }
     uintptr_t b = lapic_base_va;
     if (!b)
         return;

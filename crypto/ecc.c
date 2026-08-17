@@ -52,8 +52,15 @@ static const u64 B[4] = { B0, B1, B2, B3 };
 /* -n[0]^-1 mod 2^64 (computed at build time) */
 #define N0INV 0xccd1c8aaee00bc4fULL
 
-static u64 R2P[4]; /* 2^512 mod p */
-static u64 R2N[4]; /* 2^512 mod n */
+/* 2^512 mod p / mod n (LE limbs). Computed offline — boot must not loop 512×add. */
+static const u64 R2P[4] = {
+    0x0000000000000003ULL, 0xfffffffbffffffffULL,
+    0xfffffffffffffffeULL, 0x00000004fffffffdULL
+};
+static const u64 R2N[4] = {
+    0x83244c95be79eea2ULL, 0x4699799c49bd6fa6ULL,
+    0x2845b2392b6bec59ULL, 0x66e12d94f3d95620ULL
+};
 static u64 GXm[4], GYm[4]; /* G in Montgomery form */
 static u64 ONEM[4]; /* 1 in Montgomery form (Z=1 for affine points) */
 static u64 PM2[4]; /* p-2 (Fermat inversion exponent) */
@@ -216,14 +223,6 @@ static void mod_reduce_n(u64 r[4], const u64 a[4]) {
     }
 }
 
-/* 2^512 mod m, normal form. */
-static void compute_r2(u64 out[4], const u64 mod[4]) {
-    fe_set_zero(out);
-    out[0] = 1;
-    for (int i = 0; i < 512; i++)
-        fe_add_m(out, out, out, mod);
-}
-
 /* r = base^exp mod m (right-to-left binary exponentiation, Montgomery domain).
  * exp is 256-bit LE. */
 static void mod_exp(u64 r[4], const u64 base[4], const u64 exp[4],
@@ -241,8 +240,6 @@ static void mod_exp(u64 r[4], const u64 base[4], const u64 exp[4],
 
 static void curve_init(void) {
     if (g_curve_ready) return;
-    compute_r2(R2P, P);
-    compute_r2(R2N, N);
     to_mont_p(ONEM, ONE);
     fe_copy(PM2, P); PM2[0] -= 2;
     fe_copy(NM2, N); NM2[0] -= 2;

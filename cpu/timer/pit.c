@@ -27,6 +27,8 @@ volatile uint32_t timer_frequency = 250;
 void pit_handler(cpu_registers_t* regs) {
         pit_ticks++;
         timer_ticks++;
+        /* Before thread_init(), PIT is only an early clock source. */
+        if (!init) return;
         thread_account_timer_tick(regs && ((regs->cs & 3) == 3));
         process_itimer_tick(pit_get_time_ms());
         /* Publish now, but force this IRQ to return to the parent before any
@@ -49,8 +51,15 @@ void pit_handler(cpu_registers_t* regs) {
                 }
         }
 
-        if (!init) return;
         thread_wake_expired_timeouts();
+        /* Cursor and deferred framebuffer damage must progress in ring 3 too. */
+        if (cirrusfb_is_ready()) {
+                cirrusfb_update_cursor();
+        } else if (vbe_is_available()) {
+                vbefb_update_cursor();
+        } else {
+                vga_update_cursor();
+        }
         {
                 uint32_t resched_quantum = pit_frequency / 100u;
                 if (resched_quantum < 1u)
@@ -80,11 +89,6 @@ void pit_handler(cpu_registers_t* regs) {
            Idle loops + IPI wake other CPUs; BSP is driven by syscalls/yield. */
         if ((pit_ticks % 10) == 0 && smp_cpu_count() <= 1) {
                 thread_schedule();
-        }
-        if (cirrusfb_is_ready()) {
-                cirrusfb_update_cursor();
-        } else {
-                vbefb_update_cursor();
         }
 }
 
@@ -179,6 +183,10 @@ uint64_t pit_get_time_ms() {
 
 /* Tick-resolution microseconds (no TSC). Prefer time_monotonic_us() for apps. */
 uint64_t pit_get_time_us(void) {
+        /* Linux-style clocksource/clockevent split: once calibrated, TSC owns
+         * wall time; PIT/LAPIC ticks only drive scheduling and wakeups. */
+        if (klog_tsc_per_us)
+                return time_monotonic_us();
         uint64_t freq = timer_frequency;
         if (freq == 0)
                 return 0;

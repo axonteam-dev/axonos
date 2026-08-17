@@ -86,7 +86,7 @@ extern uint64_t virt_to_phys(uint64_t va);
 #define E1000_RX_STATUS_EOP           (1u << 1)
 
 #define E1000_TX_DESC_COUNT           64
-#define E1000_RX_DESC_COUNT           64
+#define E1000_RX_DESC_COUNT           256
 #define E1000_RX_BUF_SIZE             2048
 #define E1000_TX_BUF_SIZE             2048
 #define E1000_ETH_MIN_FRAME           60

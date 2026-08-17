@@ -16,6 +16,12 @@ static uint8_t parse_color_code(char bg, char fg);
  * plain spin + IF=1 deadlocks if an IRQ tries to take this lock while we hold it.
  * kprintf/kprint hold this for an entire format string so SMP log lines do not interleave. */
 static spinlock_t vga_lock_spin = { 0 };
+static uint16_t vga_cursor_offset = 0;
+static uint64_t vga_cursor_last_phase = 0;
+static int vga_cursor_visible = 1;
+
+extern volatile uint64_t timer_ticks;
+extern volatile uint32_t timer_frequency;
 
 /* Internal nolock primitives for callers that already hold the lock. */
 static inline void write_nolock(uint8_t character, uint8_t attribute_byte, uint16_t offset) {
@@ -25,15 +31,19 @@ static inline void write_nolock(uint8_t character, uint8_t attribute_byte, uint1
 }
 
 static inline uint16_t get_cursor_nolock(void) {
-        outb(REG_SCREEN_CTRL, 14);
-        uint8_t high_byte = inb(REG_SCREEN_DATA);
-        outb(REG_SCREEN_CTRL, 15);
-        uint8_t low_byte = inb(REG_SCREEN_DATA);
-        return (((high_byte << 8) + low_byte) * 2);
+        return vga_cursor_offset;
 }
 
 static inline void set_cursor_nolock(uint16_t pos) {
-        pos /= 2;
+        vga_cursor_offset = pos;
+}
+
+/*
+ * CRTC port writes cause a VM-exit under QEMU/VMware. Keep cursor movement in
+ * RAM while drawing and publish only the final position for the whole write.
+ */
+static inline void flush_cursor_nolock(void) {
+        uint16_t pos = (uint16_t)(vga_cursor_offset / 2);
         outb(REG_SCREEN_CTRL, 14);
         outb(REG_SCREEN_DATA, (uint8_t)(pos >> 8));
         outb(REG_SCREEN_CTRL, 15);
@@ -240,13 +250,75 @@ void vga_clear_screen_attr(uint8_t attr) {
 
 
 void vga_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t ch, uint8_t attr) {
+        if (x >= MAX_COLS || y >= MAX_ROWS || w == 0 || h == 0)
+                return;
+        if (w > MAX_COLS - x) w = MAX_COLS - x;
+        if (h > MAX_ROWS - y) h = MAX_ROWS - y;
+        unsigned long fl;
+        acquire_irqsave(&vga_lock_spin, &fl);
         for (uint32_t ry = 0; ry < h; ry++) {
-                if (y + ry >= MAX_ROWS) break;
                 for (uint32_t rx = 0; rx < w; rx++) {
-                        if (x + rx >= MAX_COLS) break;
-                        vga_putch_xy(x + rx, y + ry, ch, attr);
+                        uint16_t off = (uint16_t)((((y + ry) * MAX_COLS) + x + rx) * 2);
+                        write_nolock(ch, attr, off);
                 }
         }
+        release_irqrestore(&vga_lock_spin, fl);
+}
+
+void vga_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
+        if (!s || x >= MAX_COLS || y >= MAX_ROWS) return;
+        uint32_t cx = x, cy = y;
+        uint8_t cur_attr = attr;
+        unsigned long fl;
+        acquire_irqsave(&vga_lock_spin, &fl);
+        for (size_t i = 0; s[i] && cy < MAX_ROWS; ) {
+                if ((uint8_t)s[i] == 0x1B && s[i + 1] == '[') {
+                        i += 2;
+                        int nums[16], nnums = 0, cur = 0, hasnum = 0;
+                        while (s[i] && s[i] != 'm' && nnums < 16) {
+                                if (s[i] >= '0' && s[i] <= '9') {
+                                        hasnum = 1;
+                                        cur = cur * 10 + (s[i++] - '0');
+                                } else if (s[i] == ';') {
+                                        nums[nnums++] = cur;
+                                        cur = 0;
+                                        hasnum = 0;
+                                        i++;
+                                } else {
+                                        i++;
+                                }
+                        }
+                        if (hasnum && nnums < 16) nums[nnums++] = cur;
+                        if (s[i] == 'm') i++;
+                        if (nnums == 0) cur_attr = GRAY_ON_BLACK;
+                        for (int k = 0; k < nnums; k++) {
+                                int v = nums[k];
+                                if (v == 0) cur_attr = GRAY_ON_BLACK;
+                                else if (v == 1) cur_attr |= 0x08;
+                                else if (v >= 30 && v <= 37)
+                                        cur_attr = (uint8_t)((cur_attr & 0xF0) | (v - 30));
+                                else if (v >= 40 && v <= 47)
+                                        cur_attr = (uint8_t)(((v - 40) << 4) | (cur_attr & 0x0F));
+                                else if (v >= 90 && v <= 97)
+                                        cur_attr = (uint8_t)((cur_attr & 0xF0) | (v - 90 + 8));
+                                else if (v >= 100 && v <= 107)
+                                        cur_attr = (uint8_t)(((v - 100 + 8) << 4) | (cur_attr & 0x0F));
+                        }
+                        continue;
+                }
+                uint8_t ch = (uint8_t)s[i++];
+                uint32_t count = (ch == '\t') ? (8u - (cx % 8u)) : 1u;
+                if (ch == '\t') ch = ' ';
+                while (count-- && cy < MAX_ROWS) {
+                        write_nolock(ch, cur_attr,
+                                     (uint16_t)(((cy * MAX_COLS) + cx) * 2));
+                        if (++cx >= MAX_COLS) {
+                                cx = 0;
+                                cy++;
+                        }
+                }
+        }
+        release_irqrestore(&vga_lock_spin, fl);
 }
 
 void kprint(uint8_t *str) {
@@ -254,6 +326,8 @@ void kprint(uint8_t *str) {
         unsigned long fl;
         acquire_irqsave(&vga_lock_spin, &fl);
         while (*str) console_putc_nolock(*str++, GRAY_ON_BLACK);
+        if (!cirrusfb_is_ready() && !vbe_is_available())
+                flush_cursor_nolock();
         release_irqrestore(&vga_lock_spin, fl);
 }
 
@@ -398,6 +472,8 @@ void kputchar(uint8_t character, uint8_t attribute_byte)
         unsigned long fl;
         acquire_irqsave(&vga_lock_spin, &fl);
         console_putc_nolock(character, attribute_byte);
+        if (!cirrusfb_is_ready() && !vbe_is_available())
+                flush_cursor_nolock();
         release_irqrestore(&vga_lock_spin, fl);
 }
 
@@ -406,6 +482,7 @@ void vga_putchar_literal(uint8_t character, uint8_t attribute_byte)
         unsigned long fl;
         acquire_irqsave(&vga_lock_spin, &fl);
         kputchar_vga_text_nolock(character, attribute_byte);
+        flush_cursor_nolock();
         release_irqrestore(&vga_lock_spin, fl);
 }
 
@@ -440,6 +517,7 @@ void        scroll_line()
                 i++;
         }
         set_cursor_nolock(last_line);
+        flush_cursor_nolock();
         release_irqrestore(&vga_lock_spin, fl);
 }
 
@@ -454,19 +532,35 @@ void vga_scroll_region(uint32_t top, uint32_t bottom, uint8_t attr)
 
 	unsigned long flags;
 	acquire_irqsave(&vga_lock_spin, &flags);
-	for (uint32_t y = top; y < bottom; y++) {
-		for (uint32_t x = 0; x < MAX_COLS; x++) {
-			uint16_t dst = (uint16_t)((y * MAX_COLS + x) * 2);
-			uint16_t src = (uint16_t)(((y + 1) * MAX_COLS + x) * 2);
-			uint8_t ch = *(volatile uint8_t *)(VIDEO_ADDRESS + src);
-			uint8_t cell_attr = *(volatile uint8_t *)(VIDEO_ADDRESS + src + 1);
-			write_nolock(ch, cell_attr, dst);
-		}
-	}
+	size_t row_bytes = (size_t)MAX_COLS * 2u;
+	memmove((void *)(VIDEO_ADDRESS + (uintptr_t)top * row_bytes),
+		(const void *)(VIDEO_ADDRESS + (uintptr_t)(top + 1u) * row_bytes),
+		(size_t)(bottom - top) * row_bytes);
 	for (uint32_t x = 0; x < MAX_COLS; x++) {
 		uint16_t offset = (uint16_t)((bottom * MAX_COLS + x) * 2);
 		write_nolock(' ', attr, offset);
 	}
+	release_irqrestore(&vga_lock_spin, flags);
+}
+
+void vga_blit_cells(const uint8_t *cells, uint32_t top, uint32_t bottom)
+{
+	if (!cells || top >= MAX_ROWS)
+		return;
+	if (bottom >= MAX_ROWS)
+		bottom = MAX_ROWS - 1;
+	if (top > bottom)
+		return;
+
+	const size_t row_bytes = (size_t)MAX_COLS * 2u;
+	const size_t bytes = (size_t)(bottom - top + 1u) * row_bytes;
+	const uint64_t *src = (const uint64_t *)(cells + (size_t)top * row_bytes);
+	volatile uint64_t *dst =
+		(volatile uint64_t *)(VIDEO_ADDRESS + (uintptr_t)top * row_bytes);
+	unsigned long flags;
+	acquire_irqsave(&vga_lock_spin, &flags);
+	for (size_t i = 0; i < bytes / sizeof(uint64_t); i++)
+		dst[i] = src[i];
 	release_irqrestore(&vga_lock_spin, flags);
 }
 
@@ -531,6 +625,7 @@ void        set_cursor(uint16_t pos)
         unsigned long fl;
         acquire_irqsave(&vga_lock_spin, &fl);
         set_cursor_nolock(pos);
+        flush_cursor_nolock();
         release_irqrestore(&vga_lock_spin, fl);
 }
 
@@ -705,6 +800,8 @@ void kprintf(const char* fmt, ...)
                  */
                 acquire_irqsave(&tty->out_lock, &output_fl);
                 console_set_cursor(tty->cursor_x, tty->cursor_y);
+                /* Keep nested one-byte printk writes in one VGA cursor batch. */
+                console_begin_tty_batch();
         } else {
                 acquire_irqsave(&vga_lock_spin, &output_fl);
         }
@@ -867,18 +964,47 @@ PRINT_NUMBER_BASE10:
                  }
          }
 
-        if (tty)
+        if (tty) {
+                console_end_tty_batch();
                 release_irqrestore(&tty->out_lock, output_fl);
-        else
+        } else {
+                if (!cirrusfb_is_ready() && !vbe_is_available())
+                        flush_cursor_nolock();
                 release_irqrestore(&vga_lock_spin, output_fl);
+        }
         va_end(ap);
 }
 
 void vga_set_cursor(uint32_t x, uint32_t y) {
         if (cirrusfb_is_ready()) { cirrusfb_set_cursor(x, y); return; }
         if (vbe_is_available()) { vbefb_set_cursor(x, y); return; }
-        set_cursor_x((uint16_t)x);
-        set_cursor_y((uint16_t)y);
+        if (x >= MAX_COLS) x = MAX_COLS - 1;
+        if (y >= MAX_ROWS) y = MAX_ROWS - 1;
+        unsigned long fl;
+        acquire_irqsave(&vga_lock_spin, &fl);
+        set_cursor_nolock((uint16_t)(((y * MAX_COLS) + x) * 2));
+        flush_cursor_nolock();
+        release_irqrestore(&vga_lock_spin, fl);
+}
+
+void vga_update_cursor(void) {
+        uint32_t hz = timer_frequency ? timer_frequency : 250u;
+        uint32_t quarter_period = (hz + 3u) / 4u;
+        if (quarter_period < 1u) quarter_period = 1u;
+        uint64_t phase = timer_ticks / quarter_period;
+        if (phase == vga_cursor_last_phase) return;
+        vga_cursor_last_phase = phase;
+        int visible = ((phase & 1ULL) == 0ULL);
+        if (visible == vga_cursor_visible) return;
+        vga_cursor_visible = visible;
+
+        unsigned long fl;
+        acquire_irqsave(&vga_lock_spin, &fl);
+        outb(REG_SCREEN_CTRL, 0x0A);
+        uint8_t start = inb(REG_SCREEN_DATA);
+        outb(REG_SCREEN_DATA, visible ? (uint8_t)(start & ~0x20u)
+                                     : (uint8_t)(start | 0x20u));
+        release_irqrestore(&vga_lock_spin, fl);
 }
 
 void vga_get_cursor(uint32_t* x, uint32_t* y) {

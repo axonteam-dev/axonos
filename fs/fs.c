@@ -616,6 +616,7 @@ struct fs_file *fs_create_file(const char *path) {
 struct fs_file *fs_open(const char *path) {
         if (!path) return NULL;
         int dbg = 0;
+        int direct_miss = 0;
 
         /* Fast path: most paths have no symlinks. Try direct open first. */
         struct fs_file *f = fs_open_nofollow(path);
@@ -632,6 +633,8 @@ struct fs_file *fs_open(const char *path) {
                 /* Symlink, or stat failed (driver didn't fill st_mode): resolve before returning.
                    ld.so open()+read() on an unresolved symlink reads the link text, not the ELF. */
                 fs_file_free(f);
+        } else {
+                direct_miss = 1;
         }
 
         /* Git's .git/ paths should never need symlink resolution; if not found directly,
@@ -642,6 +645,15 @@ struct fs_file *fs_open(const char *path) {
 
         char *resolved_path = fs_resolve_symlinks(path);
         if (!resolved_path) return NULL;
+        /*
+         * The exact path was already looked up above. If resolving prefixes
+         * found no symlink and did not rewrite it, a second full overlay and
+         * SquashFS lookup can only return the same ENOENT.
+         */
+        if (direct_miss && strcmp(resolved_path, path) == 0) {
+                kfree(resolved_path);
+                return NULL;
+        }
 
         struct fs_file *result = NULL;
         struct fs_driver *mount_drv = fs_match_mount(resolved_path);

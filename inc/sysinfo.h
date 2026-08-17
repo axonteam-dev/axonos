@@ -23,6 +23,8 @@ void detect_hv_and_read_tsc(void);
 // Получатели
 const char* sysinfo_cpu_name(void);
 int sysinfo_ram_mb(void);
+/* Exclusive end of usable physical RAM reachable through the <4 GiB identity map. */
+uint64_t sysinfo_identity_usable_end(uint64_t multiboot_info_ptr);
 int sysinfo_pc_type(void);
 const char* sysinfo_boot_mode(void);
 const char* sysinfo_hypervisor_name(void);

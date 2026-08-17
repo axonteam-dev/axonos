@@ -47,7 +47,7 @@ typedef struct {
      * represent normal VMware/NAT reordering and used to silently lose tails
      * when an in-order retransmit overlapped the saved segment.
      */
-#define NET_TCP_OOO_SLOTS 16
+#define NET_TCP_OOO_SLOTS 64
 #define NET_TCP_OOO_BYTES 1600
     uint8_t ooo_buf[NET_TCP_OOO_SLOTS][NET_TCP_OOO_BYTES];
     size_t ooo_len[NET_TCP_OOO_SLOTS];
@@ -64,6 +64,10 @@ int net_tcp_connect(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t dst_ip
 int net_tcp_server_reply_syn(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t client_seq);
 /* Inbound ACK completing server handshake. Returns 0 when established. */
 int net_tcp_server_complete_ack(net_tcp_conn_t *c, uint32_t ack);
+/* Emit a pure ACK for accepted handshake data. */
+int net_tcp_send_ack(net_tcp_conn_t *c, const net_tcp_ops_t *ops);
+/* RFC 793 response to an unacceptable ACK in SYN-RECEIVED. */
+int net_tcp_reject_ack(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t ack);
 /* Resend SYN+ACK for a half-open server connection (SYN retransmit from client). */
 int net_tcp_server_resend_synack(net_tcp_conn_t *c, const net_tcp_ops_t *ops);
 /* Finish connect_pending (0=established, -1=still pending, -2=failed/timeout). */

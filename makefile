@@ -83,6 +83,8 @@ NSS_FILES_BLOB_OBJ := $(BUILD_DIR)/nss_files/shim_blob.o
 ASCII_PF2 := $(BUILD_DIR)/fonts/ascii.pf2
 ASCII_PF2_BLOB_OBJ := $(BUILD_DIR)/fonts/ascii_pf2_blob.o
 ASCII_PF2_SRC := $(firstword $(wildcard /usr/share/grub/ascii.pf2 /boot/grub/fonts/ascii.pf2))
+SYS_CA_PEM := $(BUILD_DIR)/certs/axonos-system-ca.pem
+SYS_CA_BLOB_OBJ := $(BUILD_DIR)/certs/axonos-system-ca.blob.o
 
 .PHONY: all kernel iso clean run run-uefi for-production config oldconfig
 
@@ -106,6 +108,11 @@ $(BUILD_DIR)/%.asm.o: %.asm
 	@mkdir -p $(dir $@)
 	@echo "NASM		$<"
 	@$(ASM) $(ASM_ELF_FLAGS) -o $@ $<
+
+$(BUILD_DIR)/crypto/%.c.o: crypto/%.c $(AUTOCONF_H)
+	@mkdir -p $(dir $@)
+	@echo "CC [O2]		$<"
+	@$(CC) $(CFLAGS) -O2 -c -o $@ $<
 
 $(BUILD_DIR)/%.c.o: %.c $(AUTOCONF_H)
 	@mkdir -p $(dir $@)
@@ -167,17 +174,26 @@ $(NSS_FILES_BLOB_OBJ): $(NSS_FILES_SHIM)
 	rm -f $@.tmp
 	@$(call mark_noexecstack,$@)
 
-$(CA_TRUST_PEM): core/isrgrootx1.pem
+$(SYS_CA_PEM):
 	@mkdir -p $(dir $@)
-	@cp $< $@
+	@if command -v openssl >/dev/null 2>&1; then \
+		echo "OPENSSL	$@"; \
+		openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+			-keyout $(BUILD_DIR)/certs/axonos-system-ca.key -nodes \
+			-subj "/C=RU/CN=AxonOS System CA" -days 3650 -out $@ >/dev/null 2>&1 \
+			|| { echo "warning: openssl req failed — empty system CA" >&2; printf '' > $@; }; \
+	else \
+		echo "warning: openssl missing — empty system CA" >&2; \
+		printf '' > $@; \
+	fi
 
-$(CA_TRUST_BLOB_OBJ): $(CA_TRUST_PEM)
-	@echo "LD(BIN) [ca_trust]	$<"
+$(SYS_CA_BLOB_OBJ): $(SYS_CA_PEM)
+	@echo "LD(BIN) [system_ca]	$<"
 	@ld -r -b binary -o $@.tmp $< && \
 	START=$$(nm $@.tmp | awk '$$3 ~ /^_binary_.*_start$$/ {print $$3; exit}') && \
 	END=$$(nm $@.tmp | awk '$$3 ~ /^_binary_.*_end$$/ {print $$3; exit}') && \
 	test -n "$$START" && test -n "$$END" && \
-	objcopy --redefine-sym $$START=ca_trust_pem_start --redefine-sym $$END=ca_trust_pem_end $@.tmp $@ && \
+	objcopy --redefine-sym $$START=axonos_system_ca_pem_start --redefine-sym $$END=axonos_system_ca_pem_end $@.tmp $@ && \
 	rm -f $@.tmp
 	@$(call mark_noexecstack,$@)
 
@@ -200,7 +216,7 @@ $(ASCII_PF2_BLOB_OBJ): $(ASCII_PF2)
 	rm -f $@.tmp
 	@$(call mark_noexecstack,$@)
 
-$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(NSS_FILES_BLOB_OBJ) $(CA_TRUST_BLOB_OBJ) $(ASCII_PF2_BLOB_OBJ) $(PAYLOAD_COBJS)
+$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(NSS_FILES_BLOB_OBJ) $(SYS_CA_BLOB_OBJ) $(ASCII_PF2_BLOB_OBJ) $(PAYLOAD_COBJS)
 	@mkdir -p $(BUILD_DIR)
 	@echo "LD		$@"
 	@ld $(LDFLAGS) -T linker.payload.ld -o $@ $^
@@ -247,8 +263,10 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg archive
 		exit 1; \
 	}
 
+QEMU_MEMORY ?= 3072M
+
 run: archive iso
-	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 2048M -smp 2 -serial stdio -boot d -hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0 -vga vmware -enable-kvm -cpu host -smp 4
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m $(QEMU_MEMORY) -serial stdio -boot d -hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0,hostfwd=tcp::2222-:22 -vga vmware -enable-kvm -cpu host -smp 4
 
 # UEFI (OVMF). Same machine as `run`. Needs ovmf; hybrid ISO needs grub-efi-amd64-bin.
 OVMF_CODE ?= $(firstword $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd))
@@ -266,12 +284,12 @@ run-uefi: archive iso
 		qemu-system-x86_64 \
 			-drive if=pflash,format=raw,readonly=on,file="$(OVMF_CODE)" \
 			-drive if=pflash,format=raw,file="$(OVMF_VARS)" \
-			-cdrom $(ISO_IMAGE) -m 2048M -smp 4 -serial stdio -boot d \
+			-cdrom $(ISO_IMAGE) -m $(QEMU_MEMORY) -smp 4 -serial stdio -boot d \
 			-hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0 \
 			-enable-kvm -cpu host; \
 	else \
 		qemu-system-x86_64 -bios "$(OVMF_CODE)" \
-			-cdrom $(ISO_IMAGE) -m 2048M -smp 4 -serial stdio -boot d \
+			-cdrom $(ISO_IMAGE) -m $(QEMU_MEMORY) -smp 4 -serial stdio -boot d \
 			-hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0 \
 			-enable-kvm -cpu host; \
 	fi
@@ -282,7 +300,7 @@ test-boot:
 # Run with bridged networking (real IP from router) - requires sudo and br0 bridge
 run-bridge: iso
 	@echo "Note: Requires bridge 'br0' to be configured. Run with sudo."
-	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 1024M -serial stdio -boot d -hda ../disk.img \
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m $(QEMU_MEMORY) -serial stdio -boot d -hda ../disk.img \
 		-device e1000,netdev=net0 -netdev bridge,id=net0,br=br0
 
 # Run with TAP networking (real IP from router) - requires sudo
@@ -291,7 +309,7 @@ run-tap: iso
 	@sudo ip tuntap add dev tap0 mode tap user $(USER) 2>/dev/null || true
 	@sudo ip link set tap0 up 2>/dev/null || true
 	@sudo ip link set tap0 master br0 2>/dev/null || echo "Warning: br0 not found, tap0 not bridged"
-	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 1024M -serial stdio -boot d -hda ../disk.img \
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m $(QEMU_MEMORY) -serial stdio -boot d -hda ../disk.img \
 		-device e1000,netdev=net0 -netdev tap,id=net0,ifname=tap0,script=no,downscript=no
 
 debug: iso

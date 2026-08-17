@@ -11,6 +11,7 @@
 #include <stat.h>
 #include <ext2.h>
 #include <squashfs.h>
+#include <pagecache.h>
 #include <zlib_inflate.h>
 #include <klog.h>
 
@@ -77,6 +78,8 @@ struct squashfs_inode_info {
     /* Regular file block list follows inode on disk; we store disk cursor. */
     uint64_t block_list_abs; /* absolute byte offset of first block_list u32 */
     uint32_t block_count;
+    uint32_t *block_sizes; /* raw SquashFS block size entries */
+    uint64_t *block_offsets; /* compressed data position for each block */
     char *symlink; /* kmalloc'd target for symlinks */
 };
 
@@ -95,7 +98,7 @@ struct meta_cache_ent {
 };
 
 #define META_CACHE_SLOTS 16
-#define DATA_CACHE_SLOTS 8
+#define DATA_CACHE_SLOTS 32
 
 struct data_cache_ent {
     uint64_t abs_pos;
@@ -386,6 +389,37 @@ static uint32_t sq_inode_base_size(uint16_t type)
     }
 }
 
+static int sq_capture_block_list(struct squashfs_sb *s, uint64_t *block_abs,
+                                 uint16_t *offset, struct squashfs_inode_info *out)
+{
+    uint32_t blocks = out->block_count;
+    if (blocks == 0)
+        return 0;
+
+    size_t sizes_bytes = (size_t)blocks * sizeof(uint32_t);
+    size_t offsets_bytes = (size_t)blocks * sizeof(uint64_t);
+    out->block_sizes = (uint32_t *)kmalloc(sizes_bytes);
+    out->block_offsets = (uint64_t *)kmalloc(offsets_bytes);
+    if (!out->block_sizes || !out->block_offsets)
+        goto fail;
+    if (sq_meta_read(s, block_abs, offset, out->block_sizes, sizes_bytes) != 0)
+        goto fail;
+
+    uint64_t pos = out->start_block;
+    for (uint32_t i = 0; i < blocks; i++) {
+        out->block_offsets[i] = pos;
+        pos += (uint64_t)(out->block_sizes[i] & ~SQUASHFS_COMPRESSED_BIT_BLOCK);
+    }
+    return 0;
+
+fail:
+    if (out->block_sizes) kfree(out->block_sizes);
+    if (out->block_offsets) kfree(out->block_offsets);
+    out->block_sizes = NULL;
+    out->block_offsets = NULL;
+    return -1;
+}
+
 static int sq_read_inode(struct squashfs_sb *s, uint64_t inode_ref, struct squashfs_inode_info *out)
 {
     uint64_t block_rel = inode_ref >> 16;
@@ -475,11 +509,8 @@ static int sq_read_inode(struct squashfs_sb *s, uint64_t inode_ref, struct squas
         /* Remember absolute location of block list: current metadata cursor.
          * Encode as (block_abs << 16) | offset for later reads. */
         out->block_list_abs = (block_abs << 16) | (uint64_t)offset;
-        /* Skip block list in the stream so callers that continue aren't needed */
-        if (blocks) {
-            if (sq_meta_read(s, &block_abs, &offset, NULL, blocks * 4) != 0)
-                return -1;
-        }
+        if (sq_capture_block_list(s, &block_abs, &offset, out) != 0)
+            return -1;
         return 0;
     }
     if (type == SQUASHFS_LREG_TYPE) {
@@ -500,10 +531,8 @@ static int sq_read_inode(struct squashfs_sb *s, uint64_t inode_ref, struct squas
             blocks = (uint32_t)(out->file_size / s->block_size);
         out->block_count = blocks;
         out->block_list_abs = (block_abs << 16) | (uint64_t)offset;
-        if (blocks) {
-            if (sq_meta_read(s, &block_abs, &offset, NULL, blocks * 4) != 0)
-                return -1;
-        }
+        if (sq_capture_block_list(s, &block_abs, &offset, out) != 0)
+            return -1;
         return 0;
     }
     if (type == SQUASHFS_SYMLINK_TYPE || type == SQUASHFS_LSYMLINK_TYPE) {
@@ -547,6 +576,14 @@ static void sq_inode_info_free(struct squashfs_inode_info *ino)
     if (ino->symlink) {
         kfree(ino->symlink);
         ino->symlink = NULL;
+    }
+    if (ino->block_sizes) {
+        kfree(ino->block_sizes);
+        ino->block_sizes = NULL;
+    }
+    if (ino->block_offsets) {
+        kfree(ino->block_offsets);
+        ino->block_offsets = NULL;
     }
 }
 
@@ -682,6 +719,10 @@ static int sq_read_blocklist_size(struct squashfs_sb *s, const struct squashfs_i
         return -1;
     if (index >= ino->block_count)
         return -1;
+    if (ino->block_sizes) {
+        *out_size = ino->block_sizes[index];
+        return 0;
+    }
     for (i = 0; i <= index; i++) {
         if (sq_meta_read(s, &block_abs, &offset, tmp, 4) != 0)
             return -1;
@@ -725,17 +766,22 @@ static int sq_file_read(struct squashfs_sb *s, const struct squashfs_inode_info 
             uint32_t bi;
             uint32_t bsize = 0;
 
-            for (bi = 0; bi < block_index; bi++) {
-                uint32_t sz = 0;
-                if (sq_read_blocklist_size(s, ino, bi, &sz) != 0) {
+            if (ino->block_offsets && ino->block_sizes) {
+                data_pos = ino->block_offsets[block_index];
+                bsize = ino->block_sizes[block_index];
+            } else {
+                for (bi = 0; bi < block_index; bi++) {
+                    uint32_t sz = 0;
+                    if (sq_read_blocklist_size(s, ino, bi, &sz) != 0) {
+                        kfree(block_buf);
+                        return -1;
+                    }
+                    data_pos += (sz & ~SQUASHFS_COMPRESSED_BIT_BLOCK);
+                }
+                if (sq_read_blocklist_size(s, ino, block_index, &bsize) != 0) {
                     kfree(block_buf);
                     return -1;
                 }
-                data_pos += (sz & ~SQUASHFS_COMPRESSED_BIT_BLOCK);
-            }
-            if (sq_read_blocklist_size(s, ino, block_index, &bsize) != 0) {
-                kfree(block_buf);
-                return -1;
             }
             if (bsize == 0) {
                 /* sparse hole */
@@ -1035,6 +1081,9 @@ static int squashfs_open_internal(const char *path, struct fs_file **out_file)
         f->type = FS_TYPE_DIR;
     else
         f->type = FS_TYPE_REG;
+    if (f->type == FS_TYPE_REG)
+        f->backing_id = PAGECACHE_ID_SQUASHFS(ino.inode_number);
+    f->backing_gen = 0;
 
     *out_file = f;
     return 0;

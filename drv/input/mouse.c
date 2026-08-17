@@ -27,17 +27,17 @@ static int g_pkt_idx = 0;
 static int g_mouse_sysfs_registered = 0;
 
 static int ps2_wait_input_empty(void) {
-    for (int i = 0; i < 100000; i++) {
+    for (int i = 0; i < 10000; i++) {
         if ((inb(PS2_CMD_PORT) & 0x02) == 0) return 1;
-        asm volatile("pause");
+        asm volatile("pause" ::: "memory");
     }
     return 0;
 }
 
 static int ps2_wait_output_full(void) {
-    for (int i = 0; i < 100000; i++) {
+    for (int i = 0; i < 10000; i++) {
         if (inb(PS2_CMD_PORT) & 0x01) return 1;
-        asm volatile("pause");
+        asm volatile("pause" ::: "memory");
     }
     return 0;
 }

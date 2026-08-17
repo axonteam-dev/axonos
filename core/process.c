@@ -51,6 +51,8 @@ static process_t *process_alloc_locked(process_t *parent) {
     p->sid = (int)p->pid;
     strncpy(p->cwd, "/", sizeof(p->cwd));
     p->cwd[sizeof(p->cwd) - 1] = '\0';
+    strncpy(p->fs_root, "/", sizeof(p->fs_root));
+    p->fs_root[sizeof(p->fs_root) - 1] = '\0';
     /* Default: one supplementary group matching egid (root). */
     p->ngroups = 1;
     p->groups[0] = 0;
@@ -93,6 +95,7 @@ static process_t *process_alloc_locked(process_t *parent) {
         p->rlim_as_cur = parent->rlim_as_cur;
         p->rlim_as_max = parent->rlim_as_max;
         memcpy(p->cwd, parent->cwd, sizeof(p->cwd));
+        memcpy(p->fs_root, parent->fs_root, sizeof(p->fs_root));
         memcpy(p->signal_handlers, parent->signal_handlers,
                sizeof(p->signal_handlers));
         memcpy(p->signal_flags, parent->signal_flags,
@@ -181,6 +184,7 @@ void process_attach_thread(process_t *process, thread_t *thread) {
                (size_t)process->ngroups * sizeof(gid_t));
     process->umask = thread->umask;
     memcpy(process->cwd, thread->cwd, sizeof(process->cwd));
+    memcpy(process->fs_root, thread->fs_root, sizeof(process->fs_root));
     /*
      * Publish fds only on the first attach (leader / new process).
      * CLONE_THREAD peers arrive with empty thread->fds; copying that over the
@@ -221,6 +225,7 @@ void process_sync_from_thread(process_t *process, thread_t *thread) {
                (size_t)process->ngroups * sizeof(gid_t));
     process->umask = thread->umask;
     memcpy(process->cwd, thread->cwd, sizeof(process->cwd));
+    memcpy(process->fs_root, thread->fs_root, sizeof(process->fs_root));
     for (int i = 0; i < PROCESS_MAX_FD; ++i)
         process->fds[i] = thread->fds[i];
     release_irqrestore(&process_lock, flags);

@@ -172,19 +172,14 @@ static void devfs_tty_scroll_backing(struct devfs_tty *tty, uint32_t top, uint32
     if (!tty || !tty->screen || cols == 0 || rows == 0 || top >= bottom)
         return;
     if (bottom >= rows) bottom = rows - 1;
-    for (uint32_t y = top; y < bottom; y++) {
-        for (uint32_t x = 0; x < cols; x++) {
-            size_t dst = ((size_t)(y)*cols + x) * 2;
-            size_t src = ((size_t)(y + 1) * cols + x) * 2;
-            tty->screen[dst] = tty->screen[src];
-            tty->screen[dst + 1] = tty->screen[src + 1];
-        }
-    }
-    for (uint32_t x = 0; x < cols; x++) {
-        size_t off = ((size_t)bottom * cols + x) * 2;
-        tty->screen[off] = ' ';
-        tty->screen[off + 1] = tty->current_attr;
-    }
+    size_t row_bytes = (size_t)cols * 2u;
+    memmove(tty->screen + (size_t)top * row_bytes,
+            tty->screen + (size_t)(top + 1u) * row_bytes,
+            (size_t)(bottom - top) * row_bytes);
+    uint16_t blank = (uint16_t)' ' | ((uint16_t)tty->current_attr << 8);
+    uint16_t *last = (uint16_t *)(tty->screen + (size_t)bottom * row_bytes);
+    for (uint32_t x = 0; x < cols; x++)
+        last[x] = blank;
 }
 
 static void devfs_tty_scroll_backing_down(struct devfs_tty *tty, uint32_t top,
@@ -212,8 +207,17 @@ static void devfs_tty_scroll_region_up(struct devfs_tty *tty, int tty_on_vga) {
     uint32_t top = tty->scroll_top;
     uint32_t bot = tty->scroll_bottom;
     devfs_tty_scroll_backing(tty, top, bot);
-    if (tty_on_vga)
-        console_scroll_region_up(top, bot, tty->current_attr);
+    if (tty_on_vga) {
+        /*
+         * Reading legacy VGA VRAM is extremely slow on virtual hardware.
+         * The backing buffer already contains the scrolled result, so publish
+         * it using wide write-only stores instead of VRAM read-modify-copy.
+         */
+        if (!cirrusfb_is_ready() && !vbe_is_available())
+            vga_blit_cells(tty->screen, top, bot);
+        else
+            console_scroll_region_up(top, bot, tty->current_attr);
+    }
 }
 
 static void devfs_tty_newline(struct devfs_tty *tty, int tty_on_vga) {

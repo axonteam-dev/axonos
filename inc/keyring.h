@@ -41,6 +41,19 @@
 
 int keyring_init(void);
 
+/*
+ * Linux load_system_certificate_list() + integrity_load_keys():
+ * create session / .builtin_trusted_keys / .secondary_trusted_keys.
+ * The compiled-in CA PEM is installed via keyring_install_system_ca().
+ */
+int keyring_load_system_certs(void);
+
+/* Cache built-in CA PEM on .builtin_trusted_keys (no runtime ECC). */
+int keyring_install_system_ca(const void *pem, size_t len);
+
+/* Cached system CA (PEM bytes). Pointer valid until keyring teardown. */
+int keyring_system_cert_der(const uint8_t **der, size_t *len);
+
 /* add_key(type, description, payload, plen, ring_id).
  * type is one of KEY_TYPE_*; description is a kernel-space NUL-terminated string.
  * Returns the new key serial, or a negative errno value. */

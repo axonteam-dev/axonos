@@ -53,9 +53,11 @@ void erase_cursor(void);
 static uint64_t cursor_blink_phase(void)
 {
 	uint32_t hz = timer_frequency ? timer_frequency : 250u;
-	uint32_t half_period = (hz + 1u) / 2u;
+	uint32_t quarter_period = (hz + 3u) / 4u;
 
-	return timer_ticks / half_period;
+	if (quarter_period < 1u)
+		quarter_period = 1u;
+	return timer_ticks / quarter_period;
 }
 
 static void vbe_dirty_mark(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
@@ -90,6 +92,18 @@ static void vbefb_flush_dirty(void) {
 	g_vbe_dirty = 0;
 }
 
+/* Publish pending shadow pixels even inside a tty batch. A pixel copyarea must
+ * start with front and shadow identical or unflushed glyphs would be lost when
+ * both buffers are scrolled independently. */
+static void vbefb_flush_dirty_now(void) {
+	if (!g_vbe_dirty)
+		return;
+	uint32_t w = g_vbe_dx1 - g_vbe_dx0 + 1;
+	uint32_t h = g_vbe_dy1 - g_vbe_dy0 + 1;
+	vbe_flush_region(g_vbe_dx0, g_vbe_dy0, w, h);
+	g_vbe_dirty = 0;
+}
+
 void vbefb_begin_batch(void) {
 	if (g_vbe_batch > 0) {
 		g_vbe_batch++;
@@ -106,10 +120,10 @@ void vbefb_end_batch(void) {
 		return;
 	g_vbe_batch--;
 	if (g_vbe_batch == 0) {
-		vbefb_flush_dirty();
 		cursor_frozen = 0;
 		if (cursor_visible)
 			draw_cursor();
+		/* Publish text and final cursor pixels in one framebuffer update. */
 		vbefb_flush_dirty();
 	}
 }
@@ -242,12 +256,11 @@ static void vbefb_emit_tty_char(uint8_t ch) {
 			textbuf[last_row * cols + rx].attr = current_attr;
 		}
 		cursor_y = rows - 1;
-		vbe_scroll_up_pixels(font_h);
-		draw_text_row(last_row);
-		if (cursor_visible)
-			draw_cursor();
-		vbe_dirty_mark(0, 0, fb_width, fb_height);
-		vbefb_flush_dirty();
+		vbefb_begin_batch();
+		vbefb_flush_dirty_now();
+		vbe_scroll_band_pixels(0, rows * font_h, font_h,
+			vga_attr_bg_to_pixel(current_attr));
+		vbefb_end_batch();
 	} else {
 		draw_cell_to_framebuffer(ox, oy);
 		if (cursor_visible)
@@ -488,6 +501,10 @@ void vbefb_scroll_region(uint32_t top, uint32_t bottom, uint8_t attr)
 	if (top >= bottom)
 		return;
 
+	vbefb_begin_batch();
+	/* Cursor erase and preceding glyphs must reach scanout before copyarea. */
+	vbefb_flush_dirty_now();
+
 	size_t row_bytes = (size_t)cols * sizeof(cell_t);
 	memmove(textbuf + top * cols, textbuf + (top + 1) * cols,
 		row_bytes * (bottom - top));
@@ -496,20 +513,10 @@ void vbefb_scroll_region(uint32_t top, uint32_t bottom, uint8_t attr)
 		textbuf[bottom * cols + x].attr = attr;
 	}
 
-	uint8_t *drawbuf = vbe_get_drawbuffer();
-	if (!drawbuf)
-		return;
-	vbefb_begin_batch();
 	uint32_t y0 = top * font_h;
-	uint32_t src_y = (top + 1) * font_h;
-	uint32_t bottom_y = bottom * font_h;
-	size_t move_bytes = (size_t)fb_pitch * (bottom - top) * font_h;
-
-	memmove(drawbuf + (size_t)y0 * fb_pitch,
-		drawbuf + (size_t)src_y * fb_pitch, move_bytes);
-	vbe_clear_region(0, bottom_y, fb_width, font_h,
+	uint32_t band_h = (bottom - top + 1) * font_h;
+	vbe_scroll_band_pixels(y0, band_h, font_h,
 		vga_attr_bg_to_pixel(attr));
-	vbe_dirty_mark(0, y0, fb_width, (bottom - top + 1) * font_h);
 	vbefb_end_batch();
 }
 

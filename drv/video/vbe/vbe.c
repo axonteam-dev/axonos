@@ -67,6 +67,12 @@ static void vbe_flush_region_internal(uint32_t x, uint32_t y, uint32_t w, uint32
 	if (y + h > g_height) h = g_height - y;
 
 	uint32_t bytes_per_pixel = (g_bpp + 7) / 8;
+	if (x == 0 && w == g_width) {
+		memcpy((uint8_t *)g_frontbuf + (size_t)y * g_pitch,
+		       (const uint8_t *)g_backbuf + (size_t)y * g_pitch,
+		       (size_t)h * g_pitch);
+		return;
+	}
 	for (uint32_t row = 0; row < h; row++) {
 		uint8_t *src = (uint8_t*)g_backbuf + (size_t)( (y + row) * g_pitch + x * bytes_per_pixel );
 		uint8_t *dst = (uint8_t*)g_frontbuf + (size_t)( (y + row) * g_pitch + x * bytes_per_pixel );
@@ -104,41 +110,78 @@ uint32_t vbe_pack_pixel(uint8_t r, uint8_t g, uint8_t b) {
 	return pixel;
 }
 
-/* Scroll framebuffer up by given pixel rows (fast memmove). */
-void vbe_scroll_up_pixels(uint32_t pixels) {
-	uint8_t *fb = vbe_drawbuffer();
-
-	if (!g_enabled || !fb || pixels == 0 || pixels >= g_height) return;
-	uint32_t bytes_per_pixel = (g_bpp + 7) / 8;
-	size_t row_bytes = (size_t)g_pitch;
-	size_t move_bytes = row_bytes * (size_t)(g_height - pixels);
-	/* memmove handles overlap */
-	memmove(fb, fb + (size_t)pixels * row_bytes, move_bytes);
-	/* clear bottom area */
-	uint32_t clear_y = g_height - pixels;
-	uint32_t packed_clear = vbe_pack_pixel(0,0,0);
-	size_t clear_bytes = row_bytes * (size_t)pixels;
-	if (packed_clear == 0) {
-		/* Fast path for black clear, critical for smooth text scrolling. */
-		memset(fb + (size_t)clear_y * row_bytes, 0, clear_bytes);
+static void vbe_fill_rows(void *buffer, uint32_t y, uint32_t h,
+                          uint32_t packed_pixel) {
+	uint8_t *fb = (uint8_t *)buffer;
+	uint32_t bytespp = (g_bpp + 7) / 8;
+	if (!fb || h == 0) return;
+	if (packed_pixel == 0) {
+		memset(fb + (size_t)y * g_pitch, 0, (size_t)h * g_pitch);
 		return;
 	}
-	for (uint32_t ry = 0; ry < pixels; ry++) {
-		uint8_t *line = fb + (size_t)( (clear_y + ry) * row_bytes );
-		/* fill each pixel */
+	if (bytespp == 4) {
+		uint64_t pair = ((uint64_t)packed_pixel << 32) | packed_pixel;
+		for (uint32_t row = 0; row < h; row++) {
+			uint32_t *line = (uint32_t *)(fb + (size_t)(y + row) * g_pitch);
+			uint32_t x = 0;
+			for (; x + 1 < g_width; x += 2)
+				*(uint64_t *)(void *)(line + x) = pair;
+			if (x < g_width) line[x] = packed_pixel;
+		}
+		return;
+	}
+	for (uint32_t row = 0; row < h; row++) {
+		uint8_t *line = fb + (size_t)(y + row) * g_pitch;
 		for (uint32_t x = 0; x < g_width; x++) {
-			uint8_t *dst = line + (size_t)x * bytes_per_pixel;
-			if (bytes_per_pixel == 4) *(uint32_t*)dst = packed_clear;
-			else if (bytes_per_pixel == 3) {
-				dst[0] = (uint8_t)(packed_clear & 0xFF);
-				dst[1] = (uint8_t)((packed_clear >> 8) & 0xFF);
-				dst[2] = (uint8_t)((packed_clear >> 16) & 0xFF);
-			} else if (bytes_per_pixel == 2) {
-				dst[0] = (uint8_t)(packed_clear & 0xFF);
-				dst[1] = (uint8_t)((packed_clear >> 8) & 0xFF);
+			uint8_t *dst = line + (size_t)x * bytespp;
+			if (bytespp == 3) {
+				dst[0] = (uint8_t)packed_pixel;
+				dst[1] = (uint8_t)(packed_pixel >> 8);
+				dst[2] = (uint8_t)(packed_pixel >> 16);
+			} else if (bytespp == 2) {
+				*(uint16_t *)(void *)dst = (uint16_t)packed_pixel;
 			}
 		}
 	}
+}
+
+/*
+ * Linux fbcon-style copyarea for a vertical text band. Keep RAM shadow and
+ * scanout synchronized in-place, so the caller does not need to push the
+ * complete screen from shadow to framebuffer after every newline.
+ */
+void vbe_scroll_band_pixels(uint32_t y, uint32_t band_h, uint32_t pixels,
+                            uint32_t packed_clear) {
+	if (!g_enabled || !g_frontbuf || band_h == 0 || pixels == 0) return;
+	if (y >= g_height) return;
+	if (band_h > g_height - y) band_h = g_height - y;
+	if (pixels >= band_h) {
+		vbe_fill_rows(vbe_drawbuffer(), y, band_h, packed_clear);
+		if (g_backbuf && g_frontbuf != g_backbuf)
+			vbe_fill_rows(g_frontbuf, y, band_h, packed_clear);
+		return;
+	}
+
+	size_t move_bytes = (size_t)(band_h - pixels) * g_pitch;
+	size_t src_off = (size_t)(y + pixels) * g_pitch;
+	size_t dst_off = (size_t)y * g_pitch;
+	uint8_t *draw = (uint8_t *)vbe_drawbuffer();
+	memmove(draw + dst_off, draw + src_off, move_bytes);
+	if (g_backbuf && g_frontbuf != g_backbuf) {
+		uint8_t *front = (uint8_t *)g_frontbuf;
+		memmove(front + dst_off, front + src_off, move_bytes);
+	}
+
+	uint32_t clear_y = y + band_h - pixels;
+	vbe_fill_rows(draw, clear_y, pixels, packed_clear);
+	if (g_backbuf && g_frontbuf != g_backbuf)
+		vbe_fill_rows(g_frontbuf, clear_y, pixels, packed_clear);
+}
+
+/* Scroll whole framebuffer up by given pixel rows. */
+void vbe_scroll_up_pixels(uint32_t pixels) {
+	if (pixels >= g_height) return;
+	vbe_scroll_band_pixels(0, g_height, pixels, vbe_pack_pixel(0, 0, 0));
 }
 
 /* Clear pixel region in front buffer using packed pixel value. */

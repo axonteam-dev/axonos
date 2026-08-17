@@ -32,6 +32,64 @@ static const uint32_t divider_values[] = {16, 2, 4, 8, 32, 64, 128, 1};
 static uint8_t g_timer_div_reg = 0x3;
 static uint32_t g_timer_div_val = 16;
 static uint32_t g_timer_init_count = 0;
+static int g_tsc_deadline_mode;
+static uint64_t g_tsc_deadline_interval;
+static uint64_t g_tsc_deadline_next;
+
+#define MSR_IA32_TSC_DEADLINE 0x6E0u
+
+static uint64_t apic_rdtsc(void);
+
+static void apic_wrmsr(uint32_t msr, uint64_t value) {
+    uint32_t lo = (uint32_t)value;
+    uint32_t hi = (uint32_t)(value >> 32);
+    asm volatile("wrmsr" :: "c"(msr), "a"(lo), "d"(hi));
+}
+
+static int apic_has_tsc_deadline(void) {
+    uint32_t a, b, c, d;
+    asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1u), "c"(0u));
+    (void)a; (void)b; (void)d;
+    return (c & (1u << 24)) != 0;
+}
+
+static uint64_t apic_tsc_frequency_hz(void) {
+    if (klog_tsc_hz >= 1000000ull)
+        return klog_tsc_hz;
+    uint64_t hint = sysinfo_tsc_hz_hint();
+    if (hint >= 1000000ull)
+        return hint;
+
+    uint32_t max_leaf, b, c, d;
+    asm volatile("cpuid" : "=a"(max_leaf), "=b"(b), "=c"(c), "=d"(d)
+                 : "a"(0u), "c"(0u));
+    if (max_leaf >= 0x15u) {
+        uint32_t denom, numer, crystal;
+        asm volatile("cpuid" : "=a"(denom), "=b"(numer), "=c"(crystal), "=d"(d)
+                     : "a"(0x15u), "c"(0u));
+        if (denom && numer && crystal)
+            return ((uint64_t)crystal * (uint64_t)numer) / (uint64_t)denom;
+    }
+    if (max_leaf >= 0x16u) {
+        uint32_t base_mhz;
+        asm volatile("cpuid" : "=a"(base_mhz), "=b"(b), "=c"(c), "=d"(d)
+                     : "a"(0x16u), "c"(0u));
+        if (base_mhz)
+            return (uint64_t)base_mhz * 1000000ull;
+    }
+    return 0;
+}
+
+static void apic_tsc_deadline_rearm(void) {
+    if (!g_tsc_deadline_mode || !g_tsc_deadline_interval)
+        return;
+    uint64_t now = apic_rdtsc();
+    uint64_t next = g_tsc_deadline_next + g_tsc_deadline_interval;
+    if (next <= now)
+        next = now + g_tsc_deadline_interval;
+    g_tsc_deadline_next = next;
+    apic_wrmsr(MSR_IA32_TSC_DEADLINE, next);
+}
 
 // Find best divider for target frequency
 static uint8_t find_best_divider(uint32_t target_freq, uint32_t base_freq, uint32_t* out_count) {
@@ -65,6 +123,34 @@ static uint32_t divider_val_for_reg(uint8_t reg) {
     return 16;
 }
 
+static uint64_t apic_rdtsc(void) {
+    uint32_t lo, hi;
+    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/* A missing PIT IRQ must degrade to PIT mode, never hang kernel bring-up. */
+static int wait_pit_ticks_bounded(uint64_t start, uint64_t need, uint32_t sample_ms,
+                                  uint64_t *delta_out) {
+    uint64_t tsc_hz = sysinfo_tsc_hz_hint();
+    uint64_t tsc_start = apic_rdtsc();
+    uint64_t max_ms = (uint64_t)sample_ms * 4ull + 100ull;
+    uint64_t max_cycles = tsc_hz ? (tsc_hz / 1000ull) * max_ms : 0;
+    uint32_t spins = 0;
+    const uint32_t max_spins = 10000000u;
+
+    while ((pit_get_ticks() - start) < need) {
+        if (max_cycles && apic_rdtsc() - tsc_start >= max_cycles)
+            break;
+        if (++spins >= max_spins)
+            break;
+        asm volatile("pause" ::: "memory");
+    }
+    uint64_t delta = pit_get_ticks() - start;
+    if (delta_out) *delta_out = delta;
+    return delta >= need ? 0 : -1;
+}
+
 /* Calibrate APIC timer base frequency against PIT ticks.
    This is far more stable across machines than CPUID/busy-loop heuristics. */
 static uint32_t quick_calibrate(void) {
@@ -78,28 +164,23 @@ static uint32_t quick_calibrate(void) {
     if (sample_ticks < 5ull)
         sample_ticks = 5ull;
     uint64_t pit_start = pit_get_ticks();
-    uint64_t wait_guard = pit_start + sample_ticks + (uint64_t)pit_hz; /* +1s guard */
-    uint32_t spin_guard = 0;
-    const uint32_t max_spins = 50000000;
 
     /* One-shot, masked: we only read CURRENT counter and don't need interrupts. */
     apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_ONESHOT, true);
     apic_write(LAPIC_TIMER_DIV_REG, 0x3); /* divider=16 */
     apic_write(LAPIC_TIMER_INIT_REG, 0xFFFFFFFFu);
 
-    while ((pit_get_ticks() - pit_start) < sample_ticks) {
-        uint64_t now = pit_get_ticks();
-        if (now > wait_guard) break;
-        if (++spin_guard >= max_spins) break; /* interrupts may be disabled here */
-        asm volatile("pause");
-    }
+    uint64_t rflags = 0;
+    asm volatile("pushfq; popq %0" : "=r"(rflags));
+    uint64_t pit_delta = 0;
+    if (rflags & (1ull << 9))
+        (void)wait_pit_ticks_bounded(pit_start, sample_ticks, sample_ms, &pit_delta);
 
     uint32_t remaining = apic_read(LAPIC_TIMER_CURRENT_REG);
     uint32_t elapsed = 0xFFFFFFFF - remaining;
     apic_write(LAPIC_TIMER_INIT_REG, 0);
     apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_ONESHOT, true);
 
-    uint64_t pit_delta = pit_get_ticks() - pit_start;
     if (pit_delta >= 5 && elapsed > 0) {
         /* base_hz = bus_counts * divider / seconds = counts * div * pit_hz / ticks */
         uint64_t base_hz = ((uint64_t)elapsed * (uint64_t)divider * (uint64_t)pit_hz) / pit_delta;
@@ -249,10 +330,20 @@ uint64_t apic_timer_get_uptime_seconds(void) {
 }
 
 void apic_timer_handler(cpu_registers_t* regs) {
+    apic_tsc_deadline_rearm();
     apic_timer_ticks++;
     apic_timer_state.ticks = apic_timer_ticks;
     if (!pit_is_enabled())
         timer_ticks++;
+    /*
+     * Early clockevent mode: calibration starts before thread_init(). Linux
+     * likewise keeps the early timer handler to accounting + EOI; scheduler,
+     * process timers and framebuffer work become legal only after init=1.
+     */
+    if (!init) {
+        apic_eoi();
+        return;
+    }
     /* Charge CPU time before any schedule/publish side effects. */
     thread_account_timer_tick(regs && ((regs->cs & 3) == 3));
     process_itimer_tick(pit_get_time_ms());
@@ -325,6 +416,17 @@ void apic_timer_handler(cpu_registers_t* regs) {
      * CPU count here disabled preemption on cpu0 and let one shell freeze all
      * user terminals.  Preempt the BSP's ring-3 task regardless of AP count.
      */
+    /* Cursor and deferred framebuffer damage must progress while ring 3 runs. */
+    if (smp_sched_cpu_id() == 0) {
+        if (cirrusfb_is_ready()) {
+            cirrusfb_update_cursor();
+        } else if (vbe_is_available()) {
+            vbefb_update_cursor();
+        } else {
+            vga_update_cursor();
+        }
+    }
+
     if (regs && ((regs->cs & 3) == 3) && smp_sched_cpu_id() == 0) {
         apic_eoi();
         /*
@@ -356,11 +458,6 @@ void apic_timer_handler(cpu_registers_t* regs) {
     }
 
     /* Kernel-mode/AP timer ticks do not schedule from IRQ context. */
-    if (cirrusfb_is_ready()) {
-        cirrusfb_update_cursor();
-    } else {
-        vbefb_update_cursor();
-    }
     apic_eoi();
 }
 
@@ -399,6 +496,26 @@ void apic_timer_start(uint32_t freq_hz) {
 
     uint32_t count = 0;
     uint8_t divider = find_best_divider(freq_hz, apic_timer_state.base_frequency, &count);
+
+    uint64_t deadline_tsc_hz = apic_tsc_frequency_hz();
+    if (apic_has_tsc_deadline() && deadline_tsc_hz >= 1000000ull) {
+        uint64_t interval = deadline_tsc_hz / (uint64_t)freq_hz;
+        if (interval > 0) {
+            g_tsc_deadline_mode = 1;
+            g_tsc_deadline_interval = interval;
+            g_tsc_deadline_next = apic_rdtsc() + interval;
+            g_timer_init_count = 1;
+            apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_TSC_DEADLINE, false);
+            apic_wrmsr(MSR_IA32_TSC_DEADLINE, g_tsc_deadline_next);
+            apic_timer_state.frequency = freq_hz;
+            apic_timer_state.running = true;
+            apic_timer_state.mode = APIC_TIMER_TSC_DEADLINE;
+            apic_timer_ticks = 0;
+            kprintf("APIC: TSC-deadline clockevent at %u Hz (TSC=%llu Hz)\n",
+                    freq_hz, (unsigned long long)deadline_tsc_hz);
+            return;
+        }
+    }
 
     if (count < 10) count = 10;
     if (count > 0xFFFFF) count = 0xFFFFF;
@@ -445,9 +562,11 @@ uint32_t apic_timer_refine(uint32_t target_hz, uint32_t sample_ms) {
         if (need < 5ull)
             need = 5ull;
         uint64_t p0 = pit_get_ticks();
-        while ((pit_get_ticks() - p0) < need)
-            asm volatile("pause" ::: "memory");
-        uint64_t got = pit_get_ticks() - p0;
+        uint64_t got = 0;
+        if (wait_pit_ticks_bounded(p0, need, sample_ms, &got) != 0) {
+            kprintf("APIC: PIT reference timeout during refine\n");
+            return 0;
+        }
         /* Exact wall time from ticks we actually waited (avoids ceil bias → slow timer). */
         elapsed_us = (got * 1000000ull) / (uint64_t)pit_hz;
     } else if (klog_tsc_per_us) {
@@ -457,12 +576,12 @@ uint32_t apic_timer_refine(uint32_t target_hz, uint32_t sample_ms) {
             asm volatile("pause" ::: "memory");
         elapsed_us = time_monotonic_us() - wall0;
     } else {
-        return apic_timer_state.frequency;
+        return 0;
     }
 
     uint64_t irq_delta = apic_timer_ticks - t0;
     if (irq_delta < 2ull || elapsed_us < 1000ull)
-        return apic_timer_state.frequency;
+        return 0;
 
     uint64_t measured_hz = (irq_delta * 1000000ull) / elapsed_us;
     if (measured_hz < 10ull || measured_hz > 10000ull) {
@@ -470,6 +589,9 @@ uint32_t apic_timer_refine(uint32_t target_hz, uint32_t sample_ms) {
                 (unsigned long long)measured_hz);
         return apic_timer_state.frequency;
     }
+    /* TSC-deadline is derived directly from the calibrated clocksource. */
+    if (g_tsc_deadline_mode)
+        return (uint32_t)measured_hz;
 
     /*
      * count_new = count_old * measured / target
@@ -517,9 +639,11 @@ uint32_t apic_timer_commit_measured(uint32_t sample_ms) {
         if (need < 5ull)
             need = 5ull;
         uint64_t p0 = pit_get_ticks();
-        while ((pit_get_ticks() - p0) < need)
-            asm volatile("pause" ::: "memory");
-        uint64_t got = pit_get_ticks() - p0;
+        uint64_t got = 0;
+        if (wait_pit_ticks_bounded(p0, need, sample_ms, &got) != 0) {
+            kprintf("APIC: PIT reference timeout during commit\n");
+            return 0;
+        }
         elapsed_us = (got * 1000000ull) / (uint64_t)pit_hz;
     } else if (klog_tsc_per_us) {
         uint64_t wall0 = time_monotonic_us();
@@ -528,16 +652,18 @@ uint32_t apic_timer_commit_measured(uint32_t sample_ms) {
             asm volatile("pause" ::: "memory");
         elapsed_us = time_monotonic_us() - wall0;
     } else {
-        return apic_timer_state.frequency;
+        return 0;
     }
 
     uint64_t irq_delta = apic_timer_ticks - t0;
     if (irq_delta < 2ull || elapsed_us < 1000ull)
-        return apic_timer_state.frequency;
+        return 0;
 
     uint64_t measured_hz = (irq_delta * 1000000ull) / elapsed_us;
     if (measured_hz < 10ull || measured_hz > 10000ull)
         return apic_timer_state.frequency;
+    if (g_tsc_deadline_mode)
+        return (uint32_t)measured_hz;
 
     apic_timer_state.frequency = (uint32_t)measured_hz;
     if (!pit_is_enabled())
@@ -551,6 +677,11 @@ uint32_t apic_timer_commit_measured(uint32_t sample_ms) {
 void apic_timer_start_oneshot(uint32_t microseconds) {
     if (!apic_timer_state.calibrated) return;
 
+    if (g_tsc_deadline_mode) {
+        apic_wrmsr(MSR_IA32_TSC_DEADLINE, 0);
+        g_tsc_deadline_mode = 0;
+    }
+
     uint32_t count = (apic_timer_state.base_frequency * microseconds) / 1000000;
     if (count < 10) count = 10;
 
@@ -563,6 +694,11 @@ void apic_timer_start_oneshot(uint32_t microseconds) {
 }
 
 void apic_timer_stop(void) {
+    if (g_tsc_deadline_mode)
+        apic_wrmsr(MSR_IA32_TSC_DEADLINE, 0);
+    g_tsc_deadline_mode = 0;
+    g_tsc_deadline_interval = 0;
+    g_tsc_deadline_next = 0;
     apic_set_lvt_timer(0, 0, true); // Mask timer
     apic_write(LAPIC_TIMER_INIT_REG, 0); // Stop counter
     apic_timer_state.running = false;
@@ -601,6 +737,10 @@ bool apic_timer_is_running(void) {
 
 bool apic_timer_is_calibrated(void) {
     return apic_timer_state.calibrated;
+}
+
+bool apic_timer_uses_tsc_deadline(void) {
+    return g_tsc_deadline_mode != 0;
 }
 
 void apic_timer_sleep_ms(uint32_t ms) {

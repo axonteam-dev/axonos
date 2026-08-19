@@ -32,26 +32,14 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
 
-static int exec_stdio_is_dev_null(const struct fs_file *f) {
-    if (!f || !f->path)
-        return 0;
-    return strcmp(f->path, "/dev/null") == 0 ||
-           strcmp(f->path, "null") == 0;
-}
-
-/* Intentional redirects (pipes, sockets, regular files) must survive exec.
- * Only closed fds or /dev/null need the boot console rebind. */
+/*
+ * Linux execve(2) does not remap open descriptors. Only closed 0/1/2 need a
+ * boot console (BusyBox init). /dev/null is an intentional sink: apt ExecGPGV
+ * does dup2(nullfd, STDERR_FILENO) so gpgv's "Good signature" lines stay off
+ * the tty. Replacing that with /dev/console leaked them into apt update.
+ */
 static int exec_stdio_needs_console(const struct fs_file *f) {
-    if (!f)
-        return 1;
-    if (f->type == FS_TYPE_PIPE || f->type == FS_TYPE_SOCKET)
-        return 0;
-    if (devfs_is_tty_file((struct fs_file *)f))
-        return 0;
-    if (exec_stdio_is_dev_null(f))
-        return 1;
-    /* Keep open non-tty files (redirections to regular paths). */
-    return 0;
+    return f == NULL;
 }
 
 /* Linux AT_RANDOM: 16 bytes used for the stack canary / glibc. */
@@ -79,8 +67,9 @@ void exec_boot_ensure_stdio(thread_t *ut) {
      * an empty inittab console id, spawn never reopens a real tty — ash then
      * sees EOF on stdin and exits, and ::respawn loops forever.
      *
-     * Only rebind closed /dev/null stdio. Never replace pipes/sockets: that
-     * destroyed `echo test | cat` (stdin pipe freed on execve → no "test").
+     * Rebind only *closed* 0/1/2. Never replace pipes, sockets, ttys, or
+     * /dev/null: apt ExecGPGV dup2's gpgv stderr to /dev/null, and putting
+     * the console there printed "Good signature" into apt update.
      *
      * fds 0/1/2 often alias the same fs_file; free each unique pointer once
      * per aliased slot (refcount may be wrong after fork/exec).
@@ -649,6 +638,83 @@ static int pml4_map_one(void *pml4_ptr, uint64_t va, uint64_t pa, uint64_t flags
 }
 
 /* Validate minimal ELF64 header */
+static int elf_validate_header(const Elf64_Ehdr *eh, size_t len);
+
+/*
+ * Linux open_exec: the main binary and PT_INTERP must be openable before
+ * mmput(old). Loading apt after usrmerge left a dangling
+ * /lib64/ld-linux-x86-64.so.2; mmput had already dropped BusyBox, so
+ * execve's ENOENT returned to RIP in a zeroed image (add [rax],al with
+ * rax=-ENOENT -> #PF CR2=0xfffffffffffffffe).
+ */
+static int elf_probe_exec_open(const char *path) {
+    struct fs_file *f;
+    Elf64_Ehdr eh;
+    Elf64_Phdr *phdrs;
+    size_t phsz;
+    int i;
+    char interp[192];
+
+    if (!path)
+        return -1;
+    f = fs_open(path);
+    if (!f)
+        return -1;
+    if (fs_read(f, &eh, sizeof(eh), 0) != (ssize_t)sizeof(eh) ||
+        !elf_validate_header(&eh, sizeof(eh))) {
+        fs_file_free(f);
+        return 0; /* shebang / non-ELF: file exists */
+    }
+    if (eh.e_phoff == 0 || eh.e_phnum == 0 ||
+        eh.e_phentsize != sizeof(Elf64_Phdr)) {
+        fs_file_free(f);
+        return 0;
+    }
+    phsz = (size_t)eh.e_phnum * (size_t)eh.e_phentsize;
+    if (phsz == 0 || phsz > 256u * 1024u) {
+        fs_file_free(f);
+        return -1;
+    }
+    phdrs = (Elf64_Phdr *)kmalloc(phsz);
+    if (!phdrs) {
+        fs_file_free(f);
+        return -1;
+    }
+    if (fs_read(f, phdrs, phsz, (size_t)eh.e_phoff) != (ssize_t)phsz) {
+        kfree(phdrs);
+        fs_file_free(f);
+        return -1;
+    }
+    interp[0] = '\0';
+    for (i = 0; i < (int)eh.e_phnum; i++) {
+        size_t n;
+        if (phdrs[i].p_type != 3)
+            continue;
+        n = (size_t)phdrs[i].p_filesz;
+        if (n == 0 || n >= sizeof(interp)) {
+            kfree(phdrs);
+            fs_file_free(f);
+            return -1;
+        }
+        if (fs_read(f, interp, n, (size_t)phdrs[i].p_offset) != (ssize_t)n) {
+            kfree(phdrs);
+            fs_file_free(f);
+            return -1;
+        }
+        interp[n] = '\0';
+        break;
+    }
+    kfree(phdrs);
+    fs_file_free(f);
+    if (interp[0]) {
+        struct fs_file *ip = fs_open(interp);
+        if (!ip)
+            return -1;
+        fs_file_free(ip);
+    }
+    return 0;
+}
+
 static int elf_validate_header(const Elf64_Ehdr *eh, size_t len) {
     if (!eh) return 0;
     if (len < sizeof(Elf64_Ehdr)) return 0;
@@ -1711,6 +1777,29 @@ static void exec_register_loaded_range_vma(uint64_t tid, const elf_load_info_t *
     (void)user_vma_add(tid, lo, (size_t)(hi - lo), 7, USER_VMA_KIND_ELF_LOAD);
 }
 
+/*
+ * Linux fs/exec.c setup_arg_pages(): insert a VM_STACK / VM_GROWSDOWN VMA
+ * over [stack_top - RLIMIT_STACK, stack_top), plus the TLS slot below it.
+ * Only the argv tip is prefaulted; the rest is demand-zero (expand_stack).
+ * Anonymous lazy so fork skips unpopulated identity leftovers (copy_page_range).
+ */
+static void exec_setup_arg_pages(thread_t *t, uintptr_t stack_top)
+{
+    uintptr_t stack_base;
+    uintptr_t tls_base;
+    uint64_t tid;
+
+    if (!t || stack_top <= (uintptr_t)USER_STACK_SIZE)
+        return;
+    stack_base = (stack_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
+    tls_base = stack_base;
+    if (tls_base > (uintptr_t)USER_TLS_SIZE)
+        tls_base -= (uintptr_t)USER_TLS_SIZE;
+    tid = t->tid ? (uint64_t)t->tid : 1ull;
+    (void)user_vma_add(tid, tls_base, (size_t)(stack_top - tls_base), 3,
+                       USER_VMA_KIND_MMAP_LAZY);
+}
+
 /* Rebuild userspace stack/TLS layout for a specific target tid.
    Used as a recovery path when the final created thread tid differs from the
    initially planned slot (rare concurrent thread creation race). */
@@ -2065,17 +2154,13 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
     }
 
     /*
-     * Linux open_exec before exec_mmap: fail missing paths while oldmm can
-     * still be restored. Then mmput(old) before load_elf — holding Soft_COW
-     * dockerd image through a multi-MiB PT_LOAD OOMed frames and surfaced as
-     * ENOENT from fork/exec of docker-containerd.
+     * Linux open_exec before exec_mmap: fail missing paths (binary + PT_INTERP)
+     * while oldmm can still be restored. Then mmput(old) before load_elf —
+     * holding Soft_COW dockerd image through a multi-MiB PT_LOAD OOMed frames
+     * and surfaced as ENOENT from fork/exec of docker-containerd.
      */
-    {
-        struct fs_file *probe = fs_open(curpath);
-        if (!probe)
-            return -1;
-        fs_file_free(probe);
-    }
+    if (elf_probe_exec_open(curpath) != 0)
+        return -1;
     {
         thread_t *tc = elf_bprm_thread();
         if (tc) {
@@ -2387,6 +2472,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         cur_user->user_stack = final_stack;
         cur_user->user_stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
         cur_user->user_stack_limit = stack_top;
+        exec_setup_arg_pages(cur_user, stack_top);
         cur_user->user_fs_base = (uint64_t)fs_base;
         /*
          * posix_spawn/clone(child_stack) leaves saved_user_rsp on a heap/brk
@@ -2424,9 +2510,8 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
             process_sync_from_thread(cur_user->process, cur_user);
         }
         /*
-         * After setsid(), BusyBox init with empty console id leaves /dev/null
-         * on stdio. Re-bind console before entering ash or the shell exits on
-         * EOF and ::respawn spins.
+         * Linux execve keeps inherited stdio. Closed 0/1/2 still get a console
+         * so BusyBox ash is not started on EOF; /dev/null redirects stay.
          */
         exec_boot_ensure_stdio(cur_user);
         /* Set foreground so Ctrl+C terminates this process when waiting */
@@ -2505,6 +2590,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         ut->user_stack = final_stack;
         ut->user_stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
         ut->user_stack_limit = stack_top;
+        exec_setup_arg_pages(ut, stack_top);
         ut->user_fs_base = (uint64_t)fs_base;
         if (loaded_brk_end != 0) {
             user_as_set_brk_after_load(ut, loaded_brk_end,

@@ -333,6 +333,11 @@ void sysinfo_init(uint32_t multiboot_magic, uint64_t multiboot_info_ptr) {
             sys_ram_mb = mb2_total_ram_mb(multiboot_info_ptr);
         }
     }
+    if (sys_ram_mb <= 0 && multiboot_info_ptr != 0) {
+        uint64_t iend = sysinfo_identity_usable_end(multiboot_info_ptr);
+        if (iend >= (16ULL * 1024ULL * 1024ULL))
+            sys_ram_mb = (int)(iend / (1024ULL * 1024ULL));
+    }
     /* VBE init moved to kernel_main (heap not yet initialized here) */
 }
 

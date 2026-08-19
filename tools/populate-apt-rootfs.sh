@@ -91,6 +91,7 @@ for f in \
     /usr/bin/dpkg-maintscript-helper /usr/bin/dpkg-realpath \
     /usr/sbin/start-stop-daemon \
     /usr/bin/sqv \
+    /usr/bin/gpgv \
     /usr/bin/tar /usr/bin/xz /usr/bin/xzcat /usr/bin/zstd /usr/bin/lz4 \
     /usr/bin/bzip2 /usr/bin/bunzip2
  do
@@ -185,6 +186,10 @@ mkdir -p "$DEST/usr/lib/apt"
 cp -a /usr/lib/apt/. "$DEST/usr/lib/apt/"
 rm -rf "$DEST/usr/lib/apt/apt.systemd.daily" \
        "$DEST/usr/lib/systemd" 2>/dev/null || true
+# Debian apt prefers methods/sqv when /usr/bin/sqv exists. Sequoia+libgmp on
+# the 140KiB trixie InRelease (EdDSA) has been an unreliable verifier here;
+# gpgv (libgcrypt) is apt's documented fallback and matches Debian without sqv.
+rm -f "$DEST/usr/lib/apt/methods/sqv"
 
 mkdir -p "$DEST/usr/lib/dpkg/methods"
 if [[ -d /usr/lib/dpkg/methods/apt ]]; then
@@ -231,6 +236,8 @@ Dir::Bin::xz "/usr/bin/xz";
 Dir::Bin::lz4 "/usr/bin/lz4";
 Dir::Bin::zstd "/usr/bin/zstd";
 Dir::Bin::lzma "/usr/bin/xz";
+Dir::Bin::gpgv "/usr/bin/gpgv";
+APT::Key::GPGVCommand "/usr/bin/gpgv";
 Acquire::Languages "none";
 Acquire::ForceIPv4 "true";
 Acquire::ForceIPv6 "false";
@@ -241,9 +248,11 @@ Acquire::http::Timeout "20";
 Acquire::https::Timeout "20";
 Acquire::Retries "5";
 Dir::Cache "/var/cache/apt/";
-APT::Cache-Start "134217728";
+APT::Install-Recommends "false";
+APT::Install-Suggests "false";
+APT::Cache-Start "33554432";
 APT::Cache-Grow "16777216";
-APT::Cache-Limit "268435456";
+APT::Cache-Limit "134217728";
 Dpkg::Use-Pty "false";
 DPkg::Inhibit-Shutdown "false";
 DPkg::FlushSTDIN "false";
@@ -257,13 +266,13 @@ Types: deb
 URIs: http://deb.debian.org/debian
 Suites: trixie trixie-updates
 Components: main contrib non-free-firmware
-Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp
 
 Types: deb
 URIs: http://security.debian.org/debian-security
 Suites: trixie-security
 Components: main contrib non-free-firmware
-Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp
 EOF
 
 # Fresh dpkg database — do NOT copy the host's full status (thousands of pkgs).
@@ -272,6 +281,15 @@ EOF
 # not "broken" (libssl3t64 → openssl-provider-legacy).
 : > "$DEST/var/lib/dpkg/status"
 : > "$DEST/var/lib/dpkg/available"
+# Previous usrmerge left ../../../lib/... SONAME cycles under /usr/lib.
+for gnu in "$DEST/lib/x86_64-linux-gnu" "$DEST/usr/lib/x86_64-linux-gnu"; do
+    [[ -d "$gnu" ]] || continue
+    find "$gnu" -maxdepth 1 -type l -print0 2>/dev/null | while IFS= read -r -d '' l; do
+        if [[ ! -e "$l" ]]; then
+            rm -f "$l"
+        fi
+    done
+done
 python3 - "$DEST" <<'PY'
 import os, re, subprocess, sys
 
@@ -358,7 +376,11 @@ for pkg, _ in seen:
                 tgt = ""
             if "busybox" in tgt:
                 continue
-        subprocess.check_call(["cp", "-a", src, dst])
+            os.remove(dst)
+        copy = ["cp", "-aL", src, dst] if (
+            src.startswith("/lib/") or src.startswith("/usr/lib/") or os.path.islink(src)
+        ) else ["cp", "-a", src, dst]
+        subprocess.check_call(copy)
         copied += 1
 
 print(f"dpkg-status-seed pkgs={len(seen)} files={copied}")
@@ -383,6 +405,22 @@ libdir = os.path.join(dest, "lib/x86_64-linux-gnu")
 usrdir = os.path.join(dest, "usr/lib/x86_64-linux-gnu")
 os.makedirs(libdir, exist_ok=True)
 os.makedirs(usrdir, exist_ok=True)
+
+def drop_bad_link(path):
+    if not os.path.islink(path):
+        return
+    try:
+        os.stat(path)
+    except OSError:
+        os.remove(path)
+
+for d in (libdir, usrdir):
+    try:
+        names = os.listdir(d)
+    except OSError:
+        continue
+    for name in names:
+        drop_bad_link(os.path.join(d, name))
 
 def readelf_d(path):
     return subprocess.check_output(["readelf", "-d", path], text=True, stderr=subprocess.DEVNULL)
@@ -465,17 +503,24 @@ while queue:
         base = os.path.basename(f)
         soname = sonames[0] if sonames else base
         dest_file = os.path.join(libdir, base)
-        if not os.path.exists(dest_file):
-            subprocess.check_call(["cp", "-a", f, dest_file])
+        if os.path.islink(dest_file):
+            os.remove(dest_file)
+        if not os.path.isfile(dest_file):
+            subprocess.check_call(["cp", "-aL", f, dest_file])
             copied += 1
             print(f"  + /lib/x86_64-linux-gnu/{base}")
         if soname != base:
-            link = os.path.join(libdir, soname)
-            if not os.path.exists(link) and not os.path.lexists(link):
-                os.symlink(base, link)
-        usr_link = os.path.join(usrdir, soname)
-        if not os.path.exists(usr_link) and not os.path.lexists(usr_link):
-            os.symlink(os.path.join("../../../lib/x86_64-linux-gnu", soname), usr_link)
+            # Same-directory SONAME. ../../../lib/... breaks after /lib -> usr/lib.
+            for link in (os.path.join(libdir, soname), os.path.join(usrdir, soname)):
+                if os.path.islink(link) or (os.path.lexists(link) and not os.path.isfile(link)):
+                    try:
+                        os.stat(link)
+                    except OSError:
+                        os.remove(link)
+                if os.path.islink(link) and not os.path.exists(link):
+                    os.remove(link)
+                if not os.path.lexists(link):
+                    os.symlink(base, link)
     for n in needed:
         r = resolve(n)
         if r:
@@ -486,6 +531,108 @@ while queue:
 
 print(f"copied-libs={copied} elf-roots={len(roots)}")
 PY
+
+# Debian trixie refuses unmerged /bin vs /usr/bin (different inodes).
+# Keep GNU tools in /usr/*; move leftover BusyBox applets, then symlink.
+merge_usr_tree() {
+    local src="$1"
+    local dst="$2"
+    mkdir -p "$dst"
+    local f
+    shopt -s nullglob
+    for f in "$src"/*; do
+        [[ -e "$f" || -L "$f" ]] || continue
+        local base
+        base="$(basename "$f")"
+        if [[ -d "$f" && ! -L "$f" ]]; then
+            merge_usr_tree "$f" "$dst/$base"
+        elif [[ -L "$dst/$base" ]]; then
+            # Prefer a real file (or a working symlink) over a dangling
+            # ../../../lib/... leftover from the unmerged layout.
+            if [[ ! -e "$dst/$base" ]] || [[ -f "$f" && ! -L "$f" ]]; then
+                rm -f "$dst/$base"
+                mv "$f" "$dst/$base"
+            fi
+        elif [[ ! -e "$dst/$base" && ! -L "$dst/$base" ]]; then
+            mv "$f" "$dst/$base"
+        fi
+    done
+}
+
+merge_usr_dir() {
+    local abs="$1"
+    local rel="$2"
+    local src="$DEST$abs"
+    local dst="$DEST/$rel"
+    mkdir -p "$dst"
+    if [[ -L "$src" ]]; then
+        return 0
+    fi
+    if [[ ! -d "$src" ]]; then
+        if [[ ! -e "$src" ]]; then
+            ln -s "$rel" "$src"
+        fi
+        return 0
+    fi
+    merge_usr_tree "$src" "$dst"
+    rm -rf "$src"
+    ln -s "$rel" "$src"
+    log "usrmerge $abs -> $rel"
+}
+
+merge_usr_dir /lib usr/lib
+if [[ -e "$DEST/lib64" || -L "$DEST/lib64" || -d "$DEST/usr/lib64" ]]; then
+    merge_usr_dir /lib64 usr/lib64
+fi
+merge_usr_dir /sbin usr/sbin
+merge_usr_dir /bin usr/bin
+
+# Rewrite leftover ../../../lib/x86_64-linux-gnu/SONAME links to same-dir
+# names, and copy any still-missing objects from the host (ld-linux, libc).
+repair_gnu_lib_links() {
+    local dir="$DEST/usr/lib/x86_64-linux-gnu"
+    local host=""
+    local f base tgt
+    [[ -d "$dir" ]] || return 0
+    if [[ -d /usr/lib/x86_64-linux-gnu ]]; then
+        host=/usr/lib/x86_64-linux-gnu
+    elif [[ -d /lib/x86_64-linux-gnu ]]; then
+        host=/lib/x86_64-linux-gnu
+    fi
+    shopt -s nullglob
+    for f in "$dir"/*; do
+        [[ -L "$f" ]] || continue
+        [[ -e "$f" ]] && continue
+        base="$(basename "$f")"
+        tgt="$(readlink "$f")"
+        tgt="${tgt##*/}"
+        if [[ -n "$tgt" && -e "$dir/$tgt" ]]; then
+            rm -f "$f"
+            ln -s "$tgt" "$f"
+            continue
+        fi
+        if [[ -n "$host" && -e "$host/$base" ]]; then
+            rm -f "$f"
+            cp -aL "$host/$base" "$f" 2>/dev/null || cp -a "$host/$base" "$f"
+        fi
+    done
+    mkdir -p "$DEST/usr/lib64"
+    if [[ ! -e "$DEST/usr/lib64/ld-linux-x86-64.so.2" ]]; then
+        if [[ -e "$dir/ld-linux-x86-64.so.2" ]]; then
+            ln -s "../lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" \
+                "$DEST/usr/lib64/ld-linux-x86-64.so.2"
+        elif [[ -e /lib64/ld-linux-x86-64.so.2 ]]; then
+            cp -aL /lib64/ld-linux-x86-64.so.2 "$DEST/usr/lib64/ld-linux-x86-64.so.2"
+        elif [[ -e /usr/lib64/ld-linux-x86-64.so.2 ]]; then
+            cp -aL /usr/lib64/ld-linux-x86-64.so.2 "$DEST/usr/lib64/ld-linux-x86-64.so.2"
+        fi
+    fi
+    if [[ ! -e "$DEST/usr/lib64/ld-linux-x86-64.so.2" ]]; then
+        log "ERROR: missing ld-linux-x86-64.so.2 after usrmerge"
+        exit 1
+    fi
+}
+repair_gnu_lib_links
 
 log "populated $DEST"
 log "dpkg=$(file -b "$DEST/usr/bin/dpkg" | cut -c1-60)"

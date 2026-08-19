@@ -16,34 +16,32 @@
 #include <isofs.h>
 #include <squashfs.h>
 #include <overlayfs.h>
+#include <ns.h>
+#include <cgroup.h>
 
 #ifndef EIO
 #define EIO 5
 #endif
 
 #define MAX_FS_DRIVERS 16
-#define MAX_FS_MOUNTS 16
 
 static struct fs_driver *g_drivers[MAX_FS_DRIVERS];
 static int g_drivers_count = 0;
-struct mount_entry {
-        char path[64];
-        size_t path_len;
-        struct fs_driver *driver;
-};
-
-static struct mount_entry g_mounts[MAX_FS_MOUNTS];
-static int g_mount_count = 0;
 
 int fs_mount_count(void) {
-        return g_mount_count;
+        int *cnt = NULL;
+        (void)ns_mnt_vec(&cnt);
+        return cnt ? *cnt : 0;
 }
 
 int fs_mount_get(int index, char *out_path, size_t out_path_len, char *out_fs_name, size_t out_fs_name_len) {
-        if (index < 0 || index >= g_mount_count) return -1;
+        int *cnt = NULL;
+        struct ns_mount *vec = ns_mnt_vec(&cnt);
+        struct ns_mount *m;
+        if (!cnt || index < 0 || index >= *cnt || !vec) return -1;
         if (!out_path || out_path_len == 0 || !out_fs_name || out_fs_name_len == 0) return -1;
 
-        struct mount_entry *m = &g_mounts[index];
+        m = &vec[index];
         if (!m->driver || !m->driver->ops || !m->driver->ops->name) return -1;
 
         size_t plen = strlen(m->path);
@@ -65,6 +63,8 @@ int fs_get_mount_children(const char *dir_path, char names[][64], int max_count)
         /* normalize dir_path into a small fixed buffer */
         char dir[64];
         size_t dlen = strlen(dir_path);
+        int *cnt = NULL;
+        struct ns_mount *vec = ns_mnt_vec(&cnt);
         if (dlen == 0) return 0;
         if (dlen >= sizeof(dir)) dlen = sizeof(dir) - 1;
         memcpy(dir, dir_path, dlen);
@@ -77,16 +77,17 @@ int fs_get_mount_children(const char *dir_path, char names[][64], int max_count)
         if (dlen == 0) { dir[0] = '/'; dir[1] = '\0'; dlen = 1; }
 
         int out = 0;
-        for (int i = 0; i < g_mount_count && out < max_count; i++) {
-                if (!g_mounts[i].driver) continue;
-                if (g_mounts[i].path[0] != '/') continue;
+        int mount_count = cnt ? *cnt : 0;
+        for (int i = 0; i < mount_count && out < max_count; i++) {
+                if (!vec[i].driver) continue;
+                if (vec[i].path[0] != '/') continue;
 
                 /* normalize mount path (strip trailing slashes) */
                 char mp[64];
-                size_t mlen = g_mounts[i].path_len;
+                size_t mlen = vec[i].path_len;
                 if (mlen == 0) continue;
                 if (mlen >= sizeof(mp)) mlen = sizeof(mp) - 1;
-                memcpy(mp, g_mounts[i].path, mlen);
+                memcpy(mp, vec[i].path, mlen);
                 mp[mlen] = '\0';
                 while (mlen > 1 && mp[mlen - 1] == '/') {
                         mp[mlen - 1] = '\0';
@@ -178,8 +179,11 @@ static struct fs_driver *fs_match_mount(const char *path) {
         size_t path_len = strlen(path);
         struct fs_driver *best = NULL;
         size_t best_len = 0;
-        for (int i = 0; i < g_mount_count; i++) {
-                struct mount_entry *m = &g_mounts[i];
+        int *cnt = NULL;
+        struct ns_mount *vec = ns_mnt_vec(&cnt);
+        int mount_count = cnt ? *cnt : 0;
+        for (int i = 0; i < mount_count; i++) {
+                struct ns_mount *m = &vec[i];
                 if (!m->driver) continue;
                 if (!fs_mount_covers_path(path, path_len, m->path, m->path_len))
                         continue;
@@ -201,8 +205,11 @@ struct fs_driver *fs_get_mount_driver_exact(const char *path) {
         size_t len = strlen(path);
         while (len > 1 && path[len - 1] == '/')
                 len--;
-        for (int i = 0; i < g_mount_count; i++) {
-                struct mount_entry *m = &g_mounts[i];
+        int *cnt = NULL;
+        struct ns_mount *vec = ns_mnt_vec(&cnt);
+        int mount_count = cnt ? *cnt : 0;
+        for (int i = 0; i < mount_count; i++) {
+                struct ns_mount *m = &vec[i];
                 if (!m->driver) continue;
                 if (m->path_len != len) continue;
                 if (strncmp(m->path, path, len) == 0)
@@ -216,8 +223,11 @@ int fs_get_mount_index(const char *path) {
         size_t path_len = strlen(path);
         size_t best_len = 0;
         int best = -1;
-        for (int i = 0; i < g_mount_count; i++) {
-                struct mount_entry *m = &g_mounts[i];
+        int *cnt = NULL;
+        struct ns_mount *vec = ns_mnt_vec(&cnt);
+        int mount_count = cnt ? *cnt : 0;
+        for (int i = 0; i < mount_count; i++) {
+                struct ns_mount *m = &vec[i];
                 if (!m->driver) continue;
                 if (!fs_mount_covers_path(path, path_len, m->path, m->path_len))
                         continue;
@@ -244,11 +254,14 @@ static int fs_file_matches_driver(const struct fs_driver *drv, const struct fs_f
 
 int fs_get_mount_path(const struct fs_driver *drv, char *out, size_t outlen) {
         if (!drv || !out || outlen == 0) return -1;
-        for (int i = 0; i < g_mount_count; i++) {
-                if (g_mounts[i].driver == drv) {
-                        size_t len = g_mounts[i].path_len;
+        int *cnt = NULL;
+        struct ns_mount *vec = ns_mnt_vec(&cnt);
+        int mount_count = cnt ? *cnt : 0;
+        for (int i = 0; i < mount_count; i++) {
+                if (vec[i].driver == drv) {
+                        size_t len = vec[i].path_len;
                         if (len >= outlen) return -1;
-                        memcpy(out, g_mounts[i].path, len);
+                        memcpy(out, vec[i].path, len);
                         out[len] = '\0';
                         return 0;
                 }
@@ -263,8 +276,11 @@ int fs_get_matching_mount_prefix(const char *path, char *out, size_t outlen) {
         size_t path_len = strlen(path);
         size_t best_len = 0;
         const char *best = NULL;
-        for (int i = 0; i < g_mount_count; i++) {
-                struct mount_entry *m = &g_mounts[i];
+        int *cnt = NULL;
+        struct ns_mount *vec = ns_mnt_vec(&cnt);
+        int mount_count = cnt ? *cnt : 0;
+        for (int i = 0; i < mount_count; i++) {
+                struct ns_mount *m = &vec[i];
                 if (!m->driver) continue;
                 if (!fs_mount_covers_path(path, path_len, m->path, m->path_len))
                         continue;
@@ -305,24 +321,29 @@ int fs_unregister_driver(struct fs_driver *drv) {
 int fs_mount(const char *path, struct fs_driver *drv) {
         if (!path || !drv) return -1;
         size_t len = strlen(path);
-        if (len == 0 || len >= sizeof(g_mounts[0].path)) return -1;
+        int *cnt = NULL;
+        struct ns_mount *vec = ns_mnt_vec(&cnt);
+        int mount_count;
+        if (len == 0 || len >= sizeof(vec[0].path)) return -1;
+        mount_count = cnt ? *cnt : 0;
         /* Linux: remounting the same fstype on the same path is a no-op success for
          * our virtual mounts; a different driver on a busy mountpoint is EBUSY. */
-        for (int i = 0; i < g_mount_count; i++) {
-                if (g_mounts[i].path_len == len && strcmp(g_mounts[i].path, path) == 0) {
-                        if (g_mounts[i].driver == drv)
+        for (int i = 0; i < mount_count; i++) {
+                if (vec[i].path_len == len && strcmp(vec[i].path, path) == 0) {
+                        if (vec[i].driver == drv)
                                 return 0;
                         return -1; /* busy: something else already mounted here */
                 }
         }
-        if (g_mount_count >= MAX_FS_MOUNTS) return -1;
+        if (mount_count >= NS_MNT_MAX) return -1;
 
         // Make mountpoint visible in ramfs directory listings
         fs_ensure_ramfs_mountpoint_dir(path);
-        strcpy(g_mounts[g_mount_count].path, path);
-        g_mounts[g_mount_count].path_len = len;
-        g_mounts[g_mount_count].driver = drv;
-        g_mount_count++;
+        strcpy(vec[mount_count].path, path);
+        vec[mount_count].path_len = len;
+        vec[mount_count].driver = drv;
+        if (cnt)
+                (*cnt)++;
         return 0;
 }
 
@@ -347,14 +368,17 @@ int fs_mkdir(const char *path) {
 
 int fs_unmount(const char *path) {
         if (!path) return -1;
-        for (int i = 0; i < g_mount_count; i++) {
-                if (strcmp(g_mounts[i].path, path) == 0) {
-                        // remove this mount by shifting remaining entries
-                        for (int j = i; j + 1 < g_mount_count; j++) g_mounts[j] = g_mounts[j+1];
-                        // clear last
-                        g_mounts[--g_mount_count].driver = NULL;
-                        g_mounts[g_mount_count].path[0] = '\0';
-                        g_mounts[g_mount_count].path_len = 0;
+        int *cnt = NULL;
+        struct ns_mount *vec = ns_mnt_vec(&cnt);
+        int mount_count = cnt ? *cnt : 0;
+        for (int i = 0; i < mount_count; i++) {
+                if (strcmp(vec[i].path, path) == 0) {
+                        for (int j = i; j + 1 < mount_count; j++) vec[j] = vec[j+1];
+                        vec[--mount_count].driver = NULL;
+                        vec[mount_count].path[0] = '\0';
+                        vec[mount_count].path_len = 0;
+                        if (cnt)
+                                *cnt = mount_count;
                         return 0;
                 }
         }
@@ -648,6 +672,9 @@ struct fs_file *fs_open(const char *path) {
                 if (sr == 0 && (st.st_mode & S_IFLNK) != S_IFLNK) {
                         return f;  /* regular file or dir, no resolution needed */
                 }
+                /* Linux nsfs: open(/proc/pid/ns/X) does not follow the magic link. */
+                if (sr == 0 && ns_path_is_proc_ns(path))
+                        return f;
                 /* Symlink, or stat failed (driver didn't fill st_mode): resolve before returning.
                    ld.so open()+read() on an unresolved symlink reads the link text, not the ELF. */
                 fs_file_free(f);
@@ -921,6 +948,8 @@ int vfs_fstat(struct fs_file *file, struct stat *st) {
                         if (ramfs_fill_stat(file, st) == 0) goto fix_mode;
                 } else if (name && strcmp(name, "procfs") == 0) {
                         if (procfs_fill_stat(file, st) == 0) goto fix_mode;
+                } else if (name && strcmp(name, "cgroup2") == 0) {
+                        if (cgroupfs_fill_stat(file, st) == 0) goto fix_mode;
                 } else if (name && strcmp(name, "devfs") == 0) {
                         if (devfs_fill_stat(file, st) == 0) goto fix_mode;
                 } else if (name && strcmp(name, "squashfs") == 0) {

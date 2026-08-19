@@ -31,6 +31,9 @@ struct stat {
 #ifndef FB_MAJOR
 #define FB_MAJOR 29
 #endif
+#ifndef DRM_MAJOR
+#define DRM_MAJOR 226
+#endif
 
 /* File type macros */
 #ifndef S_IFDIR

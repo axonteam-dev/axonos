@@ -14,6 +14,7 @@
 #include <debug.h>
 #include <klog.h>
 #include <fbdev.h>
+#include <frame.h>
 #include <string.h>
 #include <axonos.h>
 
@@ -31,6 +32,8 @@ enum {
     MAP_ANONYMOUS = 0x20,
     MAP_PRIVATE = 0x02,
     MAP_SHARED = 0x01,
+    MAP_DROPPABLE = 0x08, /* Linux 6.11; glibc may pass with ANON|PRIVATE */
+    MAP_32BIT = 0x40,
     MAP_GROWSDOWN = 0x0100,
     MAP_DENYWRITE = 0x0800,
     MAP_EXECUTABLE = 0x1000,
@@ -42,13 +45,18 @@ enum {
     MAP_HUGETLB = 0x40000,
     MAP_SYNC = 0x80000,
     MAP_FIXED_NOREPLACE = 0x100000,
+    MAP_UNINITIALIZED = 0x4000000,
 };
 
-/* Linux treats these as hints / bookkeeping; ignore after anon install. */
+/*
+ * Linux calc_vm_flag_bits() only copies known bits. Returning ENOSYS for
+ * leftover flags made glibc malloc() return NULL → xz LZMA_MEM_ERROR.
+ */
 enum {
     MAP_IGNORABLE = MAP_GROWSDOWN | MAP_DENYWRITE | MAP_EXECUTABLE |
                     MAP_LOCKED | MAP_NORESERVE | MAP_POPULATE | MAP_NONBLOCK |
-                    MAP_STACK | MAP_HUGETLB | MAP_SYNC
+                    MAP_STACK | MAP_HUGETLB | MAP_SYNC | MAP_32BIT |
+                    MAP_DROPPABLE | MAP_UNINITIALIZED
 };
 
 static int user_mmap_unmap_pages(thread_t *t, uintptr_t addr, size_t len) {
@@ -81,18 +89,40 @@ static int user_mmap_install_pages(uintptr_t addr, size_t len, uintptr_t top_lim
         return -1;
     /*
      * MAP_SHARED anon must stay coherent across fork (nginx accept mutex /
-     * slab zones). Use identity VA==PA leaves; fork + #PF keep them shared.
+     * slab zones). Install Soft_OWNED 4K frames — not identity 2MiB.
+     * map_page_2m() is a no-op when a leftover L1 exists (munmap of a prior
+     * private mapping), so the next userspace store #PF-livelocks.
      * MAP_PRIVATE: never identity-map into a private mm (ash GPF after fork).
      */
     if (shared_mapping) {
-        uintptr_t map_begin = addr & ~((uintptr_t)PAGE_SIZE_2M - 1);
-        uintptr_t map_end = (uintptr_t)(((uint64_t)addr + (uint64_t)len + PAGE_SIZE_2M - 1) &
-                                        ~((uint64_t)PAGE_SIZE_2M - 1));
-        if (map_begin >= map_end || map_end > top_limit)
+        thread_t *t = thread_get_current_user();
+        mm_t *k = mm_kernel();
+        mm_t *share;
+        uint64_t va;
+
+        if (!t)
+            t = thread_current();
+        if (!t || !t->mm || !k || !t->mm->pml4 || t->mm->pml4 == k->pml4)
             return -1;
-        for (uintptr_t va = map_begin; va < map_end; va += PAGE_SIZE_2M) {
-            if (map_page_2m(va, va, PG_PRESENT | PG_RW | PG_US) != 0)
+        share = t->mm_ptemplate ? t->mm_ptemplate : k;
+        if (!share || !share->pml4)
+            return -1;
+        if (mm_unmap_user_range(t->mm, share->pml4, req_lo, req_hi) != 0)
+            return -1;
+        for (va = req_lo; va < req_hi; va += 0x1000ULL) {
+            void *frame = frame_alloc_zero();
+            uint64_t pa;
+            uint64_t flags;
+
+            if (!frame)
                 return -1;
+            pa = (uint64_t)(uintptr_t)frame;
+            flags = PG_PRESENT | PG_RW | PG_US | PG_SOFT_OWNED | PG_NX;
+            if (mm_map_user_page(t->mm, va, pa, flags) != 0) {
+                frame_release(pa);
+                return -1;
+            }
+            invlpg((void *)(uintptr_t)va);
         }
         return 0;
     }
@@ -604,7 +634,7 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
          * and docker's pthread_create never reached clone. */
         flags &= ~(MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED | MAP_FIXED |
                    MAP_FIXED_NOREPLACE | MAP_IGNORABLE);
-        if (flags != 0) return user_mm_ret_err(USER_MM_ENOSYS);
+        /* Unknown leftover bits are ignored (Linux do_mmap). */
         if (!reserve_only)
             user_as_mmap_memset_zero_chunked(addr, len);
     } else if (!file_lazy) {
@@ -689,13 +719,13 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     if (file_lazy) {
         if (user_vma_add_file(vtid, addr, len, prot & 7, mmap_vma_kind,
                               file_lazy_f, file_lazy_off) != 0)
-            return user_mm_ret_err(USER_MM_ENOSPC);
+            return user_mm_ret_err(USER_MM_ENOMEM);
     } else if (eager_file) {
         if (user_vma_add_file(vtid, addr, len, prot & 7, mmap_vma_kind,
                               eager_file, eager_file_off) != 0)
-            return user_mm_ret_err(USER_MM_ENOSPC);
+            return user_mm_ret_err(USER_MM_ENOMEM);
     } else if (user_vma_add(vtid, addr, len, prot & 7, mmap_vma_kind) != 0) {
-        return user_mm_ret_err(USER_MM_ENOSPC);
+        return user_mm_ret_err(USER_MM_ENOMEM);
     }
 
     uint64_t sum_next = (uint64_t)addr + len_u64;

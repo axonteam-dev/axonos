@@ -41,9 +41,16 @@ typedef struct {
     uint32_t snd_nxt;
     uint32_t syn_isn;    /* initial seq for outbound SYN (connect handshake) */
     uint32_t rcv_nxt;
-    /* Bigger receive window for HTTP downloads; 8 KiB caused frequent sender stalls. */
-    uint8_t rx_buf[65536];
+    /*
+     * Linux sk_rcvbuf (net.ipv4.tcp_rmem default ~128KiB–256KiB), allocated
+     * on connect. An inline 64KiB window without RFC 7323 scaling truncated
+     * debian trixie InRelease (~140KiB) so apt-secure saw "No good signature".
+     */
+    uint8_t *rx_buf;
+    size_t rx_cap;
     size_t rx_len;
+    uint8_t rcv_wscale; /* announced on SYN; encodes wnd in tcp_hdr */
+    uint8_t snd_wscale; /* peer's scale from SYN-ACK (unused for TX yet) */
     /*
      * Bounded selective reassembly queue. A single saved segment cannot
      * represent normal VMware/NAT reordering and used to silently lose tails
@@ -79,8 +86,22 @@ int net_tcp_send(net_tcp_conn_t *c, const net_tcp_ops_t *ops, const uint8_t *dat
 int net_tcp_flush_tx(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t timeout_ms);
 int net_tcp_recv(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t *out, size_t cap, uint32_t timeout_ms);
 int net_tcp_close(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t timeout_ms);
-/* Drop handshake/FIN/RST flags without wiping the 64KiB receive buffer. */
+/* Drop handshake/FIN/RST flags; releases sk_rcvbuf. */
 void net_tcp_reset(net_tcp_conn_t *c);
+/* Release sk_rcvbuf then memset — use instead of memset(&tcp, 0). */
+void net_tcp_conn_clear(net_tcp_conn_t *c);
+/* Linux tcp_init_sock: allocate sk_rcvbuf (256KiB, fallback 128/64). */
+int net_tcp_rx_ensure(net_tcp_conn_t *c);
+void net_tcp_rx_release(net_tcp_conn_t *c);
+/* Drop the pointer without kfree (accept() steals the request_sock buffer). */
+void net_tcp_rx_orphan(net_tcp_conn_t *c);
 int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget);
 /* Tell peer receive window opened after application read() drains rx_buf. */
 int net_tcp_window_update(net_tcp_conn_t *c, const net_tcp_ops_t *ops);
+
+static inline size_t net_tcp_rx_room(const net_tcp_conn_t *c)
+{
+    if (!c || !c->rx_buf || c->rx_len >= c->rx_cap)
+        return 0;
+    return c->rx_cap - c->rx_len;
+}

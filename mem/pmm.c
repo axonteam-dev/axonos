@@ -82,7 +82,14 @@ void *pmm_alloc_page(void)
     acquire_irqsave(&pmm_lock, &irqf);
     page = pmm_free_head;
     if (!page) {
+        static int oom_once;
+        size_t total = pmm_total;
         release_irqrestore(&pmm_lock, irqf);
+        if (!oom_once) {
+            oom_once = 1;
+            kprintf("pmm: out of pages (arena %llu MiB) -- user mmap/fork/xz will ENOMEM\n",
+                    (unsigned long long)((total * (size_t)PAGE_SIZE_4K) / (1024ull * 1024ull)));
+        }
         return NULL;
     }
     pmm_free_head = *(uintptr_t *)(void *)page;

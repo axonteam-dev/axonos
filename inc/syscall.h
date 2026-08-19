@@ -123,6 +123,8 @@ typedef struct syscall_frame {
 #define SYS_shmdt   67
 #define SYS_mount   165
 #define SYS_umount2 166
+#define SYS_unshare 272
+#define SYS_setns   308
 #define SYS_rt_sigtimedwait 128
 #define SYS_clock_nanosleep 230
 #define SYS_select  23

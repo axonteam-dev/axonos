@@ -141,6 +141,11 @@ int mm_clear_range_private(mm_t *mm, uint64_t *share_l4, uint64_t va_begin, uint
  * share_l4 is the fork/exec baseline used to break shared page-table paths. */
 int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
                         uint64_t va_begin, uint64_t va_end);
+/* Drop demoted identity leftovers (pa==va, !SOFT_OWNED) in [va_begin,va_end).
+ * Keeps Soft_OWNED fork COW frames.  Used after copy_page_range so lazy
+ * file/anon holes #PF as !present (filemap_fault / do_anonymous_page). */
+int mm_punch_identity_leftovers(mm_t *mm, uint64_t *share_l4,
+                                uint64_t va_begin, uint64_t va_end);
 
 /* Install one 4KiB user leaf. Caller consumed a frame ref as PG_SOFT_OWNED
  * (frame_release the PA if this returns non-zero). */

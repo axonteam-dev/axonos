@@ -255,22 +255,33 @@ int ramfs_symlink(const char *path, const char *target) {
 }
 
 /* Create hard link: newpath will point to same inode as oldpath. */
-int ramfs_link(const char *oldpath, const char *newpath) {
-    if (!oldpath || oldpath[0] != '/' || !newpath || newpath[0] != '/') return -1;
-    /* resolve oldpath (follow symlinks) to get target node */
-    struct ramfs_node *target = ramfs_lookup(oldpath);
-    if (!target) return -2;
-    if (target->is_dir) return -1; /* EPERM: cannot link directory */
-    if (target->link_target) target = target->link_target; /* resolve if oldpath is itself a link */
+static int ramfs_link_inode(struct ramfs_node *target, const char *newpath)
+{
+    size_t new_len;
+    char *tmp;
+    char *slash;
+    const char *parent_path;
+    char *name;
+    struct ramfs_node *parent;
+    struct ramfs_node *link;
+    size_t nlen;
+    unsigned long irqf = 0;
 
-    /* get parent and basename of newpath */
-    size_t new_len = strlen(newpath);
-    char *tmp = (char*)kmalloc(new_len + 1);
-    if (!tmp) return -5;
+    if (!target || !newpath || newpath[0] != '/')
+        return -1;
+    if (target->is_dir)
+        return -1;
+    if (target->link_target)
+        target = target->link_target;
+
+    new_len = strlen(newpath);
+    tmp = (char *)kmalloc(new_len + 1);
+    if (!tmp)
+        return -5;
     memcpy(tmp, newpath, new_len + 1);
-    char *slash = strrchr(tmp, '/');
-    const char *parent_path = NULL;
-    char *name = NULL;
+    slash = strrchr(tmp, '/');
+    parent_path = NULL;
+    name = NULL;
     if (slash == tmp) {
         parent_path = "/";
         name = slash + 1;
@@ -282,28 +293,81 @@ int ramfs_link(const char *oldpath, const char *newpath) {
         kfree(tmp);
         return -3;
     }
-    if (!name || !name[0]) { kfree(tmp); return -3; }
+    if (!name || !name[0]) {
+        kfree(tmp);
+        return -3;
+    }
 
-    struct ramfs_node *parent = ramfs_lookup(parent_path);
-    if (!parent) { kfree(tmp); return -2; }
-    if (!parent->is_dir) { kfree(tmp); return -3; }
-    if (ramfs_find_child(parent, name)) { kfree(tmp); return -17; } /* EEXIST=17 */
+    parent = ramfs_lookup(parent_path);
+    if (!parent) {
+        kfree(tmp);
+        return -2;
+    }
+    if (!parent->is_dir) {
+        kfree(tmp);
+        return -3;
+    }
 
-    /* allocate link node (minimal: name, parent, next, link_target) */
-    struct ramfs_node *link = (struct ramfs_node*)kmalloc(sizeof(*link));
-    if (!link) { kfree(tmp); return -5; }
+    link = (struct ramfs_node *)kmalloc(sizeof(*link));
+    if (!link) {
+        kfree(tmp);
+        return -5;
+    }
     memset(link, 0, sizeof(*link));
-    size_t nlen = strlen(name) + 1;
-    link->name = (char*)kmalloc(nlen);
-    if (!link->name) { kfree(link); kfree(tmp); return -5; }
+    nlen = strlen(name) + 1;
+    link->name = (char *)kmalloc(nlen);
+    if (!link->name) {
+        kfree(link);
+        kfree(tmp);
+        return -5;
+    }
     memcpy(link->name, name, nlen);
     link->link_target = target;
+    ramfs_tree_lock_acquire(&irqf);
+    if (ramfs_find_child(parent, name)) {
+        ramfs_tree_lock_release(irqf);
+        kfree(link->name);
+        kfree(link);
+        kfree(tmp);
+        return -17;
+    }
     link->parent = parent;
     link->next = parent->children;
     parent->children = link;
     target->nlink++;
+    ramfs_tree_lock_release(irqf);
     kfree(tmp);
     return 0;
+}
+
+int ramfs_link(const char *oldpath, const char *newpath) {
+    struct ramfs_node *target;
+
+    if (!oldpath || oldpath[0] != '/' || !newpath || newpath[0] != '/')
+        return -1;
+    target = ramfs_lookup(oldpath);
+    if (!target)
+        return -2;
+    return ramfs_link_inode(target, newpath);
+}
+
+int ramfs_link_open_file(struct fs_file *file, const char *newpath)
+{
+    struct ramfs_file_handle *fh;
+    struct ramfs_node *target;
+
+    if (!file || !newpath || newpath[0] != '/')
+        return -1;
+    /* ramfs/tmpfs only — overlay wraps a different driver_private. */
+    if (file->fs_private != ramfs_root || !file->driver_private)
+        return -1;
+    if (file->type != FS_TYPE_REG)
+        return -1;
+    fh = (struct ramfs_file_handle *)file->driver_private;
+    target = fh->node;
+    if (!target)
+        return -2;
+    return ramfs_link_inode(target, newpath);
 }
 
 static struct ramfs_node *ramfs_resolve_link(struct ramfs_node *n) {
@@ -429,6 +493,18 @@ static struct ramfs_node *ramfs_find_child(struct ramfs_node *parent, const char
     return NULL;
 }
 
+/* Lookup must take the same lock as create/unlink (Linux d_lookup vs d_lock). */
+static struct ramfs_node *ramfs_find_child_sync(struct ramfs_node *parent, const char *name)
+{
+    unsigned long irqf = 0;
+    struct ramfs_node *c;
+
+    ramfs_tree_lock_acquire(&irqf);
+    c = ramfs_find_child(parent, name);
+    ramfs_tree_lock_release(irqf);
+    return c;
+}
+
 /* Return pointer to next path component within an absolute path string.
    Advances *p. Copies component into out (NUL-terminated).
    Returns 1 if a component was read, 0 if end reached. */
@@ -511,7 +587,7 @@ static struct ramfs_node *ramfs_lookup_nofollow(const char *path) {
         char comp[256];
         int restarted = 0;
         while (ramfs_next_component(&p, comp, sizeof(comp)) && cur) {
-            struct ramfs_node *child = ramfs_find_child(cur, comp);
+            struct ramfs_node *child = ramfs_find_child_sync(cur, comp);
             if (!child) {
                 kfree(curpath);
                 return NULL;
@@ -589,7 +665,7 @@ static struct ramfs_node *ramfs_lookup(const char *path) {
         char comp[256];
         int restarted = 0;
         while (ramfs_next_component(&p, comp, sizeof(comp)) && cur) {
-            struct ramfs_node *child = ramfs_find_child(cur, comp);
+            struct ramfs_node *child = ramfs_find_child_sync(cur, comp);
             if (!child) { kfree(curpath); return NULL; }
             if ((child->mode & S_IFLNK) == S_IFLNK) {
                 /* remaining path (skip slashes) */

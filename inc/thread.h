@@ -147,6 +147,8 @@ typedef struct thread {
         /* Linux TGID copied at process_attach. Kept after SIGCHLD IGN drop so
          * waitpid(fork_pid) still matches when process_t is already gone. */
         int linux_tgid;
+        /* Linux task_struct.real_parent tgid. Slot parent_tid is not TGID. */
+        int linux_ppid;
         /* fork/clone3: unblock child after parent syscall returns (avoid clobbering per-CPU syscall stack). */
         /* Rare CLONE_THREAD deferral only; normal fork uses wake_up_new_task. */
         struct thread *fork_child_to_publish;
@@ -160,6 +162,12 @@ typedef struct thread {
         /* Sticky: last wait4 returned ECHILD. Used to break BusyBox waitfor()
          * when it then kill(own_pid,0) — which succeeds and spins forever. */
         int wait4_last_echild;
+        /* Linux wait_opts from kernel_wait4: captured once at syscall entry.
+         * Re-reading sc_a* after schedule turned waitpid(gpgv) into waitpid(0)
+         * or WNOHANG; apt then unlinked /tmp/apt.* while gpgv still ran. */
+        int wait_upid;
+        int wait_options;
+        uint64_t wait_status_u;
         
         /* exit status encoded like wait(2) returns (status word) */
         int exit_status;

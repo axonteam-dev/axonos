@@ -47,6 +47,9 @@ void fbdev_register_linear(void *kva, uint64_t fb_pa, size_t byte_len,
 	g_fbdev.bpp = bpp;
 	g_fbdev.active = 1;
 	(void)devfs_create_char_node("/dev/fb0", (void *)&fbdev_devfs_tag);
+	/* Linux DRM card node so X/docker probes succeed; fbdev remains the
+	 * real scanout.  access("/dev/dri/card0") must not SKIP axon-tests. */
+	(void)devfs_create_char_node("/dev/dri/card0", (void *)&fbdev_devfs_tag);
 }
 
 void fbdev_unregister(void) {

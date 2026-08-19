@@ -806,7 +806,7 @@ static const int devfs_special_count = sizeof(devfs_special_names) / sizeof(devf
 
 /* Linux-like virtual directories under /dev. Always listed; some start empty. */
 static const char * const devfs_subdir_names[] = {
-    "input", "pts", "shm", "fd", "net",
+    "input", "pts", "shm", "fd", "net", "dri",
 };
 static const int devfs_subdir_count =
     (int)(sizeof(devfs_subdir_names) / sizeof(devfs_subdir_names[0]));
@@ -819,6 +819,7 @@ enum {
     DEVFS_DIR_INPUT = 2,
     DEVFS_DIR_EMPTY = 3, /* shm / fd / net stubs: only . and .. */
     DEVFS_DIR_PTS = 4,   /* /dev/pts — allocated slave names */
+    DEVFS_DIR_DRI = 5,   /* /dev/dri — card0 (fbdev-backed stub) */
 };
 typedef struct {
     int is_dir;
@@ -945,9 +946,12 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
                 h->kind = DEVFS_DIR_INPUT;
             else if (strcmp(devfs_subdir_names[di], "pts") == 0)
                 h->kind = DEVFS_DIR_PTS;
+            else if (strcmp(devfs_subdir_names[di], "dri") == 0)
+                h->kind = DEVFS_DIR_DRI;
             else
                 h->kind = DEVFS_DIR_EMPTY;
-            h->dir_count = (h->kind == DEVFS_DIR_INPUT) ? 1 : 0;
+            h->dir_count = (h->kind == DEVFS_DIR_INPUT ||
+                            h->kind == DEVFS_DIR_DRI) ? 1 : 0;
             f->driver_private = (void*)h;
             f->type = FS_TYPE_DIR;
             f->size = 0;
@@ -1306,6 +1310,40 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 de.rec_len = (uint16_t)rec_len;
                 de.name_len = (uint8_t)namelen;
                 de.file_type = (i < 2) ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
+                memcpy(tmp, &de, 8);
+                memcpy(tmp + 8, nm, namelen);
+                size_t entry_off = ((size_t)offset > pos) ? (size_t)offset - pos : 0;
+                size_t avail = size - written;
+                size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
+                if (tocopy > avail) tocopy = avail;
+                memcpy(out + written, tmp + entry_off, tocopy);
+                written += tocopy;
+                pos += rec_len;
+            }
+            return (ssize_t)written;
+        }
+
+        if (dh->kind == DEVFS_DIR_DRI) {
+            uint8_t *out = (uint8_t*)buf;
+            size_t pos = 0;
+            size_t written = 0;
+            static const char *const names[] = { ".", "..", "card0" };
+            for (int i = 0; i < 3; i++) {
+                const char *nm = names[i];
+                size_t namelen = strlen(nm);
+                size_t rec_len = 8 + namelen;
+                rec_len = (rec_len + 3) & ~3u;
+                if (rec_len < sizeof(struct ext2_dir_entry)) rec_len = sizeof(struct ext2_dir_entry);
+                if (pos + rec_len <= (size_t)offset) { pos += rec_len; continue; }
+                if (written >= size) break;
+                uint8_t tmp[64];
+                memset(tmp, 0, sizeof(tmp));
+                struct ext2_dir_entry de;
+                memset(&de, 0, sizeof(de));
+                de.inode = (uint32_t)(110 + i);
+                de.rec_len = (uint16_t)rec_len;
+                de.name_len = (uint8_t)namelen;
+                de.file_type = (i < 2) ? EXT2_FT_DIR : EXT2_FT_CHRDEV;
                 memcpy(tmp, &de, 8);
                 memcpy(tmp + 8, nm, namelen);
                 size_t entry_off = ((size_t)offset > pos) ? (size_t)offset - pos : 0;
@@ -2411,6 +2449,19 @@ int devfs_fill_stat(struct fs_file *file, struct stat *st) {
         st->st_gid = 0;
         st->st_rdev = MKDEV(FB_MAJOR, 0);
         st->st_size = (off_t)fbdev_byte_len();
+        return 0;
+    }
+
+    /* Linux DRM: major 226, card0 = minor 0 */
+    if (strcmp(p, "/dev/dri/card0") == 0) {
+        st->st_dev = MKDEV(0, 1);
+        st->st_ino = 2101;
+        st->st_mode = (mode_t)(S_IFCHR | 0666);
+        st->st_nlink = 1;
+        st->st_uid = 0;
+        st->st_gid = 0;
+        st->st_rdev = MKDEV(DRM_MAJOR, 0);
+        st->st_size = 0;
         return 0;
     }
 

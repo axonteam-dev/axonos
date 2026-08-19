@@ -111,6 +111,113 @@ static uint16_t tcp_checksum(uint32_t src_ip_be, uint32_t dst_ip_be, const uint8
     return (c == 0) ? 0xFFFFu : c;
 }
 
+/* Linux net/ipv4/tcp.c tcp_select_window_scaling(). */
+static uint8_t tcp_select_window_scaling(size_t space)
+{
+    uint8_t w = 0;
+
+    while (w < 14 && (space >> w) > 65535u)
+        w++;
+    return w;
+}
+
+int net_tcp_rx_ensure(net_tcp_conn_t *c)
+{
+    static const size_t tries[] = {
+        256u * 1024u, 128u * 1024u, 64u * 1024u
+    };
+    unsigned i;
+
+    if (!c)
+        return -1;
+    if (c->rx_buf && c->rx_cap)
+        return 0;
+    for (i = 0; i < 3; i++) {
+        c->rx_buf = (uint8_t *)kmalloc(tries[i]);
+        if (c->rx_buf) {
+            c->rx_cap = tries[i];
+            c->rx_len = 0;
+            c->rcv_wscale = tcp_select_window_scaling(c->rx_cap);
+            return 0;
+        }
+    }
+    c->rx_cap = 0;
+    c->rcv_wscale = 0;
+    return -1;
+}
+
+void net_tcp_rx_release(net_tcp_conn_t *c)
+{
+    if (!c)
+        return;
+    if (c->rx_buf)
+        kfree(c->rx_buf);
+    c->rx_buf = NULL;
+    c->rx_cap = 0;
+    c->rx_len = 0;
+}
+
+void net_tcp_rx_orphan(net_tcp_conn_t *c)
+{
+    if (!c)
+        return;
+    c->rx_buf = NULL;
+    c->rx_cap = 0;
+    c->rx_len = 0;
+}
+
+void net_tcp_conn_clear(net_tcp_conn_t *c)
+{
+    if (!c)
+        return;
+    net_tcp_rx_release(c);
+    memset(c, 0, sizeof(*c));
+}
+
+/* RFC 7323: MSS + NOP + Window Scale (Linux tcp_syn_options). */
+static size_t tcp_syn_options(const net_tcp_conn_t *c, uint8_t *opts, size_t cap)
+{
+    if (!opts || cap < 8)
+        return 0;
+    opts[0] = 0x02;
+    opts[1] = 0x04;
+    opts[2] = 0x05;
+    opts[3] = 0xB4; /* MSS 1460 */
+    opts[4] = 0x01; /* NOP */
+    opts[5] = 0x03; /* TCPOPT_WINDOW */
+    opts[6] = 0x03;
+    opts[7] = c ? (uint8_t)(c->rcv_wscale & 14) : 0;
+    return 8;
+}
+
+/* Linux tcp_parse_options(): only WINDOW from SYN/SYN-ACK. */
+static void tcp_parse_options(net_tcp_conn_t *c, const uint8_t *opt, size_t opt_len)
+{
+    size_t i = 0;
+
+    if (!c || !opt)
+        return;
+    while (i < opt_len) {
+        uint8_t kind = opt[i];
+        uint8_t len;
+
+        if (kind == 0)
+            break;
+        if (kind == 1) {
+            i++;
+            continue;
+        }
+        if (i + 1 >= opt_len)
+            break;
+        len = opt[i + 1];
+        if (len < 2 || i + len > opt_len)
+            break;
+        if (kind == 3 && len == 3)
+            c->snd_wscale = (uint8_t)(opt[i + 2] & 14);
+        i += len;
+    }
+}
+
 static int tcp_send_seg_len(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t flags,
     const uint8_t *payload, size_t payload_len, const uint8_t *opts, size_t opt_len) {
     if (!c || !ops || !ops->send_l4) return -1;
@@ -126,11 +233,14 @@ static int tcp_send_seg_len(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t
     th->ack = be32(c->rcv_nxt);
     th->doff_res = (uint8_t)((hdr_len / 4u) << 4);
     th->flags = flags;
-    size_t free_rx = sizeof(c->rx_buf) - c->rx_len;
-    /* Advertise a true zero window when full — lying with wnd=1 made peers
-     * send bytes we then dropped from the NIC (truncated wget/zip). */
-    uint16_t wnd = (free_rx > 65535u) ? 65535u : (uint16_t)free_rx;
-    th->wnd = be16(wnd);
+    {
+        /* RFC 7323: header window is sk_rcvbuf remainder >> rcv_wscale. */
+        size_t free_rx = net_tcp_rx_room(c);
+        if (c->rcv_wscale)
+            free_rx >>= c->rcv_wscale;
+        uint16_t wnd = (free_rx > 65535u) ? 65535u : (uint16_t)free_rx;
+        th->wnd = be16(wnd);
+    }
     th->csum = 0;
     th->urg = 0;
     if (opt_len > 0 && opts)
@@ -149,8 +259,9 @@ static int tcp_send_seg(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t fla
 }
 
 static int tcp_send_syn(net_tcp_conn_t *c, const net_tcp_ops_t *ops) {
-    static const uint8_t mss_opt[4] = { 0x02, 0x04, 0x05, 0xB4 }; /* MSS 1460 */
-    return tcp_send_seg_len(c, ops, 0x02u, NULL, 0, mss_opt, sizeof(mss_opt));
+    uint8_t opts[8];
+    size_t n = tcp_syn_options(c, opts, sizeof(opts));
+    return tcp_send_seg_len(c, ops, 0x02u, NULL, 0, opts, n);
 }
 
 #define TCP_FRAME_BUF 2048
@@ -185,7 +296,7 @@ static void tcp_try_merge_ooo(net_tcp_conn_t *c, const net_tcp_ops_t *ops) {
             break;
         size_t skip = (size_t)(c->rcv_nxt - c->ooo_seq[best]);
         size_t available = c->ooo_len[best] - skip;
-        size_t room = sizeof(c->rx_buf) - c->rx_len;
+        size_t room = net_tcp_rx_room(c);
         size_t cp = available > room ? room : available;
         if (cp == 0)
             break;
@@ -211,8 +322,10 @@ static void tcp_try_merge_ooo(net_tcp_conn_t *c, const net_tcp_ops_t *ops) {
 
 static size_t tcp_accept_inorder(net_tcp_conn_t *c, uint32_t seq, const uint8_t *payload, size_t payload_len) {
     size_t accepted = 0;
+    if (!c->rx_buf || c->rx_cap == 0)
+        return 0;
     if (seq == c->rcv_nxt) {
-        size_t room = sizeof(c->rx_buf) - c->rx_len;
+        size_t room = net_tcp_rx_room(c);
         size_t cp = (payload_len > room) ? room : payload_len;
         if (cp > 0) {
             memcpy(c->rx_buf + c->rx_len, payload, cp);
@@ -227,7 +340,7 @@ static size_t tcp_accept_inorder(net_tcp_conn_t *c, uint32_t seq, const uint8_t 
         uint32_t skip_u32 = c->rcv_nxt - seq;
         size_t skip = (size_t)skip_u32;
         if (skip < payload_len) {
-            size_t room = sizeof(c->rx_buf) - c->rx_len;
+            size_t room = net_tcp_rx_room(c);
             size_t tail = payload_len - skip;
             size_t cp = (tail > room) ? room : tail;
             if (cp > 0) {
@@ -352,6 +465,9 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
             tcp_return_frame(ops, frame, (size_t)n);
             continue;
         }
+        if ((th->flags & 0x02u) && doff > sizeof(tcp_hdr_t))
+            tcp_parse_options(c, (const uint8_t *)th + sizeof(tcp_hdr_t),
+                              doff - sizeof(tcp_hdr_t));
         size_t payload_len = ip_tot - ihl - doff;
         size_t frame_pay = (size_t)n - (sizeof(eth_hdr_t) + ihl + doff);
         if (payload_len > frame_pay)
@@ -375,9 +491,7 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
                     c->connect_refused = 1;
                 }
             } else if (c->established) {
-                uint32_t wnd = (uint32_t)(sizeof(c->rx_buf) - c->rx_len);
-                if (wnd > 65535u)
-                    wnd = 65535u;
+                uint32_t wnd = (uint32_t)net_tcp_rx_room(c);
                 if (seq == c->rcv_nxt) {
                     rst_ok = 1;
                 } else if (tcp_seq_in_window(seq, c->rcv_nxt, wnd)) {
@@ -428,6 +542,11 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
         }
 
         if (payload_len > 0) {
+            if (net_tcp_rx_ensure(c) != 0) {
+                (void)tcp_send_seg(c, ops, 0x10u, NULL, 0);
+                got = 1;
+                continue;
+            }
             size_t before = c->rx_len;
             if (seq == c->rcv_nxt || !tcp_seq_after(seq, c->rcv_nxt)) {
                 uint32_t rcv_before = c->rcv_nxt;
@@ -496,10 +615,12 @@ int net_tcp_connect(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t dst_ip
                 ops->return_frame(drain, (size_t)dn);
         }
     }
-    /* Preserve L2 next-hop staged by the caller; memset used to wipe it and
-     * left nonblocking SYN retransmits dependent on a global MAC flag. */
+    /* Preserve L2 next-hop and sk_rcvbuf; memset used to wipe both. */
     uint8_t saved_mac[6];
     int saved_mac_valid = c->peer_mac_valid;
+    uint8_t *saved_rx = c->rx_buf;
+    size_t saved_cap = c->rx_cap;
+    uint8_t saved_ws = c->rcv_wscale;
     if (saved_mac_valid)
         memcpy(saved_mac, c->peer_mac, 6);
     memset(c, 0, sizeof(*c));
@@ -507,6 +628,12 @@ int net_tcp_connect(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t dst_ip
         memcpy(c->peer_mac, saved_mac, 6);
         c->peer_mac_valid = 1;
     }
+    c->rx_buf = saved_rx;
+    c->rx_cap = saved_cap;
+    c->rcv_wscale = saved_ws;
+    c->rx_len = 0;
+    if (net_tcp_rx_ensure(c) != 0)
+        return -1;
     c->used = 1;
     c->dst_ip_be = dst_ip_be;
     c->dst_port = dst_port;
@@ -556,7 +683,7 @@ int net_tcp_connect(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t dst_ip
     return net_tcp_connect_poll(c, ops, timeout_ms);
 }
 
-/* Reset control fields without touching the 64KiB rx_buf / OOO payload. */
+/* Reset control fields and drop sk_rcvbuf (Linux tcp_close / tcp_done). */
 void net_tcp_reset(net_tcp_conn_t *c) {
     uint8_t mac[6];
     int mac_ok;
@@ -565,6 +692,7 @@ void net_tcp_reset(net_tcp_conn_t *c) {
     mac_ok = c->peer_mac_valid;
     if (mac_ok)
         memcpy(mac, c->peer_mac, 6);
+    net_tcp_rx_release(c);
     c->used = 0;
     c->established = 0;
     c->connect_pending = 0;
@@ -608,14 +736,19 @@ int net_tcp_server_reply_syn(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32
     c->dst_port = dst_port;
     c->src_port = src_port;
     c->used = 1;
+    if (net_tcp_rx_ensure(c) != 0)
+        return -1;
     c->syn_isn = isn;
     c->snd_una = isn;
     /* SYN-ACK must carry SEQ=ISN; snd_nxt advances to ISN+1 only after the segment is sent. */
     c->snd_nxt = isn;
     c->rcv_nxt = client_seq + 1u;
-    static const uint8_t mss_opt[4] = { 0x02, 0x04, 0x05, 0xB4 };
-    if (tcp_send_seg_len(c, ops, 0x12u, NULL, 0, mss_opt, sizeof(mss_opt)) != 0)
-        return -1;
+    {
+        uint8_t opts[8];
+        size_t n = tcp_syn_options(c, opts, sizeof(opts));
+        if (tcp_send_seg_len(c, ops, 0x12u, NULL, 0, opts, n) != 0)
+            return -1;
+    }
     c->snd_nxt = isn + 1u;
     return 0;
 }
@@ -651,11 +784,14 @@ int net_tcp_server_resend_synack(net_tcp_conn_t *c, const net_tcp_ops_t *ops) {
     if (!c || !c->used || !ops) return -1;
     uint32_t save_snd = c->snd_nxt;
     c->snd_nxt = c->syn_isn;
-    static const uint8_t mss_opt[4] = { 0x02, 0x04, 0x05, 0xB4 };
-    int r = tcp_send_seg_len(c, ops, 0x12u, NULL, 0, mss_opt, sizeof(mss_opt));
-    if (save_snd > c->syn_isn)
-        c->snd_nxt = save_snd;
-    return r;
+    {
+        uint8_t opts[8];
+        size_t n = tcp_syn_options(c, opts, sizeof(opts));
+        int r = tcp_send_seg_len(c, ops, 0x12u, NULL, 0, opts, n);
+        if (save_snd > c->syn_isn)
+            c->snd_nxt = save_snd;
+        return r;
+    }
 }
 
 static void tcp_rexmit_syn_if_due(net_tcp_conn_t *c, const net_tcp_ops_t *ops) {
@@ -668,8 +804,9 @@ static void tcp_rexmit_syn_if_due(net_tcp_conn_t *c, const net_tcp_ops_t *ops) {
     uint32_t save = c->snd_nxt;
     c->snd_nxt = save - 1;
     {
-        static const uint8_t mss_opt[4] = { 0x02, 0x04, 0x05, 0xB4 };
-        (void)tcp_send_seg_len(c, ops, 0x02u, NULL, 0, mss_opt, sizeof(mss_opt));
+        uint8_t opts[8];
+        size_t n = tcp_syn_options(c, opts, sizeof(opts));
+        (void)tcp_send_seg_len(c, ops, 0x02u, NULL, 0, opts, n);
     }
     c->snd_nxt = save;
     c->connect_syn_ms = now;

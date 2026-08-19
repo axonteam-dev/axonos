@@ -65,6 +65,8 @@
 #include <nvme.h>
 #include <e1000.h>
 #include <keyring.h>
+#include <timekeeping.h>
+#include <cgroup.h>
 void ata_dma_init(void);
 void scsi_init(void);
 int pvscsi_init(void);
@@ -422,6 +424,7 @@ void kernel_sysfs_populate_default(void) {
         sysfs_mkdir("/sys/kernel");
         sysfs_mkdir("/sys/class");
         sysfs_mkdir("/sys/bus");
+        sysfs_mkdir("/sys/fs");
         sysfs_mkdir("/sys/devices/system/cpu");
         static const struct sysfs_attr attr_cpu = { sysfs_show_cpu_name_attr, NULL, NULL };
         static const struct sysfs_attr attr_ram = { sysfs_show_ram_mb_attr, NULL, NULL };
@@ -757,7 +760,17 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 {
                         int raise_ok = 1;
                         if (identity_end > 0) {
-                                if (identity_end < (uint64_t)HEAP_ABOVE_USER + (256ULL * 1024ULL * 1024ULL))
+                                /*
+                                 * Park the object heap above USER_STACK_TOP
+                                 * whenever a few dozen MiB remain. 256MiB was
+                                 * too greedy: a VMware "2GiB" guest with SVGA
+                                 * often ends usable RAM at ~1.6–1.8GiB, so
+                                 * raise_ok stayed 0, the heap ate the user
+                                 * mmap window, and dpkg-deb's xz dictionary
+                                 * (8MiB) died with LZMA_MEM_ERROR.
+                                 */
+                                if (identity_end < (uint64_t)HEAP_ABOVE_USER +
+                                    (32ULL * 1024ULL * 1024ULL))
                                         raise_ok = 0;
                         }
                         if (raise_ok && !initrd_high) {
@@ -802,6 +815,12 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 }
                 if (heap_size == 0)
                         heap_size = 64ULL * 1024ULL * 1024ULL;
+                if (heap_start < (uintptr_t)USER_STACK_TOP)
+                        kprintf("warning: kernel heap at %p sits in user VA "
+                                "(identity_end=0x%llx) — mmap window is tiny, "
+                                "apt/xz will ENOMEM; give the VM ≥2GiB\n",
+                                        (void *)heap_start,
+                                        (unsigned long long)identity_end);
                 if (initrd_sz > 0 && (uint64_t)heap_size < (128ULL * 1024ULL * 1024ULL))
                         kprintf("warning: heap %llu MiB may be tight with initfs %llu MiB — increase VM RAM\n",
                                         (unsigned long long)(heap_size / (1024ULL * 1024ULL)),
@@ -829,25 +848,39 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                          * unable to map libstdc++. Keep Linux-like separation
                          * between filesystem cache/object memory and user pages.
                          */
-                        const size_t PMM_MIN = (heap_size > (1024ULL * 1024ULL * 1024ULL))
-                                ? (256ULL * 1024ULL * 1024ULL)
-                                : (64ULL * 1024ULL * 1024ULL);
-                        if (heap_size > PMM_MIN + (128ULL * 1024ULL * 1024ULL)) {
-                                size_t object_heap = heap_size - PMM_MIN;
+                        /*
+                         * User frames (PMM) must cover apt's Packages mmap
+                         * (tens of MiB) plus liblzma's dictionary in
+                         * dpkg-deb (xz -6 is 8MiB; -9 is 64MiB). A 2GiB
+                         * VMware guest parks this arena above the user
+                         * stack (~200–500MiB). The old 1GiB/512MiB
+                         * thresholds left 64MiB of PMM — or skipped the
+                         * carve entirely — and xz printed LZMA_MEM_ERROR
+                         * on hello.deb (53KiB).
+                         */
+                        size_t pmm_want;
+                        if (heap_size >= (512ULL * 1024ULL * 1024ULL))
+                                pmm_want = heap_size / 2u;
+                        else if (heap_size >= (256ULL * 1024ULL * 1024ULL))
+                                pmm_want = (192ULL * 1024ULL * 1024ULL);
+                        else if (heap_size >= (128ULL * 1024ULL * 1024ULL))
+                                pmm_want = (64ULL * 1024ULL * 1024ULL);
+                        else
+                                pmm_want = heap_size / 3u;
+                        if (pmm_want < (32ULL * 1024ULL * 1024ULL))
+                                pmm_want = (32ULL * 1024ULL * 1024ULL);
+                        if (pmm_want + (64ULL * 1024ULL * 1024ULL) > heap_size) {
+                                if (heap_size > (96ULL * 1024ULL * 1024ULL))
+                                        pmm_want = heap_size -
+                                                (64ULL * 1024ULL * 1024ULL);
+                                else
+                                        pmm_want = 0;
+                        }
+                        if (pmm_want >= (16ULL * 1024ULL * 1024ULL) &&
+                            heap_size > pmm_want + (32ULL * 1024ULL * 1024ULL)) {
+                                size_t object_heap = heap_size - pmm_want;
                                 if (object_heap > OBJECT_HEAP_MAX)
                                         object_heap = OBJECT_HEAP_MAX;
-                                /* ramfs/overlay is the writable root. Keep most of the
-                                 * identity arena as objects so unpack is not starved
-                                 * on machines whose usable RAM ends at the 3–4GiB hole. */
-                                if (object_heap * 2u < heap_size) {
-                                        size_t pmm = heap_size / 5u;
-                                        if (pmm < (64ULL * 1024ULL * 1024ULL))
-                                                pmm = (64ULL * 1024ULL * 1024ULL);
-                                        if (heap_size > pmm + (128ULL * 1024ULL * 1024ULL))
-                                                object_heap = heap_size - pmm;
-                                        if (object_heap > OBJECT_HEAP_MAX)
-                                                object_heap = OBJECT_HEAP_MAX;
-                                }
                                 heap_size = object_heap;
                                 heap_init(heap_start, heap_size);
                                 pmm_init(heap_start + heap_size, arena_hi);
@@ -1019,6 +1052,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         }
 
         kprintf("boot: post-timer (smp/pci/threads/initfs)...\n");
+        /* Linux timekeeping_init(): snapshot RTC against the monotonic clock. */
+        timekeeping_init();
         smp_finalize_topology(multiboot_magic, multiboot_info);
 
         pci_init();
@@ -1403,9 +1438,11 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
          * used to mean Grow() died with "Dynamic MMap ran out of room". */
         {
                 static const char apt_cache[] =
-                        "APT::Cache-Start \"134217728\";\n"
+                        "APT::Install-Recommends \"false\";\n"
+                        "APT::Install-Suggests \"false\";\n"
+                        "APT::Cache-Start \"33554432\";\n"
                         "APT::Cache-Grow \"16777216\";\n"
-                        "APT::Cache-Limit \"268435456\";\n"
+                        "APT::Cache-Limit \"134217728\";\n"
                         "Dpkg::Use-Pty \"false\";\n"
                         "DPkg::Inhibit-Shutdown \"false\";\n"
                         "DPkg::FlushSTDIN \"false\";\n"
@@ -1834,6 +1871,14 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         kernel_sysfs_populate_default();
                 else
                         klogprintf("boot: warning: failed to mount /sys\n");
+        }
+        {
+                (void)sysfs_mkdir("/sys/fs");
+                (void)ramfs_mkdir("/sys/fs");
+                (void)ramfs_mkdir("/sys/fs/cgroup");
+                (void)cgroupfs_register();
+                if (cgroupfs_mount("/sys/fs/cgroup") != 0)
+                        klogprintf("boot: warning: failed to mount cgroup2 on /sys/fs/cgroup\n");
         }
         /* Confirm /run is visible the way OpenRC mountinfo reads it. Retry mount
          * here (after /proc) so a transient early failure still leaves tmpfs on

@@ -717,6 +717,34 @@ int mm_clear_range_private(mm_t *mm, uint64_t *share_l4, uint64_t va_begin, uint
  * detail, not a userspace mapping.  Do not punch holes in it unless the leaf
  * is user-accessible.
  */
+static uint64_t mm_unmap_advance_absent(mm_t *mm, uint64_t va, uint64_t end) {
+    uint64_t e4, e3, e2, next;
+    uint64_t *l3, *l2;
+
+    if (!mm || !mm->pml4 || va >= end)
+        return end;
+    e4 = mm->pml4[(va >> 39) & 0x1FF];
+    if (!(e4 & PG_PRESENT) || (e4 & PG_PS_2M) || !pt_page_pa_ok(e4)) {
+        next = (va + (1ULL << 30)) & ~((1ULL << 30) - 1ULL);
+        return (next > va && next < end) ? next : end;
+    }
+    l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
+    e3 = l3[(va >> 30) & 0x1FF];
+    if (!(e3 & PG_PRESENT)) {
+        next = (va + (1ULL << 30)) & ~((1ULL << 30) - 1ULL);
+        return (next > va && next < end) ? next : end;
+    }
+    if ((e3 & PG_PS_2M) || !pt_page_pa_ok(e3))
+        return va;
+    l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
+    e2 = l2[(va >> 21) & 0x1FF];
+    if (!(e2 & PG_PRESENT)) {
+        next = (va + PAGE_SIZE_2M) & ~(PAGE_SIZE_2M - 1ULL);
+        return (next > va && next < end) ? next : end;
+    }
+    return va;
+}
+
 int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
                         uint64_t va_begin, uint64_t va_end) {
     if (!mm || !mm->pml4 || !share_l4 || mm == mm_kernel())
@@ -753,7 +781,8 @@ int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
     for (uint64_t va = begin; va < end; ) {
         uint64_t mapped_pa = 0;
         if (mm_va_leaf_pa(mm, va, &mapped_pa) != 0) {
-            va += PAGE_SIZE_4K;
+            uint64_t skip = mm_unmap_advance_absent(mm, va, end);
+            va = (skip > va) ? skip : (va + PAGE_SIZE_4K);
             continue;
         }
         uint64_t *l2 = NULL;
@@ -783,7 +812,8 @@ int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
     for (uint64_t va = begin; va < end; ) {
         uint64_t mapped_pa = 0;
         if (mm_va_leaf_pa(mm, va, &mapped_pa) != 0) {
-            va += PAGE_SIZE_4K;
+            uint64_t skip = mm_unmap_advance_absent(mm, va, end);
+            va = (skip > va) ? skip : (va + PAGE_SIZE_4K);
             continue;
         }
         uint64_t *l2 = NULL;
@@ -837,6 +867,83 @@ int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
                 if (old & PG_SOFT_OWNED)
                     frame_release(old_pa);
             }
+        }
+        va += PAGE_SIZE_4K;
+    }
+    rc = 0;
+out:
+    mm_leave_direct_map(dm);
+    return rc;
+}
+
+int mm_punch_identity_leftovers(mm_t *mm, uint64_t *share_l4,
+                                uint64_t va_begin, uint64_t va_end) {
+    uint64_t begin, end;
+    mm_dm_ctx_t dm;
+    int rc = -1;
+
+    if (!mm || !mm->pml4 || !share_l4 || mm == mm_kernel())
+        return -1;
+    if (va_end <= va_begin)
+        return 0;
+    if (va_begin < 0x200000ULL)
+        va_begin = 0x200000ULL;
+    if (va_end > (uint64_t)MMIO_IDENTITY_LIMIT)
+        va_end = (uint64_t)MMIO_IDENTITY_LIMIT;
+    if (va_begin >= va_end)
+        return 0;
+    begin = va_begin & ~0xFFFULL;
+    end = (va_end + 0xFFFULL) & ~0xFFFULL;
+    dm = mm_enter_direct_map();
+
+    for (uint64_t va = begin; va < end; ) {
+        uint64_t mapped_pa = 0;
+        uint64_t *l2 = NULL;
+        int l2i = 0;
+        uint64_t *l1 = NULL;
+        uint64_t ent2;
+        uint64_t page2m_lo, page2m_hi;
+
+        if (mm_va_leaf_pa(mm, va, &mapped_pa) != 0) {
+            uint64_t skip = mm_unmap_advance_absent(mm, va, end);
+            va = (skip > va) ? skip : (va + PAGE_SIZE_4K);
+            continue;
+        }
+        if (mm_fork_private_pt_path(mm, share_l4, va, &l2, &l2i, &l1) != 0)
+            goto out;
+        ent2 = l2[l2i];
+        page2m_lo = va & ~((uint64_t)PAGE_SIZE_2M - 1ULL);
+        page2m_hi = page2m_lo + PAGE_SIZE_2M;
+        if (ent2 & PG_PS_2M) {
+            uint64_t leaf2 = ent2 & PG_ADDR_MASK_2M;
+
+            if (ent2 & PG_SOFT_OWNED) {
+                va = page2m_hi;
+                continue;
+            }
+            if (leaf2 != page2m_lo) {
+                va = page2m_hi;
+                continue;
+            }
+            if (begin <= page2m_lo && end >= page2m_hi) {
+                l2[l2i] = 0;
+                va = page2m_hi;
+                continue;
+            }
+            if (split_2m_to_4k(mm, l2, l2i, va) != 0)
+                goto out;
+            if (mm_fork_private_pt_path(mm, share_l4, va, &l2, &l2i, &l1) != 0)
+                goto out;
+            ent2 = l2[l2i];
+            if (ent2 & PG_PS_2M)
+                goto out;
+        }
+        if (l1) {
+            int l1i = (int)((va >> 12) & 0x1FF);
+            uint64_t old = l1[l1i];
+            if ((old & PG_PRESENT) && !(old & PG_SOFT_OWNED) &&
+                ((old & PG_ADDR_MASK) == (va & ~0xFFFULL)))
+                l1[l1i] = 0;
         }
         va += PAGE_SIZE_4K;
     }
@@ -1715,10 +1822,8 @@ static int mm_fork_va_is_primary_stack(uint64_t va) {
 static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
                                   uint64_t *parent_l4, uint64_t owner_tid,
                                   uint64_t va, uint64_t parent_pa,
-                                  uint64_t parent_pte, int protect_parent) {
-    int shared = parent &&
-        (user_vma_is_shared_page_mm(parent, (uintptr_t)va) ||
-         user_vma_is_shared_page(owner_tid, (uintptr_t)va));
+                                  uint64_t parent_pte, int protect_parent,
+                                  int shared) {
     int owned = (parent_pte & PG_SOFT_OWNED) != 0;
     uint64_t child_pa = parent_pa & PG_ADDR_MASK;
     uint64_t flags = parent_pte &
@@ -1728,6 +1833,7 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
     void *private_copy = NULL;
     int parent_wr = ((parent_pte & PG_RW) || (parent_pte & PG_SOFT_COW)) ? 1 : 0;
 
+    (void)owner_tid;
     if (shared) {
         flags &= ~PG_SOFT_COW;
         if (owned) {
@@ -1808,7 +1914,7 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
         }
     }
 
-    int map_ret = mm_map_user_page(child, va, child_pa, flags);
+    int map_ret = mm_map_user_page_locked(child, va, child_pa, flags);
     if (map_ret) {
         devel_printf("fork: child map failed rc=%d va=0x%llx pa=0x%llx "
                 "pte=0x%llx flags=0x%llx shared=%d owned=%d\n",
@@ -1827,9 +1933,34 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
     return 0;
 }
 
+static void mm_fork_vma_class(const user_vma_fork_ent_t *s, int n, uint64_t va,
+                              int *shared, int *covers, int *lazy_file,
+                              int *lazy_anon) {
+    int i;
+
+    *shared = 0;
+    *covers = 0;
+    *lazy_file = 0;
+    *lazy_anon = 0;
+    for (i = 0; i < n; i++) {
+        if (va < (uint64_t)s[i].addr || va >= (uint64_t)s[i].end)
+            continue;
+        *covers = 1;
+        if (s[i].flags & USER_VMA_F_SHARED)
+            *shared = 1;
+        if (s[i].flags & USER_VMA_F_LAZY_FILE)
+            *lazy_file = 1;
+        if (s[i].flags & USER_VMA_F_LAZY_ANON)
+            *lazy_anon = 1;
+    }
+}
+
 static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                                               uint64_t *parent_l4, uint64_t owner_tid,
                                               int protect_parent) {
+    user_vma_fork_ent_t snap[USER_VMA_FORK_SNAP_MAX];
+    int nsnap;
+
     if (!child || !child->pml4 || !parent_l4)
         return -1;
     if (protect_parent && (!parent_for_vma || !parent_for_vma->pml4))
@@ -1837,6 +1968,9 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
     uint64_t limit = (uint64_t)USER_STACK_TOP;
     if (limit > (uint64_t)MMIO_IDENTITY_LIMIT)
         limit = (uint64_t)MMIO_IDENTITY_LIMIT;
+
+    nsnap = user_vma_fork_snapshot(parent_for_vma ? parent_for_vma : child,
+                                   owner_tid, snap, USER_VMA_FORK_SNAP_MAX);
 
     /*
      * Walk parent PTs under swapper (Linux direct map): process CR3 may have
@@ -1872,21 +2006,15 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                 if (!(e2 & PG_PRESENT))
                     continue;
                 if (e2 & PG_PS_2M) {
+                    int shared_2m, vma_backed, lazy_file_2m, lazy_anon_2m;
+                    int brk_2m;
+
                     if (!(e2 & PG_US))
                         continue;
                     uint64_t leaf2 = e2 & PG_ADDR_MASK_2M;
-                    /* Entire 2MiB identity window — not a privatized user leaf.
-                     * Exception: MAP_SHARED anon also uses identity VA==PA and
-                     * must be installed into the child (nginx shm zones).
-                     * Also copy ELF_LOAD / other VMA-backed identity pages: PID1
-                     * used to load without Soft_OWNED; skipping left the child
-                     * with demoted U=0 text and #PF right after clone/_Fork. */
-                    int shared_2m = parent_for_vma &&
-                        (user_vma_is_shared_page_mm(parent_for_vma, (uintptr_t)va_l2) ||
-                         user_vma_is_shared_page(owner_tid, (uintptr_t)va_l2));
-                    int vma_backed = user_vma_covers_page(owner_tid, (uintptr_t)va_l2);
-                    int brk_2m = parent_for_vma && mm_va_in_brk(parent_for_vma, va_l2);
-                    int lazy_file_2m = user_vma_is_lazy_file_page(owner_tid, (uintptr_t)va_l2);
+                    mm_fork_vma_class(snap, nsnap, va_l2, &shared_2m,
+                                      &vma_backed, &lazy_file_2m, &lazy_anon_2m);
+                    brk_2m = parent_for_vma && mm_va_in_brk(parent_for_vma, va_l2);
                     /*
                      * File-backed MMAP_LAZY: only Soft_OWNED leaves hold real
                      * file bytes.  Identity PG_US leftovers (or 2MiB siblings
@@ -1894,8 +2022,11 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                      * them made grub-install's fork children execute junk at
                      * ~0x808xxxx (add [rsi],al → #PF cr2=0) then the parent
                      * continued after two SIGSEGVs.
+                     * Anonymous MMAP_LAZY (apt Dynamic MMap) is the same: only
+                     * faulted Soft_OWNED pages are user data.
                      */
-                    if (lazy_file_2m && !(e2 & PG_SOFT_OWNED) && leaf2 == va_l2)
+                    if ((lazy_file_2m || lazy_anon_2m) && !(e2 & PG_SOFT_OWNED) &&
+                        leaf2 == va_l2)
                         continue;
                     if (leaf2 == va_l2 && !(e2 & PG_SOFT_OWNED) && !shared_2m &&
                         !vma_backed && !brk_2m)
@@ -1905,15 +2036,15 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                         chunk_end = limit;
                     for (uint64_t va = va_l2; va < chunk_end; va += PAGE_SIZE_4K) {
                         uint64_t pa = leaf2 + (va - va_l2);
-                        int shared_pg = shared_2m ||
-                            (parent_for_vma &&
-                             (user_vma_is_shared_page_mm(parent_for_vma, (uintptr_t)va) ||
-                              user_vma_is_shared_page(owner_tid, (uintptr_t)va)));
-                        int page_vma = vma_backed || user_vma_covers_page(owner_tid, (uintptr_t)va);
-                        int in_brk = parent_for_vma && mm_va_in_brk(parent_for_vma, va);
-                        int lazy_file = lazy_file_2m ||
-                            user_vma_is_lazy_file_page(owner_tid, (uintptr_t)va);
-                        if (lazy_file &&
+                        int shared_pg, page_vma, lazy_file, lazy_anon;
+                        int in_brk;
+
+                        mm_fork_vma_class(snap, nsnap, va, &shared_pg,
+                                          &page_vma, &lazy_file, &lazy_anon);
+                        if (shared_2m)
+                            shared_pg = 1;
+                        in_brk = parent_for_vma && mm_va_in_brk(parent_for_vma, va);
+                        if ((lazy_file || lazy_anon) &&
                             (!(e2 & PG_SOFT_OWNED) || pa == (va & ~0xFFFULL)))
                             continue;
                         if (pa == (va & ~0xFFFULL) && !(e2 & PG_SOFT_OWNED) &&
@@ -1921,7 +2052,7 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                             continue;
                         if (mm_fork_copy_user_leaf(child, parent_for_vma,
                                 parent_l4, owner_tid, va, pa, e2,
-                                protect_parent) != 0)
+                                protect_parent, shared_pg) != 0)
                             goto out;
                     }
                     continue;
@@ -1931,25 +2062,24 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                 uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
                 for (int l1i = 0; l1i < 512; ++l1i) {
                     uint64_t va = va_l2 | ((uint64_t)l1i << 12);
+                    int shared_4k, page_vma, lazy_file, lazy_anon;
+                    int in_brk;
+                    uint64_t e1, pa;
+
                     if (va < 0x200000ULL || va >= limit)
                         continue;
-                    uint64_t e1 = l1[l1i];
+                    e1 = l1[l1i];
                     if ((e1 & (PG_PRESENT | PG_US)) !=
                         (PG_PRESENT | PG_US))
                         continue;
-                    uint64_t pa = e1 & PG_ADDR_MASK;
+                    pa = e1 & PG_ADDR_MASK;
                     if (pa >= (uint64_t)MMIO_IDENTITY_LIMIT || !pt_page_pa_ok(e1))
                         continue;
-                    /* Skip bare identity leaves unless MAP_SHARED (nginx shm),
-                     * a tracked VMA (ELF_LOAD / mmap), or the brk heap. */
-                    int shared_4k = parent_for_vma &&
-                        (user_vma_is_shared_page_mm(parent_for_vma, (uintptr_t)va) ||
-                         user_vma_is_shared_page(owner_tid, (uintptr_t)va));
-                    int page_vma = user_vma_covers_page(owner_tid, (uintptr_t)va);
-                    int in_brk = parent_for_vma && mm_va_in_brk(parent_for_vma, va);
-                    int lazy_file = user_vma_is_lazy_file_page(owner_tid, (uintptr_t)va);
+                    mm_fork_vma_class(snap, nsnap, va, &shared_4k,
+                                      &page_vma, &lazy_file, &lazy_anon);
+                    in_brk = parent_for_vma && mm_va_in_brk(parent_for_vma, va);
                     /* Unpopulated or bogus Soft_OWNED-on-identity: skip. */
-                    if (lazy_file &&
+                    if ((lazy_file || lazy_anon) &&
                         (!(e1 & PG_SOFT_OWNED) || pa == (va & ~0xFFFULL)))
                         continue;
                     if (pa == (va & ~0xFFFULL) && !(e1 & PG_SOFT_OWNED) &&
@@ -1957,7 +2087,7 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                         continue;
                     if (mm_fork_copy_user_leaf(child, parent_for_vma,
                             parent_l4, owner_tid, va, pa, e1,
-                            protect_parent) != 0)
+                            protect_parent, shared_4k) != 0)
                         goto out;
                 }
             }
@@ -2027,7 +2157,7 @@ static int mm_dup_ensure_brk_copied(mm_t *child, mm_t *parent, uint64_t owner_ti
 			continue;
 
 		if (mm_fork_copy_user_leaf(child, parent, parent->pml4, owner_tid,
-					   (uint64_t)va, pa, parent_pte, 0) != 0) {
+					   (uint64_t)va, pa, parent_pte, 0, 0) != 0) {
 			mm_leave_direct_map(dm);
 			return -1;
 		}

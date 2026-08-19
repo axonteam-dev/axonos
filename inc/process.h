@@ -18,6 +18,8 @@
 
 typedef struct mm_struct mm_t;
 typedef struct thread thread_t;
+typedef struct nsproxy nsproxy_t;
+typedef struct cgroup cgroup_t;
 
 typedef enum process_state {
     PROCESS_ALIVE = 0,
@@ -76,6 +78,10 @@ typedef struct process {
     uint64_t rlim_nproc_max;
     uint64_t rlim_as_cur;
     uint64_t rlim_as_max;
+    /* Linux nsproxy + pid-namespace-local pid (getpid). */
+    nsproxy_t *nsproxy;
+    uint32_t ns_pid;
+    cgroup_t *cgroup;
 } process_t;
 
 void process_init(void);

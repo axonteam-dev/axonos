@@ -60,12 +60,32 @@ int user_vma_is_lazy_file_page(uint64_t tid, uintptr_t va);
 /* Same as above, matching any thread that shares runner's mm (CLONE_THREAD). */
 int user_vma_is_lazy_file_page_for(thread_t *runner, uintptr_t va);
 /*
+ * True if va is in an anonymous MMAP_LAZY VMA.  Fork must not memcpy identity
+ * leftovers there — apt's Dynamic MMap is a 128MiB lazy reservation; copying
+ * unfaulted 2MiB identity windows exhausted PMM and xz died with LZMA_MEM_ERROR.
+ */
+int user_vma_is_lazy_anon_page(uint64_t tid, uintptr_t va);
+/*
  * After copy_page_range: punch holes in child for lazy-file pages that were
  * not Soft_OWNED private frames in the parent.  Leaving demoted ~US identity
  * makes user access a protection #PF (err.P=1) that skips filemap_fault —
  * grub-install's fork children then execute junk / #GP at libc text.
  */
 int user_vma_fork_scrub_lazy_file(mm_t *child_mm, uint64_t from_tid);
+
+/* Compact VMA view for fork copy_page_range.  Avoids USER_VMA_MAX scans
+ * and thread-table walks on every populated 4K leaf. */
+#define USER_VMA_FORK_SNAP_MAX 256
+#define USER_VMA_F_SHARED      1u
+#define USER_VMA_F_LAZY_FILE   2u
+#define USER_VMA_F_LAZY_ANON   4u
+typedef struct {
+    uintptr_t addr;
+    uintptr_t end;
+    unsigned flags;
+} user_vma_fork_ent_t;
+int user_vma_fork_snapshot(mm_t *mm, uint64_t tid,
+                           user_vma_fork_ent_t *out, int max);
 
 int user_vma_add(uint64_t tid, uintptr_t addr, size_t len, int prot, int kind);
 int user_vma_add_mm(mm_t *mm, uintptr_t addr, size_t len, int prot, int kind);

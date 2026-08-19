@@ -27,6 +27,9 @@
 #include <syscall.h>
 #include <utsname_host.h>
 #include <keyring.h>
+#include <pmm.h>
+#include <ns.h>
+#include <cgroup.h>
 
 struct procfs_handle {
 	int kind; /* 1=root, 2=pid_dir, 3=pid_file, 4=symlink, 5=pid_fd_dir, 6=pid_fd_link, 7=plain, 8=proc_sys_dir, 9=proc_sys_file */
@@ -595,21 +598,51 @@ static ssize_t procfs_show_meminfo(char *buf, size_t size, void *priv) {
 	(void)priv;
 	if (!buf || size == 0) return 0;
 	int mb = sysinfo_ram_mb();
-	if (mb < 0) mb = 0;
-	int total_kb = mb * 1024;
-	uint64_t user_rss_kb = procfs_sum_unique_user_rss_kb();
+	uint64_t total_kb;
+	uint64_t pmm_free_kb = 0;
+	uint64_t pmm_total_kb = 0;
+	uint64_t heap_free_kb = heap_free_bytes() / 1024u;
 	uint64_t heap_kb = heap_used_bytes() / 1024u;
-	uint64_t kernel_visible_kb = heap_kb;
-	if (kernel_visible_kb > 16u * 1024u)
-		kernel_visible_kb = 16u * 1024u;
-	uint64_t used64 = user_rss_kb + kernel_visible_kb;
-	if (used64 > (uint64_t)total_kb) used64 = (uint64_t)total_kb;
-	int used_kb = (int)used64;
-	int free_kb = total_kb - used_kb;
-	int written = snprintf(buf, size,
-		"MemTotal:       %d kB\n"
-		"MemFree:        %d kB\n"
-		"MemAvailable:   %d kB\n"
+	uint64_t user_rss_kb = procfs_sum_unique_user_rss_kb();
+	uint64_t used64;
+	uint64_t free_kb;
+	int written;
+	size_t w;
+
+	if (pmm_ready()) {
+		pmm_free_kb = (uint64_t)pmm_free_pages() * 4ull;
+		pmm_total_kb = (uint64_t)pmm_total_pages() * 4ull;
+	}
+	if (mb > 0)
+		total_kb = (uint64_t)mb * 1024ull;
+	else {
+		total_kb = heap_total_bytes() / 1024u + pmm_total_kb;
+		if (total_kb < 128ull * 1024ull)
+			total_kb = 128ull * 1024ull;
+	}
+	used64 = user_rss_kb + heap_kb;
+	if (used64 > total_kb)
+		used64 = total_kb;
+	/*
+	 * dpkg-deb's xz MT decoder reads MemAvailable for
+	 * memlimit_threading. A 0 kB value made the decoder run with a
+	 * 1-byte thread budget; still decode, but glibc malloc of the
+	 * 8MiB dictionary then raced a drained PMM. Report real free
+	 * pages, never less than the PMM freelist.
+	 */
+	free_kb = pmm_free_kb + heap_free_kb;
+	if (free_kb < pmm_free_kb)
+		free_kb = pmm_free_kb;
+	if (total_kb > used64 && total_kb - used64 > free_kb)
+		free_kb = total_kb - used64;
+	if (free_kb > total_kb)
+		free_kb = total_kb;
+	if (free_kb < 64ull * 1024ull && total_kb >= 64ull * 1024ull)
+		free_kb = 64ull * 1024ull;
+	written = snprintf(buf, size,
+		"MemTotal:       %llu kB\n"
+		"MemFree:        %llu kB\n"
+		"MemAvailable:   %llu kB\n"
 		"Buffers:          0 kB\n"
 		"Cached:           0 kB\n"
 		"SwapCached:       0 kB\n"
@@ -623,12 +656,14 @@ static ssize_t procfs_show_meminfo(char *buf, size_t size, void *priv) {
 		"PageTables:       0 kB\n"
 		"SwapTotal:        0 kB\n"
 		"SwapFree:         0 kB\n",
-		total_kb, free_kb, free_kb,
+		(unsigned long long)total_kb,
+		(unsigned long long)free_kb,
+		(unsigned long long)free_kb,
 		(unsigned long long)user_rss_kb,
 		(unsigned long long)heap_kb,
 		(unsigned long long)heap_kb);
 	if (written < 0) return 0;
-	size_t w = (size_t)written;
+	w = (size_t)written;
 	if (w > size) w = size;
 	return (ssize_t)w;
 }
@@ -860,6 +895,8 @@ static ssize_t procfs_show_filesystems(char *buf, size_t size, void *priv) {
         "nodev\tdevtmpfs\n"
         "nodev\ttmpfs\n"
         "nodev\tramfs\n"
+        "nodev\tcgroup2\n"
+        "nodev\tnsfs\n"
         /* ext2 omitted: no on-disk mount yet (BusyBox auto-probe). */
         "\tminix\n"
         "\tvfat\n"
@@ -993,6 +1030,25 @@ static ssize_t procfs_write(struct fs_file *file, const void *buf, size_t size, 
 		} else {
 			if (uts_domainname_set((const char *)buf, size) != 0) return -1;
 		}
+		return (ssize_t)size;
+	}
+	if (h->kind == 3 && (h->file_id == 7 || h->file_id == 8)) {
+		process_t *target = process_find((uint64_t)(unsigned)h->pid);
+		process_t *writer = NULL;
+		thread_t *ct = thread_get_current_user();
+
+		if (!ct)
+			ct = thread_current();
+		if (ct)
+			writer = ct->process;
+		(void)offset;
+		if (!target || !writer)
+			return -1;
+		if (h->file_id == 7) {
+			if (ns_uid_map_write(writer, target, (const char *)buf, size) != 0)
+				return -1;
+		} else if (ns_gid_map_write(writer, target, (const char *)buf, size) != 0)
+			return -1;
 		return (ssize_t)size;
 	}
 	if (h->kind == 7 && h->file_id == 60) {
@@ -1578,8 +1634,50 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					}
 				}
 			} else {
-				/* other pid children: cmdline, stat, status, statm, mounts */
-			if (strncmp(rest, "cmdline", 7) == 0 && rest[7] == '\0') {
+				/* other pid children: cmdline, stat, status, statm, mounts, ns, cgroup */
+			if (strncmp(rest, "ns", 2) == 0 && (rest[2] == '\0' || rest[2] == '/')) {
+					process_t *tp = process_find((uint64_t)(unsigned)pid);
+					if (!tp) {
+						kfree(h); kfree(pp); kfree(f); return -1;
+					}
+					if (rest[2] == '\0') {
+						h->kind = 17;
+						h->pid = pid;
+						f->type = FS_TYPE_DIR;
+						f->size = 0;
+						f->driver_private = h;
+						*out_file = f;
+						return 0;
+					} else {
+						int t = ns_type_from_name(rest + 3);
+						char tmp[64];
+						int n;
+
+						if (t < 0) {
+							kfree(h); kfree(pp); kfree(f); return -1;
+						}
+						n = snprintf(tmp, sizeof(tmp), "%s:[%u]",
+							     ns_type_name((enum ns_type)t),
+							     ns_inum(tp, (enum ns_type)t));
+						if (n < 0)
+							n = 0;
+						h->kind = 18;
+						h->pid = pid;
+						h->file_id = t;
+						f->type = FS_TYPE_REG;
+						h->cache = (char *)kmalloc((size_t)n + 1u);
+						if (h->cache) {
+							memcpy(h->cache, tmp, (size_t)n);
+							h->cache[(size_t)n] = '\0';
+							h->cache_len = (size_t)n;
+							f->size = (size_t)n;
+						}
+						(void)ns_bind_proc_file(f, tp, (enum ns_type)t);
+						f->driver_private = h;
+						*out_file = f;
+						return 0;
+					}
+			} else if (strncmp(rest, "cmdline", 7) == 0 && rest[7] == '\0') {
 					h->kind = 3; h->pid = pid; h->file_id = 0; f->type = FS_TYPE_REG;
 				} else if (strncmp(rest, "stat", 4) == 0 && rest[4] == '\0') {
 					h->kind = 3; h->pid = pid; h->file_id = 1; f->type = FS_TYPE_REG;
@@ -1596,6 +1694,14 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					procfs_fill_kind7_cache(h, f);
 					*out_file = f;
 					return 0;
+				} else if (strncmp(rest, "mountinfo", 9) == 0 && rest[9] == '\0') {
+					h->kind = 3; h->pid = pid; h->file_id = 5; f->type = FS_TYPE_REG;
+				} else if (strncmp(rest, "cgroup", 6) == 0 && rest[6] == '\0') {
+					h->kind = 3; h->pid = pid; h->file_id = 6; f->type = FS_TYPE_REG;
+				} else if (strncmp(rest, "uid_map", 7) == 0 && rest[7] == '\0') {
+					h->kind = 3; h->pid = pid; h->file_id = 7; f->type = FS_TYPE_REG;
+				} else if (strncmp(rest, "gid_map", 7) == 0 && rest[7] == '\0') {
+					h->kind = 3; h->pid = pid; h->file_id = 8; f->type = FS_TYPE_REG;
 				} else {
 					kfree(h); kfree(pp); kfree(f); return -1;
 				}
@@ -1604,11 +1710,16 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				h->cache = (char*)kmalloc(cap);
 				if (h->cache) {
 					ssize_t full = 0;
+					process_t *tp = process_find((uint64_t)(unsigned)h->pid);
 					if (h->file_id == 0) full = procfs_show_cmdline(h->cache, cap, (void*)(uintptr_t)h->pid);
 					else if (h->file_id == 1) full = procfs_show_stat(h->cache, cap, h);
 					else if (h->file_id == 2) full = procfs_show_status(h->cache, cap, (void*)(uintptr_t)h->pid);
 					else if (h->file_id == 3) full = procfs_show_statm(h->cache, cap, (void*)(uintptr_t)h->pid);
 					else if (h->file_id == 4) full = procfs_show_environ(h->cache, cap, (void*)(uintptr_t)h->pid);
+					else if (h->file_id == 5) full = ns_show_mountinfo_for(tp, h->cache, cap);
+					else if (h->file_id == 6) full = cgroup_show_path(tp, h->cache, cap);
+					else if (h->file_id == 7) full = ns_uid_map_show(tp, h->cache, cap);
+					else if (h->file_id == 8) full = ns_gid_map_show(tp, h->cache, cap);
 					if (full > 0) {
 						f->size = (size_t)full;
 						h->cache_len = f->size;
@@ -1651,10 +1762,17 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
     }
 
     if (h->kind == 2) {
-        /* /proc/<pid> dir: entries cmdline/stat/status/statm/environ */
-        const char *names[6] = { "task", "cmdline", "stat", "status", "statm", "environ" };
-        const uint8_t types[6] = { EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
-                                   EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE };
+        /* /proc/<pid> dir */
+        const char *names[12] = {
+            "task", "cmdline", "stat", "status", "statm", "environ",
+            "mounts", "mountinfo", "cgroup", "uid_map", "gid_map", "ns"
+        };
+        const uint8_t types[12] = {
+            EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
+            EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
+            EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
+            EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_DIR
+        };
         size_t pos = 0;
         size_t written = 0;
         uint8_t *out = (uint8_t*)buf;
@@ -1693,7 +1811,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
             }
             pos += rec_len;
         }
-        for (int idx = 0; idx < 6; idx++) {
+        for (int idx = 0; idx < 12; idx++) {
             size_t namelen = strlen(names[idx]);
             size_t rec_len = 8 + namelen;
             rec_len = (rec_len + 3) & ~3u;
@@ -1966,8 +2084,8 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         return (ssize_t)written;
     }
 
-    /* regular file */
-    if (h->kind == 3) {
+    /* regular file or nsfs magic link body */
+    if (h->kind == 3 || h->kind == 18) {
         if (!h->cache) return 0;
         if ((size_t)offset >= h->cache_len) return 0;
         size_t to_copy = h->cache_len - (size_t)offset;
@@ -2089,6 +2207,50 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 		return (ssize_t)tocopy;
 	}
 
+	/* /proc/<pid>/ns directory */
+	if (h->kind == 17) {
+		static const char *nnames[] = {
+			"mnt", "uts", "ipc", "pid", "user", "net", "cgroup", "time"
+		};
+		size_t pos = 0, written = 0;
+		uint8_t *out = (uint8_t *)buf;
+		int idx;
+
+		for (idx = 0; idx < (int)(sizeof(nnames) / sizeof(nnames[0])); idx++) {
+			size_t namelen = strlen(nnames[idx]);
+			size_t rec_len = (8 + namelen + 3) & ~3u;
+			size_t entry_off = 0;
+			uint8_t tmp[64];
+			struct ext2_dir_entry de;
+
+			if (pos + rec_len <= offset) {
+				pos += rec_len;
+				continue;
+			}
+			if (written >= size)
+				break;
+			if ((size_t)offset > pos)
+				entry_off = (size_t)offset - pos;
+			memset(tmp, 0, sizeof(tmp));
+			de.inode = (uint32_t)(5000 + idx);
+			de.rec_len = (uint16_t)rec_len;
+			de.name_len = (uint8_t)namelen;
+			de.file_type = EXT2_FT_SYMLINK;
+			memcpy(tmp, &de, 8);
+			memcpy(tmp + 8, nnames[idx], namelen);
+			{
+				size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
+				if (tocopy > size - written)
+					tocopy = size - written;
+				if (tocopy)
+					memcpy(out + written, tmp + entry_off, tocopy);
+				written += tocopy;
+			}
+			pos += rec_len;
+		}
+		return (ssize_t)written;
+	}
+
     return -1;
 }
 
@@ -2109,7 +2271,7 @@ int procfs_fill_stat(struct fs_file *file, struct stat *st) {
     if (!h) return -1;
     if (h->kind == 1 || h->kind == 2 || h->kind == 5 || h->kind == 8 || h->kind == 10 ||
         h->kind == 11 || h->kind == 12 || h->kind == 13 || h->kind == 14 || h->kind == 15 ||
-        h->kind == 16) {
+        h->kind == 16 || h->kind == 17) {
         st->st_ino = (h->kind == 2 && h->pid > 0) ? (ino_t)((unsigned)h->pid + 100u)
                    : (h->kind == 5 && h->pid > 0) ? (ino_t)((unsigned)h->pid + 200u)
                    : 1;
@@ -2122,9 +2284,10 @@ int procfs_fill_stat(struct fs_file *file, struct stat *st) {
                 st->st_gid = (gid_t)pt->egid;
             }
         }
-    } else if (h->kind == 6) {
-        /* fd links are symlinks */
-        st->st_ino = 0;
+    } else if (h->kind == 6 || h->kind == 18) {
+        /* fd links and nsfs magic links */
+        process_t *tp = (h->kind == 18) ? process_find((uint64_t)(unsigned)h->pid) : NULL;
+        st->st_ino = (h->kind == 18 && tp) ? (ino_t)ns_inum(tp, (enum ns_type)h->file_id) : 0;
         st->st_mode = S_IFLNK | 0777;
         st->st_nlink = 1;
         st->st_size = (off_t)file->size;
@@ -2135,8 +2298,9 @@ int procfs_fill_stat(struct fs_file *file, struct stat *st) {
         st->st_nlink = 1;
         st->st_size = (off_t)file->size;
     } else {
+        int rw = (h->kind == 3 && (h->file_id == 7 || h->file_id == 8));
         st->st_ino = 0;
-        st->st_mode = S_IFREG | 0444;
+        st->st_mode = S_IFREG | (rw ? 0644 : 0444);
         st->st_nlink = 1;
         st->st_size = (off_t)file->size;
     }

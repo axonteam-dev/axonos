@@ -433,6 +433,7 @@ int thread_reparent_orphans(int dead_parent_tid) {
                 if (!t) continue;
                 if (t->parent_tid != dead_parent_tid) continue;
                 t->parent_tid = init_tid;
+                t->linux_ppid = 1;
                 if (t->state != THREAD_TERMINATED)
                         n++;
         }
@@ -510,6 +511,7 @@ void thread_init() {
         main_thread.cwd[sizeof(main_thread.cwd) - 1] = '\0';
         main_thread.rseq_ptr = NULL;
         main_thread.parent_tid = -1;
+        main_thread.linux_ppid = -1;
         main_thread.saved_user_rip = 0;
         main_thread.saved_user_rsp = 0;
         main_thread.waiter_tid = -1;
@@ -674,6 +676,7 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->mm_ptemplate = NULL;
         t->rseq_ptr = NULL;
         t->parent_tid = -1;
+        t->linux_ppid = -1;
         t->saved_user_rip = 0;
         t->saved_user_rsp = 0;
         t->saved_user_rbx = 0;
@@ -841,6 +844,7 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->mm_ptemplate = NULL;
         t->rseq_ptr = NULL;
         t->parent_tid = -1;
+        t->linux_ppid = -1;
         t->saved_user_rip = 0;
         t->saved_user_rsp = 0;
         t->saved_user_rbx = 0;
@@ -1142,7 +1146,6 @@ void thread_stop(int pid) {
         acquire_irqsave(&sched_lock, &irqf);
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->tid == pid && threads[i]->state != THREAD_TERMINATED) {
-                        kprintf("thread_stop: stopping tid=%d name=%s\n", pid, threads[i]->name);
                         threads[i]->state = THREAD_TERMINATED;
                     threads[i]->sleep_until = 0;
                     release_irqrestore(&sched_lock, irqf);
@@ -1150,7 +1153,6 @@ void thread_stop(int pid) {
                 }
         }
         release_irqrestore(&sched_lock, irqf);
-        klogprintf("thread_stop: thread %d not found or already terminated\n", pid);
 }
 
 void thread_block(int pid) {

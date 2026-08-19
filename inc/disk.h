@@ -27,3 +27,8 @@ int disk_publish_sd(int device_id, uint32_t sectors);
 int disk_publish_sr(int device_id, uint32_t sectors);
 int disk_sd_index(int device_id);
 int disk_sr_index(int device_id);
+
+/* Linux rescan_partitions / ioctl(BLKRRPART): drop child nodes and re-read MBR/GPT. */
+void disk_note_capacity(int device_id, uint32_t sectors);
+int disk_get_capacity(int device_id, uint32_t *sectors);
+int disk_reread_partitions(int device_id);

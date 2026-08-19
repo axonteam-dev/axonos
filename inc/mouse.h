@@ -16,3 +16,7 @@ ssize_t mouse_read_stream(void *buf, size_t size);
 int mouse_stream_available(void);
 /* Feed one raw AUX byte into mouse packet parser. */
 void mouse_process_byte(uint8_t b);
+/* True after AUX self-test succeeded. IRQ1 must not treat i8042 bit5 as AUX
+ * unless this is set: on AT-style controllers bit5 is timeout and dropping
+ * those bytes eats keys. */
+int ps2_aux_is_live(void);

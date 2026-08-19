@@ -145,12 +145,16 @@ void keyboard_handler(cpu_registers_t* regs) {
                 uint8_t st = inb(0x64);
                 if ((st & 0x01u) == 0) break;
                 uint8_t data = inb(0x60);
-                if (st & 0x20u) {
-                        /* Some controllers/VMs can route AUX bytes through IRQ1. */
+                /*
+                 * IRQ1 is the keyboard port. AUX bytes belong on IRQ12.
+                 * Only divert when AUX init succeeded: i8042 bit5 is AUX data
+                 * on PS/2, but timeout on AT. Dropping timeouts ate keys.
+                 */
+                if ((st & 0x20u) && ps2_aux_is_live()) {
                         mouse_process_byte(data);
-                } else {
-                        keyboard_process_scancode(data);
+                        continue;
                 }
+                keyboard_process_scancode(data);
         }
         // EOI отправляется центральным диспетчером прерываний в isr_dispatch
 }
@@ -165,6 +169,24 @@ void keyboard_handler(cpu_registers_t* regs) {
 static void kbd_push_sequence(int tty, const char *seq) {
     if (!seq) return;
     devfs_tty_push_input_sequence(tty, seq, strlen(seq));
+}
+
+static void kbd_emit_ascii(int tty, uint8_t scancode) {
+        if (scancode >= 128)
+                return;
+        char c = shift_pressed ? scancode_to_ascii_shift[scancode]
+                               : scancode_to_ascii[scancode];
+        if (c == 0)
+                return;
+        if (ctrl_pressed) {
+                unsigned char uc = (unsigned char)c;
+                if (uc >= 'a' && uc <= 'z') uc = (unsigned char)(uc - 'a' + 'A');
+                if (uc >= 'A' && uc <= 'Z')
+                        c = (char)(uc - 'A' + 1);
+        }
+        if (c == 3)
+                ctrlc_pending = true;
+        kbd_push_char(tty, c);
 }
 
 void keyboard_process_scancode(uint8_t scancode) {
@@ -236,7 +258,14 @@ void keyboard_process_scancode(uint8_t scancode) {
                         case 0x1C: /* Keypad Enter */ kbd_push_char(target_tty_for_user, '\r'); break;
                         case 0x35: /* Keypad '/' */   kbd_push_char(target_tty_for_user, '/'); break;
                         case 0x01: /* Escape (E0 01 on some kbd) */ devfs_tty_push_input_noblock(target_tty_for_user, 27); break;
-                        default: break;
+                        default:
+                                /*
+                                 * Stray E0 (VMware/AUX) must not eat set1 letters.
+                                 * E0 19 is multimedia Next Track on some keyboards
+                                 * and also the make code for 'p'.
+                                 */
+                                kbd_emit_ascii(target_tty_for_user, scancode);
+                                break;
                 }
                 kbd_extended_prefix = false;
                 return;
@@ -325,25 +354,7 @@ void keyboard_process_scancode(uint8_t scancode) {
                         }
                         break;
                 default:
-                        // Обычная клавиша
-                        if (scancode < 128) {
-                                char c = shift_pressed ? scancode_to_ascii_shift[scancode] : scancode_to_ascii[scancode];
-                                if (c != 0) {
-                                        // Обработка Ctrl-комбинаций: Ctrl+A..Z -> 0x01..0x1A
-                                        if (ctrl_pressed) {
-                                                unsigned char uc = (unsigned char)c;
-                                                if (uc >= 'a' && uc <= 'z') uc = (unsigned char)(uc - 'a' + 'A');
-                                                if (uc >= 'A' && uc <= 'Z') {
-                                                        c = (char)(uc - 'A' + 1);
-                                                }
-                                        }
-                                if (c == 3) {
-                                        ctrlc_pending = true;
-                                }
-                                        kbd_push_char(target_tty_for_user, c);
-                                        //qemu_debug_printf("kbd: char '%c' (0x%02x) -> buffer_count=%d\n", c, (unsigned char)c, buffer_count);
-                                }
-                        }
+                        kbd_emit_ascii(target_tty_for_user, scancode);
                         break;
         }
 }
@@ -355,6 +366,7 @@ void ps2_keyboard_init() {
         ctrl_pressed = false;
         alt_pressed = false;
         ctrlc_pending = false;
+        kbd_extended_prefix = false;
 
         // Устанавливаем обработчик прерывания
         idt_set_handler(33, keyboard_handler);

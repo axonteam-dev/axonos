@@ -15,6 +15,10 @@ int overlayfs_unregister(void);
  * Requires squashfs_prepare_image() and an existing ramfs tree. */
 int overlayfs_mount_root(void);
 
+/* Linux overlay upperdir= — path of an already-mounted FS used as upper.
+ * Empty/NULL restores ramfs (live default). */
+int overlayfs_set_upperdir(const char *path);
+
 struct fs_driver *overlayfs_get_driver(void);
 int overlayfs_fill_stat(struct fs_file *file, struct stat *st);
 int overlayfs_ftruncate(struct fs_file *file, off_t length);

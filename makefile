@@ -86,7 +86,7 @@ ASCII_PF2_SRC := $(firstword $(wildcard /usr/share/grub/ascii.pf2 /boot/grub/fon
 SYS_CA_PEM := $(BUILD_DIR)/certs/axonos-system-ca.pem
 SYS_CA_BLOB_OBJ := $(BUILD_DIR)/certs/axonos-system-ca.blob.o
 
-.PHONY: all kernel iso clean run run-uefi for-production config oldconfig
+.PHONY: all kernel iso clean run run-uefi for-production config oldconfig archive initfs-apt-libs initfs-apt
 
 all: iso
 
@@ -141,10 +141,13 @@ $(AP_TRAMP_OBJ): $(AP_TRAMP_BIN)
 		"$@"
 	@$(call mark_noexecstack,$@)
 
+# nostdlib — must not NEEDED libc.so.6 (static busybox dlopen), same as files shim.
 $(NSS_DNS_SHIM): core/nss_dns_shim/nss_dns.c
 	@mkdir -p $(dir $@)
 	@echo "HOST CC [nss_dns]	$<"
-	@gcc -shared -fPIC -O2 -Wall -Wextra -Wl,-soname,libnss_dns.so.2 -o $@ $<
+	@gcc -shared -fPIC -O2 -nostdlib -nodefaultlibs -fno-builtin -ffreestanding \
+		-fno-tree-loop-distribute-patterns \
+		-Wall -Wextra -Wl,-soname,libnss_dns.so.2 -Wl,--no-undefined -o $@ $<
 
 $(NSS_DNS_BLOB_OBJ): $(NSS_DNS_SHIM)
 	@echo "LD(BIN) [nss_dns]	$<"
@@ -316,11 +319,14 @@ debug: iso
 	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 1024M -smp 2 -serial stdio -hda ../disk.img -boot d -s -S & gdb -ex "target remote localhost:1234" $(PAYLOAD_ELF)
 
 disk:
-	@dd if=/dev/zero of=../disk.img bs=1M count=10
-	@mkfs.fat -F 32 ../disk.img
+	@truncate -s 1G ../disk.img
+	@echo "Created 1GiB blank ../disk.img (partition with fdisk from the live CD)"
 
 # Host helper for converting a legacy initfs.cpio into SquashFS.
 MKINITFS_SQUASH := tools/mkinitfs-squashfs.sh
+INJECT_APT_LIBS := tools/inject-apt-libs.sh
+POPULATE_APT_ROOTFS := tools/populate-apt-rootfs.sh
+INJECT_APT_ROOTFS := tools/inject-apt-rootfs.sh
 
 archive:
 	@if [ ! -f iso/boot/initfs.sfs ]; then \
@@ -340,6 +346,15 @@ archive:
 		fi; \
 	fi
 	@test -f iso/boot/initfs.sfs
+
+# Host Debian apt's .so closure → iso/boot/initfs.sfs (/lib/x86_64-linux-gnu).
+initfs-apt-libs: archive
+	@$(INJECT_APT_LIBS) iso/boot/initfs.sfs
+
+# GNU dpkg + apt methods + Debian sources → $HOME/rootfs and initfs.sfs.
+initfs-apt: archive
+	@$(POPULATE_APT_ROOTFS) $(HOME)/rootfs
+	@$(INJECT_APT_ROOTFS) iso/boot/initfs.sfs
 
 clean:
 	@rm -rf $(BUILD_DIR)

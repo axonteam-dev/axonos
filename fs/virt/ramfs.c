@@ -34,6 +34,12 @@
 #ifndef E2BIG
 #define E2BIG 7
 #endif
+#ifndef EISDIR
+#define EISDIR 21
+#endif
+#ifndef EACCES
+#define EACCES 13
+#endif
 
 struct ramfs_xattr {
     char *name;
@@ -56,6 +62,7 @@ struct ramfs_node {
     unsigned int uid;
     unsigned int gid;
     unsigned int nlink;
+    unsigned int open_count; /* open fds; unlink must not free while > 0 */
     time_t atime;
     time_t mtime;
     time_t ctime;
@@ -72,6 +79,8 @@ static void ramfs_free_node_shallow(struct ramfs_node *n);
 static struct ramfs_node *ramfs_find_child(struct ramfs_node *parent, const char *name);
 static struct ramfs_node *ramfs_lookup(const char *path);
 static void ramfs_release(struct fs_file *file);
+static void ramfs_unlink_from_parent(struct ramfs_node *n);
+static void ramfs_maybe_free_inode(struct ramfs_node *n);
 
 struct ramfs_file_handle {
     struct ramfs_node *node;
@@ -93,6 +102,83 @@ static inline void ramfs_tree_lock_release(unsigned long flags) {
     release_irqrestore(&ramfs_tree_lock, flags);
 }
 
+/* Syscalls can run with thread_current() still a kernel helper while
+ * thread_get_current_user() is the process whose euid must own new files. */
+static thread_t *ramfs_cred(void)
+{
+    thread_t *t = thread_get_current_user();
+    if (t)
+        return t;
+    return thread_current();
+}
+
+static void ramfs_set_create_owner(struct ramfs_node *n)
+{
+    thread_t *ct = ramfs_cred();
+    if (!n)
+        return;
+    if (ct) {
+        n->uid = ct->euid;
+        n->gid = ct->egid;
+    }
+}
+
+static void ramfs_apply_umask_mode(struct ramfs_node *n, mode_t base_perm)
+{
+    thread_t *user = thread_get_current_user();
+    thread_t *ct;
+    unsigned int um;
+    mode_t type;
+    if (!n || !user)
+        return;
+    ct = ramfs_cred();
+    um = ct ? (ct->umask & 07777u) : 0022u;
+    type = n->mode & 0170000u;
+    n->mode = type | (base_perm & 07777u & ~(mode_t)um);
+}
+
+static int ramfs_in_group(thread_t *ct, gid_t gid)
+{
+    int i;
+    if (!ct)
+        return 0;
+    if (ct->egid == gid)
+        return 1;
+    for (i = 0; i < ct->ngroups && i < AXON_NGROUPS_MAX; i++) {
+        if (ct->groups[i] == gid)
+            return 1;
+    }
+    return 0;
+}
+
+static int ramfs_dir_writable(struct ramfs_node *dir, thread_t *ct)
+{
+    mode_t m;
+    if (!dir)
+        return 0;
+    if (!ct || ct->euid == 0)
+        return 1;
+    m = dir->mode;
+    if (ct->euid == dir->uid && (m & 0200))
+        return 1;
+    if (ramfs_in_group(ct, dir->gid) && (m & 0020))
+        return 1;
+    if (m & 0002)
+        return 1;
+    return 0;
+}
+
+static int ramfs_may_unlink_node(struct ramfs_node *parent, struct ramfs_node *n, thread_t *ct)
+{
+    if (!n || !ramfs_dir_writable(parent, ct))
+        return 0;
+    /* Sticky bit: only file owner, directory owner, or root. */
+    if ((parent->mode & 01000) && ct && ct->euid != 0 &&
+        ct->euid != n->uid && ct->euid != parent->uid)
+        return 0;
+    return 1;
+}
+
 static struct ramfs_node *ramfs_alloc_node(const char *name, int is_dir) {
     if (!name) name = "";
     struct ramfs_node *n = (struct ramfs_node*)kmalloc(sizeof(*n));
@@ -108,6 +194,7 @@ static struct ramfs_node *ramfs_alloc_node(const char *name, int is_dir) {
     n->uid = 0;
     n->gid = 0;
     n->nlink = is_dir ? 2u : 1u;
+    n->open_count = 0;
     n->size = 0;
     n->generation = 1;
     n->atime = n->mtime = n->ctime = 0;
@@ -162,9 +249,7 @@ int ramfs_symlink(const char *path, const char *target) {
     memcpy(n->data, target, tlen+1);
     n->size = tlen;
     n->capacity = tlen + 1;
-    /* owner */
-    thread_t* ct = thread_current();
-    if (ct) { n->uid = ct->euid; n->gid = ct->egid; }
+    ramfs_set_create_owner(n);
     kfree(tmp);
     return 0;
 }
@@ -264,6 +349,24 @@ static void ramfs_free_xattrs(struct ramfs_node *n) {
         kfree(x);
     }
     n->xattrs = NULL;
+}
+
+/* Linux: an unlinked inode stays alive until the last close. */
+static void ramfs_maybe_free_inode(struct ramfs_node *n) {
+    if (!n || n->is_dir)
+        return;
+    if (n->nlink > 0 || n->open_count > 0)
+        return;
+    if (n->parent)
+        ramfs_unlink_from_parent(n);
+    if (n->name) {
+        kfree(n->name);
+        n->name = NULL;
+    }
+    pagecache_invalidate(PAGECACHE_ID_RAMFS(n->ino));
+    ramfs_free_data_owned(n);
+    ramfs_free_xattrs(n);
+    kfree(n);
 }
 
 static void ramfs_free_node_shallow(struct ramfs_node *n) {
@@ -569,9 +672,8 @@ static int ramfs_create(const char *path, struct fs_file **out_file) {
     }
     struct ramfs_node *n = ramfs_alloc_node(name, 0);
     if (!n) { kfree(tmp); return -5; }
-    /* set owner to current thread euid/egid */
-    thread_t* ct = thread_current();
-    if (ct) { n->uid = ct->euid; n->gid = ct->egid; }
+    ramfs_set_create_owner(n);
+    ramfs_apply_umask_mode(n, 0666);
     {
         unsigned long irqf = 0;
         ramfs_tree_lock_acquire(&irqf);
@@ -632,6 +734,7 @@ static int ramfs_create(const char *path, struct fs_file **out_file) {
         return -6;
     }
     fh->node = n;
+    n->open_count++;
     f->driver_private = fh;
     ramfs_file_set_backing(f, n);
     if (out_file) *out_file = f;
@@ -700,6 +803,7 @@ static int ramfs_open(const char *path, struct fs_file **out_file) {
     struct ramfs_file_handle *fh = (struct ramfs_file_handle*)kmalloc(sizeof(*fh));
     if (!fh) { kfree(pp); kfree(f); return -2; }
     fh->node = n;
+    n->open_count++;
     f->driver_private = fh;
     ramfs_file_set_backing(f, n);
     if (out_file) *out_file = f;
@@ -821,7 +925,18 @@ static ssize_t ramfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         }
         size_t copy = size;
         if (offset + copy > n->size) copy = n->size - offset;
-        memcpy(buf, n->data + offset, copy);
+        /* Sparse grow (posix_fallocate): i_size can exceed the kmalloc payload. */
+        if (!n->data || offset >= n->capacity) {
+            memset(buf, 0, copy);
+        } else {
+            size_t have = n->capacity - offset;
+            if (have >= copy) {
+                memcpy(buf, n->data + offset, copy);
+            } else {
+                memcpy(buf, n->data + offset, have);
+                memset((char *)buf + have, 0, copy - have);
+            }
+        }
         release_irqrestore(&n->io_lock, irqf);
         return (ssize_t)copy;
     }
@@ -832,7 +947,7 @@ int ramfs_chmod(const char *path, mode_t mode) {
     struct ramfs_node *n = ramfs_lookup(path);
     if (!n) return -1;
     /* permission: only owner or root */
-    thread_t* ct = thread_current();
+    thread_t* ct = ramfs_cred();
     uid_t uid = ct ? ct->euid : 0;
     if (uid != 0 && uid != n->uid) return -1;
     /* chmod changes permission/special bits, never the inode file type. */
@@ -844,7 +959,7 @@ int ramfs_chown(const char *path, uid_t uid, gid_t gid) {
     if (!path) return -1;
     struct ramfs_node *n = ramfs_lookup(path);
     if (!n) return -1;
-    thread_t *ct = thread_current();
+    thread_t *ct = ramfs_cred();
     if (ct && ct->euid != 0) return -1;
     /* Linux chown(2): (uid_t)-1 / (gid_t)-1 means leave unchanged. */
     if (uid != (uid_t)-1) n->uid = uid;
@@ -859,7 +974,7 @@ int ramfs_lchown(const char *path, uid_t uid, gid_t gid) {
     /* lchown(2) operates on the final symlink dentry itself. */
     struct ramfs_node *n = ramfs_lookup_nofollow(path);
     if (!n) return -1;
-    thread_t *ct = thread_current();
+    thread_t *ct = ramfs_cred();
     if (ct && ct->euid != 0) return -1;
     if (uid != (uid_t)-1) n->uid = uid;
     if (gid != (gid_t)-1) n->gid = gid;
@@ -873,14 +988,18 @@ int ramfs_ftruncate(struct fs_file *file, off_t length) {
     struct ramfs_file_handle *fh = (struct ramfs_file_handle *)file->driver_private;
     struct ramfs_node *n = fh->node;
     if (!n || n->is_dir) return -22;
-    thread_t *ct = thread_current();
+    thread_t *ct = ramfs_cred();
     if (ct && ct->euid != 0 && (unsigned)ct->euid != n->uid) return -22;
     size_t newsize = (size_t)length;
     if ((off_t)newsize != length) return -22; /* overflow */
-    unsigned long irqf;
-    acquire_irqsave(&n->io_lock, &irqf);
+    /*
+     * Same as ramfs_write: do not cli across kmalloc/memset. posix_fallocate of
+     * a PostgreSQL DSM used to freeze the machine (IF=0 + memset of tens of MiB)
+     * and parked the payload in the user mmap identity window.
+     */
+    acquire(&n->io_lock);
     if (newsize == n->size) {
-        release_irqrestore(&n->io_lock, irqf);
+        release(&n->io_lock);
         return 0;
     }
     if (newsize == 0) {
@@ -889,17 +1008,17 @@ int ramfs_ftruncate(struct fs_file *file, off_t length) {
         file->size = 0;
         ramfs_inode_changed(n);
         file->backing_gen = n->generation;
-        release_irqrestore(&n->io_lock, irqf);
+        release(&n->io_lock);
         return 0;
     }
-    if (ramfs_ensure_heap_data_locked(n) != 0) {
-        release_irqrestore(&n->io_lock, irqf);
-        return -12;
-    }
     if (newsize < n->size) {
+        if (ramfs_ensure_heap_data_locked(n) != 0) {
+            release(&n->io_lock);
+            return -12;
+        }
         char *d = (char *)krealloc(n->data, newsize);
         if (!d) {
-            release_irqrestore(&n->io_lock, irqf);
+            release(&n->io_lock);
             return -12; /* ENOMEM */
         }
         n->data = d;
@@ -908,30 +1027,14 @@ int ramfs_ftruncate(struct fs_file *file, off_t length) {
         file->size = (off_t)n->size;
         ramfs_inode_changed(n);
         file->backing_gen = n->generation;
-        release_irqrestore(&n->io_lock, irqf);
+        release(&n->io_lock);
         return 0;
     }
-    /* grow */
-    char *d;
-    if (!n->data) {
-        d = (char *)kmalloc(newsize);
-        if (d) memset(d, 0, newsize);
-    } else {
-        d = (char *)krealloc(n->data, newsize);
-        if (d && newsize > n->size)
-            memset(d + n->size, 0, newsize - n->size);
-    }
-    if (!d) {
-        release_irqrestore(&n->io_lock, irqf);
-        return -12;
-    }
-    n->data = d;
+    /* Grow: Linux tmpfs fallocate raises i_size and leaves holes. Page cache
+     * zeros on fault; MAP_SHARED attaches stay coherent (no generation bump). */
     n->size = newsize;
-    n->capacity = newsize;
     file->size = (off_t)n->size;
-    ramfs_inode_changed(n);
-    file->backing_gen = n->generation;
-    release_irqrestore(&n->io_lock, irqf);
+    release(&n->io_lock);
     return 0;
 }
 
@@ -963,12 +1066,10 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
     if (!file || !file->driver_private) return -1;
     struct ramfs_file_handle *fh = (struct ramfs_file_handle*)file->driver_private;
     struct ramfs_node *n = fh->node;
-    if (n->is_dir) return -1;
-    /* allow kernel context (ct == NULL), root (euid 0), or file owner */
-    thread_t* ct = thread_current();
-    if (ct) {
-        if (ct->euid != 0 && (unsigned)ct->euid != n->uid) return -1;
-    }
+    if (!n) return -1;
+    if (n->is_dir) return -EISDIR;
+    /* Linux: write(2) on an already-open fd does not re-check ownership.
+     * Re-checking euid here turned apt sandbox / fork+exec writes into EIO. */
     /*
      * ramfs is never touched from interrupt context. Keeping IF=0 while
      * krealloc copies a multi-megabyte archive stalls timers, networking and
@@ -978,7 +1079,7 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
     acquire(&n->io_lock);
     if (ramfs_ensure_heap_data_locked(n) != 0) {
         release(&n->io_lock);
-        return -1;
+        return -ENOMEM;
     }
     /* Geometric capacity avoids O(file_size^2) copying during archive extract. */
     const size_t CHUNK = 64 * 1024; /* 64 KiB */
@@ -1003,14 +1104,25 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
                 capacity = next;
             }
             char *d;
+            size_t old_cap = n->capacity;
             if (!n->data) {
                 d = (char*)kmalloc(capacity);
                 if (d) memset(d, 0, capacity);
             } else {
-                size_t oldsz = n->size;
                 d = (char*)krealloc(n->data, capacity);
-                if (d && capacity > oldsz)
-                    memset(d + oldsz, 0, capacity - oldsz);
+                if (d && capacity > old_cap)
+                    memset(d + old_cap, 0, capacity - old_cap);
+            }
+            if (!d && capacity > needed_end) {
+                capacity = needed_end;
+                if (!n->data) {
+                    d = (char*)kmalloc(capacity);
+                    if (d) memset(d, 0, capacity);
+                } else {
+                    d = (char*)krealloc(n->data, capacity);
+                    if (d && capacity > old_cap)
+                        memset(d + old_cap, 0, capacity - old_cap);
+                }
             }
             if (!d) {
                 kprintf("ramfs OOM: write alloc failed path=%s needed=%llu heap_used=%llu heap_total=%llu\n",
@@ -1020,13 +1132,18 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
                 kprintf("ramfs: write: alloc failed path=%s needed_end=%u\n",
                         file && file->path ? file->path : "(null)", (unsigned)needed_end);
                 release(&n->io_lock);
-                return -1;
+                return -ENOMEM;
             }
             n->data = d;
             n->capacity = capacity;
         }
         if (needed_end > n->size) {
-            memset(n->data + n->size, 0, needed_end - n->size);
+            if (n->data && n->size < n->capacity) {
+                size_t zfrom = n->size;
+                size_t zto = needed_end < n->capacity ? needed_end : n->capacity;
+                if (zto > zfrom)
+                    memset(n->data + zfrom, 0, zto - zfrom);
+            }
             n->size = needed_end;
         }
         memcpy(n->data + write_pos, (const char*)buf + src_pos, chunk);
@@ -1046,7 +1163,15 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
 
 static void ramfs_release(struct fs_file *file) {
     if (!file) return;
-    if (file->driver_private) kfree(file->driver_private);
+    if (file->driver_private) {
+        struct ramfs_file_handle *fh = (struct ramfs_file_handle *)file->driver_private;
+        if (fh->node) {
+            if (fh->node->open_count > 0)
+                fh->node->open_count--;
+            ramfs_maybe_free_inode(fh->node);
+        }
+        kfree(fh);
+    }
     if (file->path) kfree((void*)file->path);
     kfree(file);
 }
@@ -1075,6 +1200,8 @@ int ramfs_mkdir(const char *path) {
     if (ramfs_find_child(parent, name)) { kfree(tmp); return -4; }
     struct ramfs_node *n = ramfs_alloc_node(name, 1);
     if (!n) { kfree(tmp); return -5; }
+    ramfs_set_create_owner(n);
+    ramfs_apply_umask_mode(n, 0777);
     n->parent = parent;
     n->next = parent->children;
     parent->children = n;
@@ -1156,17 +1283,17 @@ int ramfs_remove(const char *path) {
     if (!path) return -1;
     if (strcmp(path, "/") == 0) return -2;
     /*
-     * Root-only for userspace. Boot/kernel context has no current thread —
-     * treat that as privileged (otherwise fs_unlink of initfs NSS stubs
-     * silently fails and static glibc still dlopens the hollow Debian .so).
+     * Boot/kernel context has no creds — treat that as privileged (otherwise
+     * fs_unlink of initfs NSS stubs silently fails). Userspace follows Linux
+     * unlink: write on the parent, plus sticky-bit owner checks.
      */
-    thread_t* ct = thread_current();
-    if (ct && ct->euid != 0) return -1;
+    thread_t* ct = ramfs_cred();
     /* unlink(2): do not follow the final symlink; operate on the dentry. */
     struct ramfs_node *n = ramfs_lookup_nofollow(path);
     if (!n) return -3;
     struct ramfs_node *p = n->parent;
     if (!p) return -4;
+    if (ct && !ramfs_may_unlink_node(p, n, ct)) return -1;
 
     /* Hard-link dentry: drop the name, keep the inode until nlink==0. */
     if (n->link_target) {
@@ -1176,18 +1303,8 @@ int ramfs_remove(const char *path) {
         kfree(n);
         if (target->nlink > 0)
             target->nlink--;
-        if (target->nlink == 0) {
-            if (target->parent)
-                ramfs_unlink_from_parent(target);
-            if (target->name) {
-                kfree(target->name);
-                target->name = NULL;
-            }
-            pagecache_invalidate(PAGECACHE_ID_RAMFS(target->ino));
-            ramfs_free_data_owned(target);
-            ramfs_free_xattrs(target);
-            kfree(target);
-        }
+        if (target->nlink == 0)
+            ramfs_maybe_free_inode(target);
         return 0;
     }
 
@@ -1195,8 +1312,10 @@ int ramfs_remove(const char *path) {
     if (n->nlink > 0)
         n->nlink--;
     /* Still named via hard-link dentries — leave orphan inode alive. */
-    if (!n->is_dir && n->nlink > 0)
+    if (!n->is_dir) {
+        ramfs_maybe_free_inode(n);
         return 0;
+    }
 
     /* free recursively */
     struct ramfs_node *stack[64]; int sp = 0;

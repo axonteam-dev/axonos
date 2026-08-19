@@ -1,6 +1,7 @@
 /*
- * Shared file page cache for MAP_PRIVATE / ELF demand paging.
- * Key: (backing_id, generation, page_index). SquashFS gen is always 0.
+ * Shared file page cache for MAP_SHARED (PostgreSQL DSM) and MAP_PRIVATE /
+ * ELF demand paging. Key: (backing_id, generation, page_index).
+ * SquashFS gen is always 0.
  */
 #include <pagecache.h>
 #include <frame.h>
@@ -8,6 +9,7 @@
 #include <spinlock.h>
 #include <heap.h>
 #include <string.h>
+#include <mm.h>
 
 #define PAGECACHE_BUCKETS 512
 #define PAGECACHE_MAX     2048
@@ -86,6 +88,8 @@ int pagecache_get(struct fs_file *file, uint64_t file_off, uint64_t *pa_out)
     uint64_t pa;
     ssize_t nr;
     size_t n;
+    int rc = -1;
+    mm_dm_ctx_t dm;
 
     if (!file || !pa_out || file->backing_id == 0)
         return -1;
@@ -94,23 +98,31 @@ int pagecache_get(struct fs_file *file, uint64_t file_off, uint64_t *pa_out)
     generation = file->backing_gen;
     page_index = aligned >> 12;
 
+    /*
+     * MAP_SHARED mmap unmaps the process identity window first. PMM frames
+     * and the object heap live in that VA==PA range, so fill must run under
+     * swapper CR3 (same rule as mm_map_user_page).
+     */
+    dm = mm_enter_direct_map();
+
     acquire_irqsave(&g_pc_lock, &irqf);
     hit = pc_find_locked(backing_id, generation, page_index);
     if (hit) {
         if (frame_retain(hit->pa) != 0) {
             release_irqrestore(&g_pc_lock, irqf);
-            return -1;
+            goto out;
         }
         hit->last_used = ++g_pc_tick;
         *pa_out = hit->pa;
         release_irqrestore(&g_pc_lock, irqf);
-        return 0;
+        rc = 0;
+        goto out;
     }
     release_irqrestore(&g_pc_lock, irqf);
 
     page = frame_alloc_zero();
     if (!page)
-        return -1;
+        goto out;
     pa = (uint64_t)(uintptr_t)page;
     n = (size_t)PAGE_SIZE_4K;
     if (aligned >= (uint64_t)file->size)
@@ -121,7 +133,7 @@ int pagecache_get(struct fs_file *file, uint64_t file_off, uint64_t *pa_out)
         nr = fs_read(file, page, n, (size_t)aligned);
         if (nr < 0 || (size_t)nr != n) {
             frame_release(pa);
-            return -1;
+            goto out;
         }
     }
 
@@ -131,13 +143,14 @@ int pagecache_get(struct fs_file *file, uint64_t file_off, uint64_t *pa_out)
         if (frame_retain(hit->pa) != 0) {
             release_irqrestore(&g_pc_lock, irqf);
             frame_release(pa);
-            return -1;
+            goto out;
         }
         hit->last_used = ++g_pc_tick;
         *pa_out = hit->pa;
         release_irqrestore(&g_pc_lock, irqf);
         frame_release(pa);
-        return 0;
+        rc = 0;
+        goto out;
     }
     while (g_pc_count >= PAGECACHE_MAX) {
         if (pc_evict_one_locked() != 0)
@@ -158,17 +171,21 @@ int pagecache_get(struct fs_file *file, uint64_t file_off, uint64_t *pa_out)
             if (frame_retain(pa) != 0) {
                 release_irqrestore(&g_pc_lock, irqf);
                 frame_release(pa);
-                return -1;
+                goto out;
             }
             *pa_out = pa;
             release_irqrestore(&g_pc_lock, irqf);
-            return 0;
+            rc = 0;
+            goto out;
         }
     }
     /* Cache is full of busy pages: hand the private frame to the caller. */
     *pa_out = pa;
     release_irqrestore(&g_pc_lock, irqf);
-    return 0;
+    rc = 0;
+out:
+    mm_leave_direct_map(dm);
+    return rc;
 }
 
 void pagecache_invalidate(uint64_t backing_id)

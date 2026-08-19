@@ -17,6 +17,8 @@ typedef struct heap_block_header {
     size_t size;                 // payload size (bytes)
     struct heap_block_header* next;
     struct heap_block_header* prev;
+    struct heap_block_header* free_next; /* explicit free list (not address order) */
+    struct heap_block_header* free_prev;
     uint32_t magic;
     uint32_t free;
     size_t req_size;             // requested size (before alignment), for diagnostics
@@ -28,9 +30,9 @@ typedef struct heap_block_header {
 static uint8_t* heap_base = 0;
 static size_t   heap_capacity = 0;
 static heap_block_header_t* head = 0;
-/* Next-fit cursor. Starting every allocation at head makes short-lived VFS
- * allocations O(number of all historical heap blocks) after boot. */
+/* Next-fit cursor kept as a fallback start; allocation walks the free list. */
 static heap_block_header_t* alloc_rover = 0;
+static heap_block_header_t* free_head = 0;
 
 static size_t heap_used_now = 0;
 static size_t heap_peak     = 0;
@@ -90,10 +92,38 @@ void heap_init(uintptr_t heap_start, size_t heap_size) {
     head->magic = HEAP_MAGIC_FREE;
     head->req_size = 0;
     head->alloc_caller = 0;
+    head->free_next = 0;
+    head->free_prev = 0;
     alloc_rover = head;
+    free_head = head;
 
     heap_used_now = 0;
     heap_peak = 0;
+}
+
+static void fl_remove(heap_block_header_t *b)
+{
+    if (!b)
+        return;
+    if (b->free_prev)
+        b->free_prev->free_next = b->free_next;
+    else if (free_head == b)
+        free_head = b->free_next;
+    if (b->free_next)
+        b->free_next->free_prev = b->free_prev;
+    b->free_next = 0;
+    b->free_prev = 0;
+}
+
+static void fl_insert(heap_block_header_t *b)
+{
+    if (!b)
+        return;
+    b->free_prev = 0;
+    b->free_next = free_head;
+    if (free_head)
+        free_head->free_prev = b;
+    free_head = b;
 }
 
 static void split_block(heap_block_header_t* blk, size_t size) {
@@ -107,30 +137,54 @@ static void split_block(heap_block_header_t* blk, size_t size) {
     newblk->alloc_caller = 0;
     newblk->next = blk->next;
     newblk->prev = blk;
+    newblk->free_next = 0;
+    newblk->free_prev = 0;
     if (newblk->next) newblk->next->prev = newblk;
     blk->next = newblk;
     blk->size = size;
+    fl_insert(newblk);
+    /* Coalesce leftover with the following free block only. The previous
+     * neighbor is the block we just shrank and may still be marked free
+     * (kmalloc splits before flipping ALLOC). Merging backward would undo
+     * the split. */
+    if (newblk->next && newblk->next->free &&
+        newblk->next->magic == HEAP_MAGIC_FREE) {
+        fl_remove(newblk->next);
+        newblk->size += sizeof(heap_block_header_t) + newblk->next->size;
+        newblk->next = newblk->next->next;
+        if (newblk->next)
+            newblk->next->prev = newblk;
+    }
 }
 
-static void coalesce(heap_block_header_t* blk) {
+/* Returns the surviving free block. Caller inserts it on the free list iff
+ * it was not already there (i.e. not merged into a previous free neighbor). */
+static heap_block_header_t *coalesce(heap_block_header_t* blk) {
     // merge with next
     if (blk->next && blk->next->free) {
         if (alloc_rover == blk->next) alloc_rover = blk;
+        fl_remove(blk->next);
         blk->size += sizeof(heap_block_header_t) + blk->next->size;
         blk->next = blk->next->next;
         if (blk->next) blk->next->prev = blk;
     }
-    // merge with prev
+    // merge with prev: prev is already on the free list
     if (blk->prev && blk->prev->free) {
         if (alloc_rover == blk) alloc_rover = blk->prev;
+        fl_remove(blk);
         blk->prev->size += sizeof(heap_block_header_t) + blk->size;
         blk->prev->next = blk->next;
         if (blk->next) blk->next->prev = blk->prev;
         blk = blk->prev;
+        blk->magic = HEAP_MAGIC_FREE;
+        blk->req_size = 0;
+        blk->alloc_caller = 0;
+        return blk;
     }
     blk->magic = HEAP_MAGIC_FREE;
     blk->req_size = 0;
     blk->alloc_caller = 0;
+    return blk;
 }
 
 /* forward declarations for diagnostic helpers used by krealloc */
@@ -145,15 +199,18 @@ static void* kmalloc_nolock(size_t size) {
 #else
     size = ALIGN16(req);
 #endif
-    heap_block_header_t* cur = alloc_rover ? alloc_rover : head;
-    heap_block_header_t* start = cur;
+    heap_block_header_t* cur = free_head;
     if (!cur) return 0;
-    do {
-        if (cur->free && cur->size >= size) {
+    while (cur) {
+        heap_block_header_t *next_free = cur->free_next;
+        if (cur->free && cur->magic == HEAP_MAGIC_FREE && cur->size >= size) {
+            fl_remove(cur);
             split_block(cur, size);
             cur->free = 0;
             cur->magic = HEAP_MAGIC_ALLOC;
             cur->req_size = req;
+            cur->free_next = 0;
+            cur->free_prev = 0;
             /* best-effort: capture external caller of kmalloc(), not kmalloc_nolock() */
             cur->alloc_caller = __builtin_return_address(1);
             heap_used_now += cur->size;
@@ -167,8 +224,8 @@ static void* kmalloc_nolock(size_t size) {
             alloc_rover = cur->next ? cur->next : head;
             return p;
         }
-        cur = cur->next ? cur->next : head;
-    } while (cur && cur != start);
+        cur = next_free;
+    }
     /* OOM: do not kprintf here — kmalloc() holds heap_lock and kprintf may kmalloc → deadlock. */
     return 0; /* out of memory */
 }
@@ -216,8 +273,15 @@ static void kfree_nolock(void* ptr, void *caller) {
 #endif
     blk->free = 1;
     blk->magic = HEAP_MAGIC_FREE;
+    blk->free_next = 0;
+    blk->free_prev = 0;
     if (heap_used_now >= blk->size) heap_used_now -= blk->size; else heap_used_now = 0;
-    coalesce(blk);
+    {
+        int had_free_prev = (blk->prev && blk->prev->free) ? 1 : 0;
+        heap_block_header_t *surv = coalesce(blk);
+        if (!had_free_prev)
+            fl_insert(surv);
+    }
 }
 
 static void* krealloc_nolock(void* ptr, size_t new_size) {
@@ -282,6 +346,12 @@ static void* krealloc_nolock(void* ptr, size_t new_size) {
         if (accumulated >= new_size) {
             /* scan points to last absorbed free block; link to the first non-absorbed one. */
             heap_block_header_t *after = last_absorbed ? last_absorbed->next : NULL;
+            heap_block_header_t *gone = blk->next;
+            while (gone && gone != after) {
+                heap_block_header_t *nx = gone->next;
+                fl_remove(gone);
+                gone = nx;
+            }
             /* set blk to cover the entire accumulated region */
             blk->size = accumulated;
             blk->next = after;
@@ -426,10 +496,10 @@ int heap_ptr_is_kmalloc(const void *ptr) {
 /* Return largest single free payload size currently available (doesn't include header). */
 static size_t heap_largest_free_block(void) {
     size_t max = 0;
-    heap_block_header_t *cur = head;
+    heap_block_header_t *cur = free_head;
     while (cur) {
         if (cur->free && cur->size > max) max = cur->size;
-        cur = cur->next;
+        cur = cur->free_next;
     }
     return max;
 }
@@ -437,10 +507,10 @@ static size_t heap_largest_free_block(void) {
 /* Sum of all free payload bytes (for diagnostics). */
 static size_t heap_total_free_bytes(void) {
     size_t total = 0;
-    heap_block_header_t *cur = head;
+    heap_block_header_t *cur = free_head;
     while (cur) {
         if (cur->free) total += cur->size;
-        cur = cur->next;
+        cur = cur->free_next;
     }
     return total;
 }

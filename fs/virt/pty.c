@@ -2,8 +2,8 @@
  * Unix98 PTY (Linux /dev/ptmx + /dev/pts/N)
  *
  * Master write → slave read (m2s); slave write → master read (s2m).
- * Termios is stored and returned via TCGETS/TCSETS; line discipline is
- * pass-through (raw rings) — enough for tmux/shell after tcsetattr.
+ * Line discipline (OPOST/ONLCR, ICRNL, VERASE, ECHO) is applied here so
+ * SSH sessions do not staircase and backspace matches Linux termios.
  */
 #include <pty.h>
 #include <stdint.h>
@@ -21,6 +21,35 @@
 
 #define PTY_BUF_CAP 4096
 #define PTY_HANDLE_MAGIC 0x50545948u /* 'PTYH' */
+#define PTY_NCCS 19
+
+/* Linux x86 termbits (octal in asm-generic/termbits.h). */
+#define TCS_IGNCR   0x00000080u
+#define TCS_INLCR   0x00000040u
+#define TCS_ICRNL   0x00000100u
+#define TCS_IXON    0x00000400u
+#define TCS_IUTF8   0x00004000u
+#define TCS_OPOST   0x00000001u
+#define TCS_ONLCR   0x00000004u
+#define TCS_OCRNL   0x00000008u
+#define TCS_ISIG    0x00000001u
+#define TCS_ICANON  0x00000002u
+#define TCS_ECHO    0x00000008u
+#define TCS_ECHOE   0x00000010u
+#define TCS_ECHOK   0x00000020u
+#define TCS_ECHONL  0x00000040u
+#define TCS_ECHOCTL 0x00000200u
+#define TCS_IEXTEN  0x00008000u
+
+#define TCS_VINTR  0
+#define TCS_VQUIT  1
+#define TCS_VERASE 2
+#define TCS_VKILL  3
+#define TCS_VEOF   4
+#define TCS_VTIME  5
+#define TCS_VMIN   6
+
+#define TCS_CFLAG_DEF 0x00000CB7u /* CS8|CREAD|CLOCAL|B38400-ish */
 
 struct pty_ring {
 	char buf[PTY_BUF_CAP];
@@ -40,9 +69,11 @@ struct pty_pair {
 	int slave_opens;
 	int fg_pgrp;
 	int controlling_sid;
+	uint32_t term_iflag;
+	uint32_t term_oflag;
+	uint32_t term_cflag;
 	uint32_t term_lflag;
-	uint8_t term_vmin;
-	uint8_t term_vtime;
+	uint8_t term_cc[PTY_NCCS];
 	uint16_t ws_row;
 	uint16_t ws_col;
 	struct pty_ring m2s;
@@ -164,6 +195,139 @@ static void pty_ring_flush(struct pty_ring *r) {
 	release_irqrestore(&r->lock, flags);
 }
 
+static int pty_ring_erase_last(struct pty_ring *r) {
+	unsigned long flags = 0;
+	int ok = 0;
+	acquire_irqsave(&r->lock, &flags);
+	if (r->count > 0) {
+		size_t last = (r->tail + PTY_BUF_CAP - 1) % PTY_BUF_CAP;
+		if (r->buf[last] != '\n') {
+			r->tail = last;
+			r->count--;
+			ok = 1;
+		}
+	}
+	release_irqrestore(&r->lock, flags);
+	return ok;
+}
+
+static void pty_init_termios(struct pty_pair *p) {
+	memset(p->term_cc, 0, sizeof(p->term_cc));
+	p->term_iflag = TCS_ICRNL | TCS_IXON;
+	p->term_oflag = TCS_OPOST | TCS_ONLCR;
+	p->term_cflag = TCS_CFLAG_DEF;
+	p->term_lflag = TCS_ISIG | TCS_ICANON | TCS_ECHO | TCS_ECHOE | TCS_ECHOK | TCS_IEXTEN;
+	p->term_cc[TCS_VINTR] = 3;
+	p->term_cc[TCS_VQUIT] = 034;
+	p->term_cc[TCS_VERASE] = 0177; /* DEL — what SSH/xterm send for Backspace */
+	p->term_cc[TCS_VKILL] = 025;
+	p->term_cc[TCS_VEOF] = 4;
+	p->term_cc[TCS_VTIME] = 0;
+	p->term_cc[TCS_VMIN] = 1;
+	p->term_cc[8] = 021; /* VSTART */
+	p->term_cc[9] = 023; /* VSTOP */
+	p->term_cc[10] = 032; /* VSUSP */
+}
+
+static size_t pty_ring_free(struct pty_ring *r) {
+	size_t used = pty_ring_avail(r);
+	if (used >= PTY_BUF_CAP - 1)
+		return 0;
+	return (PTY_BUF_CAP - 1) - used;
+}
+
+/* Slave → master: OPOST (ONLCR turns NL into CRNL — SSH staircase fix).
+ * Returns 1 if the source byte was consumed, 0 if the output ring is full. */
+static size_t pty_opost_one(struct pty_pair *p, unsigned char c) {
+	uint32_t oflag = p->term_oflag;
+	char tmp[2];
+	size_t tn = 1;
+
+	tmp[0] = (char)c;
+	if ((oflag & TCS_OPOST) && (oflag & TCS_ONLCR) && c == '\n') {
+		tmp[0] = '\r';
+		tmp[1] = '\n';
+		tn = 2;
+	} else if ((oflag & TCS_OPOST) && (oflag & TCS_OCRNL) && c == '\r') {
+		tmp[0] = '\n';
+		tn = 1;
+	} else if (!(oflag & TCS_OPOST)) {
+		tn = 1;
+	}
+	if (pty_ring_free(&p->s2m) < tn)
+		return 0;
+	return pty_ring_write(&p->s2m, tmp, tn) == tn ? 1 : 0;
+}
+
+static void pty_echo_char(struct pty_pair *p, unsigned char c) {
+	uint32_t lflag = p->term_lflag;
+	if (!(lflag & TCS_ECHO) && !((lflag & TCS_ECHONL) && c == '\n'))
+		return;
+	if ((lflag & TCS_ECHOCTL) && c < 32 && c != '\t' && c != '\n' && c != '\r') {
+		char vis[2];
+		vis[0] = '^';
+		vis[1] = (char)(c + '@');
+		(void)pty_ring_write(&p->s2m, vis, 2);
+		return;
+	}
+	if ((lflag & TCS_ECHOCTL) && c == 127) {
+		(void)pty_ring_write(&p->s2m, "^?", 2);
+		return;
+	}
+	(void)pty_opost_one(p, c);
+}
+
+static size_t pty_output_from_slave(struct pty_pair *p, const char *src, size_t n) {
+	size_t i;
+	for (i = 0; i < n; i++) {
+		if (!pty_opost_one(p, (unsigned char)src[i]))
+			break;
+	}
+	return i;
+}
+
+static size_t pty_input_from_master(struct pty_pair *p, const char *src, size_t n) {
+	uint32_t iflag = p->term_iflag;
+	uint32_t lflag = p->term_lflag;
+	unsigned char verase = p->term_cc[TCS_VERASE];
+	unsigned char vkill = p->term_cc[TCS_VKILL];
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		unsigned char c = (unsigned char)src[i];
+		char ch;
+
+		if ((iflag & TCS_IGNCR) && c == '\r')
+			continue;
+		if ((iflag & TCS_ICRNL) && c == '\r')
+			c = '\n';
+		else if ((iflag & TCS_INLCR) && c == '\n')
+			c = '\r';
+
+		if ((lflag & TCS_ICANON) && verase && c == verase) {
+			if (pty_ring_erase_last(&p->m2s) && (lflag & TCS_ECHO) && (lflag & TCS_ECHOE)) {
+				(void)pty_ring_write(&p->s2m, "\b \b", 3);
+			}
+			continue;
+		}
+		if ((lflag & TCS_ICANON) && vkill && c == vkill) {
+			while (pty_ring_erase_last(&p->m2s)) {
+				if ((lflag & TCS_ECHO) && (lflag & TCS_ECHOE))
+					(void)pty_ring_write(&p->s2m, "\b \b", 3);
+			}
+			continue;
+		}
+
+		if (pty_ring_free(&p->m2s) < 1)
+			break;
+		ch = (char)c;
+		if (pty_ring_write(&p->m2s, &ch, 1) != 1)
+			break;
+		pty_echo_char(p, c);
+	}
+	return i;
+}
+
 static struct fs_file *pty_alloc_file(const char *path, struct pty_pair *pair, int is_master) {
 	struct fs_file *f;
 	struct pty_handle *h;
@@ -213,12 +377,10 @@ int pty_open_ptmx(struct fs_file **out) {
 			memset(p, 0, sizeof(*p));
 			p->index = i;
 			p->in_use = 1;
-			p->locked = 1;
+			p->locked = 0;
 			p->fg_pgrp = -1;
 			p->controlling_sid = -1;
-			p->term_lflag = 0x00000002u | 0x00000008u | 0x00000001u; /* ICANON|ECHO|ISIG */
-			p->term_vmin = 1;
-			p->term_vtime = 0;
+			pty_init_termios(p);
 			p->ws_row = 24;
 			p->ws_col = 80;
 			pty_ring_init(&p->m2s);
@@ -251,7 +413,13 @@ int pty_open_slave(int index, struct fs_file **out) {
 		return -1;
 	acquire_irqsave(&g_pty_table_lock, &flags);
 	p = &g_ptys[index];
-	if (!p->in_use || p->locked) {
+	/*
+	 * Linux: the /dev/pts/N inode exists as soon as ptmx is opened.
+	 * TIOCSPTLCK is advisory; glibc grantpt() stats (and some openpty
+	 * paths open) the slave while still locked. Treating lock as
+	 * "no such file" made dropbear log openpty: ENOENT.
+	 */
+	if (!p->in_use) {
 		release_irqrestore(&g_pty_table_lock, flags);
 		return -1;
 	}
@@ -287,6 +455,9 @@ ssize_t pty_read(struct fs_file *f, void *buf, size_t n) {
 			return 0;
 		if (!h->is_master && h->pair->master_opens == 0)
 			return 0;
+		/* Linux O_NONBLOCK: dpkg child FlushSTDIN would hang forever. */
+		if (f->flags & 0x800)
+			return -11;
 		/* Block until data or peer close (re-check after wake). */
 		{
 			unsigned long flags = 0;
@@ -313,7 +484,6 @@ ssize_t pty_read(struct fs_file *f, void *buf, size_t n) {
 
 ssize_t pty_write(struct fs_file *f, const void *buf, size_t n) {
 	struct pty_handle *h = pty_handle_of(f);
-	struct pty_ring *r;
 	size_t done = 0;
 	const char *src = (const char *)buf;
 
@@ -321,14 +491,19 @@ ssize_t pty_write(struct fs_file *f, const void *buf, size_t n) {
 		return -1;
 	if (n == 0)
 		return 0;
-	r = h->is_master ? &h->pair->m2s : &h->pair->s2m;
 
 	while (done < n) {
-		size_t w = pty_ring_write(r, src + done, n - done);
+		size_t w;
+		if (h->is_master)
+			w = pty_input_from_master(h->pair, src + done, n - done);
+		else
+			w = pty_output_from_slave(h->pair, src + done, n - done);
 		if (w == 0) {
-			/* full — short write or yield and retry once */
 			thread_yield();
-			w = pty_ring_write(r, src + done, n - done);
+			if (h->is_master)
+				w = pty_input_from_master(h->pair, src + done, n - done);
+			else
+				w = pty_output_from_slave(h->pair, src + done, n - done);
 			if (w == 0)
 				break;
 		}
@@ -372,6 +547,64 @@ int pty_available(struct fs_file *f) {
 	return (int)pty_ring_avail(h->is_master ? &h->pair->s2m : &h->pair->m2s);
 }
 
+int pty_peer_hungup(struct fs_file *f) {
+	struct pty_handle *h = pty_handle_of(f);
+	if (!h)
+		return 0;
+	if (h->is_master)
+		return h->pair->slave_opens == 0;
+	return h->pair->master_opens == 0;
+}
+
+static struct pty_ring *pty_in_ring(struct pty_handle *h) {
+	return h->is_master ? &h->pair->s2m : &h->pair->m2s;
+}
+
+int pty_add_waiter(struct fs_file *f, int tid) {
+	struct pty_handle *h = pty_handle_of(f);
+	struct pty_ring *r;
+	unsigned long flags = 0;
+	int i;
+
+	if (!h || tid < 0)
+		return -1;
+	r = pty_in_ring(h);
+	acquire_irqsave(&r->lock, &flags);
+	for (i = 0; i < r->waiters_count; i++) {
+		if (r->waiters[i] == tid) {
+			release_irqrestore(&r->lock, flags);
+			return 0;
+		}
+	}
+	if (r->waiters_count >= (int)(sizeof(r->waiters) / sizeof(r->waiters[0]))) {
+		release_irqrestore(&r->lock, flags);
+		return -1;
+	}
+	r->waiters[r->waiters_count++] = tid;
+	release_irqrestore(&r->lock, flags);
+	return 0;
+}
+
+void pty_remove_waiter(struct fs_file *f, int tid) {
+	struct pty_handle *h = pty_handle_of(f);
+	struct pty_ring *r;
+	unsigned long flags = 0;
+	int i;
+
+	if (!h || tid < 0)
+		return;
+	r = pty_in_ring(h);
+	acquire_irqsave(&r->lock, &flags);
+	for (i = 0; i < r->waiters_count; i++) {
+		if (r->waiters[i] == tid) {
+			r->waiters[i] = r->waiters[r->waiters_count - 1];
+			r->waiters_count--;
+			break;
+		}
+	}
+	release_irqrestore(&r->lock, flags);
+}
+
 int pty_set_locked(struct fs_file *f, int locked) {
 	struct pty_handle *h = pty_handle_of(f);
 	if (!h || !h->is_master)
@@ -392,13 +625,34 @@ uint32_t pty_get_lflag(struct fs_file *f) {
 	return h ? h->pair->term_lflag : 0;
 }
 
-void pty_set_termios(struct fs_file *f, uint32_t lflag, uint8_t vtime, uint8_t vmin) {
+void pty_get_termios(struct fs_file *f, uint32_t *iflag, uint32_t *oflag,
+		     uint32_t *cflag, uint32_t *lflag, uint8_t *cc, size_t ncc) {
 	struct pty_handle *h = pty_handle_of(f);
 	if (!h)
 		return;
+	if (iflag) *iflag = h->pair->term_iflag;
+	if (oflag) *oflag = h->pair->term_oflag;
+	if (cflag) *cflag = h->pair->term_cflag;
+	if (lflag) *lflag = h->pair->term_lflag;
+	if (cc && ncc) {
+		size_t n = ncc < PTY_NCCS ? ncc : PTY_NCCS;
+		memcpy(cc, h->pair->term_cc, n);
+	}
+}
+
+void pty_set_termios(struct fs_file *f, uint32_t iflag, uint32_t oflag,
+		     uint32_t cflag, uint32_t lflag, const uint8_t *cc, size_t ncc) {
+	struct pty_handle *h = pty_handle_of(f);
+	if (!h)
+		return;
+	h->pair->term_iflag = iflag;
+	h->pair->term_oflag = oflag;
+	h->pair->term_cflag = cflag;
 	h->pair->term_lflag = lflag;
-	h->pair->term_vtime = vtime;
-	h->pair->term_vmin = vmin;
+	if (cc && ncc) {
+		size_t n = ncc < PTY_NCCS ? ncc : PTY_NCCS;
+		memcpy(h->pair->term_cc, cc, n);
+	}
 }
 
 void pty_get_winsize(struct fs_file *f, uint16_t *row, uint16_t *col) {
@@ -477,5 +731,10 @@ int pty_fill_stat(struct fs_file *f, struct stat *st) {
 	st->st_mode = (mode_t)(S_IFCHR | 0620);
 	st->st_nlink = 1;
 	st->st_ino = (ino_t)(1000 + h->pair->index + (h->is_master ? 0 : 100));
+	/* Linux: /dev/ptmx is 5:2; Unix98 slaves are major 136 + index. */
+	if (h->is_master)
+		st->st_rdev = MKDEV(5, 2);
+	else
+		st->st_rdev = MKDEV(136, (unsigned)h->pair->index);
 	return 0;
 }

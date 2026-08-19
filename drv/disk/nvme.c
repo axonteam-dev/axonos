@@ -446,6 +446,8 @@ static int nvme_register_namespace(nvme_dev_t *dev, int ctrl_index) {
 	char path[32];
 	snprintf(path, sizeof(path), "/dev/nvme%dn%u", ctrl_index, (unsigned)dev->nsid);
 	(void)devfs_create_block_node(path, id, g_nvme[id].sectors);
+	disk_note_capacity(id, g_nvme[id].sectors);
+	(void)disk_reread_partitions(id);
 	/* Linux: NVMe is /dev/nvmeXnY only — do not alias as sd*. */
 
 	klogprintf("nvme: registered %s sectors=%u model=\"%s\"\n",

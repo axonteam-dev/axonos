@@ -31,6 +31,8 @@ void pit_handler(cpu_registers_t* regs) {
         if (!init) return;
         thread_account_timer_tick(regs && ((regs->cs & 3) == 3));
         process_itimer_tick(pit_get_time_ms());
+        if (smp_sched_cpu_id() == 0)
+                syscall_net_l2_irq_poll();
         /* Publish now, but force this IRQ to return to the parent before any
          * later timer tick is allowed to select the new child. */
         int published_fork_child = 0;

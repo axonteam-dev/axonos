@@ -360,38 +360,64 @@ int thread_reap(int pid) {
         return -1;
 }
 
-/* True if a TERMINATED child may be freed without wait4 (matches thread_schedule auto-reap). */
+/* True if a living waiter still owns this zombie (wait4 must reap it). */
+int thread_wait_parent_alive(const thread_t *t) {
+        if (!t)
+                return 0;
+        if (t->process && t->process->parent &&
+            t->process->parent->state != PROCESS_ZOMBIE)
+                return 1;
+        if (t->waiter_tid >= 0) {
+                thread_t *w = thread_get(t->waiter_tid);
+                if (w && w->ring == 3 && w->state != THREAD_TERMINATED)
+                        return 1;
+        }
+        if (t->parent_tid < 0)
+                return 0;
+        /*
+         * thread_get() matches the slot tid only. Fork stores that, but some
+         * paths have used TGID; scan both so a live opkg is never "missing".
+         */
+        for (int i = 0; i < thread_count; ++i) {
+                thread_t *p = threads[i];
+                if (!p || p->ring != 3 || p->state == THREAD_TERMINATED)
+                        continue;
+                if ((int)(p->tid ? p->tid : 1) == t->parent_tid)
+                        return 1;
+                if (p->process && (int)p->process->pid == t->parent_tid)
+                        return 1;
+        }
+        return 0;
+}
+
+/* True if a TERMINATED child may be freed without wait4.
+ * Linux: a waitable group-leader zombie stays until wait() or init reaps it.
+ * CLONE_THREAD non-leaders are not wait(2) children. SIGCHLD IGN/NOCLDWAIT
+ * marks exit_status 0x80000000 and may be freed immediately. */
 static int thread_zombie_autoreap_ok(thread_t *t) {
         if (!t || t->state != THREAD_TERMINATED) return 0;
-        /* Never free the stack/object of the task executing this scheduler
-         * call. A later scheduling pass on another task will reclaim it. */
         if (t == thread_current()) return 0;
         if (t == &main_thread || thread_is_any_idle(t)) return 0;
         if (t->waiter_tid >= 0) return 0;
-        if (t->exit_status == (int)0x80000000) return 0;
-        /*
-         * Linux: a zombie keeps its PID until the parent wait()s. Do not
-         * free the thread while a living parent process still owns it —
-         * BusyBox ash / OpenRC fstabinfo posix_spawn waitpid(pid) then
-         * gets ECHILD and treats a successful mount(2) as failure.
-         */
-        if (t->process && t->process->parent &&
-            t->process->parent->state != PROCESS_ZOMBIE &&
-            t->process->state == PROCESS_ZOMBIE)
-                return 0;
-        if (t->process && t->process->parent &&
-            t->process->parent->state != PROCESS_ZOMBIE &&
-            t->process->leader == t)
-                return 0;
-        /* Boot often leaves a dead /sbin/init while /linuxrc stays PID1-ish. */
-        if (t->name[0] && (strstr(t->name, "/sbin/init") ||
-                           strcmp(t->name, "init") == 0))
+        /* IGN/NOCLDWAIT already dropped the process_t; the slot can go.
+         * wait4 still holds a process pointer until thread_reap — do not
+         * free a waitable zombie just because exit_status was overwritten. */
+        if (t->exit_status == (int)0x80000000) {
+                /* opkg xsystem: wget often exits during vfork-unfreeze before
+                 * waitpid. IGN drop + reap here made waitpid(tgid) ECHILD. */
+                if (thread_wait_parent_alive(t))
+                        return 0;
+                return t->process == NULL;
+        }
+        /* Non-leader thread: not a waitpid child. */
+        if (t->process && t->process->leader && t->process->leader != t)
                 return 1;
-        if (t->parent_tid < 0) return 1;
-        thread_t *pt = thread_get(t->parent_tid);
-        if (!pt) return 1;
-        if (pt->state == THREAD_TERMINATED) return 1;
-        return 0;
+        /* Group leader / process zombie: never auto-reap. Init or the parent waits. */
+        if (t->process)
+                return 0;
+        if (thread_wait_parent_alive(t))
+                return 0;
+        return 1;
 }
 
 /* Reparent living children of dead_parent to init (PID 1). Returns count moved. */
@@ -406,9 +432,9 @@ int thread_reparent_orphans(int dead_parent_tid) {
                 thread_t *t = threads[i];
                 if (!t) continue;
                 if (t->parent_tid != dead_parent_tid) continue;
-                if (t->state == THREAD_TERMINATED) continue;
                 t->parent_tid = init_tid;
-                n++;
+                if (t->state != THREAD_TERMINATED)
+                        n++;
         }
         release_irqrestore(&sched_lock, irqf);
         return n;
@@ -479,6 +505,7 @@ void thread_init() {
         main_thread.ngroups = 1;
         main_thread.groups[0] = 0;
         main_thread.attached_tty = devfs_get_active();
+        main_thread.attached_pty = -1;
         strncpy(main_thread.cwd, "/", sizeof(main_thread.cwd));
         main_thread.cwd[sizeof(main_thread.cwd) - 1] = '\0';
         main_thread.rseq_ptr = NULL;
@@ -639,6 +666,7 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->ngroups = 1;
         t->groups[0] = 0;
         t->attached_tty = -1;
+        t->attached_pty = -1;
         t->user_brk_base = 0;
         t->user_brk_cur = 0;
         t->user_mmap_next = 0;
@@ -788,7 +816,10 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                         else t->fds[i]->refcount++;
                     }
                 }
-                t->attached_tty = tc->attached_tty >= 0 ? tc->attached_tty : devfs_get_active();
+                t->attached_tty = tc->attached_tty;
+                t->attached_pty = tc->attached_pty;
+                if (t->attached_tty < 0 && t->attached_pty < 0)
+                    t->attached_tty = devfs_get_active();
                 strncpy(t->cwd, tc->cwd[0] ? tc->cwd : "/", sizeof(t->cwd));
                 t->cwd[sizeof(t->cwd) - 1] = '\0';
                 strncpy(t->fs_root, tc->fs_root[0] ? tc->fs_root : "/", sizeof(t->fs_root));
@@ -799,6 +830,7 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                 t->ngroups = 1;
                 t->groups[0] = 0;
                 t->attached_tty = devfs_get_active();
+                t->attached_pty = -1;
         }
         if (!t->cwd[0]) { strncpy(t->cwd, "/", sizeof(t->cwd)); t->cwd[sizeof(t->cwd)-1] = '\0'; }
         if (!t->fs_root[0]) { strncpy(t->fs_root, "/", sizeof(t->fs_root)); t->fs_root[sizeof(t->fs_root)-1] = '\0'; }
@@ -1275,7 +1307,9 @@ void thread_schedule() {
                 }
                 need_resched[my_cpu] = 0;
                 if (peer_ready) {
-                        cur->sched_vruntime += thread_vruntime_delta(cur) * 8u;
+                        /* One slice, not *8: syscall-return cond_resched was
+                         * starving wget/opkg (~1s openat tails on a 10ms tick). */
+                        cur->sched_vruntime += thread_vruntime_delta(cur);
                         thread_note_ready_nolock(cur);
                 }
         } else if (my_cpu >= 0 && my_cpu < SMP_MAX_CPUS) {

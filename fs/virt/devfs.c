@@ -25,6 +25,20 @@
 
 #define DEVFS_TTY_COUNT 6
 
+/* Linux x86 termbits (same as fs/virt/pty.c). */
+#define TTY_IGNCR   0x00000080u
+#define TTY_INLCR   0x00000040u
+#define TTY_ICRNL   0x00000100u
+#define TTY_IXON    0x00000400u
+#define TTY_OPOST   0x00000001u
+#define TTY_ONLCR   0x00000004u
+#define TTY_ISIG    0x00000001u
+#define TTY_ICANON  0x00000002u
+#define TTY_ECHO    0x00000008u
+#define TTY_IFLAG_SANE (TTY_ICRNL | TTY_IXON)
+#define TTY_OFLAG_SANE (TTY_OPOST | TTY_ONLCR)
+#define TTY_CFLAG_SANE 0x00000CB7u /* CS8|CREAD|CLOCAL */
+#define TTY_LFLAG_SANE (TTY_ISIG | TTY_ICANON | TTY_ECHO)
 
 static struct devfs_tty dev_ttys[DEVFS_TTY_COUNT];
 static int devfs_active = 0;
@@ -37,6 +51,7 @@ static void *devfs_driver_data = NULL;
 /* forward declarations (used by devfs_unlink) */
 static int devfs_open(const char *path, struct fs_file **out_file);
 static void devfs_release(struct fs_file *file);
+static int devfs_tty_try_erase(struct devfs_tty *t, int tty);
 
 /* devfs is a virtual filesystem: device nodes are not removable from userspace.
    However we must implement unlink() so tools like BusyBox rm report EPERM
@@ -123,6 +138,171 @@ static void devfs_tty_blit_to_console(struct devfs_tty *tty) {
     size_t copy_sz = scr_sz < vga_scr_sz ? scr_sz : vga_scr_sz;
     memcpy((uint8_t *)VIDEO_ADDRESS, tty->screen, copy_sz);
     console_set_cursor(tty->cursor_x, tty->cursor_y);
+}
+
+void devfs_tty_restore_sane(int tty_idx) {
+    if (tty_idx < 0 || tty_idx >= DEVFS_TTY_COUNT) return;
+    struct devfs_tty *t = &dev_ttys[tty_idx];
+    t->term_iflag = TTY_IFLAG_SANE;
+    t->term_oflag = TTY_OFLAG_SANE;
+    t->term_cflag = TTY_CFLAG_SANE;
+    t->term_lflag = TTY_LFLAG_SANE;
+    t->term_vmin = 1;
+    t->term_vtime = 0;
+    t->echo_escape_state = 0;
+}
+
+/* Linux n_tty: IGNCR / ICRNL / INLCR on the byte as it arrives, ICANON or not.
+ * Cooked mode (ICANON) always maps CR→NL even if userspace cleared ICRNL:
+ * a TCSETS that updates iflag but leaves ICANON turned Enter into a literal
+ * ^M and bash ran $'\r'. Raw/cbreak (ICANON off) still sees CR when ICRNL
+ * is off — that is what readline wants. */
+static int tty_map_iflag(struct devfs_tty *t, unsigned char *c) {
+    uint32_t iflag = t ? t->term_iflag : TTY_IFLAG_SANE;
+    int icanon = t && (t->term_lflag & TTY_ICANON);
+    unsigned char ch = *c;
+    if ((iflag & TTY_IGNCR) && ch == '\r')
+        return 0;
+    if (ch == '\r' && ((iflag & TTY_ICRNL) || icanon))
+        ch = '\n';
+    else if ((iflag & TTY_INLCR) && ch == '\n')
+        ch = '\r';
+    *c = ch;
+    return 1;
+}
+
+/* Skip kernel echo of CSI/SS3. Never swallow letters: CSI final 0x70 is 'p'
+ * and a leftover ESC-[ state used to hide the next typed p. */
+static int tty_echo_skip_esc(struct devfs_tty *t, unsigned char uc) {
+    if (!t)
+        return 0;
+    if ((uc >= 'A' && uc <= 'Z') || (uc >= 'a' && uc <= 'z') ||
+        (uc >= '0' && uc <= '9')) {
+        t->echo_escape_state = 0;
+        return 0;
+    }
+    if (t->echo_escape_state == 0) {
+        if (uc == 0x1Bu) {
+            t->echo_escape_state = 1;
+            return 1;
+        }
+        return 0;
+    }
+    if (t->echo_escape_state == 1) {
+        if (uc == '[' || uc == 'O') {
+            t->echo_escape_state = 2;
+            return 1;
+        }
+        t->echo_escape_state = 0;
+        return 0;
+    }
+    if (uc >= 0x40u && uc <= 0x7Eu)
+        t->echo_escape_state = 0;
+    return 1;
+}
+
+static void devfs_tty_echo_bytes(struct devfs_tty *tty, const uint8_t *bytes,
+                                 size_t count);
+
+static void tty_echo_input_byte(struct devfs_tty *t, unsigned char uc) {
+    if (!t || !(t->term_lflag & TTY_ECHO) || t->id != devfs_get_active())
+        return;
+    if (tty_echo_skip_esc(t, uc))
+        return;
+    if (uc == '\n' || uc == '\t' || uc >= 32u)
+        devfs_tty_echo_bytes(t, &uc, 1);
+}
+
+static void tty_irq_ovf_push(struct devfs_tty *t, unsigned char c) {
+    unsigned long flags = 0;
+    acquire_irqsave(&t->irq_ovf_lock, &flags);
+    if (t->irq_ovf_count < DEVFS_TTY_IRQ_OVF) {
+        t->irq_ovf[t->irq_ovf_tail] = (char)c;
+        t->irq_ovf_tail = (uint8_t)((t->irq_ovf_tail + 1u) % (unsigned)DEVFS_TTY_IRQ_OVF);
+        t->irq_ovf_count++;
+    }
+    release_irqrestore(&t->irq_ovf_lock, flags);
+}
+
+static void tty_irq_ovf_flush(struct devfs_tty *t) {
+    unsigned long flags = 0;
+    acquire_irqsave(&t->irq_ovf_lock, &flags);
+    t->irq_ovf_head = 0;
+    t->irq_ovf_tail = 0;
+    t->irq_ovf_count = 0;
+    release_irqrestore(&t->irq_ovf_lock, flags);
+}
+
+static void tty_drain_irq_ovf_locked(struct devfs_tty *t) {
+    unsigned long flags = 0;
+    acquire_irqsave(&t->irq_ovf_lock, &flags);
+    while (t->irq_ovf_count > 0 && t->in_count < (int)sizeof(t->inbuf)) {
+        unsigned char c = (unsigned char)t->irq_ovf[t->irq_ovf_head];
+        t->irq_ovf_head = (uint8_t)((t->irq_ovf_head + 1u) % (unsigned)DEVFS_TTY_IRQ_OVF);
+        t->irq_ovf_count--;
+        t->inbuf[t->in_tail] = (char)c;
+        t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
+        t->in_count++;
+    }
+    release_irqrestore(&t->irq_ovf_lock, flags);
+}
+
+static int tty_enqueue_byte_locked(struct devfs_tty *t, unsigned char c) {
+    if ((t->term_lflag & TTY_ICANON) && (c == '\b' || c == 0x7Fu))
+        return devfs_tty_try_erase(t, t->id);
+    if (t->in_count < (int)sizeof(t->inbuf)) {
+        t->inbuf[t->in_tail] = (char)c;
+        t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
+        t->in_count++;
+        return 1;
+    }
+    tty_irq_ovf_push(t, c);
+    return 0;
+}
+
+static void tty_wake_waiters_locked(struct devfs_tty *t) {
+    for (int i = 0; i < t->waiters_count; i++) {
+        int tid = t->waiters[i];
+        if (tid >= 0) thread_unblock(tid);
+    }
+    t->waiters_count = 0;
+}
+
+static void tty_wake_waiters_unlocked(struct devfs_tty *t) {
+    for (int i = 0; i < t->waiters_count; i++) {
+        int tid = t->waiters[i];
+        if (tid >= 0) thread_unblock(tid);
+    }
+    t->waiters_count = 0;
+}
+
+/* Caller holds in_lock. */
+static int tty_take_inbyte_locked(struct devfs_tty *t) {
+    tty_drain_irq_ovf_locked(t);
+    if (t->unget_char >= 0) {
+        int c = t->unget_char;
+        t->unget_char = -1;
+        return c;
+    }
+    if (t->in_count <= 0)
+        return -1;
+    unsigned char c = (unsigned char)t->inbuf[t->in_head];
+    t->in_head = (t->in_head + 1) % (int)sizeof(t->inbuf);
+    t->in_count--;
+    return (int)c;
+}
+
+static int tty_pending_locked(struct devfs_tty *t) {
+    int v;
+    unsigned long flags = 0;
+    tty_drain_irq_ovf_locked(t);
+    v = t->in_count;
+    if (t->unget_char >= 0)
+        v++;
+    acquire_irqsave(&t->irq_ovf_lock, &flags);
+    v += t->irq_ovf_count;
+    release_irqrestore(&t->irq_ovf_lock, flags);
+    return v;
 }
 
 void devfs_tty_leave_alt_screen(int tty_idx) {
@@ -851,11 +1031,31 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
             f->path = (const char*)pp;
             f->fs_private = &devfs_driver_data;
             /*
-             * Linux: /dev/tty and /dev/std{in,out,err} are the controlling tty.
-             * Bind at open so TIOCSPGRP/TIOCGPGRP update real tty->fg_pgrp —
-             * a deferred int marker left fg_pgrp stale (^C only hit the shell).
+             * Linux: /dev/tty is the controlling terminal. No ctty → ENXIO
+             * (open fails). Do not fall back to the active VC — that made
+             * dropbear's post-setsid open("/dev/tty") succeed and then ash
+             * job-control spin against the VGA console.
+             * /dev/std{in,out,err} keep the VC fallback for boot stdio.
              */
-            if (si == 3 || si == 4 || si == 5 || si == 6) {
+            if (si == 6) {
+                thread_t *cur = thread_current();
+                if (!cur) cur = thread_get_current_user();
+                if (cur && cur->attached_pty >= 0 && cur->attached_pty < PTY_MAX) {
+                    kfree((void*)f->path);
+                    kfree(f);
+                    if (pty_open_slave(cur->attached_pty, out_file) != 0)
+                        return -1;
+                    if (*out_file && !(*out_file)->fs_private)
+                        (*out_file)->fs_private = &devfs_driver_data;
+                    return 0;
+                }
+                if (!cur || cur->attached_tty < 0 || cur->attached_tty >= DEVFS_TTY_COUNT) {
+                    kfree((void*)f->path);
+                    kfree(f);
+                    return -1;
+                }
+                f->driver_private = (void*)&dev_ttys[cur->attached_tty];
+            } else if (si == 3 || si == 4 || si == 5) {
                 thread_t *cur = thread_current();
                 if (!cur) cur = thread_get_current_user();
                 int tty_idx = (cur && cur->attached_tty >= 0) ? cur->attached_tty : devfs_get_active();
@@ -875,18 +1075,34 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
                 kfree(f->driver_private);
                 kfree((void *)f->path);
                 kfree(f);
-                return pty_open_ptmx(out_file);
+                if (pty_open_ptmx(out_file) != 0)
+                    return -1;
+                if (*out_file && !(*out_file)->fs_private)
+                    (*out_file)->fs_private = &devfs_driver_data;
+                return 0;
             }
             *out_file = f;
             return 0;
         }
+    }
+    /* Linux also exposes the multiplexer as /dev/pts/ptmx. */
+    if (strcmp(path, "/dev/pts/ptmx") == 0) {
+        if (pty_open_ptmx(out_file) != 0)
+            return -1;
+        if (*out_file && !(*out_file)->fs_private)
+            (*out_file)->fs_private = &devfs_driver_data;
+        return 0;
     }
     /* /dev/pts/N — Unix98 slave */
     if (strncmp(path, "/dev/pts/", 9) == 0 && path[9] >= '0' && path[9] <= '9') {
         int n = 0;
         for (const char *p = path + 9; *p >= '0' && *p <= '9'; p++)
             n = n * 10 + (*p - '0');
-        return pty_open_slave(n, out_file);
+        if (pty_open_slave(n, out_file) != 0)
+            return -1;
+        if (*out_file && !(*out_file)->fs_private)
+            (*out_file)->fs_private = &devfs_driver_data;
+        return 0;
     }
     int tty = devfs_path_to_tty(path);
     if (tty < 0) return -1;
@@ -1234,32 +1450,40 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
     while (got < size) {
         unsigned long flags = 0;
         acquire_irqsave(&t->in_lock, &flags);
-        int is_canonical = (t->term_lflag & 0x00000002u) ? 1 : 0; /* ICANON bit (kernel mapping) */
+        int is_canonical = (t->term_lflag & TTY_ICANON) ? 1 : 0;
         uint8_t vtime = t->term_vtime;
-        if (t->in_count > 0) {
-            /* pop one */
-            /* Decide mode: canonical vs non-canonical */
+        int c = -1;
+        if (is_canonical) {
+            /* Linux: do not return a partial cooked line. That turned CR
+             * (before NL) into bash's $'\r' command. */
+            int have_eol = 0;
+            tty_drain_irq_ovf_locked(t);
+            int n = t->in_count;
+            int idx = t->in_head;
+            for (int k = 0; k < n; k++) {
+                if ((unsigned char)t->inbuf[idx] == '\n') {
+                    have_eol = 1;
+                    break;
+                }
+                idx = (idx + 1) % (int)sizeof(t->inbuf);
+            }
+            if (t->unget_char == '\n')
+                have_eol = 1;
+            if (have_eol)
+                c = tty_take_inbyte_locked(t);
+        } else {
+            c = tty_take_inbyte_locked(t);
+        }
+        if (c >= 0) {
+            /* ICRNL already applied at receive (Linux n_tty). Echo is done
+             * on input so a leftover CSI state cannot hide the next letter. */
+            release_irqrestore(&t->in_lock, flags);
+            out[got++] = (char)c;
             if (is_canonical) {
-                /* canonical: deliver one char, stop on newline */
-                char c = t->inbuf[t->in_head];
-                t->in_head = (t->in_head + 1) % (int)sizeof(t->inbuf);
-                t->in_count--;
-                release_irqrestore(&t->in_lock, flags);
-                if (c == '\r') c = '\n';
-                out[got++] = c;
-                if (c == '\n') break;
-                continue;
-            } else {
-                /* non-canonical: deliver ONE byte per lock hold so ISR never drops keypresses.
-                 * (Holding lock for N bytes caused next N keypresses to be dropped.) */
-                char c = t->inbuf[t->in_head];
-                t->in_head = (t->in_head + 1) % (int)sizeof(t->inbuf);
-                t->in_count--;
-                release_irqrestore(&t->in_lock, flags);
-                out[got++] = c;
-                if (got > 0) break;
+                if ((unsigned char)c == '\n') break;
                 continue;
             }
+            break;
         }
         /* no data: block current thread until pushed */
         thread_t* cur = thread_current();
@@ -1268,14 +1492,19 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 release_irqrestore(&t->in_lock, flags);
                 return (ssize_t)got;
             }
+            /* Linux O_NONBLOCK (0x800): apt dpkg FlushSTDIN loops until EAGAIN. */
+            if (file->flags & 0x800) {
+                release_irqrestore(&t->in_lock, flags);
+                return got > 0 ? (ssize_t)got : (ssize_t)-11;
+            }
             /* If current is main kernel thread (tid 0), fall back to direct blocking kgetc */
             if (cur->tid == 0) {
                 release_irqrestore(&t->in_lock, flags);
-                char c = kgetc();
-                if (c == '\r') c = '\n';
+                char kc = kgetc();
+                if (kc == '\r') kc = '\n';
                 /* deliver character (including backspace) to userspace and do not echo here */
-                out[got++] = c;
-                if (c == '\n') break;
+                out[got++] = kc;
+                if (kc == '\n') break;
                 continue;
             }
             /* add to waiters if not already */
@@ -1284,6 +1513,11 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             for (int i = 0; i < t->waiters_count; i++) if (t->waiters[i] == tid) { already = 1; break; }
             if (!already && t->waiters_count < (int)(sizeof(t->waiters)/sizeof(t->waiters[0]))) {
                 t->waiters[t->waiters_count++] = tid;
+            }
+            /* ISR may have parked bytes in irq_ovf while we held in_lock. */
+            if (tty_pending_locked(t) > 0) {
+                release_irqrestore(&t->in_lock, flags);
+                continue;
             }
             release_irqrestore(&t->in_lock, flags);
             if (tid == thread_get_init_user_tid())
@@ -1296,7 +1530,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             /* Woke: if still no data but have pending SIGINT (Ctrl+C), return EINTR
                so read() returns and maybe_deliver_pending_signal can terminate the process. */
             acquire_irqsave(&t->in_lock, &flags);
-            if (t->in_count == 0) {
+            if (tty_pending_locked(t) == 0) {
                 thread_t *me = thread_current();
                 if (me && (me->pending_signals & ~me->saved_sig_mask)) {
                     release_irqrestore(&t->in_lock, flags);
@@ -1535,6 +1769,9 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
                 continue;
             if (uc == '\b' || uc == '\t' || uc == '\n' || uc == '\r' ||
                 uc == 0x0B || uc == 0x0C) {
+                if (uc == '\n' && (tty->term_oflag & TTY_OPOST) &&
+                    (tty->term_oflag & TTY_ONLCR))
+                    devfs_tty_emit_byte(tty, tty_on_vga, '\r');
                 devfs_tty_emit_byte(tty, tty_on_vga, uc);
                 continue;
             }
@@ -2214,11 +2451,18 @@ int devfs_register(void) {
         dev_ttys[i].ansi_param_count = 0;
         dev_ttys[i].ansi_current_param = 0;
         dev_ttys[i].controlling_sid = -1;
-        dev_ttys[i].term_lflag = 0x00000002u /* ICANON */ | 0x00000008u /* ECHO */ | 0x00000001u /* ISIG */;
+        dev_ttys[i].term_iflag = TTY_IFLAG_SANE;
+        dev_ttys[i].term_oflag = TTY_OFLAG_SANE;
+        dev_ttys[i].term_cflag = TTY_CFLAG_SANE;
+        dev_ttys[i].term_lflag = TTY_LFLAG_SANE;
         dev_ttys[i].term_vmin = 1;
         dev_ttys[i].term_vtime = 0;
         dev_ttys[i].echo_escape_state = 0;
         dev_ttys[i].unget_char = -1;
+        dev_ttys[i].irq_ovf_head = 0;
+        dev_ttys[i].irq_ovf_tail = 0;
+        dev_ttys[i].irq_ovf_count = 0;
+        dev_ttys[i].irq_ovf_lock.lock = 0;
     }
     /* Capture boot-time console into tty0 so VC switch can restore it. */
     devfs_tty_snapshot_visible(&dev_ttys[0]);
@@ -2352,7 +2596,7 @@ static int devfs_tty_try_erase(struct devfs_tty *t, int tty) {
     t->in_tail = last_idx;
     t->in_count--;
     /* Echo erase: use TTY's cursor (kept in sync on each echo) so visual matches buffer. */
-    if ((t->term_lflag & 0x00000008u) /* ECHO */ && tty == devfs_get_active()) {
+    if ((t->term_lflag & TTY_ECHO) /* ECHO */ && tty == devfs_get_active()) {
         if (t->cursor_x > 0) {
             uint32_t cx = (uint32_t)t->cursor_x;
             uint32_t cy = (uint32_t)t->cursor_y;
@@ -2369,21 +2613,17 @@ static int devfs_tty_try_erase(struct devfs_tty *t, int tty) {
 void devfs_tty_push_input(int tty, char c) {
     if (tty < 0 || tty >= DEVFS_TTY_COUNT) return;
     struct devfs_tty *t = &dev_ttys[tty];
+    unsigned char uc = (unsigned char)c;
     unsigned long flags = 0;
     acquire_irqsave(&t->in_lock, &flags);
-    /* Backspace (DEL 0x7F / BS 0x08): never handle in kernel; always pass to application.
-       Otherwise it is handled twice (kernel try_erase + app line editor) and display/buffer get out of sync. */
-    if (t->in_count < (int)sizeof(t->inbuf)) {
-        t->inbuf[t->in_tail] = c;
-        t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
-        t->in_count++;
+    if (tty_map_iflag(t, &uc)) {
+        tty_drain_irq_ovf_locked(t);
+        (void)tty_enqueue_byte_locked(t, uc);
+        tty_wake_waiters_locked(t);
+        release_irqrestore(&t->in_lock, flags);
+        tty_echo_input_byte(t, uc);
+        return;
     }
-    /* wake waiters */
-    for (int i = 0; i < t->waiters_count; i++) {
-        int tid = t->waiters[i];
-        if (tid >= 0) thread_unblock(tid);
-    }
-    t->waiters_count = 0;
     release_irqrestore(&t->in_lock, flags);
 }
 
@@ -2443,85 +2683,53 @@ void devfs_tty_push_input_sequence(int tty, const char *seq, size_t len) {
      */
     unsigned long flags = 0;
     acquire_irqsave(&t->in_lock, &flags);
+    tty_drain_irq_ovf_locked(t);
     if ((size_t)t->in_count + len > sizeof(t->inbuf)) {
         release_irqrestore(&t->in_lock, flags);
         return;
     }
     for (size_t i = 0; i < len; i++) {
-        t->inbuf[t->in_tail] = seq[i];
+        unsigned char uc = (unsigned char)seq[i];
+        if (!tty_map_iflag(t, &uc))
+            continue;
+        t->inbuf[t->in_tail] = (char)uc;
         t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
         t->in_count++;
     }
-    for (int i = 0; i < t->waiters_count; i++) {
-        int tid = t->waiters[i];
-        if (tid >= 0) thread_unblock(tid);
-    }
-    t->waiters_count = 0;
-
-    /*
-     * Preserve the existing tty echo policy, but advance it atomically for
-     * the whole key string.  Thus ESC [ H is either fully suppressed as a
-     * function-key sequence or fully delivered; VMware cannot expose "[H".
-     */
-    if (tty == devfs_get_active() && (t->term_lflag & 0x00000008u)) {
-        for (size_t i = 0; i < len; i++) {
-            unsigned char uc = (unsigned char)seq[i];
-            if (t->echo_escape_state == 0) {
-                if (uc == 0x1Bu)
-                    t->echo_escape_state = 1;
-            } else if (t->echo_escape_state == 1) {
-                if (uc == '[' || uc == 'O')
-                    t->echo_escape_state = 2;
-                else
-                    t->echo_escape_state = 0;
-            } else if (uc >= 0x40u && uc <= 0x7Eu) {
-                t->echo_escape_state = 0;
-            }
-        }
-    }
+    tty_wake_waiters_locked(t);
     release_irqrestore(&t->in_lock, flags);
     thread_request_resched();
 }
 
-/* Non-blocking push from ISR: try lock; on failure park the char in a
- * lock-free overflow slot instead of dropping it (htop can hold in_lock via
- * poll/read briefly under STI syscalls). */
+/* Keyboard ISR: never drop keys into unget_char (read() did not consume it).
+ * If in_lock is held on another CPU, park the post-iflag byte in irq_ovf. */
 void devfs_tty_push_input_noblock(int tty, char c) {
     if (tty < 0 || tty >= DEVFS_TTY_COUNT) return;
     struct devfs_tty *t = &dev_ttys[tty];
+    unsigned char uc = (unsigned char)c;
+    int isig = (t->term_lflag & TTY_ISIG) ? 1 : 0;
+
     if (!try_acquire(&t->in_lock)) {
-        /* Ctrl+C: Linux n_tty — SIGINT to the tty foreground process group only. */
-        if ((unsigned char)c == 0x03) {
+        if (uc == 0x03 && isig) {
             int pgrp = devfs_get_tty_fg_pgrp(tty);
-            if (pgrp >= 0) {
+            if (pgrp >= 0)
                 thread_send_sigint_to_pgrp(pgrp);
-            }
             thread_request_resched();
             return;
         }
-        /* Best-effort overflow: one pending byte survives a contested lock. */
-        if (t->unget_char < 0)
-            t->unget_char = (unsigned char)c;
-        for (int i = 0; i < t->waiters_count; i++) {
-            int tid = t->waiters[i];
-            if (tid >= 0) thread_unblock(tid);
+        if (tty_map_iflag(t, &uc)) {
+            tty_irq_ovf_push(t, uc);
+            tty_echo_input_byte(t, uc);
         }
-        t->waiters_count = 0;
+        tty_wake_waiters_unlocked(t);
         thread_request_resched();
         return;
     }
-    /* Backspace (DEL 0x7F / BS 0x08): never handle in kernel; always pass to application.
-       Prevents double handling (kernel try_erase + sh line editor) and keeps display in sync. */
-    /* Ctrl+C (0x03): SIGINT to tty->pgrp only (Linux n_tty_receive_char). */
-    if ((unsigned char)c == 0x03) {
+
+    if (uc == 0x03 && isig) {
         if (t->fg_pgrp >= 0) thread_send_sigint_to_pgrp(t->fg_pgrp);
-        /* Wake readers so they can observe updated process state. */
-        for (int i = 0; i < t->waiters_count; i++) {
-            int tid = t->waiters[i];
-            if (tid >= 0) thread_unblock(tid);
-        }
-        t->waiters_count = 0;
-        int do_echo_cc = (tty == devfs_get_active() && (t->term_lflag & 0x00000008u));
+        tty_wake_waiters_locked(t);
+        int do_echo_cc = (tty == devfs_get_active() && (t->term_lflag & TTY_ECHO));
         release(&t->in_lock);
         if (do_echo_cc) {
             static const uint8_t echo_intr[] = { '^', 'C', '\n' };
@@ -2530,59 +2738,16 @@ void devfs_tty_push_input_noblock(int tty, char c) {
         thread_request_resched();
         return;
     }
-    if (t->in_count < (int)sizeof(t->inbuf)) {
-        t->inbuf[t->in_tail] = c;
-        t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
-        t->in_count++;
+
+    if (!tty_map_iflag(t, &uc)) {
+        release(&t->in_lock);
+        return;
     }
-    /* inbuf full: drop char */
-    /* wake waiters (don't unblock in ISR) */
-    for (int i = 0; i < t->waiters_count; i++) {
-        int tid = t->waiters[i];
-        if (tid >= 0) thread_unblock(tid);
-    }
-    t->waiters_count = 0;
-    /*
-     * Local echo (N_TTY). Release in_lock before painting so a concurrent
-     * reader/poll cannot starve the next scancode on try_acquire.
-     */
-    unsigned char echo_uc = 0;
-    int do_echo = 0;
-    if (tty == devfs_get_active() && (t->term_lflag & 0x00000008u)) {
-        unsigned char uc = (unsigned char)c;
-        int skip_echo = 0;
-        if (t->echo_escape_state == 0) {
-            if (uc == 0x1Bu) {
-                t->echo_escape_state = 1;
-                skip_echo = 1;
-            }
-        } else if (t->echo_escape_state == 1) {
-            if (uc == '[' || uc == 'O') {
-                t->echo_escape_state = 2;
-                skip_echo = 1;
-            } else {
-                t->echo_escape_state = 0;
-            }
-        } else { /* CSI / SS3 body */
-            skip_echo = 1;
-            if (uc >= 0x40u && uc <= 0x7Eu)
-                t->echo_escape_state = 0;
-        }
-        if (!skip_echo) {
-            if (uc == '\r')
-                uc = '\n';
-            if (uc == '\n' || uc == '\t' || uc >= 32u) {
-                echo_uc = uc;
-                do_echo = 1;
-            }
-        }
-    }
+    tty_drain_irq_ovf_locked(t);
+    (void)tty_enqueue_byte_locked(t, uc);
+    tty_wake_waiters_locked(t);
     release(&t->in_lock);
-    if (do_echo)
-        devfs_tty_echo_bytes(t, &echo_uc, 1);
-    /* IRQ context only marks waiters runnable. Scheduling from IRQ1 can
-     * corrupt the active syscall/IRQ frame; timer preemption / syscall-exit
-     * cond_resched performs the context switch after the handler returns. */
+    tty_echo_input_byte(t, uc);
     thread_request_resched();
 }
 
@@ -2591,18 +2756,9 @@ int devfs_tty_pop_nb(int tty) {
     struct devfs_tty *t = &dev_ttys[tty];
     unsigned long flags = 0;
     acquire_irqsave(&t->in_lock, &flags);
-    if (t->unget_char >= 0) {
-        int c = t->unget_char;
-        t->unget_char = -1;
-        release_irqrestore(&t->in_lock, flags);
-        return c;
-    }
-    if (t->in_count == 0) { release_irqrestore(&t->in_lock, flags); return -1; }
-    char c = t->inbuf[t->in_head];
-    t->in_head = (t->in_head + 1) % (int)sizeof(t->inbuf);
-    t->in_count--;
+    int c = tty_take_inbyte_locked(t);
     release_irqrestore(&t->in_lock, flags);
-    return (int)(unsigned char)c;
+    return c;
 }
 
 int devfs_tty_unget(int tty, int c) {
@@ -2622,8 +2778,7 @@ int devfs_tty_available(int tty) {
     struct devfs_tty *t = &dev_ttys[tty];
     unsigned long flags = 0;
     acquire_irqsave(&t->in_lock, &flags);
-    int v = t->in_count;
-    if (t->unget_char >= 0) v++;
+    int v = tty_pending_locked(t);
     release_irqrestore(&t->in_lock, flags);
     return v;
 }
@@ -2639,6 +2794,7 @@ void devfs_tty_flush_input(int tty) {
     t->in_count = 0;
     t->unget_char = -1;
     t->echo_escape_state = 0;
+    tty_irq_ovf_flush(t);
     release_irqrestore(&t->in_lock, flags);
 }
 
@@ -2647,9 +2803,18 @@ int devfs_tty_add_waiter(int tty, int tid) {
     struct devfs_tty *t = &dev_ttys[tty];
     unsigned long flags = 0;
     acquire_irqsave(&t->in_lock, &flags);
-    for (int i = 0; i < t->waiters_count; i++) if (t->waiters[i] == tid) { release_irqrestore(&t->in_lock, flags); return 0; }
+    tty_drain_irq_ovf_locked(t);
+    for (int i = 0; i < t->waiters_count; i++) if (t->waiters[i] == tid) {
+        if (tty_pending_locked(t) > 0)
+            thread_unblock(tid);
+        release_irqrestore(&t->in_lock, flags);
+        return 0;
+    }
     if (t->waiters_count >= (int)(sizeof(t->waiters)/sizeof(t->waiters[0]))) { release_irqrestore(&t->in_lock, flags); return -1; }
     t->waiters[t->waiters_count++] = tid;
+    /* Data may have arrived in irq_ovf after poll saw empty; do not sleep on it. */
+    if (tty_pending_locked(t) > 0)
+        thread_unblock(tid);
     release_irqrestore(&t->in_lock, flags);
     return 0;
 }
@@ -2745,6 +2910,7 @@ int devfs_tty_attach_thread(struct fs_file *file, thread_t *th) {
     if (!(p >= base && p < end)) return -1;
     struct devfs_tty *t = (struct devfs_tty*)p;
     th->attached_tty = t->id;
+    th->attached_pty = -1;
     return 0;
 }
 
@@ -2833,8 +2999,13 @@ void devfs_clear_controlling_by_sid(int sid) {
 }
 
 int devfs_create_block_node_lba(const char *path, int device_id, uint32_t start_lba, uint32_t sectors) {
+    int slot = -1;
     if (!path) return -1;
     for (int i = 0; i < dev_block_count; i++) {
+        if (dev_blocks[i].path[0] == 0) {
+            if (slot < 0) slot = i;
+            continue;
+        }
         if (strcmp(dev_blocks[i].path, path) == 0) {
             dev_blocks[i].device_id = device_id;
             dev_blocks[i].start_lba = start_lba;
@@ -2842,14 +3013,111 @@ int devfs_create_block_node_lba(const char *path, int device_id, uint32_t start_
             return 0;
         }
     }
-    if (dev_block_count >= (int)(sizeof(dev_blocks)/sizeof(dev_blocks[0]))) return -1;
-    strncpy(dev_blocks[dev_block_count].path, path, sizeof(dev_blocks[dev_block_count].path)-1);
-    dev_blocks[dev_block_count].path[sizeof(dev_blocks[dev_block_count].path)-1] = '\0';
-    dev_blocks[dev_block_count].device_id = device_id;
-    dev_blocks[dev_block_count].start_lba = start_lba;
-    dev_blocks[dev_block_count].sectors = sectors;
-    dev_block_count++;
+    if (slot < 0) {
+        if (dev_block_count >= (int)(sizeof(dev_blocks)/sizeof(dev_blocks[0]))) return -1;
+        slot = dev_block_count++;
+    }
+    strncpy(dev_blocks[slot].path, path, sizeof(dev_blocks[slot].path)-1);
+    dev_blocks[slot].path[sizeof(dev_blocks[slot].path)-1] = '\0';
+    dev_blocks[slot].device_id = device_id;
+    dev_blocks[slot].start_lba = start_lba;
+    dev_blocks[slot].sectors = sectors;
     return 0;
+}
+
+int devfs_remove_block_node(const char *path) {
+    int idx;
+    if (!path) return -1;
+    idx = devfs_find_block_by_path(path);
+    if (idx < 0) return -1;
+    /* Keep the slot address stable for open fds; I/O sees sectors==0. */
+    dev_blocks[idx].path[0] = '\0';
+    dev_blocks[idx].device_id = -1;
+    dev_blocks[idx].start_lba = 0;
+    dev_blocks[idx].sectors = 0;
+    return 0;
+}
+
+int devfs_get_block_geom(const char *path, int *device_id, uint32_t *start_lba,
+                         uint32_t *sectors) {
+    int idx = devfs_find_block_by_path(path);
+    if (idx < 0) return -1;
+    if (device_id) *device_id = dev_blocks[idx].device_id;
+    if (start_lba) *start_lba = dev_blocks[idx].start_lba;
+    if (sectors) *sectors = dev_blocks[idx].sectors;
+    return 0;
+}
+
+int devfs_get_logical_block_size(const char *path) {
+    const char *base;
+    if (!path) return 512;
+    base = path;
+    if (strncmp(path, "/dev/", 5) == 0)
+        base = path + 5;
+    if (strcmp(base, "cdrom") == 0 || (base[0] == 's' && base[1] == 'r'))
+        return 2048;
+    return 512;
+}
+
+int devfs_whole_disk_path(int device_id, char *out, size_t outlen) {
+    int i, best = -1;
+    if (!out || outlen == 0 || device_id < 0) return -1;
+    for (i = 0; i < dev_block_count; i++) {
+        const char *p = dev_blocks[i].path;
+        const char *base;
+        size_t n;
+        int is_part = 0;
+        if (!p[0] || dev_blocks[i].device_id != device_id)
+            continue;
+        if (dev_blocks[i].start_lba != 0)
+            continue;
+        if (strcmp(p, "/dev/cdrom") == 0)
+            continue;
+        base = (strncmp(p, "/dev/", 5) == 0) ? p + 5 : p;
+        n = strlen(base);
+        if (n >= 2 && base[0] == 's' && base[1] == 'd') {
+            /* sda1 is a partition even at start_lba==0 (empty/misparsed). */
+            if (n > 3 && base[3] >= '1' && base[3] <= '9')
+                is_part = 1;
+        } else if (strncmp(base, "nvme", 4) == 0) {
+            const char *pp = strrchr(base, 'p');
+            if (pp && pp[1] >= '1' && pp[1] <= '9')
+                is_part = 1;
+        }
+        if (is_part)
+            continue;
+        best = i;
+        if (strncmp(base, "sd", 2) == 0 || strncmp(base, "nvme", 4) == 0 ||
+            strncmp(base, "sr", 2) == 0)
+            break;
+    }
+    if (best < 0) return -1;
+    strncpy(out, dev_blocks[best].path, outlen - 1);
+    out[outlen - 1] = '\0';
+    return 0;
+}
+
+void devfs_remove_partitions_of(const char *whole_path) {
+    size_t wlen;
+    const char *base;
+    int nvme;
+    if (!whole_path || whole_path[0] == 0) return;
+    wlen = strlen(whole_path);
+    base = (strncmp(whole_path, "/dev/", 5) == 0) ? whole_path + 5 : whole_path;
+    nvme = (strncmp(base, "nvme", 4) == 0);
+    for (int i = 0; i < dev_block_count; i++) {
+        const char *p = dev_blocks[i].path;
+        if (!p[0] || strcmp(p, whole_path) == 0)
+            continue;
+        if (strncmp(p, whole_path, wlen) != 0)
+            continue;
+        if (nvme) {
+            if (p[wlen] == 'p' && p[wlen + 1] >= '1' && p[wlen + 1] <= '9')
+                (void)devfs_remove_block_node(p);
+        } else if (p[wlen] >= '1' && p[wlen] <= '9') {
+            (void)devfs_remove_block_node(p);
+        }
+    }
 }
 
 /* Create a whole-disk block node and register mapping */
@@ -2877,8 +3145,9 @@ int devfs_create_char_node(const char *path, void *driver_private) {
 
 /* helper: find block index by path */
 int devfs_find_block_by_path(const char *path) {
-    if (!path) return -1;
+    if (!path || !path[0]) return -1;
     for (int i = 0; i < dev_block_count; i++) {
+        if (!dev_blocks[i].path[0]) continue;
         if (strcmp(path, dev_blocks[i].path) == 0) return i;
     }
     return -1;

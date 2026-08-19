@@ -58,14 +58,15 @@ static inline void read_crs(uint64_t* cr0, uint64_t* cr2, uint64_t* cr3, uint64_
 }
 
 static void dump(const char* what, const char* who, cpu_registers_t* regs, uint64_t cr2, uint64_t err, bool user_mode){
-        klogprintf("Oops! %s in %s at RIP=0x%llx err=0x%llx\n", what, who, (unsigned long long)regs->rip, (unsigned long long)regs->error_code);
-        klogprintf("RIP: 0x%llx\n", (unsigned long long)regs->rip);
-        klogprintf("RSP: 0x%llx\n", (unsigned long long)regs->rsp);
-        klogprintf("RBP: 0x%llx\n", (unsigned long long)regs->rbp);
-        klogprintf("RDI: 0x%llx\n", (unsigned long long)regs->rdi);
-        klogprintf("RSI: 0x%llx\n", (unsigned long long)regs->rsi);
-        klogprintf("RDX: 0x%llx\n", (unsigned long long)regs->rdx);
-        klogprintf("RCX: 0x%llx\n", (unsigned long long)regs->rcx);
+        void (*logfn)(const char *fmt, ...) = user_mode ? klogprintf_logonly : klogprintf;
+        logfn("Oops! %s in %s at RIP=0x%llx err=0x%llx\n", what, who, (unsigned long long)regs->rip, (unsigned long long)regs->error_code);
+        logfn("RIP: 0x%llx\n", (unsigned long long)regs->rip);
+        logfn("RSP: 0x%llx\n", (unsigned long long)regs->rsp);
+        logfn("RBP: 0x%llx\n", (unsigned long long)regs->rbp);
+        logfn("RDI: 0x%llx\n", (unsigned long long)regs->rdi);
+        logfn("RSI: 0x%llx\n", (unsigned long long)regs->rsi);
+        logfn("RDX: 0x%llx\n", (unsigned long long)regs->rdx);
+        logfn("RCX: 0x%llx\n", (unsigned long long)regs->rcx);
 
         /* Mirror the most important fault info to serial (qemu -serial stdio),
            otherwise user-mode faults printed to VGA are not visible in terminal logs. */
@@ -177,17 +178,27 @@ static void ud_fault_handler(cpu_registers_t* regs) {
                                         wrmsr_u64(MSR_FS_BASE, new_fs);
                                         if (ut)
                                                 ut->user_fs_base = new_fs;
+                                        /* Linux WRFSBASE only updates the MSR. Copy the old
+                                         * canary only when the new TCB has none — never clobber
+                                         * a glibc/ld.so value already written from AT_RANDOM. */
                                         if (new_fs + 0x30u < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                                                uint64_t existing = 0;
                                                 if (umm) {
                                                         uint64_t leaf = 0;
                                                         if (mm_va_leaf_pa(umm, new_fs + 0x28u, &leaf) == 0) {
                                                                 uint64_t page = leaf & ~0xFFFULL;
-                                                                *(volatile uint64_t *)(uintptr_t)(page + ((new_fs + 0x28u) & 0xFFFULL)) = old_guard;
+                                                                existing = *(volatile uint64_t *)(uintptr_t)(page + ((new_fs + 0x28u) & 0xFFFULL));
+                                                                if (existing == 0)
+                                                                        *(volatile uint64_t *)(uintptr_t)(page + ((new_fs + 0x28u) & 0xFFFULL)) = old_guard;
                                                         } else {
-                                                                *(volatile uint64_t *)(uintptr_t)(new_fs + 0x28u) = old_guard;
+                                                                existing = *(volatile uint64_t *)(uintptr_t)(new_fs + 0x28u);
+                                                                if (existing == 0)
+                                                                        *(volatile uint64_t *)(uintptr_t)(new_fs + 0x28u) = old_guard;
                                                         }
                                                 } else {
-                                                        *(volatile uint64_t *)(uintptr_t)(new_fs + 0x28u) = old_guard;
+                                                        existing = *(volatile uint64_t *)(uintptr_t)(new_fs + 0x28u);
+                                                        if (existing == 0)
+                                                                *(volatile uint64_t *)(uintptr_t)(new_fs + 0x28u) = old_guard;
                                                 }
                                         }
                                         regs->rip += (uint64_t)(found_off + 4);
@@ -317,22 +328,33 @@ static int fault_try_user_stack_page(uint64_t cr2, uint64_t err) {
         uintptr_t lo = (uintptr_t)t->user_stack_base;
         if (lo > (uintptr_t)USER_TLS_SIZE)
                 lo -= (uintptr_t)USER_TLS_SIZE;
-        /* Allow a wide overrun past stack_limit for AVX/SIMD copies. */
-        uintptr_t hi = (uintptr_t)t->user_stack_limit + (64ULL * (uintptr_t)PAGE_SIZE_2M);
+        /* One-page SIMD overrun past the mapped top; not the old +128MiB
+         * window that could demand-zero into the kernel heap identity. */
+        uintptr_t hi = (uintptr_t)t->user_stack_limit + 0x10000u;
         if (hi > (uintptr_t)MMIO_IDENTITY_LIMIT)
                 hi = (uintptr_t)MMIO_IDENTITY_LIMIT;
         if (a < lo || a >= hi)
                 return 0;
-        /* Present write-protect: fork Soft_COW — not stack growth. */
-        if ((err & 1u) && (err & 2u))
+        /* Linux expand_stack: only !present holes. A present user/read fault
+         * (err=0x5, typically U=0 leftover) used to allocate a fresh zero page
+         * over live stack — wiping the return address so RET #GP(0)s on a
+         * non-canonical leftover (sqv/libgmp __gmpn_sbpi1_div_qr). */
+        if (err & 1u)
                 return 0;
         if (!t->mm)
                 return 0;
+        uint64_t page = (uint64_t)a & ~0xFFFULL;
+        {
+                uint64_t leaf = 0;
+                if (mm_va_leaf_pa(t->mm, page, &leaf) == 0) {
+                        invlpg((void *)(uintptr_t)page);
+                        return 1;
+                }
+        }
         /*
          * Linux MAP_GROWSDOWN / demand-zero: install a private zero page.
          * Never identity-map into the kernel heap arena.
          */
-        uint64_t page = (uint64_t)a & ~0xFFFULL;
         mm_t *share = t->mm_ptemplate ? t->mm_ptemplate : mm_kernel();
         if (mm_make_private_range_noyield(t->mm, page, page + 0x1000ULL, 0, share) != 0)
                 return 0;
@@ -370,6 +392,21 @@ static int fault_try_user_identity_us(uint64_t cr2, uint64_t err) {
                 return 0;
         if (err & 2u)
                 return 0; /* write to present: may be COW */
+        /*
+         * Present identity leftover on a lazy file VMA is not file bytes.
+         * Copy-privatizing it intern'd zeros as LC_COLLATE (glibc fnmatch
+         * #GP rdi=0x11). Linux filemap_fault fills from the inode.
+         * filemap handlers below only run for !present, so do it here.
+         */
+        if (fault_try_mmap_lazy_anon(cr2))
+                return 1;
+        {
+                thread_t *ft = thread_current();
+                if (!ft || ft->ring != 3)
+                        ft = thread_get_current_user();
+                if (ft && user_vma_is_lazy_file_page_for(ft, a))
+                        return 0;
+        }
         /*
          * Private mm: stamping PG_US on a live identity leaf keeps sharing phys
          * with the vfork parent. Copy-privatize the fault page first (preserve
@@ -541,6 +578,12 @@ static void page_fault_handler(cpu_registers_t* regs) {
                                 if (brk_base != 0 && (uintptr_t)cr2 >= brk_base &&
                                     (uintptr_t)cr2 < brk_cur)
                                         brk_wr = 1;
+                                /* MAP_SHARED file: leftover identity is not the
+                                 * page-cache frame. Install it instead of skipping
+                                 * do_wp_page and livelocking postgres --boot. */
+                                if (user_vma_is_shared_page(tid, (uintptr_t)cr2) &&
+                                    fault_try_mmap_lazy_anon(cr2))
+                                        return;
                                 if (!user_vma_is_shared_page(tid, (uintptr_t)cr2) &&
                                     (brk_wr || user_vma_allows_write(ut, (uintptr_t)cr2)) &&
                                     mm_wp_fault_writable(ut->mm, cr2, share) == 0)
@@ -577,6 +620,19 @@ static void page_fault_handler(cpu_registers_t* regs) {
                 }
         }
         if (!user) {
+            /*
+             * Linux handle_mm_fault from kernel uaccess: a syscall memcpy into a
+             * valid user VMA (lazy anon / file) must demand-fill, not Oops.
+             * ldconfig mmap(MAP_SHARED) at USER_MMAP_BASE used to hit this when
+             * populate still wrote the user VA with kernel memcpy.
+             */
+            if ((regs->error_code & 1u) == 0u &&
+                cr2 >= 0x200000ULL && cr2 < (uint64_t)USER_STACK_TOP) {
+                if (fault_try_mmap_lazy_anon(cr2))
+                    return;
+                if (fault_try_user_vma_nonpresent(cr2, regs->error_code))
+                    return;
+            }
             /*
              * Kernel uaccess store onto a fork-COW user page (e.g. rt_sigaction
              * writing oldact on the child's still-shared stack). Break COW and
@@ -786,10 +842,11 @@ pte_dump_done:
                 thread_t *ft = thread_current();
                 if (!ft || ft->ring != 3)
                     ft = thread_get_current_user();
-                kprintf("user-pf-fatal: tid=%llu name=%s rip=0x%llx cr2=0x%llx err=0x%llx fs=0x%llx rsp=0x%llx\n",
+                klogprintf("user-pf-fatal: tid=%llu name=%s rip=0x%llx rax=0x%llx cr2=0x%llx err=0x%llx fs=0x%llx rsp=0x%llx\n",
                         (unsigned long long)(ft && ft->tid ? ft->tid : 0),
                         (ft && ft->name[0]) ? ft->name : "?",
                         (unsigned long long)regs->rip,
+                        (unsigned long long)regs->rax,
                         (unsigned long long)cr2,
                         (unsigned long long)regs->error_code,
                         (unsigned long long)(ft ? ft->user_fs_base : 0),
@@ -816,7 +873,7 @@ pte_dump_done:
                     s0 = sp[0];
                     s1 = sp[1];
                 }
-                kprintf("user-pf-null-rip: rsp=0x%llx [0]=0x%llx [1]=0x%llx rbp=0x%llx rdi=0x%llx\n",
+                klogprintf_logonly("user-pf-null-rip: rsp=0x%llx [0]=0x%llx [1]=0x%llx rbp=0x%llx rdi=0x%llx\n",
                         (unsigned long long)regs->rsp,
                         (unsigned long long)s0,
                         (unsigned long long)s1,
@@ -844,7 +901,7 @@ static void gp_fault_handler(cpu_registers_t* regs){
             thread_t *gt = thread_current();
             if (!gt || gt->ring != 3)
                 gt = thread_get_current_user();
-            kprintf("user-gpf-fatal: tid=%llu name=%s rip=0x%llx err=0x%llx rsp=0x%llx fs=0x%llx rax=0x%llx rbx=0x%llx\n",
+            klogprintf_logonly("user-gpf-fatal: tid=%llu name=%s rip=0x%llx err=0x%llx rsp=0x%llx fs=0x%llx rax=0x%llx rbx=0x%llx\n",
                     (unsigned long long)(gt && gt->tid ? gt->tid : 0),
                     (gt && gt->name[0]) ? gt->name : "?",
                     (unsigned long long)regs->rip,
@@ -853,6 +910,26 @@ static void gp_fault_handler(cpu_registers_t* regs){
                     (unsigned long long)(gt ? gt->user_fs_base : 0),
                     (unsigned long long)regs->rax,
                     (unsigned long long)regs->rbx);
+            if (gt && gt->mm && gt->mm != mm_kernel() &&
+                regs->rip >= 0x200000ULL && regs->rip + 16ULL < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                uint8_t insn[16];
+                memset(insn, 0, sizeof(insn));
+                if (mm_copy_from_user(gt->mm, insn, regs->rip, sizeof(insn)) == 0)
+                    klogprintf_logonly("user-gpf-insn: %02x %02x %02x %02x %02x %02x %02x %02x "
+                            "%02x %02x %02x %02x rdi=0x%llx rsi=0x%llx rdx=0x%llx rcx=0x%llx rbp=0x%llx\n",
+                            insn[0], insn[1], insn[2], insn[3],
+                            insn[4], insn[5], insn[6], insn[7],
+                            insn[8], insn[9], insn[10], insn[11],
+                            (unsigned long long)regs->rdi,
+                            (unsigned long long)regs->rsi,
+                            (unsigned long long)regs->rdx,
+                            (unsigned long long)regs->rcx,
+                            (unsigned long long)regs->rbp);
+                uint64_t ra = 0;
+                if (mm_copy_from_user(gt->mm, &ra, regs->rsp, sizeof(ra)) == 0)
+                    klogprintf_logonly("user-gpf-ret: [rsp]=0x%llx\n",
+                            (unsigned long long)ra);
+            }
         }
         syscall_user_fatal_exit(11); /* SIGSEGV */
     }

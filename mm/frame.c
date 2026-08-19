@@ -5,7 +5,10 @@
 #include <spinlock.h>
 #include <string.h>
 
-#define FRAME_META_MAX 65536
+/* 256K slots × 4KiB = 1GiB of Soft_OWNED user pages. 64K (256MiB) was
+ * smaller than the PMM arena; apt's 128MiB cache plus lists exhausted
+ * it while fork still memcpy'd every private leaf into dpkg-deb/xz. */
+#define FRAME_META_MAX 262144
 #define FRAME_HASH_SIZE 8192
 
 typedef struct frame_meta {

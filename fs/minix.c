@@ -1171,7 +1171,7 @@ static void minix_free_mount(struct minix_mount *m) {
 	kfree(m);
 }
 
-static int minix_bind_device(int device_id) {
+static int minix_bind_device(int device_id, uint32_t start_lba) {
 	uint8_t sector[1024];
 	struct minix_super_block sb;
 	struct minix_mount *m;
@@ -1182,8 +1182,8 @@ static int minix_bind_device(int device_id) {
 	unsigned namelen = 0, dirsize = 0;
 	unsigned nzones;
 
-	/* Superblock at byte offset 1024 → LBA 2 when 512-byte sectors. */
-	if (disk_read_sectors(device_id, 2, sector, 2) != 0)
+	/* Superblock at byte offset 1024 → LBA start+2 when 512-byte sectors. */
+	if (disk_read_sectors(device_id, start_lba + 2, sector, 2) != 0)
 		return -1;
 	memcpy(&sb, sector, sizeof(sb));
 
@@ -1214,7 +1214,7 @@ static int minix_bind_device(int device_id) {
 		return -1;
 	memset(m, 0, sizeof(*m));
 	m->device_id = device_id;
-	m->start_lba = 0;
+	m->start_lba = start_lba;
 	m->version = version;
 	m->blocksize = blocksize;
 	m->sectors_per_block = spb;
@@ -1261,7 +1261,13 @@ static int minix_bind_device(int device_id) {
 int minix_probe_and_mount(int device_id) {
 	if (device_id < 0)
 		return -1;
-	return minix_bind_device(device_id);
+	return minix_bind_device(device_id, 0);
+}
+
+int minix_probe_and_mount_geom(int device_id, uint32_t start_lba) {
+	if (device_id < 0)
+		return -1;
+	return minix_bind_device(device_id, start_lba);
 }
 
 void minix_unmount_cleanup(void) {

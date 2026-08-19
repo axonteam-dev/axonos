@@ -8,6 +8,7 @@ void klog_init(void);
 
 /* Kernel printf → console + fixed ring buffer (+ qemu debug). */
 void klogprintf(const char *fmt, ...);
+void klogprintf_logonly(const char *fmt, ...);
 
 /* /dev/kmsg and SYS_syslog: inject a message into the printk ring. */
 void klog_user_write(const char *s, size_t n);

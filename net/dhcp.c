@@ -11,13 +11,13 @@
 #include <e1000.h>
 #include <pit.h>
 #include <thread.h>
+#include <spinlock.h>
 #include <klog.h>
 
 extern void klogprintf(const char *fmt, ...);
 
 /* Ethernet/IP/UDP constants */
 #define ETH_TYPE_IPV4         0x0800
-#define DHCP_FRAME_BUF        2048
 #define UDP_PORT_DHCP_SERVER  67
 #define UDP_PORT_DHCP_CLIENT  68
 
@@ -73,6 +73,28 @@ static void ip_put_csum(ipv4_hdr_t *ip, size_t ihl) {
     p[1] = (uint8_t)(c & 0xFF);
 }
 
+static uint16_t udp_checksum_ipv4(uint32_t src_be, uint32_t dst_be,
+                                  const uint8_t *udp, size_t udp_len) {
+    uint32_t sum = 0;
+    size_t i;
+    sum += (src_be >> 16) & 0xFFFFu;
+    sum += src_be & 0xFFFFu;
+    sum += (dst_be >> 16) & 0xFFFFu;
+    sum += dst_be & 0xFFFFu;
+    sum += 17u;
+    sum += (uint32_t)udp_len;
+    for (i = 0; i + 1 < udp_len; i += 2)
+        sum += ((uint16_t)udp[i] << 8) | udp[i + 1];
+    if (udp_len & 1)
+        sum += (uint16_t)udp[udp_len - 1] << 8;
+    while (sum >> 16)
+        sum = (sum & 0xFFFFu) + (sum >> 16);
+    {
+        uint16_t c = (uint16_t)(~sum);
+        return c ? c : 0xFFFFu;
+    }
+}
+
 /* DHCP option parser */
 static const uint8_t *dhcp_find_opt(const uint8_t *opts, size_t opts_len, uint8_t code, uint8_t *out_len) {
     size_t i = 0;
@@ -98,6 +120,12 @@ static dhcp_lease_t g_cached_lease;
 static uint32_t dhcp_last_logged_ip;
 static uint8_t g_cached_mac[6];
 static int g_cached_lease_valid = 0;
+
+/* Filled by dhcp_observe_frame from the shared net_rx path. */
+static spinlock_t g_dhcp_cap_lock;
+static uint32_t g_dhcp_cap_xid;
+static int g_dhcp_cap_kind; /* 0 none, 2 OFFER, 5 ACK, 6 NAK */
+static uint32_t g_dhcp_cap_ip, g_dhcp_cap_sid, g_dhcp_cap_mask, g_dhcp_cap_gw, g_dhcp_cap_dns;
 
 void dhcp_invalidate_cache(void) {
     g_cached_lease_valid = 0;
@@ -188,6 +216,13 @@ static int dhcp_send_packet(const uint8_t mac[6], uint8_t msg_type, uint32_t xid
     udp->len = be16((uint16_t)(sizeof(udp_hdr_t) + o));
     udp->csum = 0;
     memcpy((uint8_t *)udp + sizeof(udp_hdr_t), pkt, o);
+    {
+        uint16_t uc = udp_checksum_ipv4(0u, 0xFFFFFFFFu, (const uint8_t *)udp,
+                                        sizeof(udp_hdr_t) + o);
+        uint8_t *cp = (uint8_t *)&udp->csum;
+        cp[0] = (uint8_t)(uc >> 8);
+        cp[1] = (uint8_t)(uc & 0xFF);
+    }
     
     int sr = -1;
     for (int t = 0; t < 4 && sr < 0; t++)
@@ -197,12 +232,11 @@ static int dhcp_send_packet(const uint8_t mac[6], uint8_t msg_type, uint32_t xid
 }
 
 /* Keep DHCP cooperative: busy-spin (pit_sleep_ms / yield-only loops) freezes UP. */
-#define DHCP_DISCOVER_TRIES  4
-#define DHCP_REQUEST_TRIES   3
-#define DHCP_RX_TIMEOUT_MS   1500u
+#define DHCP_DISCOVER_TRIES  6
+#define DHCP_REQUEST_TRIES   4
+#define DHCP_RX_TIMEOUT_MS   3000u
 #define DHCP_LINK_SETTLE_MS  200u
 #define DHCP_LINK_WAIT_MS    8000u
-#define DHCP_BURST_POLLS     64
 
 static int dhcp_parse_offer(const uint8_t *d, size_t opts_len, uint32_t xid,
                             uint32_t *offered_ip, uint32_t *server_id,
@@ -344,6 +378,54 @@ static int dhcp_try_ack_frame(const uint8_t *frame, int n, uint32_t xid) {
     return 0;
 }
 
+static void dhcp_cap_reset(uint32_t xid) {
+    unsigned long irqf = 0;
+    acquire_irqsave(&g_dhcp_cap_lock, &irqf);
+    g_dhcp_cap_xid = xid;
+    g_dhcp_cap_kind = 0;
+    g_dhcp_cap_ip = g_dhcp_cap_sid = g_dhcp_cap_mask = g_dhcp_cap_gw = g_dhcp_cap_dns = 0;
+    release_irqrestore(&g_dhcp_cap_lock, irqf);
+}
+
+void dhcp_observe_frame(const uint8_t *frame, size_t n) {
+    uint32_t ip = 0, sid = 0, mask = 0, gw = 0, dns = 0;
+    uint32_t xid;
+    int ack;
+    unsigned long irqf = 0;
+
+    if (!frame || n < 14)
+        return;
+    acquire_irqsave(&g_dhcp_cap_lock, &irqf);
+    xid = g_dhcp_cap_xid;
+    release_irqrestore(&g_dhcp_cap_lock, irqf);
+    if (!xid)
+        return;
+
+    if (dhcp_handle_rx_frame(frame, (int)n, xid, &ip, &sid, &mask, &gw, &dns)) {
+        acquire_irqsave(&g_dhcp_cap_lock, &irqf);
+        if (g_dhcp_cap_xid == xid && g_dhcp_cap_kind != 5 && g_dhcp_cap_kind != 6) {
+            g_dhcp_cap_kind = 2;
+            g_dhcp_cap_ip = ip;
+            g_dhcp_cap_sid = sid;
+            g_dhcp_cap_mask = mask;
+            g_dhcp_cap_gw = gw;
+            g_dhcp_cap_dns = dns;
+        }
+        release_irqrestore(&g_dhcp_cap_lock, irqf);
+        return;
+    }
+    ack = dhcp_try_ack_frame(frame, (int)n, xid);
+    if (ack == 0)
+        return;
+    acquire_irqsave(&g_dhcp_cap_lock, &irqf);
+    if (g_dhcp_cap_xid == xid) {
+        g_dhcp_cap_kind = (ack == 1) ? 5 : 6;
+        if (ack == 1 && !g_dhcp_cap_ip)
+            g_dhcp_cap_ip = ip;
+    }
+    release_irqrestore(&g_dhcp_cap_lock, irqf);
+}
+
 static void dhcp_sleep_ms(uint32_t ms) {
     if (ms == 0)
         return;
@@ -351,74 +433,44 @@ static void dhcp_sleep_ms(uint32_t ms) {
     thread_sleep(ms);
 }
 
-static int dhcp_poll_offer(uint8_t *frame, uint32_t xid, uint32_t *offered_ip,
-                           uint32_t *server_id, uint32_t *netmask, uint32_t *router,
-                           uint32_t *dns, uint32_t timeout_ms) {
-    /* Short post-TX burst, then sleep-based wait so other tasks keep running. */
-    for (int burst = 0; burst < DHCP_BURST_POLLS; burst++) {
-        e1000_poll();
-        int n = e1000_recv_frame(frame, DHCP_FRAME_BUF);
-        if (n <= 0)
-            continue;
-        if (dhcp_handle_rx_frame(frame, n, xid, offered_ip, server_id, netmask, router, dns))
-            return 1;
-    }
+static int dhcp_wait_kind(int want_offer, uint32_t timeout_ms,
+                          uint32_t *offered_ip, uint32_t *server_id,
+                          uint32_t *netmask, uint32_t *router, uint32_t *dns) {
     uint64_t start = pit_get_time_ms();
-    while ((pit_get_time_ms() - start) < timeout_ms) {
-        e1000_poll();
-        int got = 0;
-        for (;;) {
-            int n = e1000_recv_frame(frame, DHCP_FRAME_BUF);
-            if (n <= 0)
-                break;
-            got = 1;
-            if (dhcp_handle_rx_frame(frame, n, xid, offered_ip, server_id, netmask, router, dns))
-                return 1;
+    for (;;) {
+        unsigned long irqf = 0;
+        int kind;
+        acquire_irqsave(&g_dhcp_cap_lock, &irqf);
+        kind = g_dhcp_cap_kind;
+        if (want_offer && kind == 2) {
+            if (offered_ip) *offered_ip = g_dhcp_cap_ip;
+            if (server_id) *server_id = g_dhcp_cap_sid;
+            if (netmask) *netmask = g_dhcp_cap_mask;
+            if (router) *router = g_dhcp_cap_gw;
+            if (dns) *dns = g_dhcp_cap_dns;
+            release_irqrestore(&g_dhcp_cap_lock, irqf);
+            return 1;
         }
-        if (*offered_ip)
+        if (!want_offer && kind == 5) {
+            release_irqrestore(&g_dhcp_cap_lock, irqf);
             return 1;
-        if (!got)
-            dhcp_sleep_ms(2);
-    }
-    return 0;
-}
-
-static int dhcp_poll_ack(uint8_t *frame, uint32_t xid, uint32_t timeout_ms) {
-    for (int burst = 0; burst < DHCP_BURST_POLLS; burst++) {
-        e1000_poll();
-        int n = e1000_recv_frame(frame, DHCP_FRAME_BUF);
-        if (n <= 0)
-            continue;
-        int ar = dhcp_try_ack_frame(frame, n, xid);
-        if (ar == 1)
-            return 1;
-        if (ar < 0)
+        }
+        if (!want_offer && kind == 6) {
+            release_irqrestore(&g_dhcp_cap_lock, irqf);
             return -1;
-    }
-    uint64_t start = pit_get_time_ms();
-    while ((pit_get_time_ms() - start) < timeout_ms) {
-        e1000_poll();
-        int got = 0;
-        for (;;) {
-            int n = e1000_recv_frame(frame, DHCP_FRAME_BUF);
-            if (n <= 0)
-                break;
-            got = 1;
-            int ar = dhcp_try_ack_frame(frame, n, xid);
-            if (ar == 1)
-                return 1;
-            if (ar < 0)
-                return -1;
         }
-        if (!got)
-            dhcp_sleep_ms(2);
+        release_irqrestore(&g_dhcp_cap_lock, irqf);
+        if ((pit_get_time_ms() - start) >= timeout_ms)
+            return 0;
+        /* Yield so net_rx can pull the OFFER into dhcp_observe_frame. */
+        e1000_poll();
+        dhcp_sleep_ms(10);
     }
-    return 0;
 }
 
 int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
     if (!mac || !out_lease) return -1;
-    
+
     memset(out_lease, 0, sizeof(*out_lease));
 
     /* Wait for link (VMware bridged WiFi can take many seconds after host roam). */
@@ -429,60 +481,70 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
         klogprintf("dhcp: link not up after %us, proceeding anyway\n",
                    (unsigned)(DHCP_LINK_WAIT_MS / 1000u));
 
-    /* Brief settle so bridged vSwitch/DHCP relay is ready — do not spin for seconds. */
     dhcp_sleep_ms(DHCP_LINK_SETTLE_MS);
 
-    e1000_flush_rx();
-    
     uint32_t xid = (uint32_t)(pit_get_ticks() ^ 0xA5F0C31Du);
     uint32_t offered_ip = 0, server_id = 0, netmask = 0, router = 0, dns = 0;
-    uint8_t *frame = kmalloc(DHCP_FRAME_BUF);
-    if (!frame) return -1;
-    
-    /* PHASE 1: DISCOVER -> OFFER (with retries) */
+
+    /* PHASE 1: DISCOVER -> OFFER (with retries). net_rx delivers the reply. */
     for (int disc_try = 0; disc_try < DHCP_DISCOVER_TRIES && !offered_ip; disc_try++) {
         if (disc_try > 0) {
             xid = (uint32_t)(pit_get_ticks() ^ 0xA5F0C31Du ^ (uint32_t)disc_try);
             dhcp_sleep_ms(200);
         }
+        dhcp_cap_reset(xid);
         if (dhcp_send_packet(mac, 1, xid, 0, 0) != 0) {
             dhcp_sleep_ms(100);
             continue;
         }
-        if (dhcp_poll_offer(frame, xid, &offered_ip, &server_id, &netmask, &router, &dns,
-                            DHCP_RX_TIMEOUT_MS))
+        if (dhcp_wait_kind(1, DHCP_RX_TIMEOUT_MS, &offered_ip, &server_id,
+                           &netmask, &router, &dns) == 1)
             break;
+        offered_ip = 0;
     }
-    
+
     if (!offered_ip) {
         klogprintf("dhcp: failed - no OFFER\n");
-        kfree(frame);
+        dhcp_cap_reset(0);
         return -1;
     }
     if (!server_id)
         server_id = router ? router : offered_ip;
-    
+
     /* PHASE 2: REQUEST -> ACK (with retries) */
     for (int req_try = 0; req_try < DHCP_REQUEST_TRIES; req_try++) {
         if (req_try > 0)
             dhcp_sleep_ms(200);
+        dhcp_cap_reset(xid);
+        /* Keep the offered addresses across reset of kind. */
+        {
+            unsigned long irqf = 0;
+            acquire_irqsave(&g_dhcp_cap_lock, &irqf);
+            g_dhcp_cap_xid = xid;
+            g_dhcp_cap_ip = offered_ip;
+            g_dhcp_cap_sid = server_id;
+            g_dhcp_cap_mask = netmask;
+            g_dhcp_cap_gw = router;
+            g_dhcp_cap_dns = dns;
+            release_irqrestore(&g_dhcp_cap_lock, irqf);
+        }
         int send_rc = dhcp_send_packet(mac, 3, xid, offered_ip, server_id);
         if (send_rc != 0) {
             dhcp_sleep_ms(100);
             continue;
         }
-        int ar = dhcp_poll_ack(frame, xid, DHCP_RX_TIMEOUT_MS);
+        int ar = dhcp_wait_kind(0, DHCP_RX_TIMEOUT_MS, NULL, NULL, NULL, NULL, NULL);
         if (ar == 1)
             goto got_ack;
         if (ar < 0) {
             klogprintf("dhcp: NAK!\n");
-            kfree(frame);
+            dhcp_cap_reset(0);
             return -1;
         }
     }
-    
+
     klogprintf("dhcp: failed - no ACK\n");
-    kfree(frame);
+    dhcp_cap_reset(0);
     return -1;
 
 got_ack:
@@ -494,9 +556,15 @@ got_ack:
     g_cached_lease = *out_lease;
     memcpy(g_cached_mac, mac, 6);
     g_cached_lease_valid = 1;
-    if (offered_ip != dhcp_last_logged_ip) {
+    if (offered_ip != dhcp_last_logged_ip)
         dhcp_last_logged_ip = offered_ip;
-    }
-    kfree(frame);
+    dhcp_cap_reset(0);
+    klogprintf("dhcp: bound %u.%u.%u.%u gw %u.%u.%u.%u\n",
+               (unsigned)((offered_ip >> 24) & 0xff), (unsigned)((offered_ip >> 16) & 0xff),
+               (unsigned)((offered_ip >> 8) & 0xff), (unsigned)(offered_ip & 0xff),
+               (unsigned)((out_lease->gw_be >> 24) & 0xff),
+               (unsigned)((out_lease->gw_be >> 16) & 0xff),
+               (unsigned)((out_lease->gw_be >> 8) & 0xff),
+               (unsigned)(out_lease->gw_be & 0xff));
     return 0;
 }

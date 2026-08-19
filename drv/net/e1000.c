@@ -421,6 +421,38 @@ int e1000_send_frame(const void *data, size_t len) {
     return -3; /* ring full */
 }
 
+int e1000_send_frame_nowait(const void *data, size_t len) {
+    if (!g_e1000.initialized || !data) return -1;
+    if (len == 0 || len > E1000_TX_BUF_SIZE) return -1;
+    if (!try_acquire(&g_e1000_lock)) return -4;
+
+    uint32_t tail = g_e1000.tx_tail % E1000_TX_DESC_COUNT;
+    uint32_t next = (tail + 1) % E1000_TX_DESC_COUNT;
+    volatile e1000_tx_desc_t *d = (volatile e1000_tx_desc_t *)&g_e1000.tx_desc[tail];
+    if ((d->status & E1000_TX_STATUS_DD) == 0) {
+        release(&g_e1000_lock);
+        return -3;
+    }
+
+    size_t wire_len = (len < E1000_ETH_MIN_FRAME) ? E1000_ETH_MIN_FRAME : len;
+    memcpy(g_e1000.tx_buf[tail], data, len);
+    if (wire_len > len) memset(g_e1000.tx_buf[tail] + len, 0, wire_len - len);
+
+    d->length = (uint16_t)wire_len;
+    d->cso = 0;
+    d->cmd = E1000_TX_CMD_EOP | E1000_TX_CMD_IFCS | E1000_TX_CMD_RS;
+    d->status = 0;
+    d->css = 0;
+    d->special = 0;
+
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    g_e1000.tx_tail = next;
+    e1000_write32(E1000_REG_TDT, next);
+    g_e1000.stats.tx_packets++;
+    release(&g_e1000_lock);
+    return (int)len;
+}
+
 int e1000_recv_frame(void *buf, size_t cap) {
     if (!g_e1000.initialized || !buf || cap == 0) return -1;
 
@@ -459,6 +491,45 @@ int e1000_recv_frame(void *buf, size_t cap) {
     g_e1000.rx_next = (idx + 1) % E1000_RX_DESC_COUNT;
     g_e1000.stats.rx_packets++;
     release_irqrestore(&g_e1000_lock, irqf);
+    return (int)copy_len;
+}
+
+int e1000_recv_frame_nowait(void *buf, size_t cap) {
+    if (!g_e1000.initialized || !buf || cap == 0) return -1;
+    if (!try_acquire(&g_e1000_lock)) return -4;
+
+    (void)e1000_read32(E1000_REG_ICR);
+    uint32_t idx = g_e1000.rx_next;
+    volatile e1000_rx_desc_t *d = (volatile e1000_rx_desc_t *)&g_e1000.rx_desc[idx];
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    if ((d->status & E1000_RX_STATUS_DD) == 0) {
+        release(&g_e1000_lock);
+        return 0;
+    }
+
+    if ((d->status & E1000_RX_STATUS_EOP) == 0 || d->errors != 0) {
+        d->status = 0;
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        e1000_write32(E1000_REG_RDT, idx);
+        g_e1000.rx_next = (idx + 1) % E1000_RX_DESC_COUNT;
+        g_e1000.stats.rx_errors++;
+        release(&g_e1000_lock);
+        return -2;
+    }
+
+    size_t frame_len = (size_t)(d->length & 0x3FFFu);
+    if (frame_len > E1000_RX_BUF_SIZE)
+        frame_len = E1000_RX_BUF_SIZE;
+    size_t copy_len = (frame_len > cap) ? cap : frame_len;
+    __asm__ volatile("" ::: "memory");
+    memcpy(buf, g_e1000.rx_buf[idx], copy_len);
+
+    d->status = 0;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    e1000_write32(E1000_REG_RDT, idx);
+    g_e1000.rx_next = (idx + 1) % E1000_RX_DESC_COUNT;
+    g_e1000.stats.rx_packets++;
+    release(&g_e1000_lock);
     return (int)copy_len;
 }
 

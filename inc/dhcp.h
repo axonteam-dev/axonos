@@ -2,6 +2,7 @@
 #define DHCP_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 /* DHCP lease result */
 typedef struct {
@@ -23,5 +24,9 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease);
 
 /* Drop in-RAM lease cache (required after link/network change). */
 void dhcp_invalidate_cache(void);
+
+/* Linux-like: the NIC RX pump feeds frames here so DISCOVER/OFFER is not
+ * stolen from a second e1000 consumer. Safe from net_rx. */
+void dhcp_observe_frame(const uint8_t *frame, size_t n);
 
 #endif /* DHCP_H */

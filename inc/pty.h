@@ -19,11 +19,17 @@ ssize_t pty_write(struct fs_file *f, const void *buf, size_t n);
 void pty_release_handle(struct fs_file *f);
 
 int pty_available(struct fs_file *f);
+int pty_peer_hungup(struct fs_file *f);
+int pty_add_waiter(struct fs_file *f, int tid);
+void pty_remove_waiter(struct fs_file *f, int tid);
 int pty_set_locked(struct fs_file *f, int locked);
 int pty_get_locked(struct fs_file *f);
 
 uint32_t pty_get_lflag(struct fs_file *f);
-void pty_set_termios(struct fs_file *f, uint32_t lflag, uint8_t vtime, uint8_t vmin);
+void pty_get_termios(struct fs_file *f, uint32_t *iflag, uint32_t *oflag,
+		     uint32_t *cflag, uint32_t *lflag, uint8_t *cc, size_t ncc);
+void pty_set_termios(struct fs_file *f, uint32_t iflag, uint32_t oflag,
+		     uint32_t cflag, uint32_t lflag, const uint8_t *cc, size_t ncc);
 void pty_get_winsize(struct fs_file *f, uint16_t *row, uint16_t *col);
 void pty_set_winsize(struct fs_file *f, uint16_t row, uint16_t col);
 int pty_get_fg_pgrp(struct fs_file *f);

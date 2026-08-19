@@ -12,6 +12,8 @@
 #define USER_MM_EBADF    9
 #define USER_MM_ENODEV  19
 #define USER_MM_ENOSPC  28
+#define USER_MM_EBUSY   16
+#define USER_MM_EIO      5
 #endif
 
 /* Syscall return encoding: negative int64_t errno. */

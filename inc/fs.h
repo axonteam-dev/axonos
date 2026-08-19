@@ -17,6 +17,9 @@ struct fs_file {
     off_t pos;
     int type;                 /* FS_TYPE_* (set by driver) */
     int refcount;             /* VFS reference count for this handle */
+    /* Linux open(2) flags. O_NONBLOCK is 0x800 on x86_64; apt fcntl()s this
+     * on method pipes and then treats EAGAIN as "wait for select". */
+    int flags;
     /* Stable page-cache key. 0 means this handle is not cacheable. */
     uint64_t backing_id;
     uint64_t backing_gen;
@@ -127,6 +130,7 @@ int fs_unlink(const char *path);
 #define FS_TYPE_EPOLL   0x45504F4Cu
 /* Linux eventfd(2) counter fd. */
 #define FS_TYPE_EVENTFD 0x45464446u /* 'EFDF' */
+#define FS_TYPE_SIGNALFD 0x53464446u /* 'SFDF' */
 
 /* Called by fs_file_free on final unref; tears down TCP/unix private state. */
 void net_fs_file_destroy(struct fs_file *f);
@@ -134,6 +138,7 @@ void net_fs_file_destroy(struct fs_file *f);
 void epoll_fs_file_destroy(struct fs_file *f);
 /* Called by fs_file_free on final unref of an eventfd. */
 void eventfd_fs_file_destroy(struct fs_file *f);
+void signalfd_fs_file_destroy(struct fs_file *f);
 /* Linux: closing fd removes it from every epoll set in that process. */
 struct thread;
 void epoll_notify_fd_closed(struct thread *thr, int fd);

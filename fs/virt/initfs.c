@@ -660,9 +660,10 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
         if ((mode & 0170000u) == 0040000u || (strlen(target) > 1 && target[strlen(target)-1] == '/')) etype = "dir";
         else if ((mode & 0170000u) == 0100000u) etype = "file";
         else if ((mode & 0170000u) == 0120000u) etype = "symlink";
-        qemu_debug_printf("initfs: cpio #%d: %s [%s] mode=%o size=%u\n",
-                          cpio_entry_num, target, etype,
-                          (unsigned)mode, (unsigned)filesize);
+        if ((cpio_entry_num & 255) == 1)
+            qemu_debug_printf("initfs: cpio #%d: %s [%s] mode=%o size=%u\n",
+                              cpio_entry_num, target, etype,
+                              (unsigned)mode, (unsigned)filesize);
 
         if (strcmp(target, "/") == 0) {
             /* Ignore root pseudo-entry like "." */

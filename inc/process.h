@@ -91,6 +91,8 @@ process_t *process_find_child(process_t *parent, int pid, int pgid,
 void process_mark_zombie(process_t *process, int status);
 void process_reparent_children(process_t *process, process_t *new_parent);
 int process_reap(process_t *parent, process_t *child);
+/* Linux SIGCHLD IGN / SA_NOCLDWAIT: drop the zombie without wait(). */
+int process_reap_zombie(process_t *child);
 /* Roll back a process that was never published to userspace. */
 int process_discard(process_t *parent, process_t *child);
 int process_adopt_child(process_t *parent, process_t *child);
@@ -98,6 +100,7 @@ void process_set_vfork_parent(process_t *child, process_t *parent);
 void process_release_vfork_parent(process_t *child,
                                   process_vfork_release_reason_t reason);
 void process_exec_reset(process_t *process, thread_t *thread);
+void process_posix_timers_flush_pid(uint64_t pid);
 uint64_t process_pid(const thread_t *thread);
 uint64_t process_ppid(const thread_t *thread);
 int process_signal_targets(process_t *caller, int pid, int sig);

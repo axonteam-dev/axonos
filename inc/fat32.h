@@ -9,6 +9,7 @@ int fat32_register(void);
 int fat32_unregister(void);
 int fat32_mount_from_device(int device_id);
 int fat32_probe_and_mount(int device_id);
+int fat32_probe_and_mount_geom(int device_id, uint32_t start_lba);
 void fat32_unmount_cleanup(void);
 struct fs_driver *fat32_get_driver(void);
 int fat32_fill_stat(struct fs_file *file, struct stat *st);

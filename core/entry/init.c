@@ -42,6 +42,7 @@
 #include <ramfs.h>
 #include <fat32.h>
 #include <minix.h>
+#include <isofs.h>
 #include <intel_chipset.h>
 #include <disk.h>
 #include <mmio.h>
@@ -81,10 +82,9 @@ extern const char nss_dns_so_blob_end[];
  * shared libc.so.6 into a static process → fatal
  * ": error while loading shared libraries:".
  *
- * Policy for static early userspace (busybox mount/init):
- *   - remove multiarch NSS stubs entirely (ENOENT → static builtins)
- *   - do NOT install the dns shim under multiarch (it also NEEDs libc.so.6)
- *   - keep a nostdlib libnss_files stub + dns only under /lib/ for later
+ * Both shims are nostdlib. Install them under multiarch (glibc searches
+ * /lib/x86_64-linux-gnu first) and /lib. nsswitch hosts: files dns is then
+ * safe for busybox and Debian apt.
  */
 extern const char nss_files_so_blob_start[];
 extern const char nss_files_so_blob_end[];
@@ -302,17 +302,32 @@ static void ramfs_install_libnss_dns(void)
         u_dns_ma = fs_unlink("/lib/x86_64-linux-gnu/libnss_dns.so.2");
         (void)fs_unlink("/lib/libnss_files.so.2");
         (void)fs_unlink("/lib/libnss_dns.so.2");
+        (void)fs_unlink("/usr/lib/x86_64-linux-gnu/libnss_files.so.2");
+        (void)fs_unlink("/usr/lib/x86_64-linux-gnu/libnss_dns.so.2");
 
         /*
-         * Multiarch is what glibc searches first. Install ONLY the nostdlib
-         * files stub there (no NEEDED). Never put the libc-linked dns shim there.
+         * Multiarch is what glibc searches first. Both shims are nostdlib
+         * (no NEEDED libc) so static busybox can dlopen them.
          */
-        if (files_len)
+        if (files_len) {
                 (void)ramfs_write_blob("/lib/x86_64-linux-gnu/libnss_files.so.2",
                                                            nss_files_so_blob_start, files_len);
-        if (dns_len)
+                (void)ramfs_write_blob("/lib/libnss_files.so.2",
+                                                           nss_files_so_blob_start, files_len);
+                (void)ramfs_mkdir("/usr");
+                (void)ramfs_mkdir("/usr/lib");
+                (void)ramfs_mkdir("/usr/lib/x86_64-linux-gnu");
+                (void)ramfs_write_blob("/usr/lib/x86_64-linux-gnu/libnss_files.so.2",
+                                                           nss_files_so_blob_start, files_len);
+        }
+        if (dns_len) {
+                (void)ramfs_write_blob("/lib/x86_64-linux-gnu/libnss_dns.so.2",
+                                                           nss_dns_so_blob_start, dns_len);
                 (void)ramfs_write_blob("/lib/libnss_dns.so.2",
                                                            nss_dns_so_blob_start, dns_len);
+                (void)ramfs_write_blob("/usr/lib/x86_64-linux-gnu/libnss_dns.so.2",
+                                                           nss_dns_so_blob_start, dns_len);
+        }
 
         kprintf("nss-fix: unlink files=%d dns_ma=%d files_stub=%zu dns_lib=%zu\n",
                         u_files, u_dns_ma, files_len, dns_len);
@@ -815,12 +830,24 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                          * between filesystem cache/object memory and user pages.
                          */
                         const size_t PMM_MIN = (heap_size > (1024ULL * 1024ULL * 1024ULL))
-                                ? (384ULL * 1024ULL * 1024ULL)
-                                : (192ULL * 1024ULL * 1024ULL);
+                                ? (256ULL * 1024ULL * 1024ULL)
+                                : (64ULL * 1024ULL * 1024ULL);
                         if (heap_size > PMM_MIN + (128ULL * 1024ULL * 1024ULL)) {
                                 size_t object_heap = heap_size - PMM_MIN;
                                 if (object_heap > OBJECT_HEAP_MAX)
                                         object_heap = OBJECT_HEAP_MAX;
+                                /* ramfs/overlay is the writable root. Keep most of the
+                                 * identity arena as objects so unpack is not starved
+                                 * on machines whose usable RAM ends at the 3–4GiB hole. */
+                                if (object_heap * 2u < heap_size) {
+                                        size_t pmm = heap_size / 5u;
+                                        if (pmm < (64ULL * 1024ULL * 1024ULL))
+                                                pmm = (64ULL * 1024ULL * 1024ULL);
+                                        if (heap_size > pmm + (128ULL * 1024ULL * 1024ULL))
+                                                object_heap = heap_size - pmm;
+                                        if (object_heap > OBJECT_HEAP_MAX)
+                                                object_heap = OBJECT_HEAP_MAX;
+                                }
                                 heap_size = object_heap;
                                 heap_init(heap_start, heap_size);
                                 pmm_init(heap_start + heap_size, arena_hi);
@@ -1016,6 +1043,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 #ifdef MINIX_SUPPORT
         minix_register();
 #endif
+#ifdef ISO9660_SUPPORT
+        isofs_register();
+#endif
 
         if (e1000_init() != 0) {
                 klogprintf("net: e1000 not found\n");
@@ -1066,6 +1096,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                                                 klogprintf("  /dev/%s disk_id=%d sectors=%u\n", name, did, (unsigned)secs);
                                 }
                         }
+                        klogprintf("boot: post-block-devices (klog/usb/fb/ps2)\n");
                         klog_sync_varlog();
                         (void)usb_publish_devfs_nodes();
                 }
@@ -1286,6 +1317,19 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 if (status)
                         fs_file_free(status);
         }
+        /* Live image: squashfs bytes already mapped — export for `cp` to disk.
+         * Kernel ELF is still on the ISO (mount -t iso9660 /dev/sr0). */
+        (void)ramfs_mkdir("/run/live");
+        {
+                const void *img = NULL;
+                size_t sz = 0;
+                if (squashfs_get_image(&img, &sz) == 0 && img && sz > 0) {
+                        if (ramfs_create_borrowed_file("/run/live/initfs.sfs", img, sz) == 0)
+                                kprintf("boot: /run/live/initfs.sfs (%zu bytes)\n", sz);
+                        else
+                                kprintf("boot: warning: failed to export /run/live/initfs.sfs\n");
+                }
+        }
         {
                 struct stat st;
                 if (vfs_lstat("/var/run", &st) != 0)
@@ -1302,7 +1346,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         "sysfs\t\t/sys\t\tsysfs\tdefaults\t\t0\t0\n"
                         "devtmpfs\t/dev\t\tdevtmpfs\tmode=0755\t\t0\t0\n"
                         "tmpfs\t\t/run\t\ttmpfs\tmode=0755,nosuid,nodev\t0\t0\n"
-                        "tmpfs\t\t/tmp\t\ttmpfs\tmode=1777,nosuid,nodev\t0\t0\n";
+                        "tmpfs\t\t/tmp\t\ttmpfs\tmode=1777,nosuid,nodev\t0\t0\n"
+                        "tmpfs\t\t/dev/shm\ttmpfs\tmode=1777,nosuid,nodev\t0\t0\n";
                 struct fs_file *ff = fs_create_file("/etc/fstab");
                 if (!ff) ff = fs_open("/etc/fstab");
                 if (ff) {
@@ -1321,7 +1366,113 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 kprintf("boot: warning: failed to mount tmpfs on /tmp\n");
         else
                 kprintf("boot: tmpfs mounted on /tmp\n");
+        /* Linux POSIX shm: shm_open() creates files under /dev/shm. Without a
+         * writable tmpfs here, postgres initdb dies on posix_fallocate ENOSYS
+         * after opening the stub devfs directory. */
+        if (tmpfs_mount("/dev/shm") != 0)
+                kprintf("boot: warning: failed to mount tmpfs on /dev/shm\n");
+        else {
+                (void)ramfs_chmod("/dev/shm", 01777);
+                kprintf("boot: tmpfs mounted on /dev/shm\n");
+        }
         (void)ramfs_mkdir("/var/tmp");
+        /* Materialize apt/dpkg dirs in the ramfs upper. squashfs already has
+         * them, but overlay_mkdir treats a lower-only dir as EEXIST and
+         * CreateDirectory then skips mkdir -p. Without an upper parent,
+         * mkstemp(/var/cache/apt/srcpkgcache.bin.XXXXXX) is ENOENT. */
+        {
+                static const char *const apt_dirs[] = {
+                        "/var/lib",
+                        "/var/lib/apt",
+                        "/var/lib/apt/lists",
+                        "/var/lib/apt/lists/partial",
+                        "/var/lib/apt/periodic",
+                        "/var/lib/dpkg",
+                        "/var/lib/dpkg/updates",
+                        "/var/lib/dpkg/info",
+                        "/var/cache",
+                        "/var/cache/apt",
+                        "/var/cache/apt/archives",
+                        "/var/cache/apt/archives/partial",
+                        "/var/log/apt",
+                };
+                for (unsigned i = 0; i < sizeof(apt_dirs) / sizeof(apt_dirs[0]); i++)
+                        (void)ramfs_mkdir(apt_dirs[i]);
+        }
+        /* Debian trixie Packages overflow the 24MiB apt default; no mremap
+         * used to mean Grow() died with "Dynamic MMap ran out of room". */
+        {
+                static const char apt_cache[] =
+                        "APT::Cache-Start \"134217728\";\n"
+                        "APT::Cache-Grow \"16777216\";\n"
+                        "APT::Cache-Limit \"268435456\";\n"
+                        "Dpkg::Use-Pty \"false\";\n"
+                        "DPkg::Inhibit-Shutdown \"false\";\n"
+                        "DPkg::FlushSTDIN \"false\";\n"
+                        "DPkg::Path \"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\";\n"
+                        "Acquire::http::Pipeline-Depth \"0\";\n"
+                        "Acquire::Retries \"5\";\n";
+                struct fs_file *cf = fs_create_file("/etc/apt/apt.conf.d/01axonos-cache");
+                if (!cf)
+                        cf = fs_open("/etc/apt/apt.conf.d/01axonos-cache");
+                if (cf) {
+                        (void)vfs_ftruncate(cf, 0);
+                        fs_write(cf, apt_cache, sizeof(apt_cache) - 1, 0);
+                        fs_file_free(cf);
+                }
+        }
+        /* dpkg looks up ldconfig on PATH (/usr/sbin, /sbin). Binary comes from
+         * initfs; here we only write ld.so.conf and usr-merge the name. */
+        {
+                struct stat st;
+                (void)ramfs_mkdir("/etc/ld.so.conf.d");
+                if (vfs_stat("/etc/ld.so.conf", &st) != 0) {
+                        static const char ldconf[] = "include /etc/ld.so.conf.d/*.conf\n";
+                        struct fs_file *lf = fs_create_file("/etc/ld.so.conf");
+                        if (!lf)
+                                lf = fs_open("/etc/ld.so.conf");
+                        if (lf) {
+                                (void)vfs_ftruncate(lf, 0);
+                                fs_write(lf, ldconf, sizeof(ldconf) - 1, 0);
+                                fs_file_free(lf);
+                        }
+                }
+                if (vfs_stat("/etc/ld.so.conf.d/libc.conf", &st) != 0) {
+                        static const char libc_conf[] =
+                                "# libc default configuration\n"
+                                "/usr/local/lib\n";
+                        struct fs_file *lf = fs_create_file("/etc/ld.so.conf.d/libc.conf");
+                        if (!lf)
+                                lf = fs_open("/etc/ld.so.conf.d/libc.conf");
+                        if (lf) {
+                                (void)vfs_ftruncate(lf, 0);
+                                fs_write(lf, libc_conf, sizeof(libc_conf) - 1, 0);
+                                fs_file_free(lf);
+                        }
+                }
+                if (vfs_stat("/etc/ld.so.conf.d/x86_64-linux-gnu.conf", &st) != 0) {
+                        static const char multi[] =
+                                "# Multiarch support\n"
+                                "/usr/local/lib/x86_64-linux-gnu\n"
+                                "/lib/x86_64-linux-gnu\n"
+                                "/usr/lib/x86_64-linux-gnu\n";
+                        struct fs_file *lf = fs_create_file("/etc/ld.so.conf.d/x86_64-linux-gnu.conf");
+                        if (!lf)
+                                lf = fs_open("/etc/ld.so.conf.d/x86_64-linux-gnu.conf");
+                        if (lf) {
+                                (void)vfs_ftruncate(lf, 0);
+                                fs_write(lf, multi, sizeof(multi) - 1, 0);
+                                fs_file_free(lf);
+                        }
+                }
+                if (vfs_stat("/usr/sbin/ldconfig", &st) == 0) {
+                        (void)fs_chmod("/usr/sbin/ldconfig", S_IFREG | 0755);
+                        if (vfs_stat("/sbin/ldconfig", &st) != 0) {
+                                (void)ramfs_mkdir("/sbin");
+                                (void)ramfs_symlink("/sbin/ldconfig", "/usr/sbin/ldconfig");
+                        }
+                }
+        }
         /* Materialize /mnt in overlay upper so mkdir /mnt/foo works without -p races. */
         (void)ramfs_mkdir("/mnt");
         (void)fs_chmod("/tmp", S_IFDIR | 01777);
@@ -1338,15 +1489,16 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 if (!uf) uf = fs_open("/var/run/utmp");
                 if (uf) fs_file_free(uf);
         }
-#ifdef CONFIGURE_NET_START
         {
-                /* No "dns" here: libnss_dns.so NEEDs libc.so.6 and kills static busybox. */
+                /* nostdlib libnss_dns: glibc apt getaddrinfo needs "dns" here.
+                 * CONFIGURE_NET_START was never defined, so this used to be skipped
+                 * and glibc fell back to its compiled-in hosts: files dns anyway. */
                 static const char nsswitch[] =
                         "passwd: files\n"
                         "group: files\n"
                         "shadow: files\n"
                         "gshadow: files\n"
-                        "hosts: files\n"
+                        "hosts: files dns\n"
                         "networks: files\n"
                         "protocols: files\n"
                         "services: files\n"
@@ -1357,11 +1509,11 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 struct fs_file *nf = fs_create_file("/etc/nsswitch.conf");
                 if (!nf) nf = fs_open("/etc/nsswitch.conf");
                 if (nf) {
+                        (void)vfs_ftruncate(nf, 0);
                         fs_write(nf, nsswitch, sizeof(nsswitch) - 1, 0);
                         fs_file_free(nf);
                 }
         }
-#endif
         /*
          * Resolver files must exist before the first opkg/wget invocation.
          * 10.0.2.3 is QEMU user-net's DNS proxy; a later DHCP bound/renew
@@ -1445,8 +1597,27 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         fs_file_free(cf);
                 }
         }
-        syscall_net_ensure_resolv();
+                syscall_net_ensure_resolv();
         ramfs_install_libnss_dns();
+        /*
+         * Debian /etc/services lists http 80/tcp. glibc nss_files + that file
+         * makes apt GetSrvRecords succeed and then res_nquery hangs in
+         * DNS-over-TCP before "Connecting to". Keep domain only.
+         */
+        {
+                static const char services[] =
+                        "# AxonOS: no http/https — see ramfs_install_libnss_dns comment.\n"
+                        "domain\t53/tcp\n"
+                        "domain\t53/udp\n";
+                (void)fs_unlink("/etc/services");
+                struct fs_file *sf = fs_create_file("/etc/services");
+                if (!sf) sf = fs_open("/etc/services");
+                if (sf) {
+                        (void)vfs_ftruncate(sf, 0);
+                        fs_write(sf, services, sizeof(services) - 1, 0);
+                        fs_file_free(sf);
+                }
+        }
         /* Linux: load_system_certificate_list + integrity_load_keys before PID 1. */
         boot_load_system_certs();
 
@@ -1455,7 +1626,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 struct fs_file *lt = fs_create_file("/etc/localtime");
                 if (lt) fs_file_free(lt);
         }
-        /* /etc/profile: login shells (getty→login→sh -l). */
+        /* /etc/profile: login shells (getty→login→sh -l). ramfs_write_blob
+         * ramfs_remove()s first so a leftover overlay whiteout cannot hide PS1. */
         {
                 static const char profile[] =
                         "export PATH=/opt/bin:/opt/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
@@ -1463,17 +1635,39 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         "export USER=root\n"
                         "export LOGNAME=root\n"
                         "export HOME=/root\n"
+                        "export LANG=C\n"
+                        "export LC_ALL=C\n"
                         "export PS1='\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[1;37m\\w\\033[0m \\$ '\n"
                         "export OPENSSL_CONF=/etc/ssl/openssl.cnf\n"
                         "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n"
-                        "export SSL_CERT_DIR=/etc/ssl/certs\n";
-                struct fs_file *pf = fs_create_file("/etc/profile");
-                if (!pf) pf = fs_open("/etc/profile");
-                if (pf) {
-                        (void)vfs_ftruncate(pf, 0);
-                        fs_write(pf, profile, sizeof(profile) - 1, 0);
-                        fs_file_free(pf);
-                }
+                        "export SSL_CERT_DIR=/etc/ssl/certs\n"
+                        "for _f in /etc/profile.d/*.sh; do [ -r \"$_f\" ] && . \"$_f\"; done\n"
+                        "unset _f\n";
+                if (ramfs_write_blob("/etc/profile", profile, sizeof(profile) - 1) != 0)
+                        kprintf("boot: /etc/profile write failed\n");
+        }
+        /* Debian glibc defaults to C.UTF-8 when LANG is unset. Without
+         * /usr/lib/locale/C.UTF-8, fnmatch walks a collate table of file
+         * offsets and #GPs (apt install). Built-in C locale needs no files.
+         * BusyBox login clearenv(); ~/.profile is sourced after /etc/profile. */
+        {
+                static const char loc[] = "LANG=C\nLC_ALL=C\n";
+                static const char rprofile[] =
+                        "export LANG=C\n"
+                        "export LC_ALL=C\n"
+                        "export PS1='\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[1;37m\\w\\033[0m \\$ '\n";
+                static const char locsh[] = "export LANG=C\nexport LC_ALL=C\n";
+                (void)ramfs_mkdir("/etc/default");
+                (void)ramfs_mkdir("/root");
+                (void)ramfs_mkdir("/etc/profile.d");
+                if (ramfs_write_blob("/etc/environment", loc, sizeof(loc) - 1) != 0)
+                        kprintf("boot: /etc/environment write failed\n");
+                if (ramfs_write_blob("/etc/default/locale", loc, sizeof(loc) - 1) != 0)
+                        kprintf("boot: /etc/default/locale write failed\n");
+                if (ramfs_write_blob("/root/.profile", rprofile, sizeof(rprofile) - 1) != 0)
+                        kprintf("boot: /root/.profile write failed\n");
+                if (ramfs_write_blob("/etc/profile.d/locale.sh", locsh, sizeof(locsh) - 1) != 0)
+                        kprintf("boot: /etc/profile.d/locale.sh write failed\n");
         }
         /* /etc/issue: getty prints this before login prompt. \l = tty name (tty1, tty2, ...) */
         {
@@ -1554,12 +1748,14 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         "\t\t\troute add default gw \"$i\" dev \"$interface\"\n"
                         "\t\tdone\n"
                         "\tfi\n"
-                        "\techo -n > \"$RESOLV_CONF\"\n"
-                        "\techo \"options timeout:2 attempts:5 single-request-reopen\" >> \"$RESOLV_CONF\"\n"
-                        "\t[ -n \"$domain\" ] && echo \"search $domain\" >> \"$RESOLV_CONF\"\n"
-                        "\tfor i in $dns; do\n"
-                        "\t\techo \"nameserver $i\" >> \"$RESOLV_CONF\"\n"
-                        "\tdone\n"
+                        "\tif [ -n \"$dns\" ]; then\n"
+                        "\t\techo -n > \"$RESOLV_CONF\"\n"
+                        "\t\techo \"options timeout:2 attempts:5 single-request-reopen\" >> \"$RESOLV_CONF\"\n"
+                        "\t\t[ -n \"$domain\" ] && echo \"search $domain\" >> \"$RESOLV_CONF\"\n"
+                        "\t\tfor i in $dns; do\n"
+                        "\t\t\techo \"nameserver $i\" >> \"$RESOLV_CONF\"\n"
+                        "\t\tdone\n"
+                        "\tfi\n"
                         "\t;;\n"
                         "esac\n"
                         "exit 0\n";

@@ -156,30 +156,31 @@ static void klog_ring_append(const char *p, size_t n) {
 }
 
 void klog_sync_varlog(void) {
-	char *snap;
+	char chunk[4096];
 	long n;
+	long off = 0;
 	struct fs_file *f;
 
 	if (!klog_inited)
 		return;
-	snap = (char *)kmalloc(KLOG_RING_SZ);
-	if (!snap)
-		return;
-	n = klog_syslog_read_all(snap, KLOG_RING_SZ);
-	if (n < 0)
-		n = 0;
 	(void)ramfs_mkdir("/var");
 	(void)ramfs_mkdir("/var/log");
 	f = fs_open("/var/log/kernel");
 	if (!f)
 		f = fs_create_file("/var/log/kernel");
-	if (f) {
-		(void)vfs_ftruncate(f, 0);
-		if (n > 0)
-			(void)fs_write(f, snap, (size_t)n, 0);
-		fs_file_free(f);
+	if (!f)
+		return;
+	(void)vfs_ftruncate(f, 0);
+	/* Copy the ring in 4KiB slices. A 256KiB kmalloc here used to stall
+	 * real hardware (first-fit walk of every ramfs node) and then OOM. */
+	for (;;) {
+		n = klog_ring_read(chunk, sizeof(chunk), (size_t)off);
+		if (n <= 0)
+			break;
+		(void)fs_write(f, chunk, (size_t)n, (size_t)off);
+		off += n;
 	}
-	kfree(snap);
+	fs_file_free(f);
 }
 
 void klog_init(void) {
@@ -243,7 +244,23 @@ size_t klog_syslog_buf_size(void) {
 	return KLOG_RING_SZ;
 }
 
+static void klogprintf_v(int to_console, const char *fmt, va_list ap);
+
 void klogprintf(const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	klogprintf_v(1, fmt, ap);
+	va_end(ap);
+}
+
+void klogprintf_logonly(const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	klogprintf_v(0, fmt, ap);
+	va_end(ap);
+}
+
+static void klogprintf_v(int to_console, const char *fmt, va_list ap) {
 	/*
 	 * Format under the lock with IRQs off, then release before console.
 	 * Painting VBE/tty cell-by-cell with IF=0 froze the machine for seconds
@@ -258,10 +275,7 @@ void klogprintf(const char *fmt, ...) {
 		acquire_irqsave(&klog_lock, &irqf);
 
 		char msg[KLOG_MSG_MAX];
-		va_list ap;
-		va_start(ap, fmt);
 		int n = vsnprintf(msg, sizeof msg, fmt, ap);
-		va_end(ap);
 		if (n < 0) {
 			release_irqrestore(&klog_lock, irqf);
 			return;
@@ -310,7 +324,7 @@ void klogprintf(const char *fmt, ...) {
 		memcpy(line, msg, outlen);
 		line[outlen] = '\0';
 #endif
-		do_console = 1;
+		do_console = to_console;
 		klog_ring_append(line, outlen);
 		release_irqrestore(&klog_lock, irqf);
 	}

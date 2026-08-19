@@ -979,8 +979,6 @@ static pci_device_t *vmwgfx_find_pci(void) {
 		if (d->device_id == VMWARE_PCI_DEVICE_SVGA2 || d->device_id == VMWARE_PCI_DEVICE_SVGA3 ||
 		    d->device_id == VMWARE_PCI_DEVICE_SVGA1)
 			return d;
-		if (d->class_code == 0x03)
-			return d;
 	}
 	return NULL;
 }

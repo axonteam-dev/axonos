@@ -12,6 +12,9 @@ typedef struct thread thread_t;
 #ifndef DEVFS_TTY_COUNT
 #define DEVFS_TTY_COUNT 6
 #endif
+#ifndef DEVFS_TTY_IRQ_OVF
+#define DEVFS_TTY_IRQ_OVF 64
+#endif
 struct devfs_tty {
     int id;
     uint8_t *screen; /* saved VGA buffer (raw bytes 2 per cell) */
@@ -70,7 +73,10 @@ struct devfs_tty {
     uint8_t ansi_bold;
     /* controlling session id for this tty (-1 if none) */
     int controlling_sid;
-    /* POSIX termios local flags (c_lflag) for this tty */
+    /* POSIX termios flags for this virtual console (Linux n_tty). */
+    uint32_t term_iflag;
+    uint32_t term_oflag;
+    uint32_t term_cflag;
     uint32_t term_lflag;
     uint8_t term_vmin;
     uint8_t term_vtime; /* deciseconds */
@@ -78,6 +84,15 @@ struct devfs_tty {
     uint8_t echo_escape_state;
     /* single-byte pushback for readers (e.g. kgetc escape handling); -1 = none */
     int unget_char;
+    /*
+     * Keyboard-IRQ overflow: when in_lock is held on another CPU the ISR must
+     * not drop scancodes. Drain into inbuf whenever in_lock is taken.
+     */
+    char irq_ovf[DEVFS_TTY_IRQ_OVF];
+    uint8_t irq_ovf_head;
+    uint8_t irq_ovf_tail;
+    uint8_t irq_ovf_count;
+    spinlock_t irq_ovf_lock;
 };
 
 int devfs_register(void);
@@ -111,7 +126,7 @@ void devfs_tty_console_write_locked(const char *s, size_t n);
 int devfs_get_active(void);
 /* Process-context input injection; may take the tty lock. */
 void devfs_tty_push_input(int tty, char c);
-/* Non-blocking push from ISR (tries to acquire lock, drops on failure) */
+/* Keyboard ISR: enqueue (or park in irq_ovf); never uses unget_char. */
 void devfs_tty_push_input_noblock(int tty, char c);
 /* Atomically enqueue one key's complete escape sequence from keyboard IRQ. */
 void devfs_tty_push_input_sequence(int tty, const char *seq, size_t len);
@@ -131,6 +146,8 @@ void devfs_tty_remove_waiter(int tty, int tid);
 void devfs_tty_remove_waiter_from_all_ttys(int tid);
 /* Restore main TTY buffer after smcup/rmcup or fatal exit (htop/nano). */
 void devfs_tty_leave_alt_screen(int tty);
+/* ICANON|ECHO|ISIG after apt/dpkg raw-mode (StartPtyMagic) or a crash. */
+void devfs_tty_restore_sane(int tty);
 /* Check whether an fs_file is a devfs tty device */
 int devfs_is_tty_file(struct fs_file *file);
 
@@ -146,7 +163,7 @@ int devfs_get_tty_controlling_sid(struct fs_file *file);
 int devfs_set_tty_controlling_sid(struct fs_file *file, int sid);
 void devfs_clear_controlling_by_sid(int sid);
 /* Return pointer to internal tty struct (for callers that need to read/write flags).
-   Caller must not free or modify beyond term_lflag; pointer is valid while devfs registered. */
+   Caller must not free the pointer; it is valid while devfs is registered. */
 struct devfs_tty *devfs_get_tty_by_index(int idx);
 
 /* Create a block device node at given path and associate with disk device_id.
@@ -154,6 +171,17 @@ struct devfs_tty *devfs_get_tty_by_index(int idx);
 int devfs_create_block_node(const char *path, int device_id, uint32_t sectors);
 /* Create a block node mapped to [start_lba, start_lba+sectors) on parent device. */
 int devfs_create_block_node_lba(const char *path, int device_id, uint32_t start_lba, uint32_t sectors);
+/* Linux: drop a partition node (slot kept stable so open fds do not move). */
+int devfs_remove_block_node(const char *path);
+/* Whole-disk and partition geometry for mount(2). Returns 0 on success. */
+int devfs_get_block_geom(const char *path, int *device_id, uint32_t *start_lba,
+                         uint32_t *sectors);
+/* Logical block size: 2048 for CD/DVD (sr/cdrom), 512 otherwise. */
+int devfs_get_logical_block_size(const char *path);
+/* Canonical whole-disk path for device_id ("/dev/sda", "/dev/nvme0n1", …). */
+int devfs_whole_disk_path(int device_id, char *out, size_t outlen);
+/* Drop partition nodes of `whole` ("/dev/sda" → sda1…; nvme0n1 → n1pN). */
+void devfs_remove_partitions_of(const char *whole_path);
 
 /* Fill a POSIX-like stat struct for a devfs file handle. */
 int devfs_fill_stat(struct fs_file *file, struct stat *st);

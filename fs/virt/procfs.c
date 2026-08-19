@@ -213,6 +213,50 @@ static int procfs_build_root_dir(struct procfs_handle *h) {
     return 0;
 }
 
+/* Open file for /proc/<pid>/fd — process table first (CLONE_THREAD). */
+static struct fs_file *procfs_fd_file(thread_t *t, int fd) {
+    if (!t || fd < 0 || fd >= THREAD_MAX_FD)
+        return NULL;
+    if (t->process && t->process->fds[fd])
+        return t->process->fds[fd];
+    return t->fds[fd];
+}
+
+/* Linux /proc/<pid>/fd: only open descriptors, plus "." / "..".
+ * Snapshot at open so getdents rewind cannot reset a live cursor and
+ * readdir forever (apt ExecFork waits on that before exec of methods/http). */
+static int procfs_build_fd_dir(struct procfs_handle *h) {
+    if (!h)
+        return -1;
+    thread_t *t = procfs_thread_by_id(h->pid);
+    if (!t)
+        return -1;
+    char *buf = NULL;
+    size_t len = 0, cap = 0;
+    if (procfs_append_dirent(&buf, &len, &cap, ".", 1, EXT2_FT_DIR) != 0)
+        goto fail;
+    if (procfs_append_dirent(&buf, &len, &cap, "..", 2, EXT2_FT_DIR) != 0)
+        goto fail;
+    for (int i = 0; i < THREAD_MAX_FD; i++) {
+        if (!procfs_fd_file(t, i))
+            continue;
+        char namebuf[16];
+        int nlen = snprintf(namebuf, sizeof(namebuf), "%d", i);
+        if (nlen <= 0)
+            continue;
+        if (procfs_append_dirent(&buf, &len, &cap, namebuf,
+                                 (uint32_t)(i + 3), EXT2_FT_SYMLINK) != 0)
+            goto fail;
+    }
+    h->cache = buf;
+    h->cache_len = len;
+    return 0;
+fail:
+    if (buf)
+        kfree(buf);
+    return -1;
+}
+
 static void procfs_sanitize_comm(char *comm, size_t cap) {
     if (!comm || cap == 0) return;
     /* Linux get_task_comm / proc_task_name: '(' ')' never appear raw in (comm). */
@@ -952,8 +996,8 @@ static ssize_t procfs_write(struct fs_file *file, const void *buf, size_t size, 
 		return (ssize_t)size;
 	}
 	if (h->kind == 7 && h->file_id == 60) {
-		thread_t *ct = thread_current();
-		if (!ct || ct->euid != 0 || offset != 0) return -1;
+		/* Linux proc_ops.write: ppos is ignored; errno comes from store. */
+		(void)offset;
 		return procfs_net_store_dhcp((const char *)buf, size);
 	}
 	return -1;
@@ -1100,12 +1144,16 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 		const char *slash = strchr(p, '/');
 		size_t first_len = slash ? (size_t)(slash - p) : strlen(p);
 		if (first_len == 0) { kfree(h); kfree(pp); kfree(f); return -1; }
-		/* handle 'self' */
+		/* handle 'self' — Linux uses TGID, not tid. pid != tid after
+		 * process_create (next_pid vs thread id), so looking up tid in
+		 * process_find() missed /proc/self/fd and apt hung in readdir. */
 		int pid = -1;
 		if (first_len == 4 && strncmp(p, "self", 4) == 0) {
 			thread_t *ct = thread_get_current_user();
 			if (!ct) ct = thread_current();
-			pid = ct ? (int)ct->tid : -1;
+			pid = procfs_tgid(ct);
+			if (pid <= 0)
+				pid = ct ? (int)ct->tid : -1;
 		} else {
 			/* numeric pid? */
 			char tmp[32];
@@ -1488,6 +1536,8 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 			} else if (strncmp(rest, "fd", 2) == 0 && (rest[2] == '\0' || rest[2] == '/')) {
 				if (rest[2] == '\0') {
 					h->kind = 5; h->pid = pid; f->type = FS_TYPE_DIR; f->size = 0;
+					if (procfs_build_fd_dir(h) == 0)
+						f->size = h->cache_len;
 				} else {
 					/* /proc/<pid>/fd/<n> */
 					const char *rest2 = rest + 3; /* after 'fd/' */
@@ -1510,8 +1560,9 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					if (tmpbuf) {
 						/* build link target */
 						thread_t *t = procfs_thread_by_id(pid);
-						if (t && fdnum >= 0 && fdnum < THREAD_MAX_FD && t->fds[fdnum]) {
-							const char *target = t->fds[fdnum]->path ? t->fds[fdnum]->path : "(anon)";
+						struct fs_file *ff = procfs_fd_file(t, fdnum);
+						if (ff) {
+							const char *target = ff->path ? ff->path : "(anon)";
 							size_t tlen = strlen(target);
 							if (tlen >= cap) tlen = cap - 1;
 							memcpy(tmpbuf, target, tlen);
@@ -1584,8 +1635,10 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
     struct procfs_handle *h = (struct procfs_handle*)file->driver_private;
     if (!h) return -1;
 
-    /* /proc root — stable snapshot built at open (byte-offset safe for getdents). */
-    if (h->kind == 1) {
+    /* /proc root and /proc/<pid>/fd — snapshots built at open. */
+    if (h->kind == 1 || h->kind == 5) {
+        if (h->kind == 5 && !h->cache)
+            (void)procfs_build_fd_dir(h);
         if (!h->cache)
             return 0;
         if ((size_t)offset >= h->cache_len)
@@ -1992,47 +2045,16 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 		return (ssize_t)written;
 	}
 
-	/* pid fd directory listing */
-	if (h->kind == 5) {
-        if (offset == 0) h->file_id = 0;
-		thread_t *t = procfs_thread_by_id(h->pid);
-		if (!t) return -1;
-		size_t written = 0;
-		uint8_t *out = (uint8_t*)buf;
-		for (int i = h->file_id; i < THREAD_MAX_FD; i++) {
-			char namebuf[16];
-			int nlen = snprintf(namebuf, sizeof(namebuf), "%d", i);
-			if (nlen <= 0) { h->file_id = i + 1; continue; }
-			size_t namelen = (size_t)nlen;
-			size_t rec_len = 8 + namelen;
-			rec_len = (rec_len + 3) & ~3u;
-            if (written + rec_len > size) break;
-            
-			uint8_t tmp[256];
-            memset(tmp, 0, sizeof(tmp));
-			struct ext2_dir_entry de;
-			de.inode = (uint32_t)(i + 1);
-			de.rec_len = (uint16_t)rec_len;
-			de.name_len = (uint8_t)namelen;
-			de.file_type = (t->fds[i] ? EXT2_FT_REG_FILE : EXT2_FT_UNKNOWN);
-			memcpy(tmp, &de, 8);
-			memcpy(tmp + 8, namebuf, namelen);
-            memcpy(out + written, tmp, rec_len);
-			written += rec_len;
-            h->file_id = i + 1;
-		}
-		return (ssize_t)written;
-	}
+	/* pid fd directory listing is served from the open-time snapshot (kind 1 path). */
 	/* pid fd symlink target */
 	if (h->kind == 6) {
 		thread_t *t = procfs_thread_by_id(h->pid);
 		if (!t) return 0;
 		int fdnum = h->file_id;
 		const char *target = "(invalid)";
-		if (fdnum >= 0 && fdnum < THREAD_MAX_FD && t->fds[fdnum]) {
-			if (t->fds[fdnum]->path) target = t->fds[fdnum]->path;
-			else target = "(anon)";
-		}
+		struct fs_file *ff = procfs_fd_file(t, fdnum);
+		if (ff)
+			target = ff->path ? ff->path : "(anon)";
 		size_t tlen = strlen(target);
 		if ((size_t)offset >= tlen) return 0;
 		size_t tocopy = tlen - (size_t)offset;
@@ -2088,7 +2110,9 @@ int procfs_fill_stat(struct fs_file *file, struct stat *st) {
     if (h->kind == 1 || h->kind == 2 || h->kind == 5 || h->kind == 8 || h->kind == 10 ||
         h->kind == 11 || h->kind == 12 || h->kind == 13 || h->kind == 14 || h->kind == 15 ||
         h->kind == 16) {
-        st->st_ino = (h->kind == 2 && h->pid > 0) ? (ino_t)((unsigned)h->pid + 100u) : 0;
+        st->st_ino = (h->kind == 2 && h->pid > 0) ? (ino_t)((unsigned)h->pid + 100u)
+                   : (h->kind == 5 && h->pid > 0) ? (ino_t)((unsigned)h->pid + 200u)
+                   : 1;
         st->st_mode = S_IFDIR | 0555;
         st->st_nlink = 2;
         if (h->kind == 2) {

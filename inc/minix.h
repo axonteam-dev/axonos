@@ -9,6 +9,7 @@
 int minix_register(void);
 int minix_unregister(void);
 int minix_probe_and_mount(int device_id);
+int minix_probe_and_mount_geom(int device_id, uint32_t start_lba);
 void minix_unmount_cleanup(void);
 struct fs_driver *minix_get_driver(void);
 int minix_fill_stat(struct fs_file *file, struct stat *st);

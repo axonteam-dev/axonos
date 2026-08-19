@@ -657,7 +657,21 @@ static int sq_lookup_dir(struct squashfs_sb *s, const struct squashfs_inode_info
     return -1; /* not found */
 }
 
+static int sq_path_to_inode_n(struct squashfs_sb *s, const char *path,
+                              struct squashfs_inode_info *out, int depth);
+
 static int sq_path_to_inode(struct squashfs_sb *s, const char *path, struct squashfs_inode_info *out)
+{
+    return sq_path_to_inode_n(s, path, out, 0);
+}
+
+static int sq_is_symlink_type(uint16_t type)
+{
+    return type == SQUASHFS_SYMLINK_TYPE || type == SQUASHFS_LSYMLINK_TYPE;
+}
+
+static int sq_path_to_inode_n(struct squashfs_sb *s, const char *path,
+                              struct squashfs_inode_info *out, int depth)
 {
     struct squashfs_inode_info cur;
     char comp[SQUASHFS_NAME_LEN + 1];
@@ -666,6 +680,8 @@ static int sq_path_to_inode(struct squashfs_sb *s, const char *path, struct squa
     if (!s || !path || !out)
         return -1;
     if (path[0] != '/')
+        return -1;
+    if (depth > 8)
         return -1;
 
     if (sq_read_inode(s, s->sb.root_inode, &cur) != 0)
@@ -698,9 +714,42 @@ static int sq_path_to_inode(struct squashfs_sb *s, const char *path, struct squa
             sq_inode_info_free(&cur);
             return -1;
         }
-        sq_inode_info_free(&cur);
-        if (sq_read_inode(s, next_ref, &next) != 0)
+        memset(&next, 0, sizeof(next));
+        if (sq_read_inode(s, next_ref, &next) != 0) {
+            sq_inode_info_free(&cur);
             return -1;
+        }
+        /*
+         * Linux: follow intermediate directory symlinks. Last component stays
+         * a symlink so open_nofollow/readlink work. Relative one-name targets
+         * (C.UTF-8 → C.utf8) are looked up in the parent directory.
+         */
+        if (*p && sq_is_symlink_type(next.type) && next.symlink && next.symlink[0]) {
+            const char *tgt = next.symlink;
+            if (tgt[0] == '/') {
+                sq_inode_info_free(&next);
+                sq_inode_info_free(&cur);
+                if (sq_path_to_inode_n(s, tgt, &next, depth + 1) != 0)
+                    return -1;
+                cur = next;
+                continue;
+            }
+            if (!strchr(tgt, '/')) {
+                uint64_t rel_ref = 0;
+                if (sq_lookup_dir(s, &cur, tgt, &rel_ref, NULL) != 0) {
+                    sq_inode_info_free(&next);
+                    sq_inode_info_free(&cur);
+                    return -1;
+                }
+                sq_inode_info_free(&next);
+                memset(&next, 0, sizeof(next));
+                if (sq_read_inode(s, rel_ref, &next) != 0) {
+                    sq_inode_info_free(&cur);
+                    return -1;
+                }
+            }
+        }
+        sq_inode_info_free(&cur);
         cur = next;
     }
     *out = cur;
@@ -1299,6 +1348,15 @@ int squashfs_prepare_image(const void *image, size_t size)
 int squashfs_is_ready(void)
 {
     return g_sq != NULL;
+}
+
+int squashfs_get_image(const void **ptr, size_t *size)
+{
+    if (!g_sq || !ptr || !size)
+        return -1;
+    *ptr = g_sq->image;
+    *size = g_sq->size;
+    return 0;
 }
 
 int squashfs_mount(const char *path)

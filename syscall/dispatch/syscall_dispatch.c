@@ -20,6 +20,7 @@
 #include <spinlock.h>
 #include <fat32.h>
 #include <minix.h>
+#include <isofs.h>
 #include <pty.h>
 #include <disk.h>
 #include <e1000.h>
@@ -155,6 +156,7 @@ static void exit_group_reap_peer_threads(thread_t *cur);
 static void sysv_shm_detach_all_for_tid(uint64_t tid);
 static void thread_set_pending_signal(thread_t *t, int signum);
 static void thread_close_all_fds(thread_t *cur);
+static int force_fatal_signal_thread_group(thread_t *any, int sig);
 static int force_sigkill_thread_group(thread_t *any);
 
 /* True if a signal is pending that should interrupt a blocking syscall.
@@ -165,6 +167,155 @@ static int thread_has_interrupt_signal(thread_t *t) {
     blocked &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (19 - 1))); /* SIGSTOP=19 */
     return (t->pending_signals & ~blocked) != 0;
 }
+
+/*
+ * Linux do_wait: SIGCHLD wakes wait4 so it can reap; it is not EINTR.
+ * opkg xsystem / BusyBox waitpid printed "Interrupted system call" and
+ * killed wget mid-GET — truncated .ipk (libc size mismatch).
+ */
+static int wait4_eintr_pending(thread_t *t) {
+    if (!t) return 0;
+    uint64_t blocked = t->saved_sig_mask;
+    blocked &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (19 - 1)));
+    uint64_t vis = t->pending_signals & ~blocked;
+    /*
+     * Linux do_wait: SIG_DFL/IGN SIGCHLD is ignored and does not interrupt
+     * wait. A userspace SIGCHLD handler without SA_RESTART does (EINTR).
+     */
+    if (t->process) {
+        uint64_t h = t->process->signal_handlers[SIGCHLD];
+        if (h <= 1ull)
+            vis &= ~(1ULL << (SIGCHLD - 1));
+    } else {
+        vis &= ~(1ULL << (SIGCHLD - 1));
+    }
+    return vis != 0;
+}
+
+static int wait4_waiter_ptid(const thread_t *w) {
+    return w ? (int)(w->tid ? w->tid : 1) : -1;
+}
+
+static int wait4_id_matches(const thread_t *c, int pid_arg) {
+    int tid;
+    if (!c || pid_arg <= 0)
+        return 0;
+    /* waitpid(pid>0) is TGID. Fork returns process pid; after IGN drop
+     * process_pid() falls back to the tid slot which is a different number. */
+    if (c->linux_tgid > 0 && c->linux_tgid == pid_arg)
+        return 1;
+    if ((int)process_pid(c) == pid_arg)
+        return 1;
+    tid = (int)(c->tid ? c->tid : 1);
+    return tid == pid_arg;
+}
+
+static int wait4_thread_pid(const thread_t *c) {
+    if (!c)
+        return 0;
+    if (c->linux_tgid > 0)
+        return c->linux_tgid;
+    return (int)process_pid(c);
+}
+
+static int wait4_is_our_child(const thread_t *waiter, const thread_t *c) {
+    int cpt;
+    thread_t *pt;
+    if (!waiter || !c || c == waiter || c->ring != 3)
+        return 0;
+    if (c->process && waiter->process) {
+        /* CLONE_THREAD: same group, not a wait(2) child. */
+        if (c->process == waiter->process)
+            return 0;
+        if (c->process->parent == waiter->process)
+            return 1;
+    }
+    cpt = c->parent_tid;
+    if (cpt == wait4_waiter_ptid(waiter))
+        return 1;
+    /* fork() records the spawning thread's tid. waitpid from another thread
+     * of the same group (or the leader) is still the Linux real_parent. */
+    if (waiter->process && waiter->process->leader && cpt >= 0) {
+        int lt = (int)(waiter->process->leader->tid
+                       ? waiter->process->leader->tid : 1);
+        if (cpt == lt)
+            return 1;
+    }
+    pt = (cpt >= 0) ? thread_get(cpt) : NULL;
+    if (pt && waiter->process && pt->process == waiter->process)
+        return 1;
+    return 0;
+}
+
+static int wait4_pgid_ok(const thread_t *waiter, const thread_t *c, int pid_arg) {
+    int want;
+    int got;
+    if (pid_arg > 0 || pid_arg == -1)
+        return 1;
+    got = c->process ? (int)c->process->pgid : c->pgid;
+    if (pid_arg == 0) {
+        want = waiter->process ? (int)waiter->process->pgid : waiter->pgid;
+        return !want || got == want;
+    }
+    return got == -pid_arg;
+}
+
+static int wait4_zombie_waitable(const thread_t *c);
+
+static void wait4_arm_children(thread_t *waiter, int pid_arg) {
+    int wtid = wait4_waiter_ptid(waiter);
+    int n = thread_get_count();
+    for (int i = 0; i < n; i++) {
+        thread_t *c = thread_get_by_index(i);
+        if (!c)
+            continue;
+        if (!wait4_is_our_child(waiter, c))
+            continue;
+        if (pid_arg > 0 && !wait4_id_matches(c, pid_arg))
+            continue;
+        if (!wait4_pgid_ok(waiter, c, pid_arg))
+            continue;
+        if (c->state == THREAD_TERMINATED) {
+            /* Pin so fork/TCP autoreap cannot free the slot before we reap. */
+            if (wait4_zombie_waitable(c))
+                c->waiter_tid = wtid;
+            continue;
+        }
+        c->waiter_tid = wtid;
+    }
+}
+
+static int wait4_zombie_waitable(const thread_t *c) {
+    if (!c || c->state != THREAD_TERMINATED)
+        return 0;
+    if (c->exit_status != (int)0x80000000)
+        return 1;
+    if (c->process && c->process->state == PROCESS_ZOMBIE)
+        return 1;
+    /* IGN-dropped slot: still waitable until thread_reap if the parent asks. */
+    return c->linux_tgid > 0 || c->parent_tid >= 0;
+}
+
+static thread_t *wait4_find_thread_zombie(thread_t *waiter, int pid_arg) {
+    int n = thread_get_count();
+    int i;
+    for (i = 0; i < n; i++) {
+        thread_t *c = thread_get_by_index(i);
+        if (!c || c->ring != 3 || c->state != THREAD_TERMINATED)
+            continue;
+        if (!wait4_is_our_child(waiter, c))
+            continue;
+        if (pid_arg > 0 && !wait4_id_matches(c, pid_arg))
+            continue;
+        if (!wait4_pgid_ok(waiter, c, pid_arg))
+            continue;
+        if (wait4_zombie_waitable(c))
+            return c;
+    }
+    return NULL;
+}
+
+static uint64_t wait4_reap_found_thread(thread_t *waiter, thread_t *zombie);
 
 void syscall_user_fatal_exit(int signo) {
     /* Exception handlers run in the context of the faulting thread. Prefer
@@ -187,7 +338,7 @@ void syscall_user_fatal_exit(int signo) {
                 cur->pgid,
                 (unsigned long long)(cu && cu->tid ? cu->tid : 0),
                 (cu && cu->name[0]) ? cu->name : "(none)");
-            kprintf("fatal-exit: sig=%d tid=%llu name=%s parent=%d pgid=%d cu=%llu/%s\n",
+            klogprintf_logonly("fatal-exit: sig=%d tid=%llu name=%s parent=%d pgid=%d cu=%llu/%s\n",
                 signo,
                 (unsigned long long)(cur->tid ? cur->tid : 1),
                 cur->name[0] ? cur->name : "(noname)",
@@ -202,8 +353,10 @@ void syscall_user_fatal_exit(int signo) {
          * member's mm left the leader running on a freed address space and
          * wedged the shell (no prompt after curl's DNS worker #PF).
          */
-        if (leader->attached_tty >= 0)
+        if (leader->attached_tty >= 0) {
             devfs_tty_leave_alt_screen(leader->attached_tty);
+            devfs_tty_restore_sane(leader->attached_tty);
+        }
         {
             int nt = thread_get_count();
             for (int i = 0; i < nt; i++) {
@@ -1693,18 +1846,22 @@ static void exit_group_reap_peer_threads(thread_t *cur) {
 }
 
 /*
- * Linux SIGKILL: terminate the whole thread group immediately from the killer's
+ * Linux SIGKILL / fatal SIG_DFL: tear the thread group down from this
  * context. Do not wait for the victim to return from poll/sleep and run
- * maybe_deliver — that left udhcpc alive after kill -9 (pending set, never applied).
+ * maybe_deliver — that left udhcpc alive after kill -9. Do not mm_release
+ * here: walking a postgres-sized page table under cli (mm_enter_direct_map)
+ * froze the whole machine after kill <pid>. Scheduler autoreap / wait4
+ * frees the mm later.
  */
-static int force_sigkill_thread_group(thread_t *any) {
+static int force_fatal_signal_thread_group(thread_t *any, int sig)
+{
     if (!any || any->ring != 3 || any->state == THREAD_TERMINATED)
         return 0;
+    if (sig <= 0 || sig > 63)
+        sig = 9; /* SIGKILL */
     process_t *proc = any->process;
     thread_t *leader = (proc && proc->leader) ? proc->leader : any;
-    int sig = SIGKILL;
 
-    /* Reap every user thread in the group (including leader). */
     int nt = thread_get_count();
     for (int i = 0; i < nt; i++) {
         thread_t *t = thread_get_by_index(i);
@@ -1722,12 +1879,14 @@ static int force_sigkill_thread_group(thread_t *any) {
             thread_unblock(w);
         }
         t->pending_signals = 0;
-        t->exit_status = sig;
+        t->exit_status = sig; /* WIFSIGNALED, WTERMSIG = sig */
         t->state = THREAD_TERMINATED;
     }
 
-    if (leader->attached_tty >= 0)
+    if (leader->attached_tty >= 0) {
         devfs_tty_leave_alt_screen(leader->attached_tty);
+        devfs_tty_restore_sane(leader->attached_tty);
+    }
     thread_close_all_fds(leader);
     if (leader->parent_tid >= 0) {
         thread_t *pt = thread_get(leader->parent_tid);
@@ -1751,6 +1910,11 @@ static int force_sigkill_thread_group(thread_t *any) {
     if (leader->waiter_tid >= 0)
         thread_unblock(leader->waiter_tid);
     return 1;
+}
+
+static int force_sigkill_thread_group(thread_t *any)
+{
+    return force_fatal_signal_thread_group(any, 9 /* SIGKILL */);
 }
 
 enum {
@@ -1804,12 +1968,14 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define EINTR   4
 #define EPIPE   32
 #define EIO     5
+#define ENXIO   6
 #define EEXIST  17
 #define EADDRINUSE 98
 #define EADDRNOTAVAIL 99
 #define EACCES  13
 #define EBUSY   16
 #define ENOTDIR 20
+#define EISDIR  21
 #define ENOTEMPTY 39
 #define ENOSPC  28
 #define EIDRM   43
@@ -1861,8 +2027,8 @@ static int pipe_trace_left = 160;
 int syscall_pipe_watch_active;
 int syscall_pipe_watch_owner_tid;
 
-static ssize_t pipe_read_bytes(pipe_t *p, void *buf, size_t cnt, thread_t *cur);
-static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t *cur);
+static ssize_t pipe_read_bytes(pipe_t *p, void *buf, size_t cnt, thread_t *cur, int nonblock);
+static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t *cur, int nonblock);
 
 /* Linux eventfd(2): 64-bit counter used by curl's async DNS waiter. */
 enum {
@@ -1969,6 +2135,80 @@ static ssize_t eventfd_write_bytes(eventfd_t *e, const void *buf, size_t cnt, th
     }
 }
 
+enum {
+    SFD_CLOEXEC_K  = 02000000,
+    SFD_NONBLOCK_K = 00004000
+};
+
+typedef struct signalfd {
+    uint64_t mask; /* bits 0..62 = SIG 1..63 */
+} signalfd_t;
+
+void signalfd_fs_file_destroy(struct fs_file *f) {
+    if (!f || f->type != FS_TYPE_SIGNALFD) return;
+    signalfd_t *s = (signalfd_t *)f->driver_private;
+    f->driver_private = NULL;
+    if (s) kfree(s);
+    if (f->path) {
+        kfree((void *)f->path);
+        f->path = NULL;
+    }
+    kfree(f);
+}
+
+static uint64_t signalfd_ready(thread_t *thr, const signalfd_t *s) {
+    if (!thr || !s)
+        return 0;
+    return thr->pending_signals & s->mask;
+}
+
+static ssize_t signalfd_read_bytes(thread_t *thr, struct fs_file *f, void *buf, size_t cnt) {
+    signalfd_t *s;
+    size_t done = 0;
+    if (!thr || !f || !buf)
+        return -EINVAL;
+    s = (signalfd_t *)f->driver_private;
+    if (!s)
+        return -EBADF;
+    if (cnt < 128)
+        return -EINVAL;
+    for (;;) {
+        uint64_t ready = signalfd_ready(thr, s);
+        if (ready) {
+            while (done + 128 <= cnt && ready) {
+                uint8_t info[128];
+                uint32_t signo = 0;
+                int i;
+                for (i = 1; i <= 63; i++) {
+                    uint64_t bit = 1ULL << (i - 1);
+                    if (ready & bit) {
+                        signo = (uint32_t)i;
+                        break;
+                    }
+                }
+                if (signo == 0)
+                    break;
+                thr->pending_signals &= ~(1ULL << (signo - 1));
+                memset(info, 0, sizeof(info));
+                memcpy(info, &signo, sizeof(signo));
+                memcpy((char *)buf + done, info, 128);
+                done += 128;
+                ready = signalfd_ready(thr, s);
+            }
+            return (ssize_t)done;
+        }
+        if (f->flags & 0x800)
+            return -EAGAIN;
+        {
+            int tid = (int)(thr->tid ? thr->tid : 1);
+            thread_block(tid);
+            thread_yield();
+            if (thread_has_interrupt_signal(thr))
+                return -EINTR;
+        }
+    }
+}
+
 void pipe_release_end(struct fs_file *f) {
     if (!f || f->type != FS_TYPE_PIPE || !f->driver_private) return;
     pipe_t *p = (pipe_t *)f->driver_private;
@@ -1995,7 +2235,7 @@ void pipe_release_end(struct fs_file *f) {
     }
 }
 
-static ssize_t pipe_read_bytes(pipe_t *p, void *buf, size_t cnt, thread_t *cur) {
+static ssize_t pipe_read_bytes(pipe_t *p, void *buf, size_t cnt, thread_t *cur, int nonblock) {
     if (!p || !buf || cnt == 0) return -EINVAL;
     unsigned long fl = 0;
     for (;;) {
@@ -2027,22 +2267,24 @@ static ssize_t pipe_read_bytes(pipe_t *p, void *buf, size_t cnt, thread_t *cur) 
                         cur ? (int)(cur->tid ? cur->tid : 1) : -1, ref);
             return 0;
         }
-        p->reader_waiter_tid = cur ? (int)cur->tid : -1;
-        int waiter = p->reader_waiter_tid;
+        int waiter = cur ? (int)cur->tid : -1;
         int ref = p->refcount;
         uint64_t id = p->id;
+        if (!nonblock)
+            p->reader_waiter_tid = waiter;
+        release_irqrestore(&p->lock, fl);
+        if (nonblock)
+            return -EAGAIN;
         if (waiter >= 0)
             thread_block(waiter);
-        release_irqrestore(&p->lock, fl);
         if (pipe_trace_left-- > 0)
             devel_printf("pipe: read-wait id=%llu tid=%d pref=%d\n",
                     (unsigned long long)id, waiter, ref);
-        if (waiter >= 0)
-            thread_yield();
+        thread_yield();
     }
 }
 
-static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t *cur) {
+static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t *cur, int nonblock) {
     if (!p || !buf || cnt == 0) return -EINVAL;
     unsigned long fl = 0;
     size_t written = 0;
@@ -2074,13 +2316,15 @@ static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t
             continue;
         }
         if (p->refcount < 2) { release_irqrestore(&p->lock, fl); return written > 0 ? (ssize_t)written : -EPIPE; }
-        p->writer_waiter_tid = cur ? (int)cur->tid : -1;
-        int waiter = p->writer_waiter_tid;
+        int waiter = cur ? (int)cur->tid : -1;
+        if (!nonblock)
+            p->writer_waiter_tid = waiter;
+        release_irqrestore(&p->lock, fl);
+        if (nonblock)
+            return written > 0 ? (ssize_t)written : -EAGAIN;
         if (waiter >= 0)
             thread_block(waiter);
-        release_irqrestore(&p->lock, fl);
-        if (waiter >= 0)
-            thread_yield();
+        thread_yield();
     }
     return (ssize_t)written;
 }
@@ -2102,6 +2346,10 @@ static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t
 #define SOCK_CLOEXEC_LINUX    02000000
 /* Linux: SOCK_NONBLOCK == O_NONBLOCK (glibc sets this in socket type / fcntl). */
 #define O_NONBLOCK_LINUX      0x800
+static inline int fs_open_nonblock(const struct fs_file *f)
+{
+    return f && (f->flags & O_NONBLOCK_LINUX);
+}
 /* F_GETFL must include accmode; 0 breaks glibc fdopen/wget (bogus "out of memory"). */
 #define O_RDWR_LINUX          2
 #define IPPROTO_ICMP_LOCAL    1
@@ -2298,6 +2546,7 @@ static tcp_syn_wait_t *g_tcp_syn_wait[TCP_SYN_WAIT_SLOTS];
 static spinlock_t g_tcp_syn_wait_lock = { 0 };
 
 static int net_tcp_dispatch_incoming(const uint8_t *frame, size_t n);
+static int net_tcp_client_wants_frame(const uint8_t *frame, size_t n);
 static ksock_net_t *net_tcp_find_listener(uint16_t port);
 static int lo_tcp_stream_connect(ksock_net_t *client, uint32_t dst_ip_be, uint16_t dport, thread_t *t);
 
@@ -2771,6 +3020,15 @@ static inline void ksock_rx_pending_install(ksock_net_t *s, int rn) {
     s->rx_has_pending = 1;
     s->rx_pending_len = n;
     s->rx_pending_off = 0;
+    /* RFC 1035 DNS-over-TCP: 2-byte BE length then message. glibc writes that
+     * framing on the fake TCP :53 socket; replies must be framed the same way
+     * or read() never completes and apt sits at "0% [Working]". */
+    if (s->dns_tcp_udp_bridge && n + 2u <= cap) {
+        memmove(s->rx_pending + 2, s->rx_pending, n);
+        s->rx_pending[0] = (uint8_t)((n >> 8) & 0xff);
+        s->rx_pending[1] = (uint8_t)(n & 0xff);
+        s->rx_pending_len = n + 2u;
+    }
 }
 
 typedef struct {
@@ -2791,7 +3049,10 @@ static net_state_t g_net;
 static net_state_t g_net_shadow;
 static int g_net_shadow_valid = 0;
 static int g_net_from_dhcp = 0; /* lease came from userspace DHCP / ioctl path */
-static volatile int g_net_dhcp_busy = 0; /* dhcp_acquire owns NIC RX; net_rx must not steal */
+static volatile int g_net_dhcp_busy = 0; /* kdhcpd running (proc snapshot) */
+static volatile int g_net_dhcp_pending = 0; /* kdhcpd: another renew queued */
+static volatile int g_net_dhcp_cancel = 0;  /* release won the race vs acquire */
+static int g_net_dhcp_thread_started = 0;
 static int g_net_trace_budget;
 static int g_net_l2_trace_budget;
 
@@ -3062,6 +3323,7 @@ typedef struct __attribute__((packed)) {
 /* ---------- RX pump: answer ARP/ICMP and queue everything else ---------- */
 static uint16_t ip_checksum16(const void *data, size_t len);
 static void ip_be_to_bytes(uint32_t ip_be, uint8_t out[4]);
+static void net_send_gratuitous_arp(void);
 static int net_send_eth_ipv4(const uint8_t dst_mac[6], uint32_t dst_ip_be, uint8_t proto, const void *l4, size_t l4_len);
 
 #define NET_RXQ_SLOTS  512
@@ -3081,14 +3343,79 @@ static uint8_t g_tcp_xmit_mac[6];
 static int g_tcp_xmit_mac_valid = 0;
 static int g_net_rx_thread_started = 0;
 
+static int net_frame_l4_tcp(const uint8_t *frame, size_t n) {
+    if (!frame || n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + 20u) return 0;
+    const eth_hdr_t *eth = (const eth_hdr_t *)frame;
+    if (be16(eth->ethertype) != ETH_TYPE_IPV4) return 0;
+    const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
+    size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
+    if (ip->proto != IPPROTO_TCP_LOCAL || ihl < sizeof(ipv4_hdr_t)) return 0;
+    return (n >= sizeof(eth_hdr_t) + ihl + sizeof(tcp_hdr_t)) ? 1 : 0;
+}
+
+static int net_frame_udp_dns(const uint8_t *frame, size_t n) {
+    if (!frame || n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t)) return 0;
+    const eth_hdr_t *eth = (const eth_hdr_t *)frame;
+    if (be16(eth->ethertype) != ETH_TYPE_IPV4) return 0;
+    const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
+    size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
+    if (ip->proto != IPPROTO_UDP_LOCAL || ihl < sizeof(ipv4_hdr_t)) return 0;
+    if (n < sizeof(eth_hdr_t) + ihl + sizeof(udp_hdr_t)) return 0;
+    const udp_hdr_t *uh = (const udp_hdr_t *)(frame + sizeof(eth_hdr_t) + ihl);
+    uint16_t sp = be16(uh->src_port);
+    uint16_t dp = be16(uh->dst_port);
+    return (sp == 53u || dp == 53u) ? 1 : 0;
+}
+
+/* Caller holds g_net_rxq_lock. Rotate `offset` frames head→tail, then drop head. */
+static void net_rxq_drop_offset_locked(uint32_t offset) {
+    uint8_t tmp[NET_RXQ_BUF];
+    if (g_net_rxq_count == 0 || g_net_rxq_slots == 0) return;
+    if (offset >= g_net_rxq_count) offset = 0;
+    for (uint32_t r = 0; r < offset; r++) {
+        uint32_t hi = g_net_rxq_head;
+        uint16_t tn = g_net_rxq_len[hi];
+        memcpy(tmp, g_net_rxq[hi], tn);
+        g_net_rxq_len[hi] = 0;
+        g_net_rxq_head = (hi + 1) % g_net_rxq_slots;
+        g_net_rxq_count--;
+        uint32_t ti = g_net_rxq_tail;
+        memcpy(g_net_rxq[ti], tmp, tn);
+        g_net_rxq_len[ti] = tn;
+        g_net_rxq_tail = (ti + 1) % g_net_rxq_slots;
+        g_net_rxq_count++;
+    }
+    uint32_t hi2 = g_net_rxq_head;
+    g_net_rxq_len[hi2] = 0;
+    g_net_rxq_head = (hi2 + 1) % g_net_rxq_slots;
+    g_net_rxq_count--;
+}
+
 static int net_rxq_push(const uint8_t *frame, size_t n) {
     if (!frame || n == 0) return -1;
     if (n > NET_RXQ_BUF) n = NET_RXQ_BUF;
     unsigned long irqf = 0;
     acquire_irqsave(&g_net_rxq_lock, &irqf);
     if (g_net_rxq_count >= g_net_rxq_slots) {
-        release_irqrestore(&g_net_rxq_lock, irqf);
-        return -2;
+        /*
+         * After wget/opkg HTTP the RX thread parks leftover TCP in this
+         * queue. Refusing the next frame dropped DNS replies → BusyBox
+         * "wget: bad address" while ping (ICMP, never queued) still worked.
+         * Evict: prefer a non-DNS occupant when the new frame is DNS.
+         */
+        uint32_t drop_at = 0;
+        if (net_frame_udp_dns(frame, n)) {
+            uint32_t cnt = g_net_rxq_count;
+            uint32_t head0 = g_net_rxq_head;
+            for (uint32_t i = 0; i < cnt; i++) {
+                uint32_t idx = (head0 + i) % g_net_rxq_slots;
+                if (!net_frame_udp_dns(g_net_rxq[idx], g_net_rxq_len[idx])) {
+                    drop_at = i;
+                    break;
+                }
+            }
+        }
+        net_rxq_drop_offset_locked(drop_at);
     }
     memcpy(g_net_rxq[g_net_rxq_tail], frame, n);
     g_net_rxq_len[g_net_rxq_tail] = (uint16_t)n;
@@ -3108,17 +3435,23 @@ static int net_rxq_pop(void *out, size_t cap) {
     }
     uint32_t idx = g_net_rxq_head;
     uint16_t n = g_net_rxq_len[idx];
+    size_t copy_len = (n > cap) ? cap : (size_t)n;
+    memcpy(out, g_net_rxq[idx], copy_len);
     g_net_rxq_len[idx] = 0;
     g_net_rxq_head = (idx + 1) % g_net_rxq_slots;
     g_net_rxq_count--;
     release_irqrestore(&g_net_rxq_lock, irqf);
-    size_t copy_len = (n > cap) ? cap : (size_t)n;
-    memcpy(out, g_net_rxq[idx], copy_len);
     return (int)copy_len;
 }
 
-static int net_reply_arp_if_needed(const uint8_t *frame, size_t n) {
-    if (!g_net.ready || !frame || n < sizeof(eth_hdr_t) + sizeof(arp_hdr_t)) return 0;
+static int net_ipv4_configured(void) {
+    return (g_net.if_up && g_net.ip_be) ? 1 : 0;
+}
+
+static int net_build_arp_reply(const uint8_t *frame, size_t n, uint8_t *reply, size_t reply_cap) {
+    if (!net_ipv4_configured() || !frame || !reply || reply_cap < 64)
+        return 0;
+    if (n < sizeof(eth_hdr_t) + sizeof(arp_hdr_t)) return 0;
     const eth_hdr_t *eth = (const eth_hdr_t *)frame;
     if (be16(eth->ethertype) != ETH_TYPE_ARP) return 0;
     const arp_hdr_t *arp = (const arp_hdr_t *)(frame + sizeof(eth_hdr_t));
@@ -3127,8 +3460,7 @@ static int net_reply_arp_if_needed(const uint8_t *frame, size_t n) {
     uint32_t tpa = ((uint32_t)arp->tpa[0] << 24) | ((uint32_t)arp->tpa[1] << 16) | ((uint32_t)arp->tpa[2] << 8) | arp->tpa[3];
     if (tpa != g_net.ip_be) return 0;
 
-    uint8_t reply[64];
-    memset(reply, 0, sizeof(reply));
+    memset(reply, 0, 64);
     eth_hdr_t *reth = (eth_hdr_t *)reply;
     memcpy(reth->dst, eth->src, 6);
     memcpy(reth->src, g_net.mac, 6);
@@ -3143,7 +3475,22 @@ static int net_reply_arp_if_needed(const uint8_t *frame, size_t n) {
     ip_be_to_bytes(g_net.ip_be, rarp->spa);
     memcpy(rarp->tha, arp->sha, 6);
     memcpy(rarp->tpa, arp->spa, 4);
-    (void)e1000_send_frame(reply, sizeof(reply));
+    return 64;
+}
+
+static int net_reply_arp_if_needed(const uint8_t *frame, size_t n) {
+    uint8_t reply[64];
+    int len = net_build_arp_reply(frame, n, reply, sizeof(reply));
+    if (len <= 0) return 0;
+    (void)e1000_send_frame(reply, (size_t)len);
+    return 1;
+}
+
+static int net_reply_arp_if_needed_nowait(const uint8_t *frame, size_t n) {
+    uint8_t reply[64];
+    int len = net_build_arp_reply(frame, n, reply, sizeof(reply));
+    if (len <= 0) return 0;
+    (void)e1000_send_frame_nowait(reply, (size_t)len);
     return 1;
 }
 
@@ -3190,6 +3537,8 @@ static int net_reply_icmp_echo_if_needed(const uint8_t *frame, size_t n) {
 static int net_process_incoming_or_queue(const uint8_t *frame, size_t n) {
     if (!frame || n == 0) return 0;
 
+    /* In-kernel DHCP client shares this path with AF_PACKET (udhcpc). */
+    dhcp_observe_frame(frame, n);
     /* Learn ARP before demux so resolve/send do not race the RX pump. */
     net_arp_observe_frame(frame, n);
     (void)net_packet_deliver(frame, n);
@@ -3197,6 +3546,11 @@ static int net_process_incoming_or_queue(const uint8_t *frame, size_t n) {
     if (net_reply_arp_if_needed(frame, n)) return 1;
     if (net_reply_icmp_echo_if_needed(frame, n)) return 1;
     if (net_tcp_dispatch_incoming(frame, n)) return 1;
+    /* TCP for a closed wget/opkg socket has no receiver. Queueing it pinned
+     * the global RXQ full so the next DNS reply was dropped. Keep SYN-ACK
+     * for in-progress connect (tcp.used 4-tuple still matches). */
+    if (net_frame_l4_tcp(frame, n) && !net_tcp_client_wants_frame(frame, n))
+        return 1;
     (void)net_rxq_push(frame, n);
     return 1;
 }
@@ -3259,11 +3613,7 @@ static void net_nic_drain_to_rxq(int budget) {
     for (int i = 0; i < budget; i++) {
         int n = net_nic_pull_frame(frame, sizeof(frame));
         if (n <= 0) break;
-        if (net_reply_arp_if_needed(frame, (size_t)n)) continue;
-        if (net_reply_icmp_echo_if_needed(frame, (size_t)n)) continue;
-        /* Preserve ordering. TCP retransmits an unacknowledged newest frame;
-         * evicting the oldest creates a permanent head-of-line gap. */
-        (void)net_rxq_push(frame, (size_t)n);
+        (void)net_process_incoming_or_queue(frame, (size_t)n);
     }
 }
 
@@ -3338,6 +3688,28 @@ static int net_tcp_match_frame(const uint8_t *frame, size_t n, uint32_t local_ip
     return 1;
 }
 
+static int net_tcp_client_wants_frame(const uint8_t *frame, size_t n) {
+    if (!g_net.ready || !frame) return 0;
+    int want = 0;
+    unsigned long flags;
+    acquire_irqsave(&g_ksock_registry_lock, &flags);
+    for (int i = 0; i < KSOCK_REGISTRY_MAX; ++i) {
+        ksock_net_t *s = g_ksock_registry[i];
+        if (!s || s->kref <= 0 || s->unix_domain_stub || s->dns_tcp_udp_bridge)
+            continue;
+        if (s->type_base != SOCK_STREAM_LOCAL || s->protocol != IPPROTO_TCP_LOCAL)
+            continue;
+        if (!s->tcp.used)
+            continue;
+        if (net_tcp_match_frame(frame, n, g_net.ip_be, &s->tcp)) {
+            want = 1;
+            break;
+        }
+    }
+    release_irqrestore(&g_ksock_registry_lock, flags);
+    return want;
+}
+
 /* Log any IPv4 RX during blocking connect (SYN-ACK, ICMP errors, etc.). */
 static void net_tcp_sniff_frame(const uint8_t *frame, size_t n, const net_tcp_conn_t *c) {
     if (!g_net_tcp_connect_active || !frame || n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t))
@@ -3384,15 +3756,16 @@ static int net_rxq_take_tcp_frame(const net_tcp_conn_t *c, uint32_t local_ip_be,
     if (!c || !buf || cap == 0) return 0;
     unsigned long irqf = 0;
     acquire_irqsave(&g_net_rxq_lock, &irqf);
+    uint32_t slots = g_net_rxq_slots;
     uint32_t cnt = g_net_rxq_count;
-    if (cnt == 0) {
+    if (cnt == 0 || slots == 0) {
         release_irqrestore(&g_net_rxq_lock, irqf);
         return 0;
     }
     uint32_t head0 = g_net_rxq_head;
     int found_at = -1;
     for (uint32_t i = 0; i < cnt; i++) {
-        uint32_t idx = (head0 + i) % NET_RXQ_SLOTS;
+        uint32_t idx = (head0 + i) % slots;
         uint16_t fn = g_net_rxq_len[idx];
         if (fn == 0) continue;
         if (net_tcp_match_frame(g_net_rxq[idx], fn, local_ip_be, c)) {
@@ -3410,27 +3783,40 @@ static int net_rxq_take_tcp_frame(const net_tcp_conn_t *c, uint32_t local_ip_be,
         uint16_t tn = g_net_rxq_len[hi];
         memcpy(tmp, g_net_rxq[hi], tn);
         g_net_rxq_len[hi] = 0;
-        g_net_rxq_head = (hi + 1) % NET_RXQ_SLOTS;
+        g_net_rxq_head = (hi + 1) % slots;
         g_net_rxq_count--;
         uint32_t ti = g_net_rxq_tail;
         memcpy(g_net_rxq[ti], tmp, tn);
         g_net_rxq_len[ti] = tn;
-        g_net_rxq_tail = (ti + 1) % NET_RXQ_SLOTS;
+        g_net_rxq_tail = (ti + 1) % slots;
         g_net_rxq_count++;
     }
     uint32_t hi2 = g_net_rxq_head;
     uint16_t n = g_net_rxq_len[hi2];
+    memcpy(tmp, g_net_rxq[hi2], n);
     g_net_rxq_len[hi2] = 0;
-    g_net_rxq_head = (hi2 + 1) % NET_RXQ_SLOTS;
+    g_net_rxq_head = (hi2 + 1) % slots;
     g_net_rxq_count--;
     release_irqrestore(&g_net_rxq_lock, irqf);
     size_t copy_len = (n > cap) ? cap : (size_t)n;
-    memcpy(buf, g_net_rxq[hi2], copy_len);
+    memcpy(buf, tmp, copy_len);
     return (int)copy_len;
+}
+
+static void net_rxq_drop_tcp_conn(const net_tcp_conn_t *c) {
+    uint8_t junk[NET_RXQ_BUF];
+    int i;
+    if (!c || !c->used)
+        return;
+    for (i = 0; i < 512; i++) {
+        if (net_rxq_take_tcp_frame(c, g_net.ip_be, junk, sizeof(junk)) <= 0)
+            break;
+    }
 }
 
 static int net_stack_init(void);
 static int net_run_dhcp(void);
+static int net_request_dhcp(void);
 static int net_ensure_ipv4(void);
 static int net_apply_ipv4(uint32_t ip_be, uint32_t mask_be, uint32_t gw_be, uint32_t dns_be, int from_dhcp);
 static void net_announce_ipv4(const char *how);
@@ -3438,17 +3824,13 @@ static void net_write_resolv_from_dns(uint32_t dns_be);
 
 static void net_rx_pump_thread(void) {
     uint8_t buf[NET_RXQ_BUF];
+    uint64_t last_garp_ms = 0;
     for (;;) {
-        if (g_net_dhcp_busy) {
-            /* In-kernel dhcp_acquire (legacy) polls e1000 — do not steal frames. */
-            thread_sleep(5);
-            continue;
-        }
         if (!g_net.if_up) {
             thread_sleep(50);
             continue;
         }
-        /* Always drain L2 RX: ARP + AF_PACKET (udhcpc) before IPv4 is configured. */
+        /* Always drain L2 RX: ARP + AF_PACKET + in-kernel DHCP before IPv4. */
         int drained = 0;
         for (int i = 0; i < 256; i++) {
             int n = net_nic_pull_frame(buf, sizeof(buf));
@@ -3456,10 +3838,51 @@ static void net_rx_pump_thread(void) {
             (void)net_process_incoming_or_queue(buf, (size_t)n);
             drained++;
         }
+        /* Frames the timer IRQ parked in RXQ (ARP answered, TCP/ICMP queued). */
+        net_rxq_drain_process_incoming(32);
+        if (g_net.ip_be) {
+            uint64_t now = pit_get_time_ms();
+            if (last_garp_ms == 0 || now - last_garp_ms >= 15000ull) {
+                last_garp_ms = now;
+                net_send_gratuitous_arp();
+            }
+        }
         /* Keep draining a non-empty RX ring; sleep only after catching up. */
         if (drained < 256)
             thread_sleep(1);
     }
+}
+
+/* Kernel is not preempted inside syscalls. First SSH can hold the CPU long
+ * enough that net_rx never runs, Linux neighbor goes FAILED, and the second
+ * ssh(1) returns "No route to host". Answer ARP from the timer instead. */
+void syscall_net_l2_irq_poll(void) {
+    static int busy;
+    static uint8_t frame[NET_RXQ_BUF];
+    int i;
+
+    if (busy)
+        return;
+    if (!g_net.inited || !g_net.if_up)
+        return;
+    if (!try_acquire(&g_net_nic_lock))
+        return;
+    busy = 1;
+    for (i = 0; i < 4; i++) {
+        int n = e1000_recv_frame_nowait(frame, sizeof(frame));
+        if (n == -4)
+            break;
+        if (n <= 0)
+            break;
+        dhcp_observe_frame(frame, (size_t)n);
+        net_arp_observe_frame(frame, (size_t)n);
+        (void)net_packet_deliver(frame, (size_t)n);
+        if (net_reply_arp_if_needed_nowait(frame, (size_t)n))
+            continue;
+        (void)net_rxq_push(frame, (size_t)n);
+    }
+    busy = 0;
+    release(&g_net_nic_lock);
 }
 
 static inline uint16_t be16(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
@@ -3564,10 +3987,15 @@ static int net_rxq_peek_udp_payload_for_sock(ksock_net_t *s) {
     unsigned long irqf = 0;
     acquire_irqsave(&g_net_rxq_lock, &irqf);
     uint32_t cnt = g_net_rxq_count;
+    uint32_t slots = g_net_rxq_slots;
     uint32_t head0 = g_net_rxq_head;
     int plen = 0;
+    if (slots == 0) {
+        release_irqrestore(&g_net_rxq_lock, irqf);
+        return 0;
+    }
     for (uint32_t i = 0; i < cnt; i++) {
-        uint32_t idx = (head0 + i) % NET_RXQ_SLOTS;
+        uint32_t idx = (head0 + i) % slots;
         uint16_t fn = g_net_rxq_len[idx];
         if (fn == 0) continue;
         if (net_udp_match_sock_frame(g_net_rxq[idx], fn, s)) {
@@ -3584,9 +4012,7 @@ static int net_recv_post_arp_icmp_from_nic(void *buf, size_t cap) {
     for (int i = 0; i < 16; i++) {
         int nn = net_nic_pull_frame(buf, cap);
         if (nn <= 0) return nn;
-        if (net_reply_arp_if_needed((const uint8_t *)buf, (size_t)nn)) continue;
-        if (net_reply_icmp_echo_if_needed((const uint8_t *)buf, (size_t)nn)) continue;
-        (void)net_rxq_push((const uint8_t *)buf, (size_t)nn);
+        (void)net_process_incoming_or_queue((const uint8_t *)buf, (size_t)nn);
     }
     return 0;
 }
@@ -3596,15 +4022,16 @@ static int net_rxq_take_udp_datagram(ksock_net_t *s, uint8_t *out, size_t out_ca
     if (!s || !out || out_cap == 0) return -1;
     unsigned long irqf = 0;
     acquire_irqsave(&g_net_rxq_lock, &irqf);
+    uint32_t slots = g_net_rxq_slots;
     uint32_t cnt = g_net_rxq_count;
-    if (cnt == 0) {
+    if (cnt == 0 || slots == 0) {
         release_irqrestore(&g_net_rxq_lock, irqf);
         return 0;
     }
     uint32_t head0 = g_net_rxq_head;
     int found_at = -1;
     for (uint32_t i = 0; i < cnt; i++) {
-        uint32_t idx = (head0 + i) % NET_RXQ_SLOTS;
+        uint32_t idx = (head0 + i) % slots;
         uint16_t fn = g_net_rxq_len[idx];
         if (fn == 0) continue;
         if (net_udp_match_sock_frame(g_net_rxq[idx], fn, s)) {
@@ -3622,19 +4049,19 @@ static int net_rxq_take_udp_datagram(ksock_net_t *s, uint8_t *out, size_t out_ca
         uint16_t tn = g_net_rxq_len[hi];
         memcpy(tmp, g_net_rxq[hi], tn);
         g_net_rxq_len[hi] = 0;
-        g_net_rxq_head = (hi + 1) % NET_RXQ_SLOTS;
+        g_net_rxq_head = (hi + 1) % slots;
         g_net_rxq_count--;
         uint32_t ti = g_net_rxq_tail;
         memcpy(g_net_rxq[ti], tmp, tn);
         g_net_rxq_len[ti] = tn;
-        g_net_rxq_tail = (ti + 1) % NET_RXQ_SLOTS;
+        g_net_rxq_tail = (ti + 1) % slots;
         g_net_rxq_count++;
     }
     uint32_t hi2 = g_net_rxq_head;
     uint16_t n = g_net_rxq_len[hi2];
     memcpy(tmp, g_net_rxq[hi2], n);
     g_net_rxq_len[hi2] = 0;
-    g_net_rxq_head = (hi2 + 1) % NET_RXQ_SLOTS;
+    g_net_rxq_head = (hi2 + 1) % slots;
     g_net_rxq_count--;
     release_irqrestore(&g_net_rxq_lock, irqf);
     return net_udp_copy_payload_from_frame(tmp, n, out, out_cap, out_src_ip_be, out_src_port);
@@ -3645,15 +4072,16 @@ static int net_rxq_take_udp_raw(uint16_t local_port, uint32_t peer_ip_be, uint16
     if (!out || out_cap == 0 || local_port == 0) return -1;
     unsigned long irqf = 0;
     acquire_irqsave(&g_net_rxq_lock, &irqf);
+    uint32_t slots = g_net_rxq_slots;
     uint32_t cnt = g_net_rxq_count;
-    if (cnt == 0) {
+    if (cnt == 0 || slots == 0) {
         release_irqrestore(&g_net_rxq_lock, irqf);
         return 0;
     }
     uint32_t head0 = g_net_rxq_head;
     int found_at = -1;
     for (uint32_t i = 0; i < cnt; i++) {
-        uint32_t idx = (head0 + i) % NET_RXQ_SLOTS;
+        uint32_t idx = (head0 + i) % slots;
         uint16_t fn = g_net_rxq_len[idx];
         if (fn == 0) continue;
         if (net_udp_match_raw_frame(g_net_rxq[idx], fn, local_port, peer_ip_be, peer_port)) {
@@ -3671,19 +4099,19 @@ static int net_rxq_take_udp_raw(uint16_t local_port, uint32_t peer_ip_be, uint16
         uint16_t tn = g_net_rxq_len[hi];
         memcpy(tmp, g_net_rxq[hi], tn);
         g_net_rxq_len[hi] = 0;
-        g_net_rxq_head = (hi + 1) % NET_RXQ_SLOTS;
+        g_net_rxq_head = (hi + 1) % slots;
         g_net_rxq_count--;
         uint32_t ti = g_net_rxq_tail;
         memcpy(g_net_rxq[ti], tmp, tn);
         g_net_rxq_len[ti] = tn;
-        g_net_rxq_tail = (ti + 1) % NET_RXQ_SLOTS;
+        g_net_rxq_tail = (ti + 1) % slots;
         g_net_rxq_count++;
     }
     uint32_t hi2 = g_net_rxq_head;
     uint16_t n = g_net_rxq_len[hi2];
     memcpy(tmp, g_net_rxq[hi2], n);
     g_net_rxq_len[hi2] = 0;
-    g_net_rxq_head = (hi2 + 1) % NET_RXQ_SLOTS;
+    g_net_rxq_head = (hi2 + 1) % slots;
     g_net_rxq_count--;
     release_irqrestore(&g_net_rxq_lock, irqf);
     return net_udp_copy_payload_from_frame(tmp, n, out, out_cap, NULL, NULL);
@@ -3794,6 +4222,24 @@ static uint32_t g_net_ephemeral_port_seq;
 /* Linux-style dynamic ports (32768–65535). Per-tid reuse broke resolver: parallel A/AAAA
  * UDP sockets on one thread shared the same local port and stole each other's replies. */
 static uint16_t net_alloc_ephemeral_port(void) {
+    for (int tries = 0; tries < 32768; tries++) {
+        uint32_t n = __atomic_add_fetch(&g_net_ephemeral_port_seq, 1u, __ATOMIC_RELAXED);
+        uint16_t p = (uint16_t)(32768u + (n % 32768u));
+        int used = 0;
+        unsigned long flags;
+        acquire_irqsave(&g_ksock_registry_lock, &flags);
+        for (int i = 0; i < KSOCK_REGISTRY_MAX; ++i) {
+            ksock_net_t *s = g_ksock_registry[i];
+            if (!s || s->kref <= 0) continue;
+            if (s->local_port == p) {
+                used = 1;
+                break;
+            }
+        }
+        release_irqrestore(&g_ksock_registry_lock, flags);
+        if (!used)
+            return p;
+    }
     uint32_t n = __atomic_add_fetch(&g_net_ephemeral_port_seq, 1u, __ATOMIC_RELAXED);
     return (uint16_t)(32768u + (n % 32768u));
 }
@@ -3805,23 +4251,18 @@ static int net_recv_udp_datagram(ksock_net_t *s, uint8_t *out, size_t out_cap, u
     if (!frame) return -1;
     uint64_t start = pit_get_time_ms();
     int ret = 0;
-    /* timeout_ms==0: single attempt (poll / non-blocking). Old code used while(elapsed<0) and ran zero times. */
+    /* timeout_ms==0: drain NIC once. Drain queues into rxq and returns 0, so
+     * always take from rxq again before treating the attempt as idle. */
     do {
         int q = net_rxq_take_udp_datagram(s, out, out_cap, out_src_ip_be, out_src_port);
         if (q > 0) { ret = q; break; }
         if (q < 0) { ret = q; break; }
-        int n = net_recv_post_arp_icmp_from_nic(frame, NET_FRAME_BUF);
-        if (n <= 0) {
-            if (pit_get_time_ms() - start >= (uint64_t)timeout_ms) break;
-            thread_sleep(1);
-            continue;
-        }
-        if (net_udp_match_sock_frame((const uint8_t *)frame, (size_t)n, s)) {
-            ret = net_udp_copy_payload_from_frame((const uint8_t *)frame, (size_t)n, out, out_cap, out_src_ip_be, out_src_port);
-            break;
-        }
-        (void)net_rxq_push((const uint8_t *)frame, (size_t)n);
-        thread_sleep(0);
+        (void)net_recv_post_arp_icmp_from_nic(frame, NET_FRAME_BUF);
+        q = net_rxq_take_udp_datagram(s, out, out_cap, out_src_ip_be, out_src_port);
+        if (q > 0) { ret = q; break; }
+        if (q < 0) { ret = q; break; }
+        if (pit_get_time_ms() - start >= (uint64_t)timeout_ms) break;
+        thread_sleep(1);
     } while (ret == 0 && (pit_get_time_ms() - start) < (uint64_t)timeout_ms);
     kfree(frame);
     return ret;
@@ -3840,18 +4281,12 @@ static int net_recv_udp_raw(uint16_t local_port, uint32_t peer_ip_be, uint16_t p
         int q = net_rxq_take_udp_raw(local_port, peer_ip_be, peer_port, out, out_cap);
         if (q > 0) { ret = q; break; }
         if (q < 0) { ret = q; break; }
-        int n = net_recv_post_arp_icmp_from_nic(frame, NET_FRAME_BUF);
-        if (n <= 0) {
-            if (pit_get_time_ms() - start >= (uint64_t)timeout_ms) break;
-            thread_sleep(1);
-            continue;
-        }
-        if (net_udp_match_raw_frame((const uint8_t *)frame, (size_t)n, local_port, peer_ip_be, peer_port)) {
-            ret = net_udp_copy_payload_from_frame((const uint8_t *)frame, (size_t)n, out, out_cap, NULL, NULL);
-            break;
-        }
-        (void)net_rxq_push((const uint8_t *)frame, (size_t)n);
-        thread_sleep(0);
+        (void)net_recv_post_arp_icmp_from_nic(frame, NET_FRAME_BUF);
+        q = net_rxq_take_udp_raw(local_port, peer_ip_be, peer_port, out, out_cap);
+        if (q > 0) { ret = q; break; }
+        if (q < 0) { ret = q; break; }
+        if (pit_get_time_ms() - start >= (uint64_t)timeout_ms) break;
+        thread_sleep(1);
     } while (ret == 0 && (pit_get_time_ms() - start) < (uint64_t)timeout_ms);
     kfree(frame);
     return ret;
@@ -3872,7 +4307,8 @@ static int net_udp_recv_into_pending(ksock_net_t *s) {
         }
         return (rn < 0) ? -1 : 0;
     }
-    uint64_t deadline = pit_get_time_ms() + (uint64_t)NET_UDP_BLOCK_MAX_MS;
+    uint64_t deadline = pit_get_time_ms() +
+        (uint64_t)(s->dns_tcp_udp_bridge ? 8000u : NET_UDP_BLOCK_MAX_MS);
     for (;;) {
         uint32_t slice = 10000u;
         uint64_t now = pit_get_time_ms();
@@ -4022,8 +4458,9 @@ static void ksock_drop(ksock_net_t *s) {
     if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge && !s->unix_conn) {
         if (s->tcp.used) {
             net_tcp_ops_t ops;
+            net_rxq_drop_tcp_conn(&s->tcp);
             net_make_tcp_ops(&ops, &s->tcp);
-            (void)net_tcp_close(&s->tcp, &ops, 1000);
+            (void)net_tcp_close(&s->tcp, &ops, 0);
         }
     }
     kfree(s);
@@ -4076,9 +4513,17 @@ static int fork_socket_should_share_ksock(const ksock_net_t *s) {
 }
 
 static void fork_inherit_fd_table(thread_t *child, thread_t *parent) {
+    int new_proc = (!parent->process || child->process != parent->process);
+    process_t *pp = parent->process;
+    process_t *cp = child->process;
     for (int i = 0; i < THREAD_MAX_FD; i++) {
-        struct fs_file *pf = parent->fds[i];
+        /* Fork must copy the process table (syscall_fd_get's source of truth).
+         * CLONE_THREAD keeps the old thread-slot mirror so we do not extra-ref
+         * sockets that already live in the shared process table. */
+        struct fs_file *pf = (new_proc && pp && pp->fds[i]) ? pp->fds[i] : parent->fds[i];
         child->fds[i] = NULL;
+        if (cp && i < PROCESS_MAX_FD)
+            cp->fd_cloexec[i] = (pp && i < PROCESS_MAX_FD) ? pp->fd_cloexec[i] : 0;
         if (!pf) continue;
         if (pf->type == SYSCALL_FTYPE_SOCKET &&
             fork_socket_should_share_ksock((ksock_net_t *)pf->driver_private)) {
@@ -4304,6 +4749,43 @@ static struct fs_file *net_tcp_make_accepted_file(ksock_net_t *listener, const n
     return srv_f;
 }
 
+/* Do not memset the ~170KiB tcp buffers under irqsave: that stalls ARP. */
+static void net_tcp_syn_wait_clear(tcp_syn_wait_t *w) {
+    if (!w) return;
+    w->active = 0;
+    w->listener = NULL;
+    w->peer_ip_be = 0;
+    w->peer_port = 0;
+    w->last_synack_tick = 0;
+    memset(w->peer_mac, 0, sizeof(w->peer_mac));
+    net_tcp_reset(&w->tcp);
+}
+
+static void net_tcp_syn_wait_prealloc(void) {
+    for (int i = 0; i < TCP_SYN_WAIT_SLOTS; i++) {
+        unsigned long fl = 0;
+        acquire_irqsave(&g_tcp_syn_wait_lock, &fl);
+        int need = (g_tcp_syn_wait[i] == NULL);
+        release_irqrestore(&g_tcp_syn_wait_lock, fl);
+        if (!need)
+            continue;
+        mm_dm_ctx_t dm = mm_enter_direct_map();
+        tcp_syn_wait_t *fresh = (tcp_syn_wait_t *)kmalloc(sizeof(*fresh));
+        mm_leave_direct_map(dm);
+        if (!fresh)
+            break;
+        memset(fresh, 0, sizeof(*fresh));
+        acquire_irqsave(&g_tcp_syn_wait_lock, &fl);
+        if (!g_tcp_syn_wait[i]) {
+            g_tcp_syn_wait[i] = fresh;
+            fresh = NULL;
+        }
+        release_irqrestore(&g_tcp_syn_wait_lock, fl);
+        if (fresh)
+            kfree(fresh);
+    }
+}
+
 static int net_tcp_syn_wait_take_slot(tcp_syn_wait_t **out) {
     if (!out) return -1;
     *out = NULL;
@@ -4319,9 +4801,9 @@ static int net_tcp_syn_wait_take_slot(tcp_syn_wait_t **out) {
         tcp_syn_wait_t *w = g_tcp_syn_wait[i];
         if (w && w->active && w->last_synack_tick &&
             (uint32_t)(now - w->last_synack_tick) >= stale_after)
-            memset(w, 0, sizeof(*w));
+            net_tcp_syn_wait_clear(w);
         if (w && !w->active) {
-            memset(w, 0, sizeof(*w));
+            net_tcp_syn_wait_clear(w);
             w->active = 1;
             *out = w;
             release_irqrestore(&g_tcp_syn_wait_lock, fl);
@@ -4335,7 +4817,9 @@ static int net_tcp_syn_wait_take_slot(tcp_syn_wait_t **out) {
     release_irqrestore(&g_tcp_syn_wait_lock, fl);
     if (empty < 0) return -1;
 
+    mm_dm_ctx_t dm = mm_enter_direct_map();
     tcp_syn_wait_t *fresh = (tcp_syn_wait_t *)kmalloc(sizeof(*fresh));
+    mm_leave_direct_map(dm);
     if (!fresh) return -1;
     memset(fresh, 0, sizeof(*fresh));
     fresh->active = 1;
@@ -4372,7 +4856,7 @@ static void net_tcp_syn_wait_release(tcp_syn_wait_t *w) {
     if (!w) return;
     unsigned long fl = 0;
     acquire_irqsave(&g_tcp_syn_wait_lock, &fl);
-    memset(w, 0, sizeof(*w));
+    net_tcp_syn_wait_clear(w);
     release_irqrestore(&g_tcp_syn_wait_lock, fl);
 }
 
@@ -4432,15 +4916,6 @@ static int net_tcp_dispatch_incoming(const uint8_t *frame, size_t n) {
             (void)net_tcp_server_resend_synack(tc, &ops);
         else
             (void)net_tcp_server_reply_syn(tc, &ops, seq);
-
-        {
-            uint8_t drain[NET_RXQ_BUF];
-            for (int di = 0; di < 4; di++) {
-                int dn = net_nic_pull_frame(drain, sizeof(drain));
-                if (dn <= 0) break;
-                (void)net_process_incoming_or_queue(drain, (size_t)dn);
-            }
-        }
         return 1;
     }
 
@@ -4594,6 +5069,31 @@ static int net_resolve_mac(uint32_t ip_be, uint8_t out_mac[6], uint32_t timeout_
     return net_arp_cache_lookup(ip_be, out_mac);
 }
 
+static void net_send_gratuitous_arp(void) {
+    uint8_t frame[64];
+    eth_hdr_t *eth;
+    arp_hdr_t *arp;
+
+    if (!g_net.if_up || !g_net.ip_be)
+        return;
+    memset(frame, 0, sizeof(frame));
+    eth = (eth_hdr_t *)frame;
+    memset(eth->dst, 0xFF, 6);
+    memcpy(eth->src, g_net.mac, 6);
+    eth->ethertype = be16(ETH_TYPE_ARP);
+    arp = (arp_hdr_t *)(frame + sizeof(eth_hdr_t));
+    arp->htype = be16(1);
+    arp->ptype = be16(ETH_TYPE_IPV4);
+    arp->hlen = 6;
+    arp->plen = 4;
+    arp->oper = be16(1);
+    memcpy(arp->sha, g_net.mac, 6);
+    ip_be_to_bytes(g_net.ip_be, arp->spa);
+    memset(arp->tha, 0, 6);
+    ip_be_to_bytes(g_net.ip_be, arp->tpa);
+    (void)e1000_send_frame(frame, sizeof(frame));
+}
+
 
 static int net_stack_init(void) {
     if (g_net.inited) return 0;
@@ -4630,6 +5130,7 @@ static int net_set_if_up(int up) {
     }
     g_net.if_up = 1;
     g_net.ready = g_net.ip_be != 0;
+    net_tcp_syn_wait_prealloc();
     g_net_trace_budget = AXON_PRODUCTION ? 0 : 128;
     g_net_l2_trace_budget = AXON_PRODUCTION ? 0 : 16;
     klogprintf("net: eth0 state=up link=%s\n",
@@ -4696,6 +5197,7 @@ static int net_apply_ipv4(uint32_t ip_be, uint32_t mask_be, uint32_t gw_be, uint
     }
     net_announce_ipv4(from_dhcp ? "dhcp" : "static");
     net_write_resolv_from_dns(g_net.dns_be ? g_net.dns_be : g_net.gw_be);
+    net_send_gratuitous_arp();
     return 0;
 }
 
@@ -4703,13 +5205,11 @@ static int net_run_dhcp(void) {
     if (net_stack_init() != 0) return -1;
     dhcp_lease_t lease;
     int dhcp_ok = 0;
-    /* One retry only; never pit_sleep_ms — that busy-spins and freezes UP. */
+    /* Status only (/proc/net/dhcp). net_rx keeps running. */
     g_net_dhcp_busy = 1;
     for (int dhcp_round = 0; dhcp_round < 2 && !dhcp_ok; dhcp_round++) {
-        if (dhcp_round > 0) {
-            e1000_flush_rx();
+        if (dhcp_round > 0)
             thread_sleep(500);
-        }
         if (dhcp_acquire(g_net.mac, &lease) != 0)
             continue;
         dhcp_ok = 1;
@@ -4719,8 +5219,43 @@ static int net_run_dhcp(void) {
         klogprintf("net: DHCP failed (no fallback; configure with ifconfig/route)\n");
         return -1;
     }
+    if (g_net_dhcp_cancel)
+        return -1;
     return net_apply_ipv4(lease.ip_be, lease.mask_be, lease.gw_be,
                           lease.dns_be ? lease.dns_be : lease.gw_be, 1);
+}
+
+/* Linux proc/sysfs store: accept the write, run DHCP off the syscall path. */
+static void net_dhcp_worker_thread(void) {
+    for (;;) {
+        if (!g_net_dhcp_pending) {
+            thread_sleep(20);
+            continue;
+        }
+        g_net_dhcp_pending = 0;
+        if (g_net_dhcp_cancel)
+            continue;
+        (void)net_run_dhcp();
+        if (g_net_dhcp_cancel) {
+            g_net_dhcp_cancel = 0;
+            (void)net_apply_ipv4(0, 0, 0, 0, 0);
+        }
+    }
+}
+
+static int net_request_dhcp(void) {
+    if (net_set_if_up(1) != 0)
+        return -ENODEV;
+    g_net_dhcp_cancel = 0;
+    if (!g_net_dhcp_thread_started) {
+        thread_t *t = thread_create(net_dhcp_worker_thread, "kdhcpd");
+        if (!t)
+            return -ENOMEM;
+        t->nice = 5;
+        g_net_dhcp_thread_started = 1;
+    }
+    g_net_dhcp_pending = 1;
+    return 0;
 }
 
 static int net_ensure_ipv4(void) {
@@ -5314,6 +5849,8 @@ ssize_t procfs_net_snap_dhcp(char *buf, size_t size) {
     if (!buf || size < 64) return 0;
     if (!g_net.if_up)
         state = "down";
+    else if (g_net_dhcp_busy || g_net_dhcp_pending)
+        state = "requesting";
     else if (!g_net.ready)
         state = "unconfigured";
     else
@@ -5329,7 +5866,7 @@ ssize_t procfs_net_snap_dhcp(char *buf, size_t size) {
         "netmask=%u.%u.%u.%u\n"
         "gateway=%u.%u.%u.%u\n"
         "dns=%u.%u.%u.%u\n"
-        "control=write renew or release\n",
+        "control=write 1/renew to request, 0/release to drop\n",
         state, source,
         (unsigned)((g_net.ip_be >> 24) & 0xff),
         (unsigned)((g_net.ip_be >> 16) & 0xff),
@@ -5352,27 +5889,45 @@ ssize_t procfs_net_snap_dhcp(char *buf, size_t size) {
 ssize_t procfs_net_store_dhcp(const char *buf, size_t size) {
     char command[16];
     size_t len;
+    thread_t *ct;
 
-    if (!buf || !size) return -1;
+    /* Linux proc_ops.write: CAP_NET_ADMIN; accept the token; do not wait on DHCP. */
+    ct = thread_current();
+    if (!ct)
+        ct = thread_get_current_user();
+    if (!ct || ct->euid != 0)
+        return -EPERM;
+    if (!buf)
+        return -EFAULT;
+    if (!size)
+        return 0;
+
     len = size < sizeof(command) - 1 ? size : sizeof(command) - 1;
     memcpy(command, buf, len);
     command[len] = '\0';
     while (len && (command[len - 1] == '\n' ||
                    command[len - 1] == '\r' ||
-                   command[len - 1] == ' '))
+                   command[len - 1] == ' ' ||
+                   command[len - 1] == '\t'))
         command[--len] = '\0';
+    if (!len)
+        return -EINVAL;
 
     if (!strcmp(command, "renew") || !strcmp(command, "start") ||
         !strcmp(command, "1") || !strcmp(command, "true") || !strcmp(command, "on")) {
-        if (net_set_if_up(1) != 0 || net_run_dhcp() != 0)
-            return -1;
+        int rc = net_request_dhcp();
+        if (rc != 0)
+            return (ssize_t)rc;
     } else if (!strcmp(command, "release") || !strcmp(command, "stop") ||
                !strcmp(command, "0") || !strcmp(command, "false") || !strcmp(command, "off")) {
+        g_net_dhcp_pending = 0;
+        g_net_dhcp_cancel = 1;
         if (net_apply_ipv4(0, 0, 0, 0, 0) != 0)
-            return -1;
+            return -EIO;
     } else {
-        return -1;
+        return -EINVAL;
     }
+    /* sysfs/proc store: return the byte count that was accepted. */
     return (ssize_t)size;
 }
 
@@ -6155,6 +6710,25 @@ static inline uint64_t ret_read_err(ssize_t rr) {
 #define SIGFPE 8
 #endif
 
+static int signal_default_fatal(int sig)
+{
+    return (sig == SIGHUP || sig == SIGINT || sig == SIGQUIT ||
+            sig == SIGILL || sig == SIGABRT || sig == SIGBUS ||
+            sig == SIGFPE || sig == SIGKILL || sig == SIGSEGV ||
+            sig == SIGPIPE || sig == SIGALRM || sig == SIGTERM ||
+            sig == 24 /*SIGXCPU*/ || sig == 25 /*SIGXFSZ*/ ||
+            sig == 31 /*SIGSYS*/);
+}
+
+static int process_signal_dfl(const process_t *p, int sig)
+{
+    if (sig < 1 || sig > PROCESS_SIGNAL_MAX)
+        return 1;
+    if (!p)
+        return 1;
+    return p->signal_handlers[sig] == 0;
+}
+
 static void thread_set_pending_signal(thread_t *t, int signum) {
     if (!t || signum <= 0 || signum > 63) return;
     t->pending_signals |= (1ULL << (signum - 1));
@@ -6401,7 +6975,7 @@ static int has_terminated_child(thread_t *t) {
     for (int i = 0; i < thread_get_count(); i++) {
         thread_t *c = thread_get_by_index(i);
         if (!c) continue;
-        if (c->parent_tid != (int)t->tid) continue;
+        if (!wait4_is_our_child(t, c)) continue;
         if (c->state == THREAD_TERMINATED && c->exit_status != 0x80000000) {
             return 1;
         }
@@ -6414,7 +6988,7 @@ static thread_t *find_terminated_child(thread_t *t) {
     for (int i = 0; i < thread_get_count(); i++) {
         thread_t *c = thread_get_by_index(i);
         if (!c) continue;
-        if (c->parent_tid != (int)t->tid) continue;
+        if (!wait4_is_our_child(t, c)) continue;
         if (c->state == THREAD_TERMINATED && c->exit_status != 0x80000000) {
             return c;
         }
@@ -6761,6 +7335,44 @@ static int wait4_copy_status(thread_t *waiter, int status) {
     return copy_to_user_safe((void *)(uintptr_t)uaddr, &status, sizeof(status));
 }
 
+static uint64_t wait4_reap_found_thread(thread_t *waiter, thread_t *zombie) {
+    int st;
+    int dead_pid;
+    int dead_tid;
+    process_t *p;
+    if (!waiter || !zombie)
+        return ret_err(ECHILD);
+    st = zombie->exit_status;
+    dead_pid = wait4_thread_pid(zombie);
+    if (st == (int)0x80000000 && zombie->process)
+        st = zombie->process->exit_status;
+    else if (st == (int)0x80000000)
+        st = 0;
+    if (waiter->sc_a2 && wait4_copy_status(waiter, st) != 0)
+        return ret_err(EFAULT);
+    zombie->exit_status = (int)0x80000000;
+    zombie->waiter_tid = -1;
+    dead_tid = (int)(zombie->tid ? zombie->tid : 1);
+    p = zombie->process;
+    if (p) {
+        if (p->leader == zombie)
+            p->leader = NULL;
+        if (p->state != PROCESS_ZOMBIE)
+            process_mark_zombie(p, st);
+        if (!waiter->process || process_reap(waiter->process, p) != 0)
+            (void)process_reap_zombie(p);
+    }
+    zombie->process = NULL;
+    (void)thread_reap(dead_tid);
+    waiter->wait4_last_echild = 0;
+    if (!find_terminated_child(waiter))
+        waiter->pending_signals &= ~(1ULL << (SIGCHLD - 1));
+    devel_printf("wait4-reap-tid: parent=%llu child_pid=%d (via parent_tid)\n",
+        (unsigned long long)(waiter->tid ? waiter->tid : 1),
+        dead_pid);
+    return (uint64_t)(unsigned)dead_pid;
+}
+
 static int copy_from_user_raw(void *kdst, const void *usrc, size_t n) {
     if (!kdst || !usrc) return -1;
     if (n == 0) return 0;
@@ -6886,6 +7498,41 @@ static char *copy_user_cstr(const char *u, size_t maxlen) {
     return k;
 }
 
+/* Linux overlay -o upperdir=/path (workdir=/lowerdir= ignored). */
+static int parse_overlay_upperdir(const char *data, char *out, size_t cap)
+{
+    const char *p;
+    if (!data || !out || cap < 2)
+        return -1;
+    p = data;
+    while (*p) {
+        const char *end, *eq;
+        size_t klen;
+        while (*p == ',' || *p == ' ' || *p == '\t')
+            p++;
+        if (!*p)
+            break;
+        end = p;
+        while (*end && *end != ',')
+            end++;
+        eq = p;
+        while (eq < end && *eq != '=')
+            eq++;
+        klen = (size_t)(eq - p);
+        if (klen == 8 && memcmp(p, "upperdir", 8) == 0 && eq < end && eq[0] == '=') {
+            const char *v = eq + 1;
+            size_t vlen = (size_t)(end - v);
+            if (vlen == 0 || vlen >= cap)
+                return -1;
+            memcpy(out, v, vlen);
+            out[vlen] = '\0';
+            return 0;
+        }
+        p = *end ? end + 1 : end;
+    }
+    return -1;
+}
+
 /* Minimal tty state for job control-ish ioctls (single session). */
 static uint64_t user_pgrp = 1;
 
@@ -6896,7 +7543,9 @@ typedef void (*user_sighandler_t)(int);
 #define SA_ONSTACK 0x08000000u
 #endif
 #ifndef SA_NOCLDWAIT
-#define SA_NOCLDWAIT 0x01000000u
+/* Linux x86_64 uapi: SA_NOCLDWAIT=0x2. 0x01000000 was SA_RESTART>>4 and
+ * both missed real NOCLDWAIT and false-dropped zombies when bit 24 was set. */
+#define SA_NOCLDWAIT 0x00000002u
 #endif
 #ifndef SA_NODEFER
 #define SA_NODEFER 0x40000000u
@@ -6924,10 +7573,110 @@ typedef struct {
     uint64_t mask;       /* low 64 bits of sa_mask */
 } user_sigaction_t;
 static user_sigaction_t user_sig_actions[65]; /* 1..64 */
+
+/* Linux do_notify_parent: SIGCHLD IGN / SA_NOCLDWAIT is the *parent's*
+ * disposition. Checking the exiting task (BusyBox wget sets SIG_IGN for its
+ * own children) auto-reaped every wget and turned opkg xsystem waitpid into
+ * ECHILD while the zombie thread slot was still listed. */
+static process_t *wait_parent_process(thread_t *child)
+{
+    if (!child)
+        return NULL;
+    if (child->process && child->process->parent)
+        return child->process->parent;
+    if (child->parent_tid >= 0) {
+        thread_t *pt = thread_get(child->parent_tid);
+        if (pt && pt->process)
+            return pt->process;
+    }
+    return NULL;
+}
+
+static int sigchld_nocldwait(thread_t *child)
+{
+    process_t *parent = wait_parent_process(child);
+    uint64_t h;
+    uint64_t f;
+    if (!parent)
+        return 0;
+    h = parent->signal_handlers[SIGCHLD];
+    f = parent->signal_flags[SIGCHLD];
+    return (h == (uint64_t)(uintptr_t)SIG_IGN) || ((f & SA_NOCLDWAIT) != 0);
+}
+
+static void wait_wake_parent(thread_t *child, int send_sigchld)
+{
+    process_t *pp;
+    thread_t *pt;
+    int ptid;
+    int wtid;
+    if (!child)
+        return;
+    pp = wait_parent_process(child);
+    pt = (child->parent_tid >= 0) ? thread_get(child->parent_tid) : NULL;
+    if (!pt && pp && pp->leader)
+        pt = pp->leader;
+    if (pt) {
+        ptid = (int)(pt->tid ? pt->tid : 1);
+        if (send_sigchld)
+            thread_set_pending_signal(pt, SIGCHLD);
+        thread_unblock(ptid);
+        if (child->attached_tty >= 0) {
+            devfs_tty_restore_sane(child->attached_tty);
+            if (pt->attached_tty == child->attached_tty)
+                devfs_set_tty_fg_pgrp(child->attached_tty, pt->pgid);
+        }
+    }
+    wtid = child->waiter_tid;
+    if (wtid >= 0 && (!pt || wtid != (int)(pt->tid ? pt->tid : 1)))
+        thread_unblock(wtid);
+    if (pp && pp->leader && pp->leader != pt) {
+        int ltid = (int)(pp->leader->tid ? pp->leader->tid : 1);
+        if (send_sigchld)
+            thread_set_pending_signal(pp->leader, SIGCHLD);
+        thread_unblock(ltid);
+    }
+}
+
+/* Linux: SIG_IGN / SA_NOCLDWAIT does not leave a waitable zombie. */
+static void wait_drop_ignored_child(thread_t *cur) {
+    process_t *p;
+    if (!cur || !cur->process)
+        return;
+    p = cur->process;
+    if (p->state != PROCESS_ZOMBIE)
+        process_mark_zombie(p, cur->exit_status);
+    if (p->leader == cur)
+        p->leader = NULL;
+    cur->process = NULL;
+    (void)process_reap_zombie(p);
+    cur->exit_status = 0x80000000;
+}
 /* Legacy global mask; rt_sigprocmask uses per-thread saved_sig_mask when available */
 static uint64_t user_sig_mask = 0;
 /* Compatibility shim for tools (e.g. ping) that expect periodic SIGALRM. */
 static uint32_t user_itimer_interval_ms = 0;
+
+/* Strip RFC 1035 TCP DNS length prefix and send the message as UDP. */
+static ssize_t net_dns_bridge_send(ksock_net_t *s, const uint8_t *payload, size_t cnt)
+{
+    const uint8_t *dns = payload;
+    size_t n = cnt;
+    if (!s || !payload || cnt == 0)
+        return -EINVAL;
+    if (s->local_port == 0)
+        s->local_port = net_alloc_ephemeral_port();
+    if (cnt >= 2) {
+        uint16_t plen = (uint16_t)(((uint16_t)payload[0] << 8) | payload[1]);
+        if (plen >= 12u && (size_t)plen + 2u <= cnt) {
+            dns = payload + 2;
+            n = (size_t)plen;
+        }
+    }
+    if (net_send_udp_datagram(s->peer_ip_be, s->local_port, s->peer_port, dns, n) != 0)
+        return (ssize_t)(-net_l3_send_errno());
+    return (ssize_t)cnt;
+}
 
 /* write()/writev() on sockets: glibc DNS may use writev; fs_write() does not handle SYSCALL_FTYPE_SOCKET. */
 static ssize_t net_sock_write_userspace(thread_t *cur, int fd, ksock_net_t *s, const void *bufp, size_t cnt) {
@@ -6961,18 +7710,15 @@ static ssize_t net_sock_write_userspace(thread_t *cur, int fd, ksock_net_t *s, c
             if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return -EFAULT;
             if (!s->connected) return -EDESTADDRREQ;
             if (cnt > 2048) return -EINVAL;
-            if (s->local_port == 0)
-                s->local_port = net_alloc_ephemeral_port();
             uint8_t *payload = (uint8_t *)kmalloc(cnt);
             if (!payload) return -ENOMEM;
             if (copy_from_user_raw(payload, bufp, cnt) != 0) {
                 kfree(payload);
                 return -EFAULT;
             }
-            int r = net_send_udp_datagram(s->peer_ip_be, s->local_port, s->peer_port, payload, cnt);
+            ssize_t r = net_dns_bridge_send(s, payload, cnt);
             kfree(payload);
-            if (r != 0) return (ssize_t)(-net_l3_send_errno());
-            return (ssize_t)cnt;
+            return r;
         }
         if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return -EFAULT;
         if (s->tcp.peer_rst) return -ECONNRESET;
@@ -7135,6 +7881,65 @@ void epoll_notify_fd_closed(thread_t *thr, int fd) {
     }
 }
 
+typedef struct {
+    int tty_idx[16];
+    int n_tty;
+    struct fs_file *pty_f[16];
+    int n_pty;
+} poll_in_waiters_t;
+
+static void poll_in_waiters_clear(poll_in_waiters_t *w) {
+    if (w) {
+        w->n_tty = 0;
+        w->n_pty = 0;
+    }
+}
+
+static void poll_in_waiters_add_file(poll_in_waiters_t *w, struct fs_file *f, int cur_tid) {
+    if (!w || !f || cur_tid < 0)
+        return;
+    if (pty_is_file(f)) {
+        if (w->n_pty < (int)(sizeof(w->pty_f) / sizeof(w->pty_f[0])) &&
+            pty_add_waiter(f, cur_tid) == 0)
+            w->pty_f[w->n_pty++] = f;
+        return;
+    }
+    if (!devfs_is_tty_file(f))
+        return;
+    {
+        int tidx = devfs_get_tty_index_from_file(f);
+        if (tidx < 0)
+            tidx = devfs_get_active();
+        if (w->n_tty < (int)(sizeof(w->tty_idx) / sizeof(w->tty_idx[0])) &&
+            devfs_tty_add_waiter(tidx, cur_tid) == 0)
+            w->tty_idx[w->n_tty++] = tidx;
+    }
+}
+
+static void poll_in_waiters_remove(poll_in_waiters_t *w, int cur_tid) {
+    int i;
+    if (!w)
+        return;
+    for (i = 0; i < w->n_tty; i++)
+        devfs_tty_remove_waiter(w->tty_idx[i], cur_tid);
+    for (i = 0; i < w->n_pty; i++)
+        pty_remove_waiter(w->pty_f[i], cur_tid);
+    w->n_tty = 0;
+    w->n_pty = 0;
+}
+
+static int poll_in_waiters_any(const poll_in_waiters_t *w) {
+    return w && (w->n_tty > 0 || w->n_pty > 0);
+}
+
+static int path_is_dev_tty(const char *path) {
+    return path && (strcmp(path, "/dev/tty") == 0 || strcmp(path, "/tty") == 0);
+}
+
+static int thread_has_ctty(const thread_t *t) {
+    return t && (t->attached_tty >= 0 || t->attached_pty >= 0);
+}
+
 /* Shared readiness used by poll and epoll (level-triggered). */
 static short fd_poll_revents(thread_t *thr, int fd, short events) {
     short revents = 0;
@@ -7143,8 +7948,10 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
     struct fs_file *f = syscall_fd_get(thr, fd);
     if (!f) return POLLNVAL_K;
     if (pty_is_file(f)) {
-        if ((events & POLLIN_K) && pty_available(f) > 0) revents |= POLLIN_K;
+        int hung = pty_peer_hungup(f);
+        if ((events & POLLIN_K) && (pty_available(f) > 0 || hung)) revents |= POLLIN_K;
         if (events & POLLOUT_K) revents |= POLLOUT_K;
+        if (hung) revents |= POLLHUP_K;
         return revents;
     }
     if (devfs_is_tty_file(f)) {
@@ -7172,8 +7979,8 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
                     if (net_tcp_connect_poll(&s->tcp, &ops, 0) == 0) {
                         s->connected = 1;
                         revents |= POLLOUT_K;
-                    } else if (s->tcp.connect_refused) {
-                        revents |= POLLERR_K | POLLHUP_K;
+                    } else if (s->tcp.connect_refused || s->tcp.connect_timed_out) {
+                        revents |= POLLERR_K | POLLHUP_K | POLLOUT_K;
                     }
                 } else {
                     e1000_poll();
@@ -7187,6 +7994,7 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
         }
         if ((events & POLLIN_K) && s->sock_domain == AF_NETLINK_LOCAL) {
             if (s->nl_rx_off < s->nl_rx_len) revents |= POLLIN_K;
+            else if (s->nl_rx_len > 0) revents |= POLLHUP_K;
         } else if (s->unix_domain_stub) {
             if (s->unix_listening) {
                 if ((events & POLLIN_K) && s->unix_accept_count > 0) revents |= POLLIN_K;
@@ -7244,6 +8052,11 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
                 net_make_tcp_ops(&ops, &s->tcp);
                 (void)net_tcp_connect_poll(&s->tcp, &ops, 0);
             }
+            if (s->tcp.connect_refused || s->tcp.connect_timed_out) {
+                revents |= POLLERR_K | POLLHUP_K;
+                if (events & POLLOUT_K)
+                    revents |= POLLOUT_K;
+            }
             net_pump_tcp_sock(s, 1);
             if (s->tcp.rx_len > 0 || s->tcp.peer_fin || s->tcp.peer_rst || s->tcp.ooo_valid)
                 revents |= POLLIN_K;
@@ -7288,6 +8101,11 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
         release_irqrestore(&e->lock, fl);
         if ((events & POLLIN_K) && c > 0) revents |= POLLIN_K;
         if ((events & POLLOUT_K) && c != (uint64_t)-1) revents |= POLLOUT_K;
+        return revents;
+    }
+    if (f->type == FS_TYPE_SIGNALFD && f->driver_private) {
+        if ((events & POLLIN_K) && signalfd_ready(thr, (signalfd_t *)f->driver_private))
+            revents |= POLLIN_K;
         return revents;
     }
     if (events & POLLOUT_K) revents |= POLLOUT_K;
@@ -7566,11 +8384,65 @@ static uint64_t signal_pick_handler_rsp(thread_t *cur, const user_sigaction_t *s
     return top;
 }
 
+#define AXON_KERNEL_SIGSET_BYTES 8u
+
+static void sigwait_restore_saved_mask(thread_t *t) {
+    if (!t || !t->restore_sigmask)
+        return;
+    t->saved_sig_mask = t->saved_sigmask_orig;
+    t->restore_sigmask = 0;
+}
+
+/* Linux set_user_sigmask(): NULL mask is a no-op; size must be kernel sigset_t. */
+static int sigwait_begin_set(thread_t *t, const void *mask_u, size_t sigsetsize) {
+    uint64_t kmask = 0;
+    if (!t || !mask_u)
+        return 0;
+    if (sigsetsize != AXON_KERNEL_SIGSET_BYTES)
+        return -EINVAL;
+    if (copy_from_user_raw(&kmask, mask_u, AXON_KERNEL_SIGSET_BYTES) != 0)
+        return -EFAULT;
+    if (!t->restore_sigmask) {
+        t->saved_sigmask_orig = t->saved_sig_mask;
+        t->restore_sigmask = 1;
+    }
+    t->saved_sig_mask = kmask;
+    return 0;
+}
+
+/* pselect6 arg6 is struct { const sigset_t *ss; size_t ss_len; }. */
+static int sigwait_begin_pselect6(thread_t *t, uint64_t arg6) {
+    struct { uint64_t ss; uint64_t ss_len; } pack;
+    if (!arg6)
+        return 0;
+    if (copy_from_user_raw(&pack, (const void *)(uintptr_t)arg6, sizeof(pack)) != 0)
+        return -EFAULT;
+    if (!pack.ss)
+        return 0;
+    return sigwait_begin_set(t, (const void *)(uintptr_t)pack.ss, (size_t)pack.ss_len);
+}
+
+/* poll/select family is ERESTARTNOHAND: SA_RESTART does not replay them. */
+static int syscall_is_norestart(uint64_t nr) {
+    switch ((int)nr) {
+    case SYS_poll:
+    case SYS_select:
+    case 232: /* epoll_wait */
+    case 270: /* pselect6 */
+    case 271: /* ppoll */
+    case 281: /* epoll_pwait */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 /* Pick next deliverable signal. Returns:
  *   0  — nothing to do
  *   1  — *sa_out ready for user handler delivery (*sig_out set)
  *  -1  — signal consumed (IGN / bad handler / non-fatal DFL); caller should retry
- * Never returns on fatal SIG_DFL (yields / hlt). */
+ *  -2  — fatal SIG_DFL: current thread group is TERMINATED; caller must
+ *        schedule away and not return to userspace. */
 static int signal_prepare_next(thread_t *cur, int *sig_out, user_sigaction_t *sa_out) {
     if (!cur || cur->ring != 3 || cur->state == THREAD_TERMINATED) return 0;
     uint64_t blocked = cur->saved_sig_mask;
@@ -7622,58 +8494,11 @@ static int signal_prepare_next(thread_t *cur, int *sig_out, user_sigaction_t *sa
     }
     if (h == SIG_DFL) {
         cur->pending_signals &= ~(1ULL << (sig - 1));
-        /*
-         * Linux default Term/Core. SIGKILL was missing — kill -9 cleared
-         * pending with no effect (success, process still alive).
-         */
-        int fatal = (sig == SIGHUP || sig == SIGINT || sig == SIGQUIT ||
-                     sig == SIGILL || sig == SIGABRT || sig == SIGBUS ||
-                     sig == SIGFPE || sig == SIGKILL || sig == SIGSEGV ||
-                     sig == SIGPIPE || sig == SIGALRM || sig == SIGTERM ||
-                     sig == 24 /*SIGXCPU*/ || sig == 25 /*SIGXFSZ*/ ||
-                     sig == 31 /*SIGSYS*/);
-        if (fatal) {
-            cur->exit_status = sig; /* WIFSIGNALED, WTERMSIG = sig */
-            exit_group_reap_peer_threads(cur);
-            thread_close_all_fds(cur);
-            if (cur->parent_tid >= 0) {
-                thread_t *pt = thread_get(cur->parent_tid);
-                if (pt) {
-                    thread_set_pending_signal(pt, SIGCHLD);
-                    thread_unblock((int)(pt->tid ? pt->tid : 1));
-                    if (cur->attached_tty >= 0 && pt->attached_tty == cur->attached_tty)
-                        devfs_set_tty_fg_pgrp(cur->attached_tty, pt->pgid);
-                }
-            }
-            process_release_vfork_parent(cur->process, PROCESS_VFORK_FATAL);
-            process_mark_zombie(cur->process, cur->exit_status);
-            if (cur->process) {
-                process_t *init_process = NULL;
-                int init_tid = thread_get_init_user_tid();
-                thread_t *init_thread = init_tid >= 0 ? thread_get(init_tid) : NULL;
-                if (init_thread)
-                    init_process = init_thread->process;
-                process_reparent_children(cur->process, init_process);
-            }
-            if (cur->waiter_tid >= 0) thread_unblock(cur->waiter_tid);
-            if (user_range_ok((const void *)(uintptr_t)cur->clear_child_tid, 4)) {
-                uint32_t zero = 0;
-                copy_to_user_safe((void*)(uintptr_t)cur->clear_child_tid, &zero, 4);
-                { extern int futex_syscall(uintptr_t uaddr, int op, int val, const void *timeout, uintptr_t uaddr2, int val3);
-                  futex_syscall((uintptr_t)cur->clear_child_tid, 1 | 128, 1, NULL, 0, 0); }
-                cur->clear_child_tid = 0;
-            } else if (cur->clear_child_tid != 0) {
-                cur->clear_child_tid = 0;
-            }
-            cur->state = THREAD_TERMINATED;
-            if (cur->mm && cur->mm != mm_kernel()) {
-                mm_t *dead_mm = cur->mm;
-                cur->mm = NULL;
-                (void)mm_switch_away_from(dead_mm);
-                mm_release(dead_mm);
-            }
-            thread_yield();
-            for (;;) asm volatile("sti; hlt" ::: "memory");
+        if (signal_default_fatal(sig)) {
+            /* Do not mm_release / yield here — IRQ and syscall-return
+             * delivery of SIGTERM DFL froze the machine (postgres PT walk). */
+            (void)force_fatal_signal_thread_group(cur, sig);
+            return -2;
         }
         return -1;
     }
@@ -7700,9 +8525,6 @@ static uintptr_t signal_write_rt_frame(thread_t *cur, int sig, const user_sigact
         return 0;
     uintptr_t frame_start = ((sp - RT_SIGFRAME_SIZE) & ~15ULL) - 8ULL;
     if (frame_start < 0x200000ULL) return 0;
-    if (mark_user_identity_range_2m_sys((uint64_t)frame_start,
-            (uint64_t)(frame_start + RT_SIGFRAME_SIZE)) != 0)
-        return 0;
 
     k_ucontext_t uc;
     memset(&uc, 0, sizeof(uc));
@@ -7715,7 +8537,7 @@ static uintptr_t signal_write_rt_frame(thread_t *cur, int sig, const user_sigact
     uc.uc_stack_ss_sp = cur->sas_ss_sp;
     uc.uc_stack_ss_size = cur->sas_ss_size;
     uc.uc_stack_ss_flags = (uint32_t)cur->sas_ss_flags;
-    uc.uc_sigmask[0] = cur->saved_sig_mask;
+    uc.uc_sigmask[0] = cur->restore_sigmask ? cur->saved_sigmask_orig : cur->saved_sig_mask;
     if (copy_to_user_safe((void *)(uintptr_t)(frame_start + RT_SIGFRAME_UC_OFF),
                           &uc, sizeof(uc)) != 0)
         return 0;
@@ -7746,25 +8568,45 @@ static void signal_commit_delivery(thread_t *cur, int sig, const user_sigaction_
 /* Build signal frame and patch syscall return for delivery. Called from syscall_entry64. */
 int maybe_deliver_pending_signal(uint64_t syscall_ret) {
     thread_t *cur = syscall_resolve_thread();
-    if (!cur || cur->ring != 3) return 0;
+    if (!cur || cur->ring != 3) {
+        if (cur)
+            sigwait_restore_saved_mask(cur);
+        return 0;
+    }
 
     for (;;) {
         int sig = 0;
         user_sigaction_t sa;
         int prep = signal_prepare_next(cur, &sig, &sa);
-        if (prep == 0) return 0;
+        if (prep == 0) {
+            sigwait_restore_saved_mask(cur);
+            return 0;
+        }
+        if (prep == -2 || cur->state == THREAD_TERMINATED) {
+            sigwait_restore_saved_mask(cur);
+            thread_schedule();
+            for (;;)
+                asm volatile("sti; hlt" ::: "memory");
+        }
         if (prep < 0) continue;
 
         uint64_t old_rsp = cur->saved_user_rsp;
         uint64_t old_rip = cur->saved_user_rip;
-        if (!old_rsp || !old_rip) return 0;
+        if (!old_rsp || !old_rip) {
+            sigwait_restore_saved_mask(cur);
+            return 0;
+        }
         uint64_t *frame = cur->saved_syscall_frame;
-        if (!frame) return 0;
+        if (!frame) {
+            sigwait_restore_saved_mask(cur);
+            return 0;
+        }
 
         int restart_syscall = 0;
         if ((sa.flags & 0x10000000ULL) && /* SA_RESTART */
             (int64_t)syscall_ret == -(int64_t)EINTR &&
-            old_rip >= 2) {
+            old_rip >= 2 &&
+            !syscall_is_norestart(frame[14])) {
             uint8_t insn[2];
             if (copy_from_user_raw(insn, (const void *)(uintptr_t)(old_rip - 2),
                                    sizeof(insn)) == 0 &&
@@ -7796,11 +8638,17 @@ int maybe_deliver_pending_signal(uint64_t syscall_ret) {
         sc.eflags = cur->saved_user_r11;
 
         uint64_t handler = (uint64_t)(uintptr_t)sa.handler;
-        if (handler < 0x10000ULL) return 0;
+        if (handler < 0x10000ULL) {
+            sigwait_restore_saved_mask(cur);
+            return 0;
+        }
 
         uint64_t frame_rsp = signal_pick_handler_rsp(cur, &sa, old_rsp);
         uintptr_t frame_start = signal_write_rt_frame(cur, sig, &sa, frame_rsp, &sc);
-        if (!frame_start) return 0;
+        if (!frame_start) {
+            sigwait_restore_saved_mask(cur);
+            return 0;
+        }
 
         frame[8]  = (uint64_t)sig;
         if (sa.flags & SA_SIGINFO) {
@@ -7811,6 +8659,7 @@ int maybe_deliver_pending_signal(uint64_t syscall_ret) {
         frame[15] = (uint64_t)frame_start;
         syscall_user_rsp_saved = (uint64_t)frame_start;
         signal_commit_delivery(cur, sig, &sa);
+        cur->restore_sigmask = 0;
         asm volatile("mfence" ::: "memory");
         return 1;
     }
@@ -7823,23 +8672,51 @@ int maybe_deliver_pending_signal_iretq(cpu_registers_t *regs) {
     thread_t *cur = thread_current();
     if (!cur || cur->ring != 3)
         cur = thread_get_current_user();
-    if (!cur || cur->ring != 3 || cur->state == THREAD_TERMINATED) return 0;
+    if (!cur || cur->ring != 3) {
+        if (cur)
+            sigwait_restore_saved_mask(cur);
+        return 0;
+    }
+    if (cur->state == THREAD_TERMINATED) {
+        sigwait_restore_saved_mask(cur);
+        thread_schedule();
+        for (;;)
+            asm volatile("sti; hlt" ::: "memory");
+    }
 
     for (;;) {
         int sig = 0;
         user_sigaction_t sa;
         int prep = signal_prepare_next(cur, &sig, &sa);
-        if (prep == 0) return 0;
+        if (prep == 0) {
+            sigwait_restore_saved_mask(cur);
+            return 0;
+        }
+        if (prep == -2 || cur->state == THREAD_TERMINATED) {
+            sigwait_restore_saved_mask(cur);
+            thread_schedule();
+            for (;;)
+                asm volatile("sti; hlt" ::: "memory");
+        }
         if (prep < 0) continue;
 
         uint64_t handler = (uint64_t)(uintptr_t)sa.handler;
-        if (handler < 0x10000ULL) return 0;
+        if (handler < 0x10000ULL) {
+            sigwait_restore_saved_mask(cur);
+            return 0;
+        }
 
         uint64_t old_rsp = regs->rsp;
         uint64_t old_rip = regs->rip;
-        if (!old_rsp || !old_rip) return 0;
+        if (!old_rsp || !old_rip) {
+            sigwait_restore_saved_mask(cur);
+            return 0;
+        }
         /* Refuse nonsense return sites (prevents building a frame then iretq to 0). */
-        if (old_rip < 0x10000ULL) return 0;
+        if (old_rip < 0x10000ULL) {
+            sigwait_restore_saved_mask(cur);
+            return 0;
+        }
 
         k_sigcontext_t sc;
         memset(&sc, 0, sizeof(sc));
@@ -7864,7 +8741,10 @@ int maybe_deliver_pending_signal_iretq(cpu_registers_t *regs) {
 
         uint64_t frame_rsp = signal_pick_handler_rsp(cur, &sa, old_rsp);
         uintptr_t frame_start = signal_write_rt_frame(cur, sig, &sa, frame_rsp, &sc);
-        if (!frame_start) return 0;
+        if (!frame_start) {
+            sigwait_restore_saved_mask(cur);
+            return 0;
+        }
 
         regs->rdi = (uint64_t)sig;
         if (sa.flags & SA_SIGINFO) {
@@ -7884,6 +8764,7 @@ int maybe_deliver_pending_signal_iretq(cpu_registers_t *regs) {
         cur->saved_user_rsp = regs->rsp;
         cur->saved_user_r11 = regs->rflags;
         signal_commit_delivery(cur, sig, &sa);
+        cur->restore_sigmask = 0;
         asm volatile("mfence" ::: "memory");
         return 1;
     }
@@ -8061,6 +8942,7 @@ static thread_t *syscall_resolve_thread(void) {
 
 static uint64_t linux_task_tid(const thread_t *task) {
     if (!task) return 0;
+    /* Linux: the group leader's tid equals its tgid (gettid()==getpid()). */
     if (task->process && task->process->leader == task)
         return task->process->pid;
     return (uint64_t)(task->tid ? task->tid : 1);
@@ -8313,6 +9195,7 @@ static uint64_t do_linux_fork(thread_t *cur,
             child->sas_ss_flags = cur->sas_ss_flags;
             child->pending_signals = 0;
             child->attached_tty = cur->attached_tty;
+            child->attached_pty = cur->attached_pty;
             child->parent_tid = (int)(cur->tid ? cur->tid : 1);
             {
                 /* BusyBox waitfor() does waitpid(-1) then kill(spawn_pid,0). If the
@@ -8776,6 +9659,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     memcpy(child->groups, cur->groups, (size_t)child->ngroups * sizeof(gid_t));
                 child->umask = cur->umask;
                 child->attached_tty = cur->attached_tty;
+                child->attached_pty = cur->attached_pty;
                 child->parent_tid = (int)(cur->tid ? cur->tid : 1);
                 child->saved_sig_mask = cur->saved_sig_mask;
                 child->sas_ss_sp = 0;
@@ -9074,6 +9958,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     memcpy(child->groups, cur->groups, (size_t)child->ngroups * sizeof(gid_t));
                 child->umask = cur->umask;
                 child->attached_tty = cur->attached_tty;
+                child->attached_pty = cur->attached_pty;
                 child->parent_tid = (int)(cur->tid ? cur->tid : 1);
                 /* Linux: CLONE_THREAD shares TGID; otherwise new process. */
                 if (flags & CLONE3_CLONE_THREAD) {
@@ -9488,6 +10373,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (child->ngroups > 0)
                 memcpy(child->groups, p->groups, (size_t)child->ngroups * sizeof(gid_t));
             child->attached_tty = p->attached_tty;
+            child->attached_pty = p->attached_pty;
             strncpy(child->cwd, p->cwd, sizeof(child->cwd) - 1);
             child->cwd[sizeof(child->cwd) - 1] = '\0';
             strncpy(child->fs_root, p->fs_root[0] ? p->fs_root : "/", sizeof(child->fs_root) - 1);
@@ -10281,20 +11167,46 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             return 0;
         }
         case SYS_getrandom: {
-            void *bufp = (void*)(uintptr_t)a1;
+            /* Linux getrandom(2): copy_to_user, flags GRND_*. Never store
+             * through a user VA — private mm pages are not identity-mapped. */
+            enum { GRND_NONBLOCK = 0x1, GRND_RANDOM = 0x2, GRND_INSECURE = 0x4 };
+            void *bufp = (void *)(uintptr_t)a1;
             size_t len = (size_t)a2;
-            (void)a3; /* flags */
-            if (!bufp) return ret_err(EFAULT);
-            if ((uintptr_t)bufp + len > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            uint8_t *p = (uint8_t*)bufp;
-            for (size_t i = 0; i < len; i++) {
-                /* xorshift32 */
-                user_rand_state ^= user_rand_state << 13;
-                user_rand_state ^= user_rand_state >> 17;
-                user_rand_state ^= user_rand_state << 5;
-                p[i] = (uint8_t)(user_rand_state & 0xFF);
+            unsigned int flags = (unsigned int)a3;
+            if (flags & ~(unsigned)(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE))
+                return ret_err(EINVAL);
+            if ((flags & (GRND_INSECURE | GRND_RANDOM)) == (GRND_INSECURE | GRND_RANDOM))
+                return ret_err(EINVAL);
+            if (len > (size_t)0x7fffffff)
+                len = (size_t)0x7fffffff;
+            if (len == 0)
+                return 0;
+            if (!bufp || !user_range_ok(bufp, len))
+                return ret_err(EFAULT);
+            {
+                uint32_t lo = 0, hi = 0;
+                asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+                user_rand_state ^= lo ^ (hi << 1);
+                if (user_rand_state == 0)
+                    user_rand_state = 0xA53C9E11u;
             }
-            return (uint64_t)len;
+            uint8_t tmp[256];
+            size_t done = 0;
+            while (done < len) {
+                size_t chunk = len - done;
+                if (chunk > sizeof(tmp))
+                    chunk = sizeof(tmp);
+                for (size_t i = 0; i < chunk; i++) {
+                    user_rand_state ^= user_rand_state << 13;
+                    user_rand_state ^= user_rand_state >> 17;
+                    user_rand_state ^= user_rand_state << 5;
+                    tmp[i] = (uint8_t)(user_rand_state & 0xFF);
+                }
+                if (copy_to_user_safe((uint8_t *)bufp + done, tmp, chunk) != 0)
+                    return done ? (uint64_t)done : ret_err(EFAULT);
+                done += chunk;
+            }
+            return (uint64_t)done;
         }
         case SYS_clock_gettime: {
             int clk = (int)a1;
@@ -10856,7 +11768,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (!tmp) return (total > 0) ? (uint64_t)total : ret_err(EFAULT);
                     ssize_t wr;
                     if (f->type == FS_TYPE_PIPE && fs_pipe_is_write_end(f) && f->driver_private) {
-                        wr = pipe_write_bytes((pipe_t *)f->driver_private, tmp, copied, cur);
+                        wr = pipe_write_bytes((pipe_t *)f->driver_private, tmp, copied, cur,
+                                              fs_open_nonblock(f));
                     } else if (f->type == FS_TYPE_PIPE) {
                         kfree(tmp);
                         return (total > 0) ? total : ret_err(EBADF);
@@ -11218,6 +12131,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     cur->sid = pid;
                     cur->pgid = pid;
                     cur->attached_tty = -1;
+                    cur->attached_pty = -1;
                     user_pgrp = (uint64_t)pid;
                     return (uint64_t)pid;
                 }
@@ -11226,18 +12140,21 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 cur->sid = pid;
                 cur->pgid = pid;
                 cur->attached_tty = -1;
+                cur->attached_pty = -1;
                 user_pgrp = (uint64_t)pid;
                 return (uint64_t)pid;
             } else if (cur) {
                 int pid = (int)(cur->tid ? cur->tid : 1);
                 if (cur->sid == pid && cur->pgid == pid) {
                     cur->attached_tty = -1;
+                    cur->attached_pty = -1;
                     user_pgrp = (uint64_t)pid;
                     return (uint64_t)pid;
                 }
                 cur->sid = pid;
                 cur->pgid = pid;
                 cur->attached_tty = -1;
+                cur->attached_pty = -1;
                 user_pgrp = (uint64_t)pid;
                 return (uint64_t)pid;
             }
@@ -11503,7 +12420,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     }
 
                     if (want_r) {
-                        if (devfs_is_tty_file(f)) {
+                        if (pty_is_file(f)) {
+                            if (pty_available(f) > 0 || pty_peer_hungup(f)) can_r = 1;
+                        } else if (devfs_is_tty_file(f)) {
                             int tidx = devfs_get_tty_index_from_file(f);
                             if (tidx < 0) tidx = devfs_get_active();
                             if (devfs_tty_available(tidx) > 0) can_r = 1;
@@ -11516,6 +12435,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
                             if (s->sock_domain == AF_NETLINK_LOCAL) {
                                 if (s->nl_rx_off < s->nl_rx_len) can_r = 1;
+                                else if (s->nl_rx_len > 0) can_r = 1; /* EOF after dump */
                             } else if (s->sock_domain == AF_PACKET_LOCAL) {
                                 if (!packet_sock_has_data(s))
                                     net_packet_pump_rx(8);
@@ -11569,6 +12489,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             acquire_irqsave(&e->lock, &fl);
                             if (e->count > 0) can_r = 1;
                             release_irqrestore(&e->lock, fl);
+                        } else if (f->type == FS_TYPE_SIGNALFD && f->driver_private) {
+                            if (signalfd_ready(curth, (signalfd_t *)f->driver_private))
+                                can_r = 1;
                         } else {
                             if (f->type == FS_TYPE_DIR) can_r = 1;
                             else if ((size_t)f->pos < (size_t)f->size) can_r = 1;
@@ -11595,7 +12518,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                     if (net_tcp_connect_poll(&s->tcp, &ops, 0) == 0) {
                                         s->connected = 1;
                                         can_w = 1;
-                                    } else if (s->tcp.connect_refused) {
+                                    } else if (s->tcp.connect_refused || s->tcp.connect_timed_out) {
                                         can_w = 1;
                                     }
                                 } else {
@@ -11647,34 +12570,29 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return 0;
                 }
 
-                /* Wake on tty keypress like poll() — do not sleep fixed 10ms slices. */
+                /* Wake on tty/pty input like poll() — do not sleep fixed 10ms slices. */
                 int cur_tid = curth ? (int)curth->tid : -1;
-                int tty_waiting[16];
-                int n_tty_waiting = 0;
+                poll_in_waiters_t inw;
+                poll_in_waiters_clear(&inw);
                 if (cur_tid >= 0 && rin) {
-                    for (int fd = 0; fd < nfds && n_tty_waiting < (int)(sizeof(tty_waiting)/sizeof(tty_waiting[0])); fd++) {
+                    for (int fd = 0; fd < nfds; fd++) {
                         if (!((rin[fd / 64] >> (fd % 64)) & 1ULL)) continue;
                         struct fs_file *f = syscall_fd_get(curth, fd);
-                        if (!f || !devfs_is_tty_file(f)) continue;
-                        int tidx = devfs_get_tty_index_from_file(f);
-                        if (tidx < 0) tidx = devfs_get_active();
-                        if (devfs_tty_add_waiter(tidx, cur_tid) == 0)
-                            tty_waiting[n_tty_waiting++] = tidx;
+                        if (f)
+                            poll_in_waiters_add_file(&inw, f, cur_tid);
                     }
                 }
-                if (n_tty_waiting > 0 && !has_net_socket) {
+                if (poll_in_waiters_any(&inw) && !has_net_socket) {
                     if (timeout_ms < 0) {
                         thread_block(cur_tid);
                         thread_yield();
-                        for (int w = 0; w < n_tty_waiting; w++)
-                            devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
+                        poll_in_waiters_remove(&inw, cur_tid);
                         goto auto_select_check;
                     }
                     uint64_t t0 = pit_get_time_ms();
                     thread_block_with_timeout(cur_tid, (uint32_t)timeout_ms);
                     thread_yield();
-                    for (int w = 0; w < n_tty_waiting; w++)
-                        devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
+                    poll_in_waiters_remove(&inw, cur_tid);
                     int elapsed = (int)(pit_get_time_ms() - t0);
                     if (elapsed >= timeout_ms) {
                         if (readfds_u && rout) (void)copy_to_user_safe(readfds_u, rout, fdset_bytes);
@@ -11686,14 +12604,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     timeout_ms -= elapsed;
                     goto auto_select_check;
                 }
-                if (n_tty_waiting > 0) {
+                if (poll_in_waiters_any(&inw)) {
                     int step = 2;
                     if (timeout_ms > 0 && timeout_ms < step) step = timeout_ms;
                     net_pump_all_tcp(curth);
                     thread_block_with_timeout(cur_tid, (uint32_t)step);
                     thread_yield();
-                    for (int w = 0; w < n_tty_waiting; w++)
-                        devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
+                    poll_in_waiters_remove(&inw, cur_tid);
                     if (timeout_ms > 0) timeout_ms -= step;
                     goto auto_select_check;
                 }
@@ -12351,7 +13268,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (s->tcp.used) {
                     net_tcp_ops_t close_ops;
                     net_make_tcp_ops(&close_ops, &s->tcp);
-                    (void)net_tcp_close(&s->tcp, &close_ops, 500);
+                    (void)net_tcp_close(&s->tcp, &close_ops, 0);
                 }
                 memset(&s->tcp, 0, sizeof(s->tcp));
                 s->dns_tcp_udp_bridge = 0;
@@ -12671,6 +13588,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (s->tcp.connect_pending) {
                     /* Still in progress: Linux reports 0 here; EINPROGRESS is only from connect(). */
                     soerr = 0;
+                } else if (s->tcp.connect_timed_out) {
+                    soerr = ETIMEDOUT;
+                    s->tcp.connect_timed_out = 0;
                 } else if (s->tcp.connect_refused) {
                     soerr = ECONNREFUSED;
                     s->tcp.connect_refused = 0; /* Linux: SO_ERROR clears on read */
@@ -12763,6 +13683,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return (uint64_t)wr;
             }
             /* glibc send(2) -> sendto; OpenSSL wget uses this for TLS on :443. */
+            if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge) {
+                ssize_t wr = net_sock_write_userspace(t, fd, s, buf_u, len);
+                if (wr < 0) return ret_err((int)-wr);
+                return (uint64_t)wr;
+            }
             if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge) {
                 if (!buf_u || len == 0) return ret_err(EINVAL);
                 if (!user_range_ok(buf_u, len)) return ret_err(EFAULT);
@@ -12932,6 +13857,12 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return ret_err(EFAULT);
             }
             /* glibc recv(2) -> recvfrom; OpenSSL wget uses this for TLS on :443. */
+            if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge) {
+                if (!user_range_ok(buf_u, len)) return ret_err(EFAULT);
+                ssize_t rr = net_sock_read_userspace(t, s, buf_u, len);
+                if (rr < 0) return ret_read_err(rr);
+                return (uint64_t)rr;
+            }
             if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge) {
                 if (!user_range_ok(buf_u, len)) return ret_err(EFAULT);
                 if (s->unix_conn) {
@@ -13249,8 +14180,16 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 s->last_req_len = sum;
                 memcpy(s->last_req, flat, sum);
                 r = net_send_icmp_echo(s, dst_ip_be, flat, sum);
-            } else if ((s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) ||
-                       (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge)) {
+            } else if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge) {
+                if (s->local_port == 0)
+                    s->local_port = net_alloc_ephemeral_port();
+                {
+                    ssize_t wr = net_dns_bridge_send(s, flat, sum);
+                    kfree(flat);
+                    if (wr < 0) return ret_err((int)(-wr));
+                    return (uint64_t)wr;
+                }
+            } else if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
                 if (s->local_port == 0)
                     s->local_port = net_alloc_ephemeral_port();
                 r = net_send_udp_datagram(dst_ip_be, s->local_port, dst_port, flat, sum);
@@ -13404,6 +14343,38 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     m.msg_namelen = 2;
                     (void)copy_to_user_safe(msg_u, &m, sizeof(m));
                 }
+                return (uint64_t)rr;
+            }
+            if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge) {
+                for (uint64_t i = 0; i < m.msg_iovlen; i++) {
+                    if (iov[i].len == 0) continue;
+                    if (!iov[i].base || !user_range_ok(iov[i].base, (size_t)iov[i].len))
+                        return ret_err(EFAULT);
+                }
+                size_t cap = (want64 > 65536u) ? 65536u : (size_t)want64;
+                uint8_t *tmp = (uint8_t *)kmalloc(cap);
+                if (!tmp) return ret_err(ENOMEM);
+                ssize_t rr = net_sock_read_userspace(t, s, tmp, cap);
+                if (rr < 0) {
+                    kfree(tmp);
+                    return ret_read_err(rr);
+                }
+                size_t left = (size_t)rr;
+                size_t at = 0;
+                for (uint64_t i = 0; i < m.msg_iovlen && left > 0; i++) {
+                    size_t ilen = (size_t)iov[i].len;
+                    if (ilen == 0) continue;
+                    size_t cp = (ilen > left) ? left : ilen;
+                    if (copy_to_user_safe(iov[i].base, tmp + at, cp) != 0) {
+                        kfree(tmp);
+                        return ret_err(EFAULT);
+                    }
+                    at += cp;
+                    left -= cp;
+                    if (cp < ilen)
+                        break;
+                }
+                kfree(tmp);
                 return (uint64_t)rr;
             }
             if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge) {
@@ -13707,29 +14678,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             int sig = (int)a2;
             if (sig < 0 || sig > 63) return ret_err(EINVAL);
             /*
-             * BusyBox waitfor(): after waitpid ECHILD it does kill(spawn_pid,0).
-             * If spawn_pid == self (vfork child wrongly took the parent path),
-             * kill succeeds forever → spin. Break that by returning ESRCH.
+             * Linux kill(pid>0) is TGID. Do not mutate the process tree from
+             * kill(2); wait4 restores a lost real_parent if needed.
              */
-            if (sig == 0 && pid > 0 && cur->wait4_last_echild &&
-                (uint64_t)(unsigned)pid == process_pid(cur)) {
-                cur->wait4_last_echild = 0;
-                devel_printf("kill-break-waitfor-self: tid=%llu pid=%d\n",
-                    (unsigned long long)(cur->tid ? cur->tid : 1), pid);
-                return ret_err(ESRCH);
-            }
-            /* Adopt a live process that claims us as parent_tid but is not
-             * linked under our process — next wait4 can then see it. */
-            if (sig == 0 && pid > 0 && cur->process) {
-                process_t *target = process_find((uint64_t)(unsigned)pid);
-                if (target && target != cur->process && target->leader &&
-                    target->leader->parent_tid == (int)(cur->tid ? cur->tid : 1) &&
-                    target->parent != cur->process) {
-                    if (process_adopt_child(cur->process, target) == 0)
-                        devel_printf("kill-adopt: parent_tid=%llu got pid=%d\n",
-                            (unsigned long long)(cur->tid ? cur->tid : 1), pid);
-                }
-            }
             if (sig == 0)
                 cur->wait4_last_echild = 0;
             /*
@@ -13747,17 +14698,36 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (lead && force_sigkill_thread_group(lead))
                         killed++;
                 }
-                if (killed == 0 && pid > 0) {
-                    /* /proc may expose a tid; resolve to the live task / TGID. */
-                    thread_t *t = thread_get(pid);
-                    if (t && t->state != THREAD_TERMINATED) {
-                        if (t->process && t->process->leader)
-                            t = t->process->leader;
-                        if (force_sigkill_thread_group(t))
-                            killed = 1;
+                return killed > 0 ? 0 : ret_err(ESRCH);
+            }
+            /* Fatal SIG_DFL (SIGTERM, SIGHUP, …): same as SIGKILL from the
+             * killer. Pending-only delivery ran mm_release on the victim from
+             * timer iretq and hung the machine (stuck initdb postgres). */
+            if (signal_default_fatal(sig)) {
+                process_t *matched[256];
+                int n = process_collect_signal_targets(cur->process, pid,
+                                                      matched, 256);
+                int acted = 0;
+                int need_pending = 0;
+                for (int i = 0; i < n; i++) {
+                    process_t *p = matched[i];
+                    thread_t *lead = p ? p->leader : NULL;
+                    if (!lead || lead->state == THREAD_TERMINATED)
+                        continue;
+                    if (process_signal_dfl(p, sig)) {
+                        if (force_fatal_signal_thread_group(lead, sig))
+                            acted++;
+                    } else {
+                        need_pending = 1;
                     }
                 }
-                return killed > 0 ? 0 : ret_err(ESRCH);
+                if (acted && !need_pending)
+                    return 0;
+                if (acted && need_pending) {
+                    /* Mixed group: DFL members already reaped; pending below. */
+                } else if (!acted && !need_pending) {
+                    /* fall through to generic ESRCH path */
+                }
             }
             if (cur->process) {
                 if (sig == 21 && cur->name[0] && strstr(cur->name, "/bin/sh"))
@@ -13933,9 +14903,15 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (sk->nonblock) fl |= O_NONBLOCK_LINUX;
                     return (uint64_t)(unsigned)fl;
                 }
-                /* For regular files/dirs/pipes: we don't track flags yet; return accmode only so fdopen() works. */
-                return (uint64_t)(unsigned)O_RDWR_LINUX;
+                {
+                    int fl = O_RDWR_LINUX;
+                    if (f->flags & O_NONBLOCK_LINUX)
+                        fl |= O_NONBLOCK_LINUX;
+                    return (uint64_t)(unsigned)fl;
+                }
             } else if (cmd == F_SETFL) {
+                f->flags = (f->flags & ~O_NONBLOCK_LINUX) |
+                           (arg & O_NONBLOCK_LINUX);
                 if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
                     ksock_net_t *sk = (ksock_net_t *)f->driver_private;
                     sk->nonblock = (arg & O_NONBLOCK_LINUX) ? 1 : 0;
@@ -14048,8 +15024,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     } else if (strcmp(md->ops->name, "sysfs") == 0) {
                         ksf.f_type = 0x62656572;
                         ksf.f_blocks = ksf.f_bfree = ksf.f_bavail = 0;
-                    } else if (strcmp(md->ops->name, "devfs") == 0 || strcmp(md->ops->name, "devtmpfs") == 0)
-                        ksf.f_type = 0x01021994;
+                    } else if (strcmp(md->ops->name, "devfs") == 0 || strcmp(md->ops->name, "devtmpfs") == 0) {
+                        /* /dev is devtmpfs; /dev/pts is Unix98 devpts (glibc ptsname). */
+                        if (strncmp(path, "/dev/pts", 8) == 0 &&
+                            (path[8] == '\0' || path[8] == '/'))
+                            ksf.f_type = 0x1cd1; /* DEVPTS_SUPER_MAGIC */
+                        else
+                            ksf.f_type = 0x01021997; /* DEVTMPFS_MAGIC */
+                    }
                     else if (strcmp(md->ops->name, "squashfs") == 0) {
                         ksf.f_type = 0x73717368;
                         ksf.f_bfree = ksf.f_bavail = 0;
@@ -14071,6 +15053,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 struct fs_driver *md = fs_get_mount_driver(ff->path);
                 if (md && md->ops && md->ops->name && strcmp(md->ops->name, "fat32") == 0) {
                     if (fat32_statfs(&ksf) != 0) return ret_err(EIO);
+                } else if (ff->path && strncmp(ff->path, "/dev/pts", 8) == 0 &&
+                           (ff->path[8] == '\0' || ff->path[8] == '/')) {
+                    ksf.f_type = 0x1cd1; /* DEVPTS_SUPER_MAGIC */
                 } else if (md && md->ops && md->ops->name) {
                     if (strcmp(md->ops->name, "proc") == 0 ||
                         strcmp(md->ops->name, "procfs") == 0) {
@@ -14238,9 +15223,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             return 0;
         }
         case 270: {
-            /* pselect6 — musl implements select(2) via this. Sigmask ignored.
-             * Timeout is still a user timespec*; select_common handles num==270. */
-            (void)a6;
+            /* pselect6: timeout is a user timespec*; arg6 is sigset_argpack. */
+            int sm = sigwait_begin_pselect6(cur, a6);
+            if (sm < 0)
+                return ret_err(-sm);
             goto select_common;
         }
         case 121: { /* getpgid(pid) */
@@ -14982,6 +15968,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             (void)process_reap(waiter->process, dead);
                         }
                         waiter->wait4_last_echild = 0;
+                        if (!find_terminated_child(waiter))
+                            waiter->pending_signals &= ~(1ULL << (SIGCHLD - 1));
                         if (waiter->name[0] && strstr(waiter->name, "linuxrc")) {
                             static int wait4_ok_left = 16;
                             if (wait4_ok_left-- > 0) {
@@ -15009,95 +15997,69 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         }
                         return (uint64_t)(unsigned)dead_pid;
                     }
+                    /* Process list can miss a vfork wget (wrong parent_tid /
+                     * already-dropped process_t). Always scan threads. */
+                    {
+                        thread_t *tz = wait4_find_thread_zombie(waiter, pid_arg);
+                        if (tz)
+                            return wait4_reap_found_thread(waiter, tz);
+                    }
                     if (!has_child) {
-                        /* Fallback: child threads by parent_tid (process link missing). */
                         int live_by_tid = 0;
-                        thread_t *zombie_by_tid = NULL;
                         for (int i = 0; i < thread_get_count(); i++) {
                             thread_t *c = thread_get_by_index(i);
-                            if (!c || c->ring != 3) continue;
-                            if (c->parent_tid != (int)(waiter->tid ? waiter->tid : 1))
+                            if (!c || c->ring != 3)
                                 continue;
-                            if (c->state == THREAD_TERMINATED) {
-                                if (c->exit_status != 0x80000000 && !zombie_by_tid)
-                                    zombie_by_tid = c;
+                            if (c->process && waiter->process &&
+                                c->process != waiter->process &&
+                                c->process->parent != waiter->process &&
+                                c->parent_tid == wait4_waiter_ptid(waiter))
+                                (void)process_adopt_child(waiter->process, c->process);
+                            if (!wait4_is_our_child(waiter, c))
                                 continue;
-                            }
+                            if (pid_arg > 0 && !wait4_id_matches(c, pid_arg))
+                                continue;
+                            if (!wait4_pgid_ok(waiter, c, pid_arg))
+                                continue;
+                            if (c->state == THREAD_TERMINATED)
+                                continue;
                             live_by_tid = 1;
-                            c->waiter_tid = (int)(waiter->tid ? waiter->tid : 1);
+                            c->waiter_tid = wait4_waiter_ptid(waiter);
                         }
-                        if (zombie_by_tid) {
-                            int st = zombie_by_tid->exit_status;
-                            int dead_pid = (int)process_pid(zombie_by_tid);
-                            if (waiter->sc_a2) {
-                                if (wait4_copy_status(waiter, st) != 0) {
-                                    kprintf("wait4: EFAULT (tid-path) status*=0x%llx "
-                                            "pid=%d status=0x%x\n",
-                                        (unsigned long long)waiter->sc_a2,
-                                        dead_pid, (unsigned)st);
-                                    return ret_err(EFAULT);
-                                }
+                        if (!live_by_tid && pid_arg > 0) {
+                            process_t *p = process_find((uint64_t)(unsigned)pid_arg);
+                            thread_t *c = (p && p->leader) ? p->leader : NULL;
+                            if (c && c->process && waiter->process &&
+                                c->parent_tid == wait4_waiter_ptid(waiter) &&
+                                c->process->parent != waiter->process)
+                                (void)process_adopt_child(waiter->process, c->process);
+                            if (c && wait4_is_our_child(waiter, c) &&
+                                c->state != THREAD_TERMINATED) {
+                                live_by_tid = 1;
+                                c->waiter_tid = wait4_waiter_ptid(waiter);
                             }
-                            zombie_by_tid->exit_status = 0x80000000;
-                            zombie_by_tid->waiter_tid = -1;
-                            {
-                                int dead_tid = (int)(zombie_by_tid->tid ?
-                                                     zombie_by_tid->tid : 1);
-                                if (zombie_by_tid->process) {
-                                    if (zombie_by_tid->process->state != PROCESS_ZOMBIE)
-                                        process_mark_zombie(zombie_by_tid->process, st);
-                                    (void)process_reap(waiter->process,
-                                                       zombie_by_tid->process);
-                                }
-                                zombie_by_tid->process = NULL;
-                                (void)thread_reap(dead_tid);
-                            }
-                            devel_printf("wait4-reap-tid: parent=%llu child_pid=%d (via parent_tid)\n",
-                                (unsigned long long)(waiter->tid ? waiter->tid : 1),
-                                dead_pid);
-                            return (uint64_t)(unsigned)dead_pid;
                         }
                         if (!live_by_tid) {
-                            if (waiter->name[0] && (strstr(waiter->name, "linuxrc") ||
-                                strstr(waiter->name, "fstabinfo") ||
-                                strstr(waiter->name, "openrc") ||
-                                strstr(waiter->name, "mountinfo"))) {
-                                static int wait4_echild_left = 12;
-                                if (wait4_echild_left-- > 0) {
-                                    uint64_t me = process_pid(waiter);
-                                    kprintf("wait4-ECHILD: tid=%llu me_pid=%llu pid_arg=%d name=%s\n",
-                                        (unsigned long long)(waiter->tid ? waiter->tid : 1),
-                                        (unsigned long long)me, pid_arg,
-                                        waiter->name[0] ? waiter->name : "?");
-                                    devel_printf("wait4-ECHILD: tid=%llu me_pid=%llu pid_arg=%d opts=0x%x\n",
-                                        (unsigned long long)(waiter->tid ? waiter->tid : 1),
-                                        (unsigned long long)me, pid_arg, options);
-                                    for (int i = 0; i < thread_get_count(); i++) {
-                                        thread_t *c = thread_get_by_index(i);
-                                        if (!c || c->ring != 3) continue;
-                                        kprintf("  thr tid=%llu pid=%llu parent_tid=%d state=%d name=%s\n",
-                                            (unsigned long long)(c->tid ? c->tid : 1),
-                                            (unsigned long long)process_pid(c),
-                                            c->parent_tid, (int)c->state,
-                                            c->name[0] ? c->name : "?");
-                                    }
-                                }
-                            }
+                            devel_printf("wait4-ECHILD: tid=%llu me_pid=%llu pid_arg=%d name=%s opts=0x%x\n",
+                                (unsigned long long)(waiter->tid ? waiter->tid : 1),
+                                (unsigned long long)process_pid(waiter), pid_arg,
+                                waiter->name[0] ? waiter->name : "?", options);
                             waiter->wait4_last_echild = 1;
                             return ret_err(ECHILD);
                         }
                         has_child = 1;
-                        if (waiter->name[0] && strstr(waiter->name, "linuxrc")) {
-                            static int wait4_repair_left = 8;
-                            if (wait4_repair_left-- > 0)
-                                devel_printf("wait4-repair: tid=%llu blocking on parent_tid children\n",
-                                    (unsigned long long)(waiter->tid ? waiter->tid : 1));
-                        }
                     }
                     if (options & WNOHANG)
                         return 0;
-                    if (thread_has_interrupt_signal(waiter))
+                    if (wait4_eintr_pending(waiter))
                         return ret_err(EINTR);
+                    wait4_arm_children(waiter, pid_arg);
+                    /* Child may have exited between the scan and arm. */
+                    {
+                        thread_t *tz = wait4_find_thread_zombie(waiter, pid_arg);
+                        if (tz)
+                            return wait4_reap_found_thread(waiter, tz);
+                    }
 
                     process_t *live = process_find_child(waiter->process, pid_arg,
                         waiter->process->pgid, 0, NULL);
@@ -15129,26 +16091,47 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 int has_waitable_child = 0;
                 int w4_pid = (int)tcur->sc_a1;
                 if (w4_pid > 0) {
-                    /* Linux waitpid(pid): pid is TGID, not an internal tid slot.
-                     * Prefer process_find; fall back to thread_get for legacy
-                     * CLONE_THREAD cases where the arg is a tid. */
+                    /* Linux waitpid(pid>0): pid is the child's TGID. */
                     process_t *p = process_find((uint64_t)(unsigned)w4_pid);
-                    thread_t *c = (p && p->leader) ? p->leader : thread_get(w4_pid);
-                    if (c && c->parent_tid == (int)tcur->tid) {
+                    thread_t *c = (p && p->leader) ? p->leader : NULL;
+                    if (c && wait4_is_our_child(tcur, c)) {
                         found = c;
                         has_waitable_child = 1;
+                    }
+                    if (!found) {
+                        thread_t *tz = wait4_find_thread_zombie(tcur, w4_pid);
+                        if (tz) {
+                            found = tz;
+                            has_waitable_child = 1;
+                        } else {
+                        for (int i = 0; i < thread_get_count(); i++) {
+                            thread_t *ch = thread_get_by_index(i);
+                            if (!ch || !wait4_is_our_child(tcur, ch))
+                                continue;
+                            if (!wait4_id_matches(ch, w4_pid))
+                                continue;
+                            has_waitable_child = 1;
+                            if (ch->state == THREAD_TERMINATED &&
+                                wait4_zombie_waitable(ch)) {
+                                found = ch;
+                                break;
+                            }
+                        }
+                        }
                     }
                 } else if (w4_pid == 0) {
                     /* waitpid(0): any child in the caller's process group. */
                     for (int i = 0; i < thread_get_count(); i++) {
                         thread_t *c = thread_get_by_index(i);
                         if (!c) continue;
-                        if (c->parent_tid != (int)tcur->tid) continue;
-                        if (c->pgid != tcur->pgid) continue;
-                        if (c->state == THREAD_TERMINATED && c->exit_status == 0x80000000) continue;
+                        if (!wait4_is_our_child(tcur, c)) continue;
+                        if (!wait4_pgid_ok(tcur, c, 0)) continue;
+                        if (c->state == THREAD_TERMINATED &&
+                            !wait4_zombie_waitable(c))
+                            continue;
                         has_waitable_child = 1;
                         if (c->state != THREAD_TERMINATED) continue;
-                        if (c->exit_status == 0x80000000) continue;
+                        if (!wait4_zombie_waitable(c)) continue;
                         found = c;
                         break;
                     }
@@ -15159,11 +16142,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     for (int i = 0; i < thread_get_count(); i++) {
                         thread_t *c = thread_get_by_index(i);
                         if (!c) continue;
-                        if (c->parent_tid != (int)tcur->tid) continue;
-                        if (c->state == THREAD_TERMINATED && c->exit_status == 0x80000000) continue; /* already reaped */
+                        if (!wait4_is_our_child(tcur, c)) continue;
+                        if (c->state == THREAD_TERMINATED &&
+                            !wait4_zombie_waitable(c))
+                            continue; /* already reaped */
                         has_waitable_child = 1;
                         if (c->state != THREAD_TERMINATED) continue;
-                        if (c->exit_status == 0x80000000) continue; /* already reaped */
+                        if (!wait4_zombie_waitable(c)) continue;
                         found = c;
                         break;
                     }
@@ -15203,30 +16188,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         }
                         /* Block until a child exits (futex-style: safe inside syscall). */
                         if (w4_pid > 0) {
-                            for (int i = 0; i < thread_get_count(); i++) {
-                                thread_t *c = thread_get_by_index(i);
-                                if (!c) continue;
-                                if (c->parent_tid != (int)tcur->tid) continue;
-                                if ((int)c->tid == w4_pid)
-                                    c->waiter_tid = (int)(tcur->tid ? tcur->tid : 1);
-                            }
+                            wait4_arm_children(tcur, w4_pid);
                         } else if (w4_pid == 0) {
-                            for (int i = 0; i < thread_get_count(); i++) {
-                                thread_t *c = thread_get_by_index(i);
-                                if (!c) continue;
-                                if (c->parent_tid != (int)tcur->tid) continue;
-                                if (c->pgid != tcur->pgid) continue;
-                                if (c->state == THREAD_TERMINATED) continue;
-                                c->waiter_tid = (int)(tcur->tid ? tcur->tid : 1);
-                            }
+                            wait4_arm_children(tcur, 0);
                         } else if (w4_pid == -1) {
-                            for (int i = 0; i < thread_get_count(); i++) {
-                                thread_t *c = thread_get_by_index(i);
-                                if (!c) continue;
-                                if (c->parent_tid != (int)tcur->tid) continue;
-                                if (c->state == THREAD_TERMINATED) continue;
-                                c->waiter_tid = (int)(tcur->tid ? tcur->tid : 1);
-                            }
+                            wait4_arm_children(tcur, -1);
                         }
                         if (tcur->name[0] && (strstr(tcur->name, "busybox") || strstr(tcur->name, "/sh") ||
                                               strstr(tcur->name, "openrc"))) {
@@ -15263,60 +16229,17 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         (unsigned)found->exit_status,
                         (found->exit_status == 0x80000000));
                 }
-                /* If child was already reaped, behave like Linux: ECHILD */
-                if (found->state == THREAD_TERMINATED && found->exit_status == 0x80000000) {
+                if (found->state == THREAD_TERMINATED &&
+                    wait4_zombie_waitable(found))
+                    return wait4_reap_found_thread(tcur, found);
+                /* If child was already fully reaped (slot recycled), ECHILD. */
+                if (found->state == THREAD_TERMINATED &&
+                    found->exit_status == (int)0x80000000) {
                     if ((int)tcur->sc_a3 & WNOHANG) {
                         thread_sleep(1);
                         return 0;
                     }
                     return ret_err(ECHILD);
-                }
-                /* If already terminated -> return immediately */
-                if (found->state == THREAD_TERMINATED && found->exit_status != 0x80000000) {
-                    int st = found->exit_status;
-                    int dead_pid = (int)process_pid(found);
-                    if (tcur->name[0] && (strstr(tcur->name, "busybox") || strstr(tcur->name, "/sh") ||
-                                          strstr(tcur->name, "openrc"))) {
-                        static int wait4_reap_dbg_left = 24;
-                        if (wait4_reap_dbg_left-- > 0) {
-                            uint64_t frame_rip = 0;
-                            if (tcur->saved_syscall_frame)
-                                frame_rip = tcur->saved_syscall_frame[13];
-                            devel_printf("wait4-reap: parent=%llu name=%s child=%d status=0x%x status_u=0x%llx\n",
-                                (unsigned long long)(tcur->tid ? tcur->tid : 1),
-                                tcur->name,
-                                dead_pid,
-                                (unsigned)st,
-                                (unsigned long long)tcur->sc_a2);
-                            devel_printf("wait4-reap-frame: parent=%llu rcx_slot=0x%llx saved_rip=0x%llx rsp=0x%llx\n",
-                                (unsigned long long)(tcur->tid ? tcur->tid : 1),
-                                (unsigned long long)frame_rip,
-                                (unsigned long long)tcur->saved_user_rip,
-                                (unsigned long long)tcur->saved_user_rsp);
-                        }
-                    }
-                    if (tcur->sc_a2) {
-                        if (wait4_copy_status(tcur, st) != 0)
-                            return ret_err(EFAULT);
-                    }
-                    found->waiter_tid = -1;
-                    /* mark reaped */
-                    found->exit_status = 0x80000000;
-                    /* free process PID first, then tid slot (pid != tid). */
-                    {
-                        int dead_tid = (int)(found->tid ? found->tid : 1);
-                        if (found->process && tcur->process) {
-                            if (found->process->state != PROCESS_ZOMBIE)
-                                process_mark_zombie(found->process, st);
-                            (void)process_reap(tcur->process, found->process);
-                        }
-                        found->process = NULL;
-                        extern int thread_reap(int tid);
-                        (void)thread_reap(dead_tid);
-                    }
-                    if (!find_terminated_child(tcur))
-                        tcur->pending_signals &= ~(1ULL << (SIGCHLD - 1));
-                    return (uint64_t)dead_pid;
                 }
                 /* not terminated -> WNOHANG returns immediately */
                 if ((int)tcur->sc_a3 & WNOHANG) {
@@ -15335,6 +16258,92 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 /* when child exits, loop to check again */
             }
             return ret_err(EINVAL);
+        }
+        case SYS_waitid: {
+            /* waitid(idtype, id, infop, options) — Linux x86_64 247. */
+            enum { P_ALL = 0, P_PID = 1, P_PGID = 2 };
+            enum { WNOHANG = 1, WUNTRACED = 2, WCONTINUED = 8,
+                   WEXITED = 4, WNOWAIT = 0x01000000 };
+            int idtype = (int)a1;
+            int id = (int)a2;
+            uint64_t infop = a3;
+            int options = (int)a4;
+            int pid_arg;
+            if (!(options & (WEXITED | WUNTRACED | WCONTINUED)))
+                return ret_err(EINVAL);
+            if (options & ~(WNOHANG | WUNTRACED | WCONTINUED | WEXITED | WNOWAIT))
+                return ret_err(EINVAL);
+            if (idtype == P_ALL)
+                pid_arg = -1;
+            else if (idtype == P_PID)
+                pid_arg = id;
+            else if (idtype == P_PGID)
+                pid_arg = (id == 0) ? 0 : -id;
+            else
+                return ret_err(EINVAL);
+            if (infop && !user_range_ok((const void *)(uintptr_t)infop, 128))
+                return ret_err(EFAULT);
+            if (!cur->process)
+                return ret_err(ECHILD);
+            for (;;) {
+                thread_t *waiter = cur;
+                int has_child = 0;
+                process_t *dead = process_find_child(waiter->process, pid_arg,
+                    waiter->process->pgid, 1, &has_child);
+                if (dead && dead->leader && dead->leader->state != THREAD_TERMINATED)
+                    dead = NULL;
+                if (dead && !(options & WEXITED))
+                    dead = NULL;
+                if (dead) {
+                    int status = dead->exit_status;
+                    int dead_pid = (int)dead->pid;
+                    thread_t *dead_thread = dead->leader;
+                    if (infop) {
+                        uint8_t si[128];
+                        int32_t code, si_status;
+                        memset(si, 0, sizeof(si));
+                        *(int32_t *)(si + 0) = SIGCHLD;
+                        if ((status & 0x7f) == 0) {
+                            code = 1; /* CLD_EXITED */
+                            si_status = (status >> 8) & 0xff;
+                        } else {
+                            code = 2; /* CLD_KILLED */
+                            si_status = status & 0x7f;
+                        }
+                        *(int32_t *)(si + 8) = code;
+                        *(int32_t *)(si + 16) = dead_pid;
+                        *(int32_t *)(si + 24) = si_status;
+                        if (copy_to_user_safe((void *)(uintptr_t)infop, si, 128) != 0)
+                            return ret_err(EFAULT);
+                    }
+                    if (!(options & WNOWAIT)) {
+                        if (dead_thread) {
+                            int dead_tid = (int)(dead_thread->tid ?
+                                                 dead_thread->tid : 1);
+                            dead_thread->process = NULL;
+                            dead->leader = NULL;
+                            (void)process_reap(waiter->process, dead);
+                            (void)thread_reap(dead_tid);
+                        } else {
+                            (void)process_reap(waiter->process, dead);
+                        }
+                    }
+                    if (!find_terminated_child(waiter))
+                        waiter->pending_signals &= ~(1ULL << (SIGCHLD - 1));
+                    return 0;
+                }
+                if (!has_child)
+                    return ret_err(ECHILD);
+                if (options & WNOHANG)
+                    return 0;
+                if (wait4_eintr_pending(waiter))
+                    return ret_err(EINTR);
+                wait4_arm_children(waiter, pid_arg);
+                thread_block((int)(waiter->tid ? waiter->tid : 1));
+                thread_yield();
+                syscall_restore_live_frame_from_snapshot(waiter, "waitid");
+                cur = waiter;
+            }
         }
         case SYS_ioctl: {
             int fd = (int)a1;
@@ -15375,6 +16384,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 TCSETS    = 0x5402,
                 TCSETSW   = 0x5403,
                 TCSETSF   = 0x5404,
+                TCGETS2   = 0x802c542a,
+                TCSETS2   = 0x402c542b,
+                TCSETSW2  = 0x402c542c,
+                TCSETSF2  = 0x402c542d,
                 TCFLSH    = 0x540B, /* tcflush(3): arg is TCIFLUSH/TCOFLUSH/TCIOFLUSH */
                 TIOCSTI   = 0x5412, /* inject byte into tty input queue (terminal ioctls) */
                 TIOCGSID  = 0x5429, /* tcgetsid(3) */
@@ -15389,8 +16402,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 TIOCMBIC  = 0x5417,
                 TIOCGPTN  = 0x80045430, /* ptsname: get slave index */
                 TIOCSPTLCK= 0x40045431, /* unlockpt / lockpt */
-                /* Linux block ioctls commonly used by mkfs/mount utilities */
+                /* Linux block ioctls commonly used by mkfs/mount/fdisk/partprobe */
+                HDIO_GETGEO  = 0x0301,       /* struct hd_geometry* */
+                BLKRRPART    = 0x125F,       /* reread partition table */
                 BLKGETSIZE   = 0x1260,       /* get device size in 512-byte sectors (unsigned long*) */
+                BLKFLSBUF    = 0x1261,       /* flush buffers (no-op) */
                 BLKSSZGET    = 0x1268,       /* get logical sector size (int*) */
                 BLKBSZGET    = 0x80081270,   /* get block size (int*) */
                 BLKGETSIZE64 = 0x80081272,   /* get device size in bytes (uint64_t*) */
@@ -15399,21 +16415,46 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 FIOASYNC  = 0x5452, /* set/clear O_ASYNC (nginx worker channel) */
             };
 
-            /* Unix98 PTY ioctls — must run before VC tty paths. */
+            /* Unix98 PTY ioctls — must run before VC tty paths.
+             * Compare the 'T'+nr field: TIOCGPTN is 0x80045430, which sign-
+             * extends in some libc ioctl() wrappers to 0xffffffff80045430. */
             if (pty_is_file(f)) {
-                if (req == TIOCGPTN) {
+                unsigned pty_nr = (unsigned)(req & 0xffffu);
+                if (req == TIOCGPTN || pty_nr == 0x5430u) {
                     unsigned int n;
                     if (!pty_is_master(f) || !argp) return ret_err(ENOTTY);
                     n = (unsigned int)pty_get_index(f);
                     if (copy_to_user_safe(argp, &n, sizeof(n)) != 0) return ret_err(EFAULT);
                     return 0;
                 }
-                if (req == TIOCSPTLCK) {
+                if (req == TIOCSPTLCK || pty_nr == 0x5431u) {
                     int lock = 0;
                     if (!pty_is_master(f) || !argp) return ret_err(ENOTTY);
                     if (copy_from_user_raw(&lock, argp, sizeof(lock)) != 0) return ret_err(EFAULT);
                     if (pty_set_locked(f, lock != 0) != 0) return ret_err(ENOTTY);
                     return 0;
+                }
+                /* TIOCGPTPEER: ioctl returns a new slave fd (glibc openpty).
+                 * Arg is open flags, not a userspace pointer. */
+                if (pty_nr == 0x5441u) {
+                    int peer_flags = (int)(uintptr_t)argp;
+                    struct fs_file *sf = NULL;
+                    int idx;
+                    int nfd;
+                    if (!pty_is_master(f))
+                        return ret_err(ENOTTY);
+                    (void)pty_set_locked(f, 0);
+                    idx = pty_get_index(f);
+                    if (pty_open_slave(idx, &sf) != 0 || !sf)
+                        return ret_err(EIO);
+                    nfd = thread_fd_alloc(sf);
+                    if (nfd < 0) {
+                        fs_file_free(sf);
+                        return ret_err(EMFILE);
+                    }
+                    if (cur->process && (peer_flags & 02000000))
+                        cur->process->fd_cloexec[nfd] = 1;
+                    return (uint64_t)nfd;
                 }
                 if (req == TIOCGWINSZ) {
                     struct winsize { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; } ws;
@@ -15431,7 +16472,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     pty_set_winsize(f, ws.ws_row, ws.ws_col);
                     return 0;
                 }
-                if (req == TCGETS) {
+                if (req == TCGETS || req == TCGETS2 ||
+                    (uint32_t)req == (uint32_t)TCGETS2) {
                     struct termios_k {
                         uint32_t c_iflag, c_oflag, c_cflag, c_lflag;
                         uint8_t c_line, c_cc[19];
@@ -15439,27 +16481,29 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     } tio;
                     if (!argp) return ret_err(EFAULT);
                     memset(&tio, 0, sizeof(tio));
-                    tio.c_iflag = 0x00000100u;
-                    tio.c_oflag = 0x00000001u;
-                    tio.c_cflag = 0x00000CB7u;
-                    tio.c_lflag = pty_get_lflag(f);
-                    {
-                        /* VTIME/VMIN via set path only — defaults ok for isatty */
-                        tio.c_cc[6] = 1;
-                    }
+                    pty_get_termios(f, &tio.c_iflag, &tio.c_oflag, &tio.c_cflag,
+                                    &tio.c_lflag, tio.c_cc, sizeof(tio.c_cc));
                     tio.c_ispeed = 9600;
                     tio.c_ospeed = 9600;
-                    if (copy_to_user_safe(argp, &tio, 32) != 0) return ret_err(EFAULT);
+                    /* 36 bytes = Linux struct termios (flags + c_line + NCCS=19). */
+                    if (copy_to_user_safe(argp, &tio, 36) != 0) return ret_err(EFAULT);
                     return 0;
                 }
-                if (req == TCSETS || req == TCSETSW || req == TCSETSF) {
+                if (req == TCSETS || req == TCSETSW || req == TCSETSF ||
+                    req == TCSETS2 || req == TCSETSW2 || req == TCSETSF2 ||
+                    (uint32_t)req == (uint32_t)TCSETS2) {
                     struct termios_k {
                         uint32_t c_iflag, c_oflag, c_cflag, c_lflag;
                         uint8_t c_line, c_cc[19];
                     } tio;
                     if (!argp) return ret_err(EFAULT);
-                    if (copy_from_user_raw(&tio, argp, 24) != 0) return ret_err(EFAULT);
-                    pty_set_termios(f, tio.c_lflag, tio.c_cc[5], tio.c_cc[6]);
+                    memset(&tio, 0, sizeof(tio));
+                    if (copy_from_user_raw(&tio, argp, 36) != 0 &&
+                        copy_from_user_raw(&tio, argp, 32) != 0 &&
+                        copy_from_user_raw(&tio, argp, 24) != 0)
+                        return ret_err(EFAULT);
+                    pty_set_termios(f, tio.c_iflag, tio.c_oflag, tio.c_cflag,
+                                    tio.c_lflag, tio.c_cc, sizeof(tio.c_cc));
                     if (req == TCSETSF)
                         pty_flush_input(f);
                     return 0;
@@ -15502,14 +16546,24 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (req == TIOCSCTTY) {
                     int sid = cur && cur->process ? cur->process->sid : (cur ? cur->sid : -1);
                     int pgid = cur && cur->process ? (int)cur->process->pgid : (cur ? cur->pgid : -1);
+                    int idx = pty_get_index(f);
                     if (sid > 0)
                         pty_set_controlling_sid(f, sid);
                     if (pgid > 0)
                         (void)pty_set_fg_pgrp(f, pgid);
+                    if (cur && idx >= 0) {
+                        cur->attached_pty = idx;
+                        cur->attached_tty = -1;
+                    }
                     return 0;
                 }
                 if (req == TIOCNOTTY) {
-                    pty_set_controlling_sid(f, -1);
+                    int idx = pty_get_index(f);
+                    int pid = cur && cur->process ? (int)cur->process->pid : (cur ? (int)cur->tid : -1);
+                    if (cur && idx >= 0 && cur->attached_pty == idx)
+                        cur->attached_pty = -1;
+                    if (cur && cur->sid == pid)
+                        pty_set_controlling_sid(f, -1);
                     return 0;
                 }
                 if (req == TIOCGSID) {
@@ -15666,24 +16720,51 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return ret_err(ENOTTY);
             }
 
-            /* Block-device ioctls for /dev/sdX,/dev/hdX (needed by mkfs.vfat and friends). */
-            if (req == BLKSSZGET || req == BLKBSZGET || req == BLKGETSIZE || req == BLKGETSIZE64) {
+            /* Block-device ioctls for /dev/sdX,/dev/srX,/dev/nvmeXnY (mkfs/fdisk/partprobe). */
+            if (req == BLKSSZGET || req == BLKBSZGET || req == BLKGETSIZE || req == BLKGETSIZE64 ||
+                req == BLKRRPART || req == BLKFLSBUF || req == HDIO_GETGEO) {
+                int did;
+                uint32_t start_lba = 0, nsec = 0;
+                if (!f->path || devfs_get_block_geom(f->path, &did, &start_lba, &nsec) != 0)
+                    return ret_err(ENOTTY);
+                if (req == BLKRRPART) {
+                    if (disk_reread_partitions(did) != 0)
+                        return ret_err(EINVAL);
+                    return 0;
+                }
+                if (req == BLKFLSBUF)
+                    return 0;
                 if (!argp) return ret_err(EFAULT);
-                if (!f->path || devfs_get_device_id(f->path) < 0) return ret_err(ENOTTY);
-                uint64_t bytes = (uint64_t)f->size;
+                if (req == HDIO_GETGEO) {
+                    struct {
+                        unsigned char heads;
+                        unsigned char sectors;
+                        unsigned short cylinders;
+                        unsigned long start;
+                    } geo;
+                    uint32_t cyl;
+                    memset(&geo, 0, sizeof(geo));
+                    geo.heads = 255;
+                    geo.sectors = 63;
+                    cyl = nsec / (255u * 63u);
+                    geo.cylinders = (unsigned short)(cyl > 65535u ? 65535u : (cyl ? cyl : 1u));
+                    geo.start = (unsigned long)start_lba;
+                    if (copy_to_user_safe(argp, &geo, sizeof(geo)) != 0) return ret_err(EFAULT);
+                    return 0;
+                }
                 if (req == BLKSSZGET || req == BLKBSZGET) {
-                    int v = 512;
+                    int v = devfs_get_logical_block_size(f->path);
                     if (copy_to_user_safe(argp, &v, sizeof(v)) != 0) return ret_err(EFAULT);
                     return 0;
                 }
                 if (req == BLKGETSIZE64) {
-                    uint64_t v = bytes;
+                    uint64_t v = (uint64_t)nsec * 512ull;
                     if (copy_to_user_safe(argp, &v, sizeof(v)) != 0) return ret_err(EFAULT);
                     return 0;
                 }
                 /* BLKGETSIZE -> number of 512-byte sectors (unsigned long on x86_64) */
                 {
-                    uint64_t sectors = bytes / 512u;
+                    unsigned long sectors = (unsigned long)nsec;
                     if (copy_to_user_safe(argp, &sectors, sizeof(sectors)) != 0) return ret_err(EFAULT);
                     return 0;
                 }
@@ -15821,9 +16902,15 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 thread_t *ct = cur;
                 if (ct) {
                     int tty_idx = devfs_get_tty_index_from_file(f);
+                    int pid = ct->process ? (int)ct->process->pid : (int)(ct->tid ? ct->tid : 1);
                     if (tty_idx >= 0 && ct->attached_tty == tty_idx)
                         ct->attached_tty = -1;
-                    if (tty_idx >= 0 && devfs_get_tty_by_index(tty_idx) &&
+                    /* Linux: only the session leader giving up the tty
+                     * clears it for the whole session. Dropbear's child
+                     * calls TIOCNOTTY before setsid(); wiping controlling_sid
+                     * here stole the VGA console from the login shell. */
+                    if (tty_idx >= 0 && ct->sid == pid &&
+                        devfs_get_tty_by_index(tty_idx) &&
                         devfs_get_tty_by_index(tty_idx)->controlling_sid == ct->sid)
                         devfs_get_tty_by_index(tty_idx)->controlling_sid = -1;
                 }
@@ -15849,20 +16936,24 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (!devfs_is_tty_file(f)) return ret_err(ENOTTY);
                 return 0;
             }
-            if (req == TCGETS) {
+            if (req == TCGETS || req == TCGETS2 ||
+                (uint32_t)req == (uint32_t)TCGETS2) {
                 if (!argp) return ret_err(EFAULT);
                 /* isatty(3) is TCGETS success. Lying here for /dev/null made ash
                  * think stdin was interactive, read EOF, exit, and respawn-loop. */
                 if (!devfs_is_tty_file(f)) return ret_err(ENOTTY);
                 struct termios_k tio;
                 memset(&tio, 0, sizeof(tio));
-                tio.c_iflag = 0x00000100u /* ICRNL */;
-                tio.c_oflag = 0x00000001u /* OPOST */;
+                tio.c_iflag = 0x00000100u /* ICRNL */ | 0x00000400u /* IXON */;
+                tio.c_oflag = 0x00000001u /* OPOST */ | 0x00000004u /* ONLCR */;
                 tio.c_cflag = 0x00000CB7u; /* CS8|CREAD|CLOCAL */
                 tio.c_lflag = 0x00000002u /* ICANON */ | 0x00000008u /* ECHO */ | 0x00000001u /* ISIG */;
                 {
                     struct devfs_tty *tty = devfs_get_tty_by_index(devfs_get_tty_index_from_file(f));
                     if (tty) {
+                        tio.c_iflag = tty->term_iflag;
+                        tio.c_oflag = tty->term_oflag;
+                        tio.c_cflag = tty->term_cflag;
                         tio.c_lflag = tty->term_lflag;
                         tio.c_cc[5] = tty->term_vtime;
                         tio.c_cc[6] = tty->term_vmin;
@@ -15870,11 +16961,24 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 tio.c_ispeed = 9600;
                 tio.c_ospeed = 9600;
-                /* Never copy full struct termios to userspace: NCCS differs (BusyBox vs glibc)
-                 * and a 60-byte write clobbers the stack canary -> "stack smashing detected". */
-                size_t safe_sz = 32;
+                /* 36 = kernel termios (flags+c_line+NCCS). 60-byte glibc
+                 * struct would smash BusyBox canaries. */
+                size_t safe_sz = 36;
                 if (safe_sz > sizeof(tio)) safe_sz = sizeof(tio);
                 if (copy_to_user_safe(argp, &tio, safe_sz) != 0) return ret_err(EFAULT);
+                return 0;
+            }
+            if (req == FIONREAD && devfs_is_tty_file(f)) {
+                int tty_idx;
+                int n;
+                uint32_t nb;
+                if (!argp) return ret_err(EFAULT);
+                tty_idx = devfs_get_tty_index_from_file(f);
+                if (tty_idx < 0) return ret_err(ENOTTY);
+                n = devfs_tty_available(tty_idx);
+                if (n < 0) n = 0;
+                nb = (uint32_t)n;
+                if (copy_to_user_safe(argp, &nb, sizeof(nb)) != 0) return ret_err(EFAULT);
                 return 0;
             }
 
@@ -16463,16 +17567,27 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 (void)argp;
                 return 0;
             }
-            if (req == TCSETS || req == TCSETSW || req == TCSETSF) {
+            if (req == TCSETS || req == TCSETSW || req == TCSETSF ||
+                req == TCSETS2 || req == TCSETSW2 || req == TCSETSF2 ||
+                (uint32_t)req == (uint32_t)TCSETS2 ||
+                (uint32_t)req == (uint32_t)TCSETSW2 ||
+                (uint32_t)req == (uint32_t)TCSETSF2) {
                 if (!argp) return ret_err(EFAULT);
                 struct termios_k tio;
-                size_t need = 24; /* through c_cc[6] (VMIN); avoids libc-specific full struct sizes */
-                if (copy_from_user_raw(&tio, argp, need) != 0) return ret_err(EFAULT);
+                memset(&tio, 0, sizeof(tio));
+                /* 36 bytes includes VMIN/VTIME; 24 is enough for flags + VMIN if libc is short. */
+                if (copy_from_user_raw(&tio, argp, 36) != 0 &&
+                    copy_from_user_raw(&tio, argp, 32) != 0 &&
+                    copy_from_user_raw(&tio, argp, 24) != 0)
+                    return ret_err(EFAULT);
                 if (!devfs_is_tty_file(f)) return ret_err(ENOTTY);
                 int tty_idx = devfs_get_tty_index_from_file(f);
                 if (tty_idx < 0) return ret_err(ENOTTY);
                 struct devfs_tty *tty = devfs_get_tty_by_index(tty_idx);
                 if (!tty) return ret_err(ENOTTY);
+                tty->term_iflag = tio.c_iflag;
+                tty->term_oflag = tio.c_oflag;
+                tty->term_cflag = tio.c_cflag;
                 tty->term_lflag = tio.c_lflag;
                 tty->term_vtime = tio.c_cc[5];
                 tty->term_vmin = tio.c_cc[6];
@@ -16500,6 +17615,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             /* Prefer process fd table (CLONE_FILES / CLONE_THREAD). */
             struct fs_file *f = syscall_fd_get(cur, fd);
             if (!f) return ret_err(EBADF);
+            if (cnt == 0) return 0;
+            if (f->type == FS_TYPE_DIR) return ret_err(EISDIR);
             if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
                 ksock_net_t *s = (ksock_net_t *)f->driver_private;
                 ssize_t wr = net_sock_write_userspace(cur, fd, s, bufp, cnt);
@@ -16512,7 +17629,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 size_t copied = 0;
                 void *tmp = copy_from_user_safe(bufp, cnt, PIPE_RW_CHUNK, &copied);
                 if (!tmp) return ret_err(EFAULT);
-                ssize_t wr = pipe_write_bytes(p, tmp, copied, cur);
+                ssize_t wr = pipe_write_bytes(p, tmp, copied, cur, fs_open_nonblock(f));
                 kfree(tmp);
                 /* Linux pipe_write: SIGPIPE + -EPIPE when no bytes written. */
                 if (wr == -EPIPE) {
@@ -16531,6 +17648,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 ssize_t wr = eventfd_write_bytes(e, &v, 8, cur);
                 return (wr >= 0) ? (uint64_t)wr : ret_err((int)-wr);
             }
+            if (f->type == FS_TYPE_SIGNALFD)
+                return ret_err(EINVAL);
             size_t total = 0;
             while (total < cnt) {
                 size_t chunk = cnt - total;
@@ -16604,13 +17723,16 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (!tmp) return (total > 0) ? total : ret_err(ENOMEM);
                     ssize_t rr;
                     if (f->type == FS_TYPE_PIPE && fs_pipe_is_read_end(f) && f->driver_private) {
-                        rr = pipe_read_bytes((pipe_t *)f->driver_private, tmp, chunk, cur);
+                        rr = pipe_read_bytes((pipe_t *)f->driver_private, tmp, chunk, cur,
+                                             fs_open_nonblock(f));
                     } else if (f->type == FS_TYPE_EVENTFD && f->driver_private) {
                         if (chunk < 8) {
                             kfree(tmp);
                             return (total > 0) ? total : ret_err(EINVAL);
                         }
                         rr = eventfd_read_bytes((eventfd_t *)f->driver_private, tmp, 8, cur);
+                    } else if (f->type == FS_TYPE_SIGNALFD && f->driver_private) {
+                        rr = signalfd_read_bytes(cur, f, tmp, chunk);
                     } else {
                         rr = fs_read(f, tmp, chunk, f->pos);
                     }
@@ -16706,7 +17828,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!f) return ret_err(EBADF);
             /* pread on pipes/sockets is invalid (doesn't use/advance file position). */
             if (f->type == SYSCALL_FTYPE_SOCKET || f->type == FS_TYPE_PIPE ||
-                f->type == FS_TYPE_EVENTFD || f->type == FS_TYPE_EPOLL)
+                f->type == FS_TYPE_EVENTFD || f->type == FS_TYPE_EPOLL ||
+                f->type == FS_TYPE_SIGNALFD)
                 return ret_err(ESPIPE);
             if (!bufp || !user_range_ok(bufp, cnt)) return ret_err(EFAULT);
 
@@ -16757,6 +17880,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             struct fs_file *f = cur->fds[fd];
             if (!f) return ret_err(EBADF);
             if (f->type == SYSCALL_FTYPE_SOCKET || f->type == FS_TYPE_PIPE) return ret_err(ESPIPE);
+            if (f->type == FS_TYPE_DIR) return ret_err(EISDIR);
             if (!bufp || !user_range_ok(bufp, cnt)) return ret_err(EFAULT);
 
             uint64_t total = 0;
@@ -16812,7 +17936,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 size_t to_read = cnt < (size_t)PIPE_RW_CHUNK ? cnt : (size_t)PIPE_RW_CHUNK;
                 void *tmp = kmalloc(to_read);
                 if (!tmp) return ret_err(ENOMEM);
-                ssize_t rr = pipe_read_bytes(p, tmp, to_read, cur);
+                ssize_t rr = pipe_read_bytes(p, tmp, to_read, cur, fs_open_nonblock(f));
                 if (rr > 0) {
                     if (copy_to_user_safe(bufp, tmp, (size_t)rr) != 0) { kfree(tmp); return ret_err(EFAULT); }
                 }
@@ -16826,6 +17950,15 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 uint64_t v = 0;
                 ssize_t rr = eventfd_read_bytes(e, &v, 8, cur);
                 if (rr > 0 && copy_to_user_safe(bufp, &v, 8) != 0)
+                    return ret_err(EFAULT);
+                return (rr >= 0) ? (uint64_t)rr : ret_read_err(rr);
+            }
+            if (f->type == FS_TYPE_SIGNALFD && f->driver_private) {
+                uint8_t info[128];
+                ssize_t rr;
+                if (!bufp || !user_range_ok(bufp, cnt)) return ret_err(EFAULT);
+                rr = signalfd_read_bytes(cur, f, info, cnt < 128 ? cnt : 128);
+                if (rr > 0 && copy_to_user_safe(bufp, info, (size_t)rr) != 0)
                     return ret_err(EFAULT);
                 return (rr >= 0) ? (uint64_t)rr : ret_read_err(rr);
             }
@@ -17002,7 +18135,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     /* nginx body: sendfile(socket, file). fs_write() cannot TX TCP. */
                     wr = net_sock_write_kbuf(outs, tmp, (size_t)rr);
                 } else if (out_is_pipe) {
-                    wr = pipe_write_bytes((pipe_t *)fout->driver_private, tmp, (size_t)rr, cur);
+                    wr = pipe_write_bytes((pipe_t *)fout->driver_private, tmp, (size_t)rr, cur,
+                                          fs_open_nonblock(fout));
                 } else {
                     wr = fs_write(fout, tmp, (size_t)rr, fout->pos);
                 }
@@ -17042,7 +18176,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             thread_t *poll_thr = cur;
             int is_udhcpc_proc = (poll_thr && poll_thr->name[0] && strstr(poll_thr->name, "udhcpc")) ? 1 : 0;
             if (num == 271) {
-                /* Minimal ppoll: ignore sigmask/sigsetsize, translate timespec->ms for poll(). */
+                /* ppoll: timespec timeout; apply sigmask like Linux set_user_sigmask. */
                 const void *tmo_u = (const void*)(uintptr_t)a3;
                 timeout = -1; /* NULL timeout => infinite */
                 if (tmo_u) {
@@ -17054,7 +18188,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (ms > 0x7FFFFFFFULL) ms = 0x7FFFFFFFULL;
                     timeout = (int)ms;
                 }
-                /* Do NOT cap infinite poll for wget/git — that truncated HTTPS bodies. */
+                {
+                    int sm = sigwait_begin_set(poll_thr, (const void *)(uintptr_t)a4, (size_t)a5);
+                    if (sm < 0)
+                        return ret_err(-sm);
+                }
             } else {
                 timeout = (int)a3; /* milliseconds, -1 means infinite */
             }
@@ -17063,16 +18201,25 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             uint64_t poll_t_start = 0;
             int poll_first_entry = 1;
             if (nfds == 0) {
-                /* just wait for timeout */
-                if (timeout <= 0) return 0;
-                if (timeout < 0) {
-                    /* block indefinitely but yield */
-                    for (;;) { thread_sleep(10); }
-                } else {
-                    int waited = 0;
-                    while (waited < timeout) { thread_sleep(10); waited += 10; }
+                /* POSIX: nfds==0 waits for timeout or a signal. timeout==0 is
+                 * non-blocking; timeout<0 waits until interrupted. */
+                if (timeout == 0)
                     return 0;
+                if (timeout < 0) {
+                    for (;;) {
+                        if (thread_has_interrupt_signal(poll_thr))
+                            return ret_err(EINTR);
+                        thread_sleep(10);
+                    }
                 }
+                int waited = 0;
+                while (waited < timeout) {
+                    if (thread_has_interrupt_signal(poll_thr))
+                        return ret_err(EINTR);
+                    thread_sleep(10);
+                    waited += 10;
+                }
+                return 0;
             }
             size_t entry_size = 8; /* struct { int fd; short events; short revents; } */
             size_t bytes = (size_t)nfds * entry_size;
@@ -17129,30 +18276,27 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             int step = 2; /* ms — keep net+tty poll snappy (was 10ms) */
             int cur_tid = poll_thr ? (int)poll_thr->tid : -1;
-            int tty_waiting[16];
-            int n_tty_waiting;
+            poll_in_waiters_t inw;
             if (timeout < 0) {
-                /* block indefinitely: add self as TTY waiter so we wake on keypress.
+                /* block indefinitely: add self as TTY/PTY waiter so we wake on input.
                    When has_net_socket: must use bounded sleep so we periodically poll e1000 and re-check. */
                 for (;;) {
                     if (has_net_socket)
                         net_pump_all_tcp(poll_thr);
                     else
                         e1000_poll();
-                    n_tty_waiting = 0;
+                    poll_in_waiters_clear(&inw);
                     if (cur_tid >= 0) {
-                        for (int i = 0; i < nfds && n_tty_waiting < (int)(sizeof(tty_waiting)/sizeof(tty_waiting[0])); i++) {
+                        for (int i = 0; i < nfds; i++) {
                             int fd = *(int*)((uint8_t*)kbuf + i * entry_size + 0);
                             short events = *(short*)((uint8_t*)kbuf + i * entry_size + 4);
                             if (fd < 0 || fd >= THREAD_MAX_FD || !(events & POLLIN_K)) continue;
                             struct fs_file *f = syscall_fd_get(poll_thr, fd);
-                            if (!f || !devfs_is_tty_file(f)) continue;
-                            int tidx = devfs_get_tty_index_from_file(f);
-                            if (tidx < 0) tidx = devfs_get_active();
-                            if (devfs_tty_add_waiter(tidx, cur_tid) == 0) tty_waiting[n_tty_waiting++] = tidx;
+                            if (f)
+                                poll_in_waiters_add_file(&inw, f, cur_tid);
                         }
                     }
-                    if (n_tty_waiting > 0 && !has_net_socket) {
+                    if (poll_in_waiters_any(&inw) && !has_net_socket) {
                         /*
                          * A tty waiter is event driven.  Never reuse the
                          * process interval timer as a redraw/poll timeout:
@@ -17163,35 +18307,33 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                          */
                         thread_block(cur_tid);
                         thread_yield(); /* must yield so keyboard ISR can run and unblock */
-                        for (int w = 0; w < n_tty_waiting; w++) devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
+                        poll_in_waiters_remove(&inw, cur_tid);
                         goto auto_check;
                     }
-                    if (n_tty_waiting > 0 && has_net_socket) {
+                    if (poll_in_waiters_any(&inw) && has_net_socket) {
                         thread_block_with_timeout(cur_tid, (uint32_t)step);
                         thread_yield();
-                        for (int w = 0; w < n_tty_waiting; w++) devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
+                        poll_in_waiters_remove(&inw, cur_tid);
                         goto auto_check;
                     }
                     thread_sleep(step);
                     goto auto_check;
                 }
             } else {
-                /* timeout > 0: use TTY waiters + block_with_timeout to wake on keypress
+                /* timeout > 0: use TTY/PTY waiters + block_with_timeout to wake on keypress
                    (Escape) immediately instead of sleeping full timeout */
-                n_tty_waiting = 0;
+                poll_in_waiters_clear(&inw);
                 if (cur_tid >= 0) {
-                    for (int i = 0; i < nfds && n_tty_waiting < (int)(sizeof(tty_waiting)/sizeof(tty_waiting[0])); i++) {
+                    for (int i = 0; i < nfds; i++) {
                         int fd = *(int*)((uint8_t*)kbuf + i * entry_size + 0);
                         short events = *(short*)((uint8_t*)kbuf + i * entry_size + 4);
                         if (fd < 0 || fd >= THREAD_MAX_FD || !(events & POLLIN_K)) continue;
                         struct fs_file *f = syscall_fd_get(poll_thr, fd);
-                        if (!f || !devfs_is_tty_file(f)) continue;
-                        int tidx = devfs_get_tty_index_from_file(f);
-                        if (tidx < 0) tidx = devfs_get_active();
-                        if (devfs_tty_add_waiter(tidx, cur_tid) == 0) tty_waiting[n_tty_waiting++] = tidx;
+                        if (f)
+                            poll_in_waiters_add_file(&inw, f, cur_tid);
                     }
                 }
-                if (n_tty_waiting > 0) {
+                if (poll_in_waiters_any(&inw)) {
                     int remain = timeout - elapsed;
                     if (remain > 0) {
                         uint64_t t0 = pit_get_time_ms();
@@ -17199,13 +18341,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         thread_yield(); /* must yield so keyboard ISR can run and unblock */
                         elapsed += (int)(pit_get_time_ms() - t0);
                         if (elapsed >= timeout) {
-                            for (int w = 0; w < n_tty_waiting; w++) devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
+                            poll_in_waiters_remove(&inw, cur_tid);
                             if (copy_to_user_safe((void*)ufds, kbuf, bytes) != 0) { kfree(kbuf); return ret_err(EFAULT); }
                             kfree(kbuf);
                             return 0; /* timeout expired */
                         }
                     }
-                    for (int w = 0; w < n_tty_waiting; w++) devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
+                    poll_in_waiters_remove(&inw, cur_tid);
                     goto auto_check;
                 }
                 int step_ms = has_net_socket ? 10 : 2;
@@ -17265,6 +18407,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!path) return ret_err(ENOMEM);
             /* path is a heap buffer; sizeof(path) would be sizeof(char*) (8) and truncate paths */
             resolve_user_path(cur, path_u, path, 256);
+            if (path_is_dev_tty(path) && !thread_has_ctty(cur)) {
+                kfree(path);
+                return ret_err(ENXIO);
+            }
             if (strcmp(path, "/etc/inittab") == 0) {
                 struct stat st;
                 if (vfs_stat(path, &st) == 0 && st.st_size == 0) {
@@ -17351,6 +18497,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             char path[4096];
             int rc = resolve_user_path_at(cur, dirfd, path_u, path, sizeof(path));
             if (rc != 0) return ret_err(-rc);
+            if (path_is_dev_tty(path) && !thread_has_ctty(cur))
+                return ret_err(ENXIO);
             if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(path))
                 pid1_dl_log_stat("openat-req", path);
             {
@@ -17374,9 +18522,35 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             const int O_CREAT_MASK = 0x40;
             const int O_EXCL_MASK  = 0x80;
+            /* Linux x86_64: O_TMPFILE = __O_TMPFILE|O_DIRECTORY = 0x410000.
+             * open(dir, O_TMPFILE) must create an anonymous file in dir — not
+             * return the directory itself (write() on a dir became EIO). */
+            const int O_TMPFILE_BIT = 0x400000;
+
+            struct fs_file *f = NULL;
+            if (flags & O_TMPFILE_BIT) {
+                struct fs_file *dir = fs_open(path);
+                static uint32_t otmp_seq;
+                char tmpname[512];
+                uint32_t seq;
+                if (!dir || dir->type != FS_TYPE_DIR) {
+                    if (dir) fs_file_free(dir);
+                    return ret_err(dir ? ENOTDIR : ENOENT);
+                }
+                fs_file_free(dir);
+                seq = ++otmp_seq;
+                snprintf(tmpname, sizeof(tmpname), "%s/.otmp-%u-%u",
+                         path, cur ? (unsigned)cur->tid : 0u, (unsigned)seq);
+                f = fs_create_file(tmpname);
+                if (!f)
+                    return ret_err(ENOENT);
+                (void)fs_unlink(tmpname);
+                created = 1;
+            }
 
             /* POSIX: O_CREAT|O_EXCL must fail if file already exists. */
-            struct fs_file *f = fs_open(path);
+            if (!f)
+                f = fs_open(path);
             if (!f) {
                 /* chvt: "console"->/console, "tty"->/tty, "tty0"->/tty0, "vc/0"->/dev/vc/0 (handled by devfs) */
                 if (strcmp(path, "/console") == 0) f = fs_open("/dev/console");
@@ -17595,6 +18769,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             r->fs_private = PIPE_END_READ;
             w->fs_private = PIPE_END_WRITE;
             r->refcount = w->refcount = 1;
+            /* pipe2 O_NONBLOCK is octal 04000 == Linux x86_64 O_NONBLOCK 0x800. */
+            r->flags = w->flags = (flags & O_NONBLOCK) ? O_NONBLOCK_LINUX : 0;
 
             int fd0 = thread_fd_alloc(r);
             int fd1 = thread_fd_alloc(w);
@@ -17665,6 +18841,71 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 cur->process->fd_cloexec[fd] = 1;
             return (uint64_t)fd;
         }
+        case SYS_signalfd:
+        case SYS_signalfd4: {
+            /* int signalfd(int fd, const sigset_t *mask, int flags)
+             * syscall: fd, mask, sigsetsize [, flags] */
+            int ufd = (int)a1;
+            const void *mask_u = (const void *)(uintptr_t)a2;
+            size_t setsize = (size_t)a3;
+            int flags = (num == SYS_signalfd4) ? (int)a4 : 0;
+            uint64_t mask = 0;
+            if (flags & ~(SFD_CLOEXEC_K | SFD_NONBLOCK_K))
+                return ret_err(EINVAL);
+            if (setsize < 8)
+                return ret_err(EINVAL);
+            if (!mask_u || !user_range_ok(mask_u, 8))
+                return ret_err(EFAULT);
+            if (copy_from_user_raw(&mask, mask_u, 8) != 0)
+                return ret_err(EFAULT);
+            if (ufd >= 0) {
+                struct fs_file *ef = syscall_fd_get(cur, ufd);
+                signalfd_t *es;
+                if (!ef || ef->type != FS_TYPE_SIGNALFD || !ef->driver_private)
+                    return ret_err(EBADF);
+                es = (signalfd_t *)ef->driver_private;
+                es->mask = mask;
+                if (flags & SFD_NONBLOCK_K)
+                    ef->flags |= O_NONBLOCK_LINUX;
+                if (cur->process && (flags & SFD_CLOEXEC_K))
+                    cur->process->fd_cloexec[ufd] = 1;
+                return (uint64_t)(unsigned)ufd;
+            }
+            if (ufd != -1)
+                return ret_err(EBADF);
+            {
+                signalfd_t *s = (signalfd_t *)kmalloc(sizeof(*s));
+                struct fs_file *f = (struct fs_file *)kmalloc(sizeof(*f));
+                char *path = (char *)kmalloc(24);
+                int fd;
+                if (!s || !f || !path) {
+                    if (s) kfree(s);
+                    if (f) kfree(f);
+                    if (path) kfree(path);
+                    return ret_err(ENOMEM);
+                }
+                memset(s, 0, sizeof(*s));
+                memset(f, 0, sizeof(*f));
+                s->mask = mask;
+                snprintf(path, 24, "anon_inode:[signalfd]");
+                f->path = path;
+                f->type = FS_TYPE_SIGNALFD;
+                f->driver_private = s;
+                f->refcount = 1;
+                if (flags & SFD_NONBLOCK_K)
+                    f->flags |= O_NONBLOCK_LINUX;
+                fd = thread_fd_alloc(f);
+                if (fd < 0) {
+                    kfree(s);
+                    kfree(path);
+                    kfree(f);
+                    return ret_err(EMFILE);
+                }
+                if (cur->process && (flags & SFD_CLOEXEC_K))
+                    cur->process->fd_cloexec[fd] = 1;
+                return (uint64_t)(unsigned)fd;
+            }
+        }
         case SYS_close: {
             int fd = (int)a1;
             boot_io_log(cur, "close", fd, 0);
@@ -17678,6 +18919,31 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
             int r = thread_fd_close(fd);
             return (r == 0) ? 0ULL : ret_err(EBADF);
+        }
+        case 436: { /* close_range(first, last, flags) — glibc posix_spawn / apt */
+            unsigned first = (unsigned)a1;
+            unsigned last = (unsigned)a2;
+            unsigned flags = (unsigned)a3;
+            enum { CLOSE_RANGE_UNSHARE = 2u, CLOSE_RANGE_CLOEXEC = 4u };
+            if (last < first)
+                return ret_err(EINVAL);
+            if (flags & ~(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC))
+                return ret_err(EINVAL);
+            if (first >= (unsigned)THREAD_MAX_FD)
+                return 0;
+            if (last >= (unsigned)THREAD_MAX_FD)
+                last = (unsigned)THREAD_MAX_FD - 1u;
+            for (unsigned fd = first; fd <= last; fd++) {
+                if (!syscall_fd_get(cur, (int)fd))
+                    continue;
+                if (flags & CLOSE_RANGE_CLOEXEC) {
+                    if (cur->process)
+                        cur->process->fd_cloexec[fd] = 1;
+                    continue;
+                }
+                (void)thread_fd_close((int)fd);
+            }
+            return 0;
         }
         case SYS_stat:
         case SYS_lstat: {
@@ -18085,7 +19351,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             int fd = (int)a1;
             int64_t len64 = (int64_t)a2;
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
-            struct fs_file *f = cur->fds[fd];
+            struct fs_file *f = syscall_fd_get(cur, fd);
             if (!f) return ret_err(EBADF);
             if (f->type == SYSCALL_FTYPE_SOCKET) return ret_err(EINVAL);
             if (len64 < 0) return ret_err(EINVAL);
@@ -18093,6 +19359,35 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (r == 0) return 0;
             if (r < 0) return ret_err(-r);
             return ret_err(EINVAL);
+        }
+        case SYS_fallocate: {
+            /* Linux fallocate(2). glibc/uClibc posix_fallocate → this (mode 0).
+             * Postgres initdb DSM: shm_open + posix_fallocate(fd, 0, size). */
+            int fd = (int)a1;
+            int mode = (int)a2;
+            int64_t offset = (int64_t)a3;
+            int64_t len = (int64_t)a4;
+            if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
+            struct fs_file *f = syscall_fd_get(cur, fd);
+            if (!f) return ret_err(EBADF);
+            if (f->type == SYSCALL_FTYPE_SOCKET || f->type == FS_TYPE_PIPE)
+                return ret_err(ESPIPE);
+            if (f->type == FS_TYPE_DIR) return ret_err(EISDIR);
+            if (offset < 0 || len <= 0) return ret_err(EINVAL);
+            if (mode != 0) return ret_err(EOPNOTSUPP);
+            if ((uint64_t)offset + (uint64_t)len < (uint64_t)offset)
+                return ret_err(EINVAL);
+            {
+                uint64_t end = (uint64_t)offset + (uint64_t)len;
+                if (end > (uint64_t)0x7fffffffffffffffULL)
+                    return ret_err(EINVAL);
+                if ((uint64_t)f->size >= end)
+                    return 0;
+                int r = vfs_ftruncate(f, (off_t)end);
+                if (r == 0) return 0;
+                if (r < 0) return ret_err(-r);
+                return ret_err(EINVAL);
+            }
         }
         case SYS_getdents: /* historic getdents syscall (78) */
         case SYS_getdents64: {
@@ -18104,7 +19399,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!dirp_u) return ret_err(EFAULT);
             if (count < 32) return ret_err(EINVAL);
             if ((uintptr_t)dirp_u + count > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            struct fs_file *f = cur->fds[fd];
+            struct fs_file *f = syscall_fd_get(cur, fd);
             if (!f) return ret_err(EBADF);
             if (f->type != FS_TYPE_DIR) return ret_err(EINVAL);
 
@@ -18390,7 +19685,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (old_fs >= 0x200000ULL && old_fs + 0x30 < (uint64_t)MMIO_IDENTITY_LIMIT) {
                     (void)copy_from_user_raw(&old_guard, (const void *)(uintptr_t)(old_fs + 0x28), sizeof(old_guard));
                 } else {
-                    old_guard = 0x8b13f00d2a11c000ULL;
+                    old_guard = 0;
                 }
 
                 cur->user_fs_base = addr;
@@ -18422,14 +19717,18 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
 
                 /*
-                 * Always install old fs:0x28 into the new TCB. Frames entered
-                 * before SET_FS still compare against the old canary; keeping a
-                 * different glibc-written value here → "*** stack smashing ***"
-                 * in mountinfo/fstabinfo right after TLS setup.
+                 * Linux SET_FS only updates the FS base. Copy the old canary
+                 * only when the new TCB has none — never clobber ld.so's
+                 * AT_RANDOM value already stored at fs:0x28.
                  */
-                if (addr + 0x30 <= (uint64_t)USER_STACK_TOP)
-                    (void)copy_to_user_safe((void *)(uintptr_t)(addr + 0x28),
-                        &old_guard, sizeof(old_guard));
+                if (addr + 0x30 <= (uint64_t)USER_STACK_TOP) {
+                    uint64_t existing = 0;
+                    (void)copy_from_user_raw(&existing,
+                        (const void *)(uintptr_t)(addr + 0x28), sizeof(existing));
+                    if (existing == 0 && old_guard != 0)
+                        (void)copy_to_user_safe((void *)(uintptr_t)(addr + 0x28),
+                            &old_guard, sizeof(old_guard));
+                }
                 init_clear_rtld_errno(cur);
                 /* Log PID1 and early sysinit children (mount) — TLS/brk bugs. */
                 if (is_init_user(cur) ||
@@ -18466,7 +19765,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             const char *tgt_u = (const char*)(uintptr_t)a2;
             const char *type_u = (const char*)(uintptr_t)a3;
             uint64_t mnt_flags = a4;
-            (void)a5;
+            const char *data_u = (const char *)(uintptr_t)a5;
             enum { MS_REMOUNT_LOCAL = 32u };
             if (!tgt_u) return ret_err(EINVAL);
             char *k_tgt_raw = copy_user_cstr(tgt_u, 256);
@@ -18480,7 +19779,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (mnt_flags & MS_REMOUNT_LOCAL) {
                 devel_printf("mount: remount flags=0x%llx target=%s (no-op ok)\n",
                     (unsigned long long)mnt_flags, target);
-                klogprintf("mount-prof: type=remount target=%s total=%lluus rc=0\n",
+                klogprintf_logonly("mount-prof: type=remount target=%s total=%lluus rc=0\n",
                            target,
                            (unsigned long long)(time_monotonic_us() - mount_prof_start));
                 return 0;
@@ -18566,21 +19865,43 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
             } else if (strcmp(k_type, "overlay") == 0 ||
                        strcmp(k_type, "overlayfs") == 0) {
-                struct fs_driver *md = fs_get_mount_driver(target);
-                if (md && md->ops && md->ops->name &&
-                    (strcmp(md->ops->name, "overlay") == 0 ||
-                     strcmp(md->ops->name, "overlayfs") == 0)) {
-                    rc = 0;
-                } else if (strcmp(target, "/") != 0 || !squashfs_is_ready()) {
-                    errno_out = ENODEV;
+                char upper[256];
+                upper[0] = '\0';
+                if (data_u) {
+                    char *k_data = copy_user_cstr(data_u, 512);
+                    if (k_data) {
+                        char raw_up[256];
+                        if (parse_overlay_upperdir(k_data, raw_up, sizeof(raw_up)) == 0) {
+                            resolve_kernel_path(cur, raw_up, upper, sizeof(upper));
+                        }
+                        kfree(k_data);
+                    }
+                }
+                if (upper[0] && overlayfs_set_upperdir(upper) != 0) {
+                    rc = -1;
+                    errno_out = EINVAL;
                 } else {
-                    rc = overlayfs_mount_root();
-                    if (rc != 0)
-                        errno_out = EBUSY;
+                    struct fs_driver *md = fs_get_mount_driver(target);
+                    if (md && md->ops && md->ops->name &&
+                        (strcmp(md->ops->name, "overlay") == 0 ||
+                         strcmp(md->ops->name, "overlayfs") == 0)) {
+                        /* Linux: already overlay on / — rebind upperdir only. */
+                        rc = 0;
+                    } else if (strcmp(target, "/") != 0 || !squashfs_is_ready()) {
+                        errno_out = ENODEV;
+                    } else {
+                        rc = overlayfs_mount_root();
+                        if (rc != 0)
+                            errno_out = EBUSY;
+                    }
                 }
             } else if (strcmp(k_type, "minix") == 0 || strcmp(k_type, "minixfs") == 0 ||
                        strcmp(k_type, "fat32") == 0 || strcmp(k_type, "vfat") == 0 ||
-                       strcmp(k_type, "msdos") == 0 || strcmp(k_type, "auto") == 0) {
+                       strcmp(k_type, "msdos") == 0 || strcmp(k_type, "auto") == 0 ||
+                       strcmp(k_type, "iso9660") == 0 || strcmp(k_type, "isofs") == 0 ||
+                       strcmp(k_type, "cd9660") == 0 || strcmp(k_type, "iso") == 0 ||
+                       strcmp(k_type, "ext2") == 0 || strcmp(k_type, "ext3") == 0 ||
+                       strcmp(k_type, "ext4") == 0) {
                 if (!src_u) { kfree(k_type); return ret_err(EINVAL); }
                 char *k_src_raw = copy_user_cstr(src_u, 256);
                 if (!k_src_raw) { kfree(k_type); return ret_err(EFAULT); }
@@ -18589,8 +19910,12 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 kfree(k_src_raw);
                 if (source[0] == '\0') { kfree(k_type); return ret_err(EINVAL); }
 
-                int dev_id = devfs_get_device_id(source);
-                if (dev_id < 0) { kfree(k_type); return ret_err(ENOENT); }
+                int dev_id = -1;
+                uint32_t start_lba = 0, part_secs = 0;
+                if (devfs_get_block_geom(source, &dev_id, &start_lba, &part_secs) != 0) {
+                    kfree(k_type);
+                    return ret_err(ENOENT);
+                }
 
                 if (thread_has_interrupt_signal(cur)) {
                     kfree(k_type);
@@ -18605,12 +19930,21 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                    strcmp(k_type, "vfat") == 0 ||
                                    strcmp(k_type, "msdos") == 0 ||
                                    strcmp(k_type, "auto") == 0);
+                    int try_iso = (strcmp(k_type, "iso9660") == 0 ||
+                                   strcmp(k_type, "isofs") == 0 ||
+                                   strcmp(k_type, "cd9660") == 0 ||
+                                   strcmp(k_type, "iso") == 0 ||
+                                   strcmp(k_type, "auto") == 0);
+                    int try_ext2 = (strcmp(k_type, "ext2") == 0 ||
+                                    strcmp(k_type, "ext3") == 0 ||
+                                    strcmp(k_type, "ext4") == 0 ||
+                                    strcmp(k_type, "auto") == 0);
                     struct fs_driver *drv = NULL;
                     int pr = -1;
 
 #ifdef MINIX_SUPPORT
                     if (try_minix) {
-                        pr = minix_probe_and_mount(dev_id);
+                        pr = minix_probe_and_mount_geom(dev_id, start_lba);
                         if (pr == 0)
                             drv = minix_get_driver();
                         else if (pr == -EINTR || thread_has_interrupt_signal(cur)) {
@@ -18618,7 +19952,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             return ret_err(EINTR);
                         } else if (strcmp(k_type, "auto") != 0) {
                             errno_out = (pr == -EIO) ? EIO : EINVAL;
-                            klogprintf("mount: fail type=%s source=%s target=%s rc=%d\n",
+                            klogprintf_logonly("mount: fail type=%s source=%s target=%s rc=%d\n",
                                        k_type, source, target, pr);
                             kfree(k_type);
                             return ret_err(errno_out);
@@ -18629,15 +19963,15 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 #endif
 #ifdef FAT32_SUPPORT
                     if (!drv && try_fat) {
-                        pr = fat32_probe_and_mount(dev_id);
+                        pr = fat32_probe_and_mount_geom(dev_id, start_lba);
                         if (pr == 0)
                             drv = fat32_get_driver();
                         else if (pr == -EINTR || thread_has_interrupt_signal(cur)) {
                             kfree(k_type);
                             return ret_err(EINTR);
-                        } else if (strcmp(k_type, "auto") != 0 || !try_minix) {
+                        } else if (strcmp(k_type, "auto") != 0) {
                             errno_out = (pr == -EIO) ? EIO : EINVAL;
-                            klogprintf("mount: fail type=%s source=%s target=%s rc=%d\n",
+                            klogprintf_logonly("mount: fail type=%s source=%s target=%s rc=%d\n",
                                        k_type, source, target, pr);
                             kfree(k_type);
                             return ret_err(errno_out);
@@ -18646,9 +19980,41 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 #else
                     (void)try_fat;
 #endif
+#ifdef ISO9660_SUPPORT
+                    if (!drv && try_iso) {
+                        pr = isofs_probe_and_mount(dev_id, start_lba, part_secs);
+                        if (pr == 0)
+                            drv = isofs_get_driver();
+                        else if (strcmp(k_type, "auto") != 0) {
+                            errno_out = EINVAL;
+                            klogprintf_logonly("mount: fail type=%s source=%s target=%s rc=%d\n",
+                                       k_type, source, target, pr);
+                            kfree(k_type);
+                            return ret_err(errno_out);
+                        }
+                    }
+#else
+                    (void)try_iso;
+#endif
+#ifdef EXT2_SUPPORT
+                    if (!drv && try_ext2) {
+                        pr = ext2_probe_and_mount_geom(dev_id, start_lba, part_secs);
+                        if (pr == 0)
+                            drv = ext2_get_driver();
+                        else if (strcmp(k_type, "auto") != 0) {
+                            errno_out = EINVAL;
+                            klogprintf_logonly("mount: fail type=%s source=%s target=%s rc=%d\n",
+                                       k_type, source, target, pr);
+                            kfree(k_type);
+                            return ret_err(errno_out);
+                        }
+                    }
+#else
+                    (void)try_ext2;
+#endif
                     if (!drv) {
                         errno_out = EINVAL;
-                        klogprintf("mount: fail type=%s source=%s target=%s rc=%d\n",
+                        klogprintf_logonly("mount: fail type=%s source=%s target=%s rc=%d\n",
                                    k_type, source, target, pr);
                         kfree(k_type);
                         return ret_err(errno_out);
@@ -18661,23 +20027,18 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     rc = fs_mount(target, drv);
                     if (rc != 0) errno_out = EBUSY;
                 }
-            } else if (strcmp(k_type, "ext2") == 0 || strcmp(k_type, "ext3") == 0 ||
-                       strcmp(k_type, "ext4") == 0) {
-                /* No on-disk ext* yet (memory images only) — fail fast, no I/O. */
-                rc = -1;
-                errno_out = ENODEV;
             } else {
                 rc = -1;
                 errno_out = EINVAL;
             }
 
             if (rc != 0)
-                kprintf("mount: fail type=%s target=%s errno=%d\n",
+                klogprintf_logonly("mount: fail type=%s target=%s errno=%d\n",
                         k_type, target, errno_out);
             {
                 static int mount_profile_left = 64;
                 if (mount_profile_left-- > 0)
-                    klogprintf("mount-prof: type=%s target=%s total=%lluus rc=%d\n",
+                    klogprintf_logonly("mount-prof: type=%s target=%s total=%lluus rc=%d\n",
                                k_type, target,
                                (unsigned long long)(time_monotonic_us() - mount_prof_start),
                                rc == 0 ? 0 : -errno_out);
@@ -18720,6 +20081,12 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     fat32_unmount_cleanup();
                 } else if (strcmp(drv->ops->name, "minix") == 0) {
                     minix_unmount_cleanup();
+                } else if (strcmp(drv->ops->name, "iso9660") == 0 ||
+                           strcmp(drv->ops->name, "isofs") == 0) {
+                    isofs_unmount_cleanup();
+                } else if (strcmp(drv->ops->name, "ext2") == 0 ||
+                           strcmp(drv->ops->name, "ext3") == 0) {
+                    ext2_unmount_cleanup();
                 }
             }
             return 0;
@@ -19002,6 +20369,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         }
         case SYS_munmap:
             return user_syscall_munmap(a1, a2);
+        case SYS_mremap:
+            return user_syscall_mremap(cur, a1, a2, a3, a4, a5);
+        case SYS_msync:
+            return user_syscall_msync(cur, a1, a2, a3);
         case SYS_mincore: {
             /*
              * mincore(addr, length, vec) — Linux x86_64 #27.
@@ -19166,8 +20537,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     for (;;)
                         asm volatile("sti; hlt" ::: "memory");
                 }
-                int ignore_sigchld = (user_sig_actions[SIGCHLD].handler == SIG_IGN) ||
-                    ((user_sig_actions[SIGCHLD].flags & SA_NOCLDWAIT) != 0);
+                int ignore_sigchld = sigchld_nocldwait(cur);
+                process_t *exiting_proc = cur->process;
                 int code = (int)a1;
                 cur->exit_status = (code & 0xFF) << 8;
                 process_mark_zombie(cur->process, cur->exit_status);
@@ -19214,10 +20585,12 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 /* Mark zombie BEFORE waking wait4/vfork waiters: thread_schedule() below
                    may run the parent while this thread is still in SYS_exit. */
                 cur->state = THREAD_TERMINATED;
-                if (ignore_sigchld) {
-                    /* No zombie: allow scheduler to free this slot. */
-                    cur->exit_status = 0x80000000;
-                }
+                /* Keep a waitable zombie while the parent is alive. wget often
+                 * exits during vfork-unfreeze before opkg reaches waitpid;
+                 * IGN/NOCLDWAIT drop made xsystem ECHILD. */
+                if (ignore_sigchld && cur->waiter_tid < 0 &&
+                    !thread_wait_parent_alive(cur))
+                    wait_drop_ignored_child(cur);
                 if (is_watch_proc(cur)) {
                     qemu_debug_printf("exit: tid=%llu name=%s exit_status=0x%x waiter_tid=%d parent_tid=%d\n",
                         (unsigned long long)(cur->tid ? cur->tid : 1),
@@ -19240,26 +20613,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     thread_set_current_user(NULL);
                 /* Wake vfork parent only after TERMINATED + mm teardown. Waking at the
                  * start of exit let linuxrc wait4 process_reap while we still ran. */
-                process_release_vfork_parent(cur->process, PROCESS_VFORK_EXIT);
-                if (cur->parent_tid >= 0 && !ignore_sigchld) {
-                    thread_t *pt = thread_get(cur->parent_tid);
-                    if (pt) {
-                        thread_set_pending_signal(pt, SIGCHLD);
-                        thread_unblock((int)(pt->tid ? pt->tid : 1));
-                        if (cur->attached_tty >= 0 && pt->attached_tty == cur->attached_tty) {
-                            devfs_set_tty_fg_pgrp(cur->attached_tty, pt->pgid);
-                        }
-                    }
-                }
-                if (cur->waiter_tid >= 0) {
-                    if (is_watch_proc(cur)) {
-                        qemu_debug_printf("exit: pid=%llu (%s) waking waiter=%d\n",
-                            (unsigned long long)(cur->tid ? cur->tid : 1),
-                            cur->name,
-                            cur->waiter_tid);
-                    }
-                    thread_unblock(cur->waiter_tid);
-                }
+                process_release_vfork_parent(exiting_proc, PROCESS_VFORK_EXIT);
+                if (!ignore_sigchld || cur->waiter_tid >= 0)
+                    wait_wake_parent(cur, !ignore_sigchld);
             }
             /* IMPORTANT:
                If this is a scheduled kernel thread (tid!=0), do not drop into ring0 shell.
@@ -19284,8 +20640,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                               cur && cur->name ? cur->name : "(null)",
                               (unsigned long long)a1);
             if (cur) {
-                int ignore_sigchld = (user_sig_actions[SIGCHLD].handler == SIG_IGN) ||
-                    ((user_sig_actions[SIGCHLD].flags & SA_NOCLDWAIT) != 0);
+                int ignore_sigchld = sigchld_nocldwait(cur);
+                process_t *exiting_proc = cur->process;
                 {
                     devel_printf("exit_group: name=%s code=%d parent=%d\n",
                         cur->name[0] ? cur->name : "?", (int)a1, cur->parent_tid);
@@ -19333,8 +20689,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     }
                 }
                 cur->state = THREAD_TERMINATED;
-                if (ignore_sigchld)
-                    cur->exit_status = 0x80000000;
+                if (ignore_sigchld && cur->waiter_tid < 0 &&
+                    !thread_wait_parent_alive(cur))
+                    wait_drop_ignored_child(cur);
                 if (is_watch_proc(cur)) {
                     qemu_debug_printf("exit_group: tid=%llu name=%s exit_status=0x%x waiter_tid=%d parent_tid=%d\n",
                         (unsigned long long)(cur->tid ? cur->tid : 1),
@@ -19356,19 +20713,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (thread_get_current_user() == cur)
                     thread_set_current_user(NULL);
                 /* After full teardown — see SYS_exit comment. */
-                process_release_vfork_parent(cur->process, PROCESS_VFORK_EXIT);
-                if (cur->parent_tid >= 0 && !ignore_sigchld) {
-                    thread_t *pt = thread_get(cur->parent_tid);
-                    if (pt) {
-                        thread_set_pending_signal(pt, SIGCHLD);
-                        /* Parent may be blocked outside wait4 path (pipe/poll/read). */
-                        thread_unblock((int)(pt->tid ? pt->tid : 1));
-                        if (cur->attached_tty >= 0 && pt->attached_tty == cur->attached_tty) {
-                            devfs_set_tty_fg_pgrp(cur->attached_tty, pt->pgid);
-                        }
-                    }
-                }
-                if (cur->waiter_tid >= 0) thread_unblock(cur->waiter_tid);
+                process_release_vfork_parent(exiting_proc, PROCESS_VFORK_EXIT);
+                if (!ignore_sigchld || cur->waiter_tid >= 0)
+                    wait_wake_parent(cur, !ignore_sigchld);
             }
             thread_t *kcur = thread_current();
             if (kcur && kcur->tid != 0) {
@@ -19530,11 +20877,16 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             return 0;
         }
         case 232: /* epoll_wait */
-        case 281: { /* epoll_pwait — sigmask ignored (same as ppoll) */
+        case 281: { /* epoll_pwait — Linux applies arg5/arg6 via set_user_sigmask */
             int epfd = (int)a1;
             void *events_u = (void *)(uintptr_t)a2;
             int maxevents = (int)a3;
             int timeout = (int)a4;
+            if (num == 281) {
+                int sm = sigwait_begin_set(cur, (const void *)(uintptr_t)a5, (size_t)a6);
+                if (sm < 0)
+                    return ret_err(-sm);
+            }
             kepoll_t *ep = epoll_from_fd(cur, epfd);
             if (!ep) return ret_err(EBADF);
             if (maxevents <= 0 || maxevents > 1024) return ret_err(EINVAL);

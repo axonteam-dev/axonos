@@ -347,6 +347,8 @@ void apic_timer_handler(cpu_registers_t* regs) {
     /* Charge CPU time before any schedule/publish side effects. */
     thread_account_timer_tick(regs && ((regs->cs & 3) == 3));
     process_itimer_tick(pit_get_time_ms());
+    if (smp_sched_cpu_id() == 0)
+        syscall_net_l2_irq_poll();
     /* Safety net for rare deferred CLONE_THREAD wakes; normal fork wakes earlier. */
     int published_fork_child = 0;
     if (regs && ((regs->cs & 3) == 3))

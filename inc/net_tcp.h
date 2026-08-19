@@ -27,7 +27,9 @@ typedef struct {
     int connect_pending; /* nonblocking connect: SYN sent, awaiting SYN-ACK */
     int connect_peer_pkts; /* RX TCP segments from peer during connect (debug) */
     int connect_refused; /* valid RST while connecting: SO_ERROR/errno = ECONNREFUSED */
+    int connect_timed_out; /* poll/select waited past connect_born_ms */
     uint64_t connect_syn_ms; /* last SYN (re)transmit time for nonblocking poll */
+    uint64_t connect_born_ms; /* first SYN; not updated on rexmit */
     int peer_fin;
     int peer_fin_pending; /* FIN seen but rcv_nxt has not reached fin seq yet */
     uint32_t peer_fin_seq; /* seq of FIN (after any payload on that segment) */
@@ -77,6 +79,8 @@ int net_tcp_send(net_tcp_conn_t *c, const net_tcp_ops_t *ops, const uint8_t *dat
 int net_tcp_flush_tx(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t timeout_ms);
 int net_tcp_recv(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t *out, size_t cap, uint32_t timeout_ms);
 int net_tcp_close(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t timeout_ms);
+/* Drop handshake/FIN/RST flags without wiping the 64KiB receive buffer. */
+void net_tcp_reset(net_tcp_conn_t *c);
 int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget);
 /* Tell peer receive window opened after application read() drains rx_buf. */
 int net_tcp_window_update(net_tcp_conn_t *c, const net_tcp_ops_t *ops);

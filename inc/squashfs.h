@@ -25,6 +25,7 @@ int squashfs_mount(const char *path);
 
 /* True if a prepared image is ready. */
 int squashfs_is_ready(void);
+int squashfs_get_image(const void **ptr, size_t *size);
 
 struct fs_driver *squashfs_get_driver(void);
 

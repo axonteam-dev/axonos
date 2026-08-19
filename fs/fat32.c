@@ -64,6 +64,7 @@ struct fat32_mount {
     uint64_t total_sectors;
     uint32_t first_fat_sector;
     uint32_t first_data_sector;
+    uint32_t last_alloc; /* cluster hint; 0 = unused */
 };
 
 struct fat32_file_handle {
@@ -182,6 +183,10 @@ static int fat32_parse_boot(struct fat32_mount *m, uint32_t lba) {
 
 /* Probe on-disk FAT32 and bind g_fat. Always re-reads the device. */
 int fat32_mount_from_device(int device_id) {
+    return fat32_probe_and_mount_geom(device_id, 0);
+}
+
+int fat32_probe_and_mount_geom(int device_id, uint32_t start_lba) {
     if (g_fat) {
         kfree(g_fat);
         g_fat = NULL;
@@ -191,25 +196,24 @@ int fat32_mount_from_device(int device_id) {
     if (!m) return -1;
     memset(m, 0, sizeof(*m));
     m->device_id = device_id;
-    m->partition_lba = 0;
-    klogprintf("fat32: probing device %d at LBA 0\n", device_id);
+    m->partition_lba = start_lba;
+    klogprintf("fat32: probing device %d at LBA %u\n", device_id, start_lba);
 
     uint8_t buf[512];
     {
-        int rr = read_sector(device_id, 0, buf);
+        int rr = disk_read_sectors(device_id, start_lba, buf, 1);
         if (rr != 0) {
             kfree(m);
-            /* Preserve -EINTR from killable block I/O. */
             return (rr < 0) ? rr : -1;
         }
     }
     int kind0 = fat_boot_kind(buf);
     if (kind0 == 32) {
-        int pb = fat32_parse_boot(m, 0);
+        int pb = fat32_parse_boot(m, start_lba);
         if (pb == 0) {
             g_fat = m;
             fat32_driver.driver_data = (void*)g_fat;
-            klogprintf("FAT32: mounted from device %d (LBA 0)\n", device_id);
+            klogprintf("FAT32: mounted from device %d (LBA %u)\n", device_id, start_lba);
             return 0;
         }
         if (pb == -EINTR) {
@@ -217,15 +221,14 @@ int fat32_mount_from_device(int device_id) {
             return pb;
         }
     } else if (kind0 == 16) {
-        /* BusyBox mkfs.vfat often makes FAT16; we only implement FAT32 I/O. */
-        klogprintf("fat32: device %d is FAT12/16 at LBA 0 (need FAT32 / mkfs.vfat -F 32)\n",
-                   device_id);
+        klogprintf("fat32: device %d LBA %u is FAT12/16 (need mkfs.vfat -F 32)\n",
+                   device_id, start_lba);
         kfree(m);
         return -1;
     }
 
-    /* Only scan MBR partitions when LBA0 is not a FAT volume boot record. */
-    if (kind0 != 0 || buf[510] != 0x55 || buf[511] != 0xAA) {
+    /* Whole-disk: scan MBR only when we started at LBA 0. */
+    if (start_lba != 0 || kind0 != 0 || buf[510] != 0x55 || buf[511] != 0xAA) {
         kfree(m);
         return -1;
     }
@@ -233,11 +236,11 @@ int fat32_mount_from_device(int device_id) {
     for (int i = 0; i < 4; i++) {
         uint8_t *pe = buf + 446 + i * 16;
         uint8_t part_type = pe[4];
-        uint32_t start_lba = *(uint32_t*)(pe + 8);
+        uint32_t p_start = *(uint32_t*)(pe + 8);
         uint32_t part_sectors = *(uint32_t*)(pe + 12);
-        if (part_type == 0 || start_lba == 0 || part_sectors == 0) continue;
-        if (part_type == 0xCD) continue; /* isohybrid marker */
-        m->partition_lba = start_lba;
+        if (part_type == 0 || p_start == 0 || part_sectors == 0) continue;
+        if (part_type == 0xCD) continue;
+        m->partition_lba = p_start;
         {
             int pb = fat32_parse_boot(m, m->partition_lba);
             if (pb == 0) {
@@ -560,8 +563,14 @@ dir_done:
     return (ssize_t)written;
 }
 
+static int fat32_sync_direntry_meta(struct fs_file *file, uint32_t start_cluster, uint32_t size_bytes);
+
 static void fat32_release(struct fs_file *file) {
     if (!file) return;
+    if (file->driver_private && file->type == FS_TYPE_REG)
+        (void)fat32_sync_direntry_meta(file,
+            ((struct fat32_file_handle *)file->driver_private)->start_cluster,
+            ((struct fat32_file_handle *)file->driver_private)->size);
     if (file->driver_private) kfree(file->driver_private);
     if (file->path) kfree((void*)file->path);
     kfree(file);
@@ -611,14 +620,37 @@ static int fat32_write_fat_entry(struct fat32_mount *m, uint32_t cluster, uint32
     return 0;
 }
 
-/* find free cluster starting from 2 */
+/* find free cluster starting after last_alloc; scan one FAT sector at a time */
 static uint32_t fat32_find_free_cluster(struct fat32_mount *m) {
     uint32_t total_data_sectors = (uint32_t)(m->total_sectors - (m->first_data_sector - m->partition_lba));
     uint32_t total_clusters = total_data_sectors / m->sectors_per_cluster;
+    uint32_t start, c, n;
+    uint8_t sec[512];
+    uint32_t loaded = (uint32_t)-1;
+
     if (total_clusters < 2) return 0;
-    for (uint32_t c = 2; c < total_clusters + 2; c++) {
-        uint32_t v = fat32_read_fat_entry(m, c);
-        if (v == 0) return c;
+    start = (m->last_alloc >= 2) ? (m->last_alloc + 1) : 2;
+    if (start < 2 || start >= total_clusters + 2)
+        start = 2;
+    c = start;
+    for (n = 0; n < total_clusters; n++) {
+        uint32_t fat_offset = c * 4u;
+        uint32_t fat_sector = m->first_fat_sector + (fat_offset / 512u);
+        uint32_t ent_offset = fat_offset % 512u;
+        uint32_t val;
+        if (fat_sector != loaded) {
+            if (read_sector(m->device_id, fat_sector, sec) != 0)
+                return 0;
+            loaded = fat_sector;
+        }
+        val = (*(uint32_t *)(sec + ent_offset)) & 0x0FFFFFFFu;
+        if (val == 0) {
+            m->last_alloc = c;
+            return c;
+        }
+        c++;
+        if (c >= total_clusters + 2)
+            c = 2;
     }
     return 0;
 }
@@ -1415,12 +1447,15 @@ static ssize_t fat32_write(struct fs_file *file, const void *buf_in, size_t size
     size_t written = 0;
     while (remaining > 0) {
         uint32_t lba = cluster_to_lba(m, cluster);
-        /* read cluster into tmp */
-        if (read_sectors(m->device_id, lba, tmp, m->sectors_per_cluster) != 0) { kfree(tmp); return -1; }
         size_t can = bytes_per_cluster - off_in_cluster;
         size_t now = can < remaining ? can : remaining;
+        if (off_in_cluster == 0 && now == bytes_per_cluster)
+            memset(tmp, 0, bytes_per_cluster);
+        else if (read_sectors(m->device_id, lba, tmp, m->sectors_per_cluster) != 0) {
+            kfree(tmp);
+            return -1;
+        }
         memcpy(tmp + off_in_cluster, (const uint8_t*)buf_in + written, now);
-        /* write back */
         if (disk_write_sectors(m->device_id, lba, tmp, m->sectors_per_cluster) != 0) { kfree(tmp); return -1; }
         written += now;
         remaining -= now;
@@ -1428,7 +1463,6 @@ static ssize_t fat32_write(struct fs_file *file, const void *buf_in, size_t size
         if (remaining == 0) break;
         uint32_t nxt = fat32_read_fat_entry(m, cluster);
         if (nxt >= 0x0FFFFFF8) {
-            /* need to allocate one more cluster */
             uint32_t newc = fat32_alloc_clusters(m, 1);
             if (newc == 0) { kfree(tmp); return -1; }
             if (fat32_write_fat_entry(m, cluster, newc) != 0) { kfree(tmp); return -1; }
@@ -1438,10 +1472,11 @@ static ssize_t fat32_write(struct fs_file *file, const void *buf_in, size_t size
         }
     }
     kfree(tmp);
-    /* update file size in directory entry */
     fh->size = endpos > fh->size ? endpos : fh->size;
     file->size = fh->size;
-    (void)fat32_sync_direntry_meta(file, fh->start_cluster, fh->size);
+    /* Directory size is flushed on close; mid-copy every 512KiB so a kill is not empty. */
+    if ((fh->size & 0x7ffffu) < size)
+        (void)fat32_sync_direntry_meta(file, fh->start_cluster, fh->size);
     return (ssize_t)written;
 }
 

@@ -142,6 +142,23 @@ int mm_clear_range_private(mm_t *mm, uint64_t *share_l4, uint64_t va_begin, uint
 int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
                         uint64_t va_begin, uint64_t va_end);
 
+/* Install one 4KiB user leaf. Caller consumed a frame ref as PG_SOFT_OWNED
+ * (frame_release the PA if this returns non-zero). */
+int mm_map_user_page(mm_t *mm, uint64_t va, uint64_t pa, uint64_t flags);
+
+/*
+ * Switch to swapper CR3 for identity VA==PA of RAM/heap/PMM. Userspace munmap
+ * of MAP_SHARED files punches that window in the process tables; touching a
+ * page-cache frame or kmalloc from a #PF without this Oopses and hlt-loops
+ * (postgres --boot / initdb "running bootstrap script").
+ */
+typedef struct mm_direct_map_ctx {
+    uint64_t cr3;
+    unsigned long irqf;
+} mm_dm_ctx_t;
+mm_dm_ctx_t mm_enter_direct_map(void);
+void mm_leave_direct_map(mm_dm_ctx_t ctx);
+
 /* Replace identity leaves (pa==va) with private frames; copy old contents.
  * Prefer mm_privatize_identity_range_blank for user anon (do_brk_flags). */
 int mm_privatize_identity_range(mm_t *mm, uint64_t va_begin, uint64_t va_end);

@@ -161,6 +161,7 @@ void process_attach_thread(process_t *process, thread_t *thread) {
     if (first_attach)
         process->leader = thread;
     thread->process = process;
+    thread->linux_tgid = (int)process->pid;
     process->mm = thread->mm;
     /* Fork sets sid/pgid on the thread after process_create inherited them.
      * Do not clobber inherited process session ids with unset (0) thread fields. */
@@ -240,8 +241,7 @@ process_t *process_find(uint64_t pid) {
         process_t *p = process_table[i];
         if (!p || p->pid != pid)
             continue;
-        /* Prefer a live task with a live leader. Do not mutate state here —
-         * demoting to ZOMBIE during lookup left /sbin/init stuck as Z in htop. */
+        /* Linux kill/waitpid(pid>0): pid is TGID, not a tid slot. */
         if (p->state == PROCESS_ALIVE) {
             if (p->leader && p->leader->state != THREAD_TERMINATED) {
                 result = p;
@@ -260,6 +260,34 @@ process_t *process_find(uint64_t pid) {
     return result;
 }
 
+static int process_wait_spec_match(const process_t *p, int pid, int pgid) {
+    if (!p)
+        return 0;
+    if (pid > 0)
+        return p->pid == (uint64_t)(unsigned)pid;
+    if (pid == -1)
+        return 1;
+    if (pid == 0)
+        return p->pgid == pgid;
+    return p->pgid == -pid;
+}
+
+static void process_relink_child_locked(process_t *parent, process_t *p) {
+    int linked = 0;
+    if (p->parent != parent)
+        p->parent = parent;
+    for (process_t *c = parent->first_child; c; c = c->next_sibling) {
+        if (c == p) {
+            linked = 1;
+            break;
+        }
+    }
+    if (!linked) {
+        p->next_sibling = parent->first_child;
+        parent->first_child = p;
+    }
+}
+
 process_t *process_find_child(process_t *parent, int pid, int pgid,
                               int zombies_only, int *has_match) {
     if (has_match)
@@ -267,62 +295,63 @@ process_t *process_find_child(process_t *parent, int pid, int pgid,
     if (!parent)
         return NULL;
     process_t *result = NULL;
+    int matched = 0;
     unsigned long flags;
     acquire_irqsave(&process_lock, &flags);
+    /* Linux waitpid(pid>0): TGID only. Relink lost sibling/parent pointers so
+     * the real_parent invariant holds; do not match by tid slot. */
     for (process_t *p = parent->first_child; p; p = p->next_sibling) {
-        int match = 0;
-        if (pid > 0)
-            match = p->pid == (uint64_t)(unsigned)pid;
-        else if (pid == -1)
-            match = 1;
-        else if (pid == 0)
-            match = p->pgid == pgid;
-        else
-            match = p->pgid == -pid;
-        if (!match)
+        if (!process_wait_spec_match(p, pid, pgid))
             continue;
-        if (has_match)
-            *has_match = 1;
+        matched = 1;
         if (!zombies_only || p->state == PROCESS_ZOMBIE) {
             result = p;
             break;
         }
     }
-    /* Repair: child may still have parent==us while missing from first_child
-     * (lost sibling link). BusyBox waitfor then gets ECHILD + kill(pid,0)==0. */
-    if (!result || (has_match && !*has_match)) {
+    if (!matched) {
+        /* Repair: child may still have parent==us while missing from first_child. */
         for (int i = 0; i < PROCESS_TABLE_MAX; ++i) {
             process_t *p = process_table[i];
             if (!p || p->parent != parent)
                 continue;
-            int match = 0;
-            if (pid > 0)
-                match = p->pid == (uint64_t)(unsigned)pid;
-            else if (pid == -1)
-                match = 1;
-            else if (pid == 0)
-                match = p->pgid == pgid;
-            else
-                match = p->pgid == -pid;
-            if (!match)
+            if (!process_wait_spec_match(p, pid, pgid))
                 continue;
-            /* Relink into the sibling list if absent. */
-            int linked = 0;
-            for (process_t *c = parent->first_child; c; c = c->next_sibling) {
-                if (c == p) { linked = 1; break; }
-            }
-            if (!linked) {
-                p->next_sibling = parent->first_child;
-                parent->first_child = p;
-            }
-            if (has_match)
-                *has_match = 1;
+            process_relink_child_locked(parent, p);
+            matched = 1;
             if (!result && (!zombies_only || p->state == PROCESS_ZOMBIE))
                 result = p;
-            if (result && (!has_match || *has_match))
+            if (result)
                 break;
         }
     }
+    if (!matched) {
+        /* Restore real_parent when parent_tid names any thread of this process
+         * (fork from a worker, not only the group leader). */
+        for (int i = 0; i < PROCESS_TABLE_MAX; ++i) {
+            process_t *p = process_table[i];
+            thread_t *pt;
+            int cpt;
+            if (!p || p == parent || !p->leader)
+                continue;
+            cpt = p->leader->parent_tid;
+            if (cpt < 0)
+                continue;
+            pt = thread_get(cpt);
+            if (!pt || pt->process != parent)
+                continue;
+            if (!process_wait_spec_match(p, pid, pgid))
+                continue;
+            process_relink_child_locked(parent, p);
+            matched = 1;
+            if (!result && (!zombies_only || p->state == PROCESS_ZOMBIE))
+                result = p;
+            if (result)
+                break;
+        }
+    }
+    if (has_match)
+        *has_match = matched;
     release_irqrestore(&process_lock, flags);
     return result;
 }
@@ -371,6 +400,31 @@ int process_reap(process_t *parent, process_t *child) {
         return -1;
     }
     *link = child->next_sibling;
+    child->parent = NULL;
+    child->next_sibling = NULL;
+    for (int i = 0; i < PROCESS_TABLE_MAX; ++i) {
+        if (process_table[i] == child) {
+            process_table[i] = NULL;
+            break;
+        }
+    }
+    release_irqrestore(&process_lock, flags);
+    kfree(child);
+    return 0;
+}
+
+int process_reap_zombie(process_t *child) {
+    if (!child || child->state != PROCESS_ZOMBIE)
+        return -1;
+    unsigned long flags;
+    acquire_irqsave(&process_lock, &flags);
+    if (child->parent) {
+        process_t **link = &child->parent->first_child;
+        while (*link && *link != child)
+            link = &(*link)->next_sibling;
+        if (*link == child)
+            *link = child->next_sibling;
+    }
     child->parent = NULL;
     child->next_sibling = NULL;
     for (int i = 0; i < PROCESS_TABLE_MAX; ++i) {
@@ -483,14 +537,19 @@ void process_exec_reset(process_t *process, thread_t *thread) {
         if (process->signal_handlers[sig] > 1) {
             process->signal_handlers[sig] = 0;
             process->signal_flags[sig] = 0;
+            process->signal_restorer[sig] = 0;
+            process->signal_masks[sig] = 0;
         }
     }
+    /* POSIX/Linux execve: interval timers are disarmed; the signal mask is kept. */
+    process->itimer_expire_ms = 0;
+    process->itimer_interval_ms = 0;
+    process_posix_timers_flush_pid(process->pid);
     if (thread) {
-        thread->pending_signals = 0;
-        thread->saved_sig_mask = 0;
         thread->robust_list_head = 0;
         thread->robust_list_len = 0;
         thread->clear_child_tid = 0;
+        thread->restore_sigmask = 0;
     }
 }
 
@@ -808,6 +867,18 @@ int process_posix_timer_settime(int32_t timerid, int flags,
         t->expire_ms = now + value_ms;
     release_irqrestore(&g_posix_timer_lock, fl);
     return 0;
+}
+
+void process_posix_timers_flush_pid(uint64_t pid) {
+    unsigned long fl;
+    if (!pid)
+        return;
+    acquire_irqsave(&g_posix_timer_lock, &fl);
+    for (int i = 0; i < AXON_POSIX_TIMER_MAX; i++) {
+        if (g_posix_timers[i].used && g_posix_timers[i].owner_pid == pid)
+            memset(&g_posix_timers[i], 0, sizeof(g_posix_timers[i]));
+    }
+    release_irqrestore(&g_posix_timer_lock, fl);
 }
 
 int process_posix_timer_delete(int32_t timerid) {

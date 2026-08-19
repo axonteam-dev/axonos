@@ -27,9 +27,15 @@ typedef struct {
     uint64_t file_off;
 } user_vma_t;
 
-/* Register a file-backed lazy VMA (retains file). kind: MMAP_LAZY or ELF_LOAD. */
+/* Register a file-backed VMA (retains file). kind: MMAP_LAZY, ELF_LOAD, MMAP, SHM. */
 int user_vma_add_file(uint64_t tid, uintptr_t addr, size_t len, int prot, int kind,
                       struct fs_file *file, uint64_t file_off);
+/* Linux find_vma(addr): first VMA with end > addr. Snapshots and fs_file_get. */
+int user_vma_lookup_after(thread_t *runner, uintptr_t addr,
+    uintptr_t *vm_start, uintptr_t *vm_end, int *kind, int *prot,
+    struct fs_file **file, uint64_t *file_off);
+/* Extend a VMA that starts at addr with length old_len (Linux mremap in-place). */
+int user_vma_grow(thread_t *runner, uintptr_t addr, size_t old_len, size_t new_len);
 
 void user_vma_remove_all_for_tid(uint64_t tid);
 /* Unmap page tables for all VMAs in runner's address space and drop metadata. */
@@ -51,6 +57,8 @@ int user_vma_covers_page(uint64_t tid, uintptr_t va);
  * memcpy identity phys there — those bytes are not the file image.
  */
 int user_vma_is_lazy_file_page(uint64_t tid, uintptr_t va);
+/* Same as above, matching any thread that shares runner's mm (CLONE_THREAD). */
+int user_vma_is_lazy_file_page_for(thread_t *runner, uintptr_t va);
 /*
  * After copy_page_range: punch holes in child for lazy-file pages that were
  * not Soft_OWNED private frames in the parent.  Leaving demoted ~US identity

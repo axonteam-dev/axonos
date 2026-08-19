@@ -15,6 +15,7 @@
 #include <overlayfs.h>
 #include <xattr.h>
 #include <klog.h>
+#include <vga.h>
 
 #ifndef ENOENT
 #define ENOENT 2
@@ -45,27 +46,77 @@ struct overlay_file_handle {
 static struct fs_driver overlay_driver;
 static struct fs_driver_ops overlay_ops;
 static int overlay_active = 0;
+static char g_ov_upperdir[256];
 static void overlay_release(struct fs_file *file);
+
+static int ov_map_upper(const char *path, char *out, size_t cap)
+{
+    if (!path || !out || cap < 2)
+        return -1;
+    if (g_ov_upperdir[0] == 0) {
+        if (strlen(path) >= cap)
+            return -1;
+        strcpy(out, path);
+        return 0;
+    }
+    if (strcmp(path, "/") == 0) {
+        if (strlen(g_ov_upperdir) >= cap)
+            return -1;
+        strcpy(out, g_ov_upperdir);
+        return 0;
+    }
+    if (snprintf(out, cap, "%s%s", g_ov_upperdir, path) >= (int)cap)
+        return -1;
+    return 0;
+}
 
 static struct fs_driver *ov_upper(void)
 {
+    if (g_ov_upperdir[0]) {
+        struct fs_driver *d = fs_get_mount_driver_exact(g_ov_upperdir);
+        if (d && d->ops && d->ops->name &&
+            strcmp(d->ops->name, "overlay") != 0 &&
+            strcmp(d->ops->name, "overlayfs") != 0 &&
+            strcmp(d->ops->name, "squashfs") != 0)
+            return d;
+        return ramfs_get_driver();
+    }
     return ramfs_get_driver();
 }
 
 static int ov_upper_open(const char *path, struct fs_file **out)
 {
     struct fs_driver *u = ov_upper();
+    char mapped[512];
     if (!u || !u->ops || !u->ops->open)
         return -1;
-    return u->ops->open(path, out);
+    if (ov_map_upper(path, mapped, sizeof(mapped)) != 0)
+        return -1;
+    return u->ops->open(mapped, out);
 }
 
 static int ov_upper_create(const char *path, struct fs_file **out)
 {
     struct fs_driver *u = ov_upper();
+    char mapped[512];
     if (!u || !u->ops || !u->ops->create)
         return -1;
-    return u->ops->create(path, out);
+    if (ov_map_upper(path, mapped, sizeof(mapped)) != 0)
+        return -1;
+    return u->ops->create(mapped, out);
+}
+
+static int ov_upper_mkdir(const char *path)
+{
+    struct fs_driver *u = ov_upper();
+    char mapped[512];
+    if (ov_map_upper(path, mapped, sizeof(mapped)) != 0)
+        return -1;
+    if (g_ov_upperdir[0] == 0)
+        return ramfs_mkdir(path);
+    if (!u || !u->ops || !u->ops->mkdir)
+        return fs_mkdir(mapped);
+    return u->ops->mkdir(mapped);
 }
 
 static void ov_release_inner(struct fs_file *inner)
@@ -82,14 +133,22 @@ static void ov_release_inner(struct fs_file *inner)
         squashfs_release_file(inner);
         return;
     }
-    /* Fallback */
-    squashfs_release_file(inner);
+    drv = ov_upper();
+    if (drv && inner->fs_private == drv->driver_data && drv->ops && drv->ops->release) {
+        drv->ops->release(inner);
+        return;
+    }
+    fs_file_free(inner);
 }
 
 static int ov_is_upper_file(struct fs_file *inner)
 {
-    struct fs_driver *u = ov_upper();
-    return u && inner && inner->fs_private == u->driver_data;
+    struct fs_driver *lo = squashfs_get_driver();
+    if (!inner)
+        return 0;
+    if (lo && inner->fs_private == lo->driver_data)
+        return 0;
+    return 1;
 }
 
 /* True if path is a directory on squashfs lower (merged view without upper). */
@@ -141,9 +200,9 @@ static int ov_ensure_parent_upper(const char *path)
         return -1;
 
     /* Materialize lower-only directory into upper (no whiteout). */
-    if (ramfs_path_is_whiteout(tmp))
+    if (ramfs_path_is_whiteout(tmp) && g_ov_upperdir[0] == 0)
         return -1;
-    if (ramfs_mkdir(tmp) == 0)
+    if (ov_upper_mkdir(tmp) == 0)
         return 0;
     /* EEXIST / race: confirm upper dir now. */
     if (ov_upper_open(tmp, &chk) == 0) {
@@ -154,7 +213,7 @@ static int ov_ensure_parent_upper(const char *path)
         return -1;
     }
     /* Parent missing on upper but present on lower — create empty upper dir. */
-    if (ov_lower_is_dir(tmp) && ramfs_mkdir(tmp) == 0)
+    if (ov_lower_is_dir(tmp) && ov_upper_mkdir(tmp) == 0)
         return 0;
     return -1;
 }
@@ -211,7 +270,7 @@ static int ov_copy_up(const char *path)
     if (ramfs_path_is_whiteout(path))
         return -1;
     if (ov_upper_open(path, &upper) == 0) {
-        int ok = (upper->type == FS_TYPE_REG);
+        int ok = (upper->type == FS_TYPE_REG || upper->type == FS_TYPE_DIR);
         ov_release_inner(upper);
         return ok ? 0 : -1;
     }
@@ -236,7 +295,7 @@ static int ov_copy_up(const char *path)
         ov_release_inner(lower);
         if (ov_ensure_parent_upper(path) != 0)
             return -1;
-        return ramfs_mkdir(path) == 0 ? 0 : -1;
+        return ov_upper_mkdir(path) == 0 ? 0 : -1;
     }
     sz = (size_t)st.st_size;
     if (ov_ensure_parent_upper(path) != 0) {
@@ -346,11 +405,14 @@ static int ov_merge_readdir(const char *path, uint8_t **out_blob, size_t *out_le
     (void)ov_append_dirent(&blob, &len, &cap, "..", EXT2_FT_DIR, 1);
 
     if (ov_upper_open(path, &up) == 0 && up->type == FS_TYPE_DIR) {
+        int steps = 0;
         pos = 0;
         for (;;) {
             ssize_t nr = ov_upper()->ops->read(up, tmp, sizeof(tmp), pos);
             size_t off = 0;
             if (nr <= 0)
+                break;
+            if (++steps > 4096)
                 break;
             while (off + 8 <= (size_t)nr) {
                 struct ext2_dir_entry *de = (struct ext2_dir_entry *)(tmp + off);
@@ -384,11 +446,14 @@ static int ov_merge_readdir(const char *path, uint8_t **out_blob, size_t *out_le
     }
 
     if (squashfs_open_path(path, &lo) == 0 && lo->type == FS_TYPE_DIR) {
+        int steps = 0;
         pos = 0;
         for (;;) {
             ssize_t nr = squashfs_read_file(lo, tmp, sizeof(tmp), pos);
             size_t off = 0;
             if (nr <= 0)
+                break;
+            if (++steps > 4096)
                 break;
             while (off + 8 <= (size_t)nr) {
                 struct ext2_dir_entry *de = (struct ext2_dir_entry *)(tmp + off);
@@ -576,10 +641,27 @@ static int overlay_create(const char *path, struct fs_file **out_file)
     struct fs_file *f;
     if (!overlay_active || !path)
         return -1;
-    if (ov_ensure_parent_upper(path) != 0)
+    /* Linux overlay: creat/open(O_CREAT) after unlink replaces the whiteout. */
+    if (ramfs_path_is_whiteout(path)) {
+        if (ramfs_remove(path) != 0)
+            return -1;
+    }
+    if (ov_ensure_parent_upper(path) != 0) {
+        static int create_parent_warn = 8;
+        if (create_parent_warn > 0) {
+            create_parent_warn--;
+            kprintf("overlay: create parent failed path=%s\n", path);
+        }
         return -2;
-    if (ov_upper_create(path, &inner) != 0)
+    }
+    if (ov_upper_create(path, &inner) != 0) {
+        static int create_upper_warn = 8;
+        if (create_upper_warn > 0) {
+            create_upper_warn--;
+            kprintf("overlay: create upper failed path=%s\n", path);
+        }
         return -2;
+    }
     f = ov_wrap(path, inner, OV_LAYER_UPPER);
     if (!f) {
         ov_release_inner(inner);
@@ -614,7 +696,7 @@ static int overlay_mkdir(const char *path)
     }
     if (ov_ensure_parent_upper(path) != 0)
         return -2; /* ENOENT — parent missing in merged view */
-    r = ramfs_mkdir(path);
+    r = ov_upper_mkdir(path);
     if (r == -4)
         return -4; /* EEXIST */
     if (r == -2)
@@ -684,8 +766,15 @@ static ssize_t overlay_write(struct fs_file *file, const void *buf, size_t size,
     fh = (struct overlay_file_handle *)file->driver_private;
     if (fh->layer == OV_LAYER_MERGED_DIR)
         return -1;
-    if (overlay_promote_for_write(file) != 0)
+    if (overlay_promote_for_write(file) != 0) {
+        static int promote_warn = 8;
+        if (promote_warn > 0) {
+            promote_warn--;
+            kprintf("overlay: write promote failed path=%s\n",
+                    file->path ? file->path : "?");
+        }
         return -1;
+    }
     fh = (struct overlay_file_handle *)file->driver_private;
     nw = ov_upper()->ops->write(fh->inner, buf, size, offset);
     if (nw >= 0 && fh->inner) {
@@ -919,17 +1008,35 @@ int overlayfs_fill_stat(struct fs_file *file, struct stat *st)
         return -1;
     fh = (struct overlay_file_handle *)file->driver_private;
     if (fh->layer == OV_LAYER_MERGED_DIR) {
+        /*
+         * overlay_open drops the upper/lower dir inodes and only keeps a
+         * merged readdir blob. Linux getattr still uses the upper directory
+         * inode when it exists (else lower). Hardcoding uid 0 / mode 0755
+         * made initdb see "data directory has wrong ownership".
+         */
+        struct fs_file *up = NULL;
+        struct fs_file *lo = NULL;
+        int got = -1;
         memset(st, 0, sizeof(*st));
-        st->st_mode = S_IFDIR | 0755;
-        st->st_nlink = 2;
-        st->st_size = (off_t)fh->dir_blob_len;
+        if (file->path && ov_upper_open(file->path, &up) == 0) {
+            got = vfs_fstat(up, st);
+            ov_release_inner(up);
+        } else if (file->path && squashfs_open_path(file->path, &lo) == 0) {
+            got = squashfs_fill_stat(lo, st);
+            ov_release_inner(lo);
+        }
+        if (got != 0) {
+            st->st_mode = S_IFDIR | 0755;
+            st->st_nlink = 2;
+            st->st_size = (off_t)fh->dir_blob_len;
+        }
         st->st_dev = 1;
         return 0;
     }
     if (!fh->inner)
         return -1;
     if (fh->layer == OV_LAYER_UPPER)
-        rc = ramfs_fill_stat(fh->inner, st);
+        rc = vfs_fstat(fh->inner, st);
     else
         rc = squashfs_fill_stat(fh->inner, st);
     /*
@@ -974,7 +1081,7 @@ int overlayfs_ftruncate(struct fs_file *file, off_t length)
     if (!fh || !fh->inner)
         return -30;
     {
-        int trc = ramfs_ftruncate(fh->inner, length);
+        int trc = vfs_ftruncate(fh->inner, length);
         if (trc == 0) {
             file->size = fh->inner->size;
             file->backing_id = fh->inner->backing_id;
@@ -999,6 +1106,39 @@ int overlayfs_mount_root(void)
         return -1;
     }
     klogprintf("overlayfs: root mounted (upper=ramfs, lower=squashfs)\n");
+    return 0;
+}
+
+int overlayfs_set_upperdir(const char *path)
+{
+    if (!path || path[0] == 0) {
+        g_ov_upperdir[0] = 0;
+        klogprintf("overlayfs: upperdir=ramfs\n");
+        return 0;
+    }
+    if (path[0] != '/' || strlen(path) >= sizeof(g_ov_upperdir))
+        return -1;
+    {
+        struct fs_driver *d = fs_get_mount_driver_exact(path);
+        if (!d || !d->ops || !d->ops->name)
+            return -1;
+        if (strcmp(d->ops->name, "overlay") == 0 ||
+            strcmp(d->ops->name, "overlayfs") == 0 ||
+            strcmp(d->ops->name, "squashfs") == 0 ||
+            strcmp(d->ops->name, "iso9660") == 0 ||
+            strcmp(d->ops->name, "isofs") == 0)
+            return -1;
+        if (!d->ops->create || !d->ops->write)
+            return -1;
+    }
+    strncpy(g_ov_upperdir, path, sizeof(g_ov_upperdir) - 1);
+    g_ov_upperdir[sizeof(g_ov_upperdir) - 1] = 0;
+    {
+        size_t n = strlen(g_ov_upperdir);
+        while (n > 1 && g_ov_upperdir[n - 1] == '/')
+            g_ov_upperdir[--n] = 0;
+    }
+    klogprintf("overlayfs: upperdir=%s\n", g_ov_upperdir);
     return 0;
 }
 

@@ -468,11 +468,10 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
                 c->established = 0;
                 (void)tcp_send_seg(c, ops, 0x10u, NULL, 0);
             } else if (!tcp_seq_after(fin_seq, c->rcv_nxt)) {
-                /* Duplicate FIN already covered by rcv_nxt. */
-                c->peer_fin = 1;
-                c->peer_fin_pending = 0;
-                c->established = 0;
-                (void)tcp_send_seg(c, ops, 0x10u, NULL, 0);
+                /* Retransmitted FIN already covered by rcv_nxt. ACK only;
+                 * do not newly mark a live session as closed. */
+                if (c->peer_fin || c->peer_fin_pending)
+                    (void)tcp_send_seg(c, ops, 0x10u, NULL, 0);
             } else {
                 /* FIN ahead of a gap / unread payload — remember it. */
                 c->peer_fin_pending = 1;
@@ -525,6 +524,8 @@ int net_tcp_connect(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t dst_ip
     }
     c->snd_nxt = isn + 1;
     c->connect_syn_ms = ops->time_ms();
+    c->connect_born_ms = c->connect_syn_ms;
+    c->connect_timed_out = 0;
     tcp_trace("tcp: syn sent isn=%u sport=%u dport=%u\n",
         (unsigned)isn, (unsigned)c->src_port, (unsigned)c->dst_port);
     if (timeout_ms == 0) {
@@ -555,23 +556,63 @@ int net_tcp_connect(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t dst_ip
     return net_tcp_connect_poll(c, ops, timeout_ms);
 }
 
+/* Reset control fields without touching the 64KiB rx_buf / OOO payload. */
+void net_tcp_reset(net_tcp_conn_t *c) {
+    uint8_t mac[6];
+    int mac_ok;
+    if (!c)
+        return;
+    mac_ok = c->peer_mac_valid;
+    if (mac_ok)
+        memcpy(mac, c->peer_mac, 6);
+    c->used = 0;
+    c->established = 0;
+    c->connect_pending = 0;
+    c->connect_peer_pkts = 0;
+    c->connect_refused = 0;
+    c->connect_timed_out = 0;
+    c->connect_syn_ms = 0;
+    c->connect_born_ms = 0;
+    c->peer_fin = 0;
+    c->peer_fin_pending = 0;
+    c->peer_fin_seq = 0;
+    c->peer_rst = 0;
+    c->dst_ip_be = 0;
+    c->dst_port = 0;
+    c->src_port = 0;
+    c->snd_una = 0;
+    c->snd_nxt = 0;
+    c->syn_isn = 0;
+    c->rcv_nxt = 0;
+    c->rx_len = 0;
+    c->ooo_valid = 0;
+    memset(c->ooo_slot_valid, 0, sizeof(c->ooo_slot_valid));
+    memset(c->ooo_len, 0, sizeof(c->ooo_len));
+    if (mac_ok) {
+        memcpy(c->peer_mac, mac, 6);
+        c->peer_mac_valid = 1;
+    } else {
+        memset(c->peer_mac, 0, sizeof(c->peer_mac));
+        c->peer_mac_valid = 0;
+    }
+}
+
 int net_tcp_server_reply_syn(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t client_seq) {
     if (!c || !ops || !ops->time_ms) return -1;
     uint32_t isn = (uint32_t)(ops->time_ms() ^ 0x81A5D77Du);
+    uint32_t dst_ip = c->dst_ip_be;
+    uint16_t dst_port = c->dst_port;
+    uint16_t src_port = c->src_port;
+    net_tcp_reset(c);
+    c->dst_ip_be = dst_ip;
+    c->dst_port = dst_port;
+    c->src_port = src_port;
     c->used = 1;
-    c->established = 0;
-    c->connect_pending = 0;
-    c->peer_fin = 0;
-    c->peer_rst = 0;
     c->syn_isn = isn;
     c->snd_una = isn;
     /* SYN-ACK must carry SEQ=ISN; snd_nxt advances to ISN+1 only after the segment is sent. */
     c->snd_nxt = isn;
     c->rcv_nxt = client_seq + 1u;
-    c->rx_len = 0;
-    c->ooo_valid = 0;
-    memset(c->ooo_slot_valid, 0, sizeof(c->ooo_slot_valid));
-    memset(c->ooo_len, 0, sizeof(c->ooo_len));
     static const uint8_t mss_opt[4] = { 0x02, 0x04, 0x05, 0xB4 };
     if (tcp_send_seg_len(c, ops, 0x12u, NULL, 0, mss_opt, sizeof(mss_opt)) != 0)
         return -1;
@@ -645,12 +686,19 @@ int net_tcp_connect_poll(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t t
         c->connect_pending = 0;
         return -3;
     }
+    if (c->connect_timed_out && !c->established) {
+        c->connect_pending = 0;
+        return -2;
+    }
     if (!c->connect_pending && !c->used) return -1;
     uint64_t start = ops->time_ms();
     if (timeout_ms == 0) {
         /* Nonblocking / select progress: one shot. Never clear connect_pending
          * on "still waiting" — a short wait inside poll/select used to call
-         * this with 200ms and then abort the handshake after the first tick. */
+         * this with 200ms and then abort the handshake after the first tick.
+         * Do abort if the handshake itself has been pending too long: apt's
+         * http method uses poll(-1) and otherwise sits at "0% [Working]". */
+        enum { NET_TCP_NB_CONNECT_MS = 15000u };
         (void)net_tcp_service(c, ops, 8);
         tcp_rexmit_syn_if_due(c, ops);
         if (c->established) {
@@ -660,6 +708,16 @@ int net_tcp_connect_poll(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t t
         if (c->connect_refused && !c->established) {
             c->connect_pending = 0;
             return -3;
+        }
+        {
+            uint64_t born = c->connect_born_ms ? c->connect_born_ms : start;
+            if (start - born >= (uint64_t)NET_TCP_NB_CONNECT_MS) {
+                c->connect_pending = 0;
+                c->connect_timed_out = 1;
+                tcp_trace("tcp: connect poll timeout peer_pkts=%d syn=%u\n",
+                    c->connect_peer_pkts, (unsigned)c->syn_isn);
+                return -2;
+            }
         }
         return -1;
     }
@@ -795,18 +853,13 @@ int net_tcp_recv(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t *out, size
 }
 
 int net_tcp_close(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t timeout_ms) {
-    if (!c || !ops) return -1;
+    (void)timeout_ms;
+    if (!c) return -1;
     if (!c->used) return 0;
-    if (c->established) {
+    /* Fire-and-forget FIN. Waiting here (and memset of ~170KiB) froze the
+     * guest on the first SSH child's exit, so the second client hung in KEX. */
+    if (c->established && ops && ops->send_l4)
         (void)tcp_send_seg(c, ops, 0x11u, NULL, 0);
-        c->snd_nxt += 1;
-        uint64_t start = ops->time_ms();
-        while ((ops->time_ms() - start) < timeout_ms) {
-            (void)net_tcp_service(c, ops, 32);
-            if (c->peer_fin || c->snd_una >= c->snd_nxt) break;
-            ops->yield(ops->context);
-        }
-    }
-    memset(c, 0, sizeof(*c));
+    net_tcp_reset(c);
     return 0;
 }

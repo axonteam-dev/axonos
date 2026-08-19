@@ -368,6 +368,92 @@ nss_status _nss_files_getgrnam_r(const char *name, struct group *gr,
 	return lookup_group(0, 0, name, gr, buffer, buflen, errnop);
 }
 
+struct servent {
+	char *s_name;
+	char **s_aliases;
+	int s_port;
+	char *s_proto;
+};
+
+static unsigned short htons16(unsigned p)
+{
+	return (unsigned short)(((p & 0xffu) << 8) | ((p >> 8) & 0xffu));
+}
+
+static nss_status fill_serv(struct servent *se, char *buffer, size_t buflen, int *errnop,
+                            const char *name, const char *proto, unsigned port)
+{
+	size_t nl, pl, need, pad;
+	char *p;
+	char **aliases;
+
+	if (!se || !buffer || !errnop || !name || !proto)
+		return NSS_STATUS_UNAVAIL;
+	nl = xstrlen(name) + 1;
+	pl = xstrlen(proto) + 1;
+	pad = sizeof(char *);
+	need = pad + nl + pl;
+	if (buflen < need) {
+		*errnop = ERANGE;
+		return NSS_STATUS_TRYAGAIN;
+	}
+	aliases = (char **)buffer;
+	aliases[0] = 0;
+	p = buffer + pad;
+	xmemcpy(p, name, nl);
+	se->s_name = p;
+	p += nl;
+	xmemcpy(p, proto, pl);
+	se->s_proto = p;
+	se->s_aliases = aliases;
+	se->s_port = (int)htons16(port);
+	*errnop = 0;
+	return NSS_STATUS_SUCCESS;
+}
+
+/*
+ * getaddrinfo("host","http") needs this. Leave getservbyport as NOTFOUND so
+ * apt GetSrvRecords cannot fire res_nquery (libresolv DNS-over-TCP) before
+ * it sends "102 Connecting".
+ */
+nss_status _nss_files_getservbyname_r(const char *name, const char *proto,
+                                      struct servent *se, char *buffer, size_t buflen, int *errnop)
+{
+	const char *pr;
+
+	if (!name || !se || !buffer || !errnop)
+		return NSS_STATUS_UNAVAIL;
+	pr = (proto && proto[0]) ? proto : "tcp";
+	if (proto && proto[0] && xstrcmp(proto, "tcp") != 0 && xstrcmp(proto, "udp") != 0) {
+		*errnop = ENOENT;
+		return NSS_STATUS_NOTFOUND;
+	}
+	if (xstrcmp(name, "http") == 0)
+		return fill_serv(se, buffer, buflen, errnop, "http", pr, 80);
+	if (xstrcmp(name, "https") == 0)
+		return fill_serv(se, buffer, buflen, errnop, "https", pr, 443);
+	if (xstrcmp(name, "ftp") == 0)
+		return fill_serv(se, buffer, buflen, errnop, "ftp", pr, 21);
+	if (xstrcmp(name, "domain") == 0)
+		return fill_serv(se, buffer, buflen, errnop, "domain",
+		                 (proto && proto[0]) ? proto : "udp", 53);
+	*errnop = ENOENT;
+	return NSS_STATUS_NOTFOUND;
+}
+
+nss_status _nss_files_getservbyport_r(int port, const char *proto,
+                                      struct servent *se, char *buffer, size_t buflen, int *errnop)
+{
+	(void)port;
+	(void)proto;
+	(void)se;
+	(void)buffer;
+	(void)buflen;
+	if (errnop)
+		*errnop = ENOENT;
+	return NSS_STATUS_NOTFOUND;
+}
+
 /* Enumeration / remaining DB types: still NOTFOUND (unused by whoami/PS1). */
 #define STUB_NF(name) \
 	nss_status name(void) { return NSS_STATUS_NOTFOUND; }
@@ -390,8 +476,6 @@ STUB_NF(_nss_files_gethostbyaddr_r)
 STUB_NF(_nss_files_gethostent_r)
 STUB_NF(_nss_files_sethostent)
 STUB_NF(_nss_files_endhostent)
-STUB_NF(_nss_files_getservbyname_r)
-STUB_NF(_nss_files_getservbyport_r)
 STUB_NF(_nss_files_getservent_r)
 STUB_NF(_nss_files_getprotobyname_r)
 STUB_NF(_nss_files_getprotobynumber_r)

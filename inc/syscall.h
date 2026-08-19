@@ -21,6 +21,8 @@ typedef struct syscall_frame {
 #define SYS_mmap    9
 #define SYS_mprotect 10
 #define SYS_munmap  11
+#define SYS_mremap  25
+#define SYS_msync   26
 #define SYS_rt_sigaction 13
 #define SYS_rt_sigprocmask 14
 #define SYS_rt_sigsuspend 130
@@ -71,6 +73,7 @@ typedef struct syscall_frame {
 #define SYS_gettid  186
 #define SYS_mmap    9
 #define SYS_ftruncate 77
+#define SYS_fallocate 285
 #define SYS_munmap  11
 #define SYS_madvise 28
 #define SYS_mincore 27
@@ -81,6 +84,8 @@ typedef struct syscall_frame {
 #define SYS_pipe    22
 #define SYS_eventfd 284
 #define SYS_eventfd2 290
+#define SYS_signalfd 282
+#define SYS_signalfd4 289
 #define SYS_dup3    292
 #define SYS_pipe2   293
 #define SYS_arch_prctl 158
@@ -95,6 +100,7 @@ typedef struct syscall_frame {
 #define SYS_request_key 249
 #define SYS_keyctl  250
 #define SYS_wait4   61
+#define SYS_waitid  247
 #define SYS_exit_group 231
 #define SYS_openat  257
 #define SYS_newfstatat 262
@@ -180,6 +186,9 @@ typedef struct syscall_frame {
 #define SYS_iopl   172
 #define SYS_ioperm 173
 
+/* Linux x86_64: close_range = 436 */
+#define SYS_close_range 436
+
 /* AxonOS: resolve hostname via DNS, returns IPv4 in network byte order */
 #define SYS_resolve 1000
 
@@ -187,6 +196,8 @@ typedef struct syscall_frame {
 void syscall_init(void);
 /* Optional in-kernel DHCP helper (prefer userspace udhcpc). */
 int syscall_net_preinit(void);
+/* Timer/IRQ: answer ARP while a syscall holds the CPU (kernel is not preempted). */
+void syscall_net_l2_irq_poll(void);
 
 /* ISR-compatible handler (called by IDT dispatcher) */
 void isr_syscall(cpu_registers_t* regs);

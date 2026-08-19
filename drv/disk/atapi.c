@@ -249,34 +249,41 @@ static int atapi_disk_read(int device_id, uint32_t lba, void *buf, uint32_t sect
 	uint8_t *dst = (uint8_t *)buf;
 	uint64_t start_byte = (uint64_t)lba * 512ULL;
 	uint64_t remaining = (uint64_t)sectors * 512ULL;
-	uint8_t *block_buf = (uint8_t *)kmalloc(dev->atapi_block_size);
-	if (!block_buf) return -1;
+	uint8_t block_buf[2048];
+	uint8_t *tmp = block_buf;
+	int heap = 0;
+
+	if (dev->atapi_block_size > sizeof(block_buf)) {
+		tmp = (uint8_t *)kmalloc(dev->atapi_block_size);
+		if (!tmp) return -1;
+		heap = 1;
+	}
 
 	while (remaining > 0) {
 		if (keyboard_ctrlc_pending()) {
 			keyboard_consume_ctrlc();
-			kfree(block_buf);
+			if (heap) kfree(tmp);
 			return -1;
 		}
 		uint64_t blk = start_byte / dev->atapi_block_size;
 		uint32_t off = (uint32_t)(start_byte % dev->atapi_block_size);
 		if (blk >= dev->atapi_block_count) {
-			kfree(block_buf);
+			if (heap) kfree(tmp);
 			return -1;
 		}
-		if (atapi_read_block(dev, (uint32_t)blk, block_buf) != 0) {
-			kfree(block_buf);
+		if (atapi_read_block(dev, (uint32_t)blk, tmp) != 0) {
+			if (heap) kfree(tmp);
 			return -1;
 		}
 		uint64_t avail = (uint64_t)dev->atapi_block_size - (uint64_t)off;
 		uint64_t take = remaining < avail ? remaining : avail;
-		memcpy(dst, block_buf + off, (size_t)take);
+		memcpy(dst, tmp + off, (size_t)take);
 		dst += take;
 		start_byte += take;
 		remaining -= take;
 	}
 
-	kfree(block_buf);
+	if (heap) kfree(tmp);
 	return 0;
 }
 

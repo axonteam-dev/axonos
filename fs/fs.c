@@ -13,6 +13,7 @@
 #include <devfs.h>
 #include <fat32.h>
 #include <minix.h>
+#include <isofs.h>
 #include <squashfs.h>
 #include <overlayfs.h>
 
@@ -155,6 +156,23 @@ static void fs_ensure_ramfs_mountpoint_dir(const char *path) {
         (void)ramfs_mkdir(tmp);
 }
 
+/* Linux: mount "/" covers every absolute path. The old check required
+ * path[mp_len] to be '\0' or '/', so path[1] on "/var/..." is 'v' and
+ * overlay on "/" never matched. Then fs_create_file fell through to
+ * ramfs_create, which cannot see squashfs-only parents and returns -2
+ * (ENOENT) — apt's mkstemp(/var/cache/apt/srcpkgcache.bin.XXXXXX). */
+static int fs_mount_covers_path(const char *path, size_t path_len,
+                                const char *mp, size_t mp_len)
+{
+        if (!path || !mp || path_len < mp_len)
+                return 0;
+        if (strncmp(path, mp, mp_len) != 0)
+                return 0;
+        if (mp_len == 1 && mp[0] == '/')
+                return path[0] == '/';
+        return path[mp_len] == '\0' || path[mp_len] == '/';
+}
+
 static struct fs_driver *fs_match_mount(const char *path) {
         if (!path) return NULL;
         size_t path_len = strlen(path);
@@ -163,10 +181,8 @@ static struct fs_driver *fs_match_mount(const char *path) {
         for (int i = 0; i < g_mount_count; i++) {
                 struct mount_entry *m = &g_mounts[i];
                 if (!m->driver) continue;
-                // path must be at least as long as mount path so path[m->path_len] is valid */
-                if (path_len < m->path_len) continue;
-                if (strncmp(path, m->path, m->path_len) != 0) continue;
-                if (path[m->path_len] != '\0' && path[m->path_len] != '/') continue;
+                if (!fs_mount_covers_path(path, path_len, m->path, m->path_len))
+                        continue;
                 if (m->path_len > best_len) {
                         best = m->driver;
                         best_len = m->path_len;
@@ -203,9 +219,8 @@ int fs_get_mount_index(const char *path) {
         for (int i = 0; i < g_mount_count; i++) {
                 struct mount_entry *m = &g_mounts[i];
                 if (!m->driver) continue;
-                if (path_len < m->path_len) continue;
-                if (strncmp(path, m->path, m->path_len) != 0) continue;
-                if (path[m->path_len] != '\0' && path[m->path_len] != '/') continue;
+                if (!fs_mount_covers_path(path, path_len, m->path, m->path_len))
+                        continue;
                 if (m->path_len > best_len) {
                         best_len = m->path_len;
                         best = i;
@@ -251,9 +266,8 @@ int fs_get_matching_mount_prefix(const char *path, char *out, size_t outlen) {
         for (int i = 0; i < g_mount_count; i++) {
                 struct mount_entry *m = &g_mounts[i];
                 if (!m->driver) continue;
-                if (path_len < m->path_len) continue;
-                if (strncmp(path, m->path, m->path_len) != 0) continue;
-                if (path[m->path_len] != '\0' && path[m->path_len] != '/') continue;
+                if (!fs_mount_covers_path(path, path_len, m->path, m->path_len))
+                        continue;
                 if (m->path_len > best_len) {
                         best_len = m->path_len;
                         best = m->path;
@@ -593,6 +607,10 @@ struct fs_file *fs_create_file(const char *path) {
                         if (file) file->refcount = 1;
                         return file;
                 }
+                /* This mount owns the path. Do not fall through to ramfs_create:
+                 * a squashfs-only parent makes ramfs return -2 and used to abort
+                 * before overlay_create could copy-up the directory chain. */
+                return NULL;
         }
         for (int i = 0; i < g_drivers_count; i++) {
                 struct fs_driver *drv = g_drivers[i];
@@ -758,6 +776,10 @@ void fs_file_free(struct fs_file *file) {
                 eventfd_fs_file_destroy(file);
                 return;
         }
+        if (file->type == FS_TYPE_SIGNALFD) {
+                signalfd_fs_file_destroy(file);
+                return;
+        }
         for (int i = 0; i < g_drivers_count; i++) {
                 struct fs_driver *drv = g_drivers[i];
                 if (!drv || !drv->ops) continue;
@@ -909,6 +931,10 @@ int vfs_fstat(struct fs_file *file, struct stat *st) {
                         if (fat32_fill_stat(file, st) == 0) goto fix_mode;
                 } else if (name && strcmp(name, "minix") == 0) {
                         if (minix_fill_stat(file, st) == 0) goto fix_mode;
+                } else if (name && (strcmp(name, "ext2") == 0 || strcmp(name, "ext3") == 0)) {
+                        if (ext2_fill_stat(file, st) == 0) goto fix_mode;
+                } else if (name && (strcmp(name, "iso9660") == 0 || strcmp(name, "isofs") == 0)) {
+                        if (isofs_fill_stat(file, st) == 0) goto fix_mode;
                 }
                 break;
         }

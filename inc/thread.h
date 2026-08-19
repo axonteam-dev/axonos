@@ -68,8 +68,10 @@ typedef struct thread {
         /* file mode creation mask (umask) for mkdir/open */
         unsigned int umask;
 
-        /* attached tty index or -1 */
+        /* attached virtual console index, or -1 */
         int attached_tty;
+        /* Unix98 PTY slave index when that is the controlling tty, or -1 */
+        int attached_pty;
         
         /* per-thread brk state (heap) */
         uintptr_t user_brk_base;
@@ -142,6 +144,9 @@ typedef struct thread {
         int sas_ss_flags; /* SS_DISABLE=2 when unset */
         /* if non-negative, tid of thread waiting for this child (wait/waitpid) */
         int waiter_tid;
+        /* Linux TGID copied at process_attach. Kept after SIGCHLD IGN drop so
+         * waitpid(fork_pid) still matches when process_t is already gone. */
+        int linux_tgid;
         /* fork/clone3: unblock child after parent syscall returns (avoid clobbering per-CPU syscall stack). */
         /* Rare CLONE_THREAD deferral only; normal fork uses wake_up_new_task. */
         struct thread *fork_child_to_publish;
@@ -196,6 +201,11 @@ typedef struct thread {
          * 64-byte aligned for XSAVE/XRSTOR. */
         void *fpu_state_raw;
         void *fpu_state;
+        /* Linux TIF_RESTORE_SIGMASK: pselect6/ppoll/epoll_pwait apply a
+         * temporary mask, then restore the original after syscall exit
+         * (or stash it in the sigframe if a handler runs). */
+        uint8_t restore_sigmask;
+        uint64_t saved_sigmask_orig;
 } thread_t;
 
 extern int init;
@@ -249,6 +259,8 @@ int thread_get_state(int pid);
 int thread_get_count();
 /* Reparent living children of exiting parent to init. Returns count reparented. */
 int thread_reparent_orphans(int dead_parent_tid);
+/* True if a living parent still owns this child for wait(2). */
+int thread_wait_parent_alive(const thread_t *t);
 /* Remove TERMINATED zombies with no wait4 waiter (returns count reaped). */
 int thread_reap_unwaited_zombies(void);
 int thread_reap(int pid);

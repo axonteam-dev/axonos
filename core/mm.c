@@ -51,6 +51,32 @@ static void mm_user_frame_put(void *page) {
         frame_release((uint64_t)(uintptr_t)page);
 }
 
+/*
+ * Kernel heap / PMM share the identity VA space with user mappings.  A frame
+ * whose PA equals the target VA is not a private leaf — it aliases that VA.
+ * Hold colliding pages aside so the allocator cannot immediately return the
+ * same PA, then release them once a distinct frame is in hand.
+ */
+static void *mm_user_frame_alloc_avoid_va(uint64_t va, int zero) {
+    void *hold[8];
+    int n = 0;
+    uint64_t page = va & ~0xFFFULL;
+    void *p = NULL;
+
+    while (n < 8) {
+        p = mm_user_frame_alloc(zero);
+        if (!p)
+            break;
+        if (((uint64_t)(uintptr_t)p & ~0xFFFULL) != page)
+            break;
+        hold[n++] = p;
+        p = NULL;
+    }
+    while (n > 0)
+        mm_user_frame_put(hold[--n]);
+    return p;
+}
+
 static int mm_track_raw(mm_t *mm, void *raw) {
     if (!mm || !raw) return -1;
     mm_alloc_node_t *n = (mm_alloc_node_t*)kmalloc(sizeof(*n));
@@ -93,11 +119,6 @@ static inline int pt_page_pa_ok(uint64_t ent) {
  * otherwise reload the process CR3 mid-walk and either Oops or corrupt user
  * memory (seen as Go poison regs after docker pthread + PROT_NONE).
  */
-typedef struct {
-    uint64_t cr3;
-    unsigned long irqf;
-} mm_dm_ctx_t;
-
 static uint64_t mm_direct_map_cr3(void) {
     if (g_mm_ready && g_kernel_mm.cr3)
         return g_kernel_mm.cr3;
@@ -106,7 +127,7 @@ static uint64_t mm_direct_map_cr3(void) {
     return paging_read_cr3();
 }
 
-static mm_dm_ctx_t mm_enter_direct_map(void) {
+mm_dm_ctx_t mm_enter_direct_map(void) {
     mm_dm_ctx_t ctx;
     asm volatile(
         "pushfq\n\t"
@@ -122,7 +143,7 @@ static mm_dm_ctx_t mm_enter_direct_map(void) {
     return ctx;
 }
 
-static void mm_leave_direct_map(mm_dm_ctx_t ctx) {
+void mm_leave_direct_map(mm_dm_ctx_t ctx) {
     if ((paging_read_cr3() & ~0xFFFULL) != (ctx.cr3 & ~0xFFFULL))
         paging_write_cr3(ctx.cr3);
     asm volatile("push %0; popfq" :: "r"(ctx.irqf) : "memory", "cc");
@@ -537,8 +558,8 @@ static int mm_map_user_page_locked(mm_t *mm, uint64_t va, uint64_t pa,
 	return 0;
 }
 
-static int mm_map_user_page(mm_t *mm, uint64_t va, uint64_t pa,
-			    uint64_t flags)
+int mm_map_user_page(mm_t *mm, uint64_t va, uint64_t pa,
+		     uint64_t flags)
 {
 	mm_dm_ctx_t dm;
 	int ret;
@@ -1022,8 +1043,14 @@ static void mm_release_user_frames(mm_t *mm) {
                 for (int l1i = 0; l1i < 512; ++l1i) {
                     uint64_t e1 = l1[l1i];
                     if ((e1 & (PG_PRESENT | PG_US | PG_SOFT_OWNED)) !=
-                        (PG_PRESENT | PG_US | PG_SOFT_OWNED))
+                        (PG_PRESENT | PG_US | PG_SOFT_OWNED)) {
+                        if (++progress >= 512u) {
+                            progress = 0;
+                            mm_leave_direct_map(dm);
+                            dm = mm_enter_direct_map();
+                        }
                         continue;
+                    }
                     uint64_t pa = e1 & PG_ADDR_MASK;
                     if (mm_owns_pt_page(mm, (const uint64_t *)(uintptr_t)pa))
                         continue;
@@ -1676,6 +1703,15 @@ static int mm_va_in_brk(const mm_t *mm, uint64_t va) {
     return (va >= lo && va < hi) ? 1 : 0;
 }
 
+/* Primary stack + TLS: keep the parent RW across clone (VMware triple-faulted
+ * when the syscall-return stack was Soft_COW).  All other private leaves follow
+ * Linux copy_page_range (share RO; Soft_COW writable). */
+static int mm_fork_va_is_primary_stack(uint64_t va) {
+    uint64_t lo = (uint64_t)USER_TLS_BASE_LAYOUT;
+    uint64_t hi = (uint64_t)USER_STACK_TOP_LAYOUT + 0x10000ULL;
+    return (va >= lo && va < hi) ? 1 : 0;
+}
+
 static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
                                   uint64_t *parent_l4, uint64_t owner_tid,
                                   uint64_t va, uint64_t parent_pa,
@@ -1690,67 +1726,86 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
          PG_SOFT_COW | PG_SOFT_OWNED | PG_NX);
     int retained = 0;
     void *private_copy = NULL;
-
-    /*
-     * fork semantics do not require Linux's lazy copy_page_range
-     * implementation.  Eagerly copying every private user leaf is externally
-     * equivalent: parent and child see the same bytes at return and subsequent
-     * private writes are isolated.  More importantly, the parent PTE is never
-     * write-protected while its syscall/exception return stack is live.
-     *
-     * AxonOS previously used lazy Soft_COW here.  The first parent stack write
-     * after clone entered the kernel #PF path while VMware was restoring the
-     * syscall frame and could escalate to a triple fault.  Keep actual shared
-     * mappings (MAP_SHARED/SysV SHM) shared; duplicate everything else.
-     */
-    if (!shared) {
-        uint64_t src_pa = parent_pa & PG_ADDR_MASK;
-        if (src_pa >= (uint64_t)MMIO_IDENTITY_LIMIT)
-            return -1;
-        private_copy = mm_user_frame_alloc(0);
-        if (!private_copy) {
-            devel_printf("fork-cow: copy alloc failed va=0x%llx pte=0x%llx\n",
-                    (unsigned long long)va,
-                    (unsigned long long)parent_pte);
-            return -1;
-        }
-        /*
-         * Identity PA==VA may be a hole / demoted leaf under swapper while the
-         * parent process CR3 still has live heap bytes.  Seed like
-         * mm_privatize_identity_range: copy under the parent L4.
-         */
-        if (src_pa == (va & ~0xFFFULL) && parent_l4) {
-            uint64_t parent_cr3 = (parent && parent->cr3) ? parent->cr3
-                : ((uint64_t)(uintptr_t)parent_l4);
-            uint64_t saved = paging_read_cr3();
-            paging_write_cr3(parent_cr3);
-            memcpy(private_copy, (void *)(uintptr_t)va, (size_t)PAGE_SIZE_4K);
-            paging_write_cr3(saved);
-        } else {
-            memcpy(private_copy, (void *)(uintptr_t)src_pa, (size_t)PAGE_SIZE_4K);
-        }
-        child_pa = (uint64_t)(uintptr_t)private_copy;
-        flags &= ~(PG_SOFT_COW | PG_SOFT_OWNED);
-        /* A Soft_COW parent leaf represents an originally writable private
-         * mapping.  The child's new private frame can be writable immediately. */
-        if (parent_pte & PG_SOFT_COW)
-            flags |= PG_RW;
-        flags |= PG_SOFT_OWNED;
-    } else if (owned) {
-        if (frame_retain(child_pa) != 0) {
-            devel_printf("fork-cow: retain failed va=0x%llx pa=0x%llx "
-                    "pte=0x%llx refs=%u shared=%d\n",
-                    (unsigned long long)va,
-                    (unsigned long long)child_pa,
-                    (unsigned long long)parent_pte,
-                    frame_refcount(child_pa), shared);
-            return -1;
-        }
-        retained = 1;
-    }
+    int parent_wr = ((parent_pte & PG_RW) || (parent_pte & PG_SOFT_COW)) ? 1 : 0;
 
     if (shared) {
         flags &= ~PG_SOFT_COW;
+        if (owned) {
+            if (frame_retain(child_pa) != 0) {
+                devel_printf("fork-cow: retain failed va=0x%llx pa=0x%llx "
+                        "pte=0x%llx refs=%u shared=%d\n",
+                        (unsigned long long)va,
+                        (unsigned long long)child_pa,
+                        (unsigned long long)parent_pte,
+                        frame_refcount(child_pa), shared);
+                return -1;
+            }
+            retained = 1;
+        }
+    } else {
+        uint64_t src_pa = parent_pa & PG_ADDR_MASK;
+        int eager;
+
+        if (src_pa >= (uint64_t)MMIO_IDENTITY_LIMIT)
+            return -1;
+        /*
+         * Eager-copy only:
+         *  - the live primary stack/TLS (parent must stay RW through iret)
+         *  - writable identity leftovers with no frame ref (cannot Soft_COW
+         *    them without pmm_free'ing kernel identity on last release)
+         * Everything else is Linux copy_page_range: share RO text, Soft_COW
+         * private heap/mmap (apt's 128MiB cache used to be memcpy'd and the
+         * child's xz then died with LZMA_MEM_ERROR).
+         */
+        eager = parent_wr && (!owned || mm_fork_va_is_primary_stack(va));
+        if (eager) {
+            private_copy = mm_user_frame_alloc_avoid_va(va, 0);
+            if (!private_copy) {
+                devel_printf("fork-cow: copy alloc failed va=0x%llx pte=0x%llx\n",
+                        (unsigned long long)va,
+                        (unsigned long long)parent_pte);
+                return -1;
+            }
+            /*
+             * Identity PA==VA may be a hole / demoted leaf under swapper while
+             * the parent process CR3 still has live heap bytes.  Seed like
+             * mm_privatize_identity_range: copy under the parent L4.
+             */
+            if (src_pa == (va & ~0xFFFULL) && parent_l4) {
+                uint64_t parent_cr3 = (parent && parent->cr3) ? parent->cr3
+                    : ((uint64_t)(uintptr_t)parent_l4);
+                uint64_t saved = paging_read_cr3();
+                paging_write_cr3(parent_cr3);
+                memcpy(private_copy, (void *)(uintptr_t)va, (size_t)PAGE_SIZE_4K);
+                paging_write_cr3(saved);
+            } else {
+                memcpy(private_copy, (void *)(uintptr_t)src_pa, (size_t)PAGE_SIZE_4K);
+            }
+            child_pa = (uint64_t)(uintptr_t)private_copy;
+            flags &= ~(PG_SOFT_COW | PG_SOFT_OWNED);
+            if (parent_pte & PG_SOFT_COW)
+                flags |= PG_RW;
+            flags |= PG_SOFT_OWNED;
+        } else {
+            child_pa = src_pa;
+            if (owned) {
+                if (frame_retain(child_pa) == 0) {
+                    retained = 1;
+                    flags |= PG_SOFT_OWNED;
+                } else {
+                    /* 2MiB Soft_OWNED sliced to 4K: only the huge base is in
+                     * the frame table. Share without a ref so mmput does not
+                     * pmm_free a page the parent still maps. */
+                    flags &= ~PG_SOFT_OWNED;
+                }
+            }
+            if (parent_wr) {
+                flags &= ~PG_RW;
+                flags |= PG_SOFT_COW;
+            } else {
+                flags &= ~PG_SOFT_COW;
+            }
+        }
     }
 
     int map_ret = mm_map_user_page(child, va, child_pa, flags);
@@ -1766,7 +1821,9 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
             frame_release(child_pa);
         return -1;
     }
-    (void)protect_parent; /* Eager private copies never alter the parent PTE. */
+    if (!shared && parent_wr && !private_copy && protect_parent && parent &&
+        parent_l4 && mm_mark_share_user_readonly_page(parent, parent_l4, va) != 0)
+        return -1;
     return 0;
 }
 
@@ -1993,8 +2050,11 @@ mm_t *mm_dup_user(mm_t *parent, uint64_t owner_tid)
 	if (user_vma_clone_mm(child, parent))
 		goto fail;
 
+	/* protect_parent: Linux WP on private writable leaves.  The primary
+	 * stack/TLS is eager-copied in mm_fork_copy_user_leaf so clone return
+	 * never write-faults the live syscall stack (VMware triple-fault). */
 	if (mm_cow_mark_all_user_writable_walk(child, parent, parent->pml4,
-					       owner_tid, 0))
+					       owner_tid, 1))
 		goto fail;
 
 	if (mm_dup_ensure_brk_copied(child, parent, owner_tid))
@@ -2402,7 +2462,7 @@ int mm_cow_fault_page(mm_t *mm, uint64_t va, mm_t *share_cmp_mm) {
                     (unsigned long long)service_cr3,
                     (unsigned long long)saved_cr3);
     }
-    void *newp = mm_user_frame_alloc(0);
+    void *newp = mm_user_frame_alloc_avoid_va(pg, 0);
     if (!newp) {
         rc = -1;
         goto out;
@@ -2931,6 +2991,17 @@ int mm_copy_from_user(mm_t *mm, void *dst, uint64_t src, size_t len) {
             done += chunk;
             continue;
         }
+        /*
+         * Linux copy_from_user on a never-touched anonymous/file VMA
+         * demand-fills (zeros). apt write(mmap, cache_size) hits pages that
+         * RawAllocate reserved but never stored — without this, we returned
+         * EFAULT ("Bad address") and "IO Error saving source cache".
+         */
+        if (user_vma_fault_lazy_anon(va) &&
+            mm_user_memcpy_via_pa(mm, va, out + done, chunk, 0) == 0) {
+            done += chunk;
+            continue;
+        }
         {
             mm_dm_ctx_t dm = mm_enter_direct_map();
             uint64_t ent = 0;
@@ -3049,18 +3120,8 @@ static int mm_make_private_range_impl(mm_t *mm, uint64_t va_begin, uint64_t va_e
         int had_replaced = (mm_va_leaf_pa(mm, va, &replaced_pa) == 0);
         if (had_replaced)
             (void)mm_va_leaf_entry(mm, va, &replaced_pte);
-        void *newp = mm_user_frame_alloc(!copy_old);
+        void *newp = mm_user_frame_alloc_avoid_va(va, !copy_old);
         if (!newp) goto out;
-        /*
-         * Kernel heap shares the identity VA space with user stacks/mmap.
-         * If the allocator handed us the page at `va`, mapping va->va is not
-         * a private leaf — it aliases heap metadata. Discard and fail the
-         * page (caller/bulk path can retry a different VA window).
-         */
-        if (((uint64_t)(uintptr_t)newp & ~0xFFFULL) == (va & ~0xFFFULL)) {
-            mm_user_frame_put(newp);
-            goto out;
-        }
         if (copy_old) {
             uint64_t spa = 0;
             mm_t *src_mm = share_cmp_mm;
@@ -3159,14 +3220,10 @@ static int mm_make_private_range_bulk_zero_ex(mm_t *mm, uint64_t va_begin, uint6
         int had_replaced = (mm_va_leaf_pa(mm, pg, &replaced_pa) == 0);
         if (had_replaced)
             (void)mm_va_leaf_entry(mm, pg, &replaced_pte);
-        void *page = mm_user_frame_alloc(1);
+        void *page = mm_user_frame_alloc_avoid_va(pg, 1);
         if (!page)
             goto out;
         uint64_t want = (uint64_t)(uintptr_t)page;
-        if ((want & ~0xFFFULL) == (pg & ~0xFFFULL)) {
-            mm_user_frame_put(page);
-            goto out;
-        }
         if (mm_map_4k_sharedaware_body(mm, share_l4, pg, want,
                                       PG_RW | PG_US | PG_SOFT_OWNED) != 0) {
             mm_user_frame_put(page);

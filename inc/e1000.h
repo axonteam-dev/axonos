@@ -26,9 +26,15 @@ int e1000_get_mac(uint8_t out_mac[6]);
    Returns number of bytes queued/sent, or negative error code. */
 int e1000_send_frame(const void *data, size_t len);
 
+/* One-shot TX for timer/IRQ: try_acquire, no busy-wait. -4 if busy, -3 if ring full. */
+int e1000_send_frame_nowait(const void *data, size_t len);
+
 /* Receive one raw Ethernet frame (non-blocking).
    Returns frame length (>0), 0 if no packet, negative on error. */
 int e1000_recv_frame(void *buf, size_t cap);
+
+/* One-shot RX for timer/IRQ: try_acquire, no spin. -4 if the driver lock is busy. */
+int e1000_recv_frame_nowait(void *buf, size_t cap);
 
 /* Optional driver polling hook (for setups without NIC IRQ path). */
 void e1000_poll(void);

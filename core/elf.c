@@ -16,6 +16,7 @@
 static int kernel_execve_into_mm(const char *path, const char *const argv[],
                                  const char *const envp[]);
 #include <devfs.h>
+#include <pty.h>
 #include <gdt.h>
 #include <paging.h>
 #include <mm.h>
@@ -51,6 +52,19 @@ static int exec_stdio_needs_console(const struct fs_file *f) {
         return 1;
     /* Keep open non-tty files (redirections to regular paths). */
     return 0;
+}
+
+/* Linux AT_RANDOM: 16 bytes used for the stack canary / glibc. */
+static void elf_fill_at_random(uint8_t *rp) {
+    uint32_t lo = 0, hi = 0;
+    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint32_t s = lo ^ (hi * 0x9e3779b9u) ^ 0xA53C9E11u;
+    for (size_t i = 0; i < 16; i++) {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        rp[i] = (uint8_t)(s & 0xFFu);
+    }
 }
 
 void exec_boot_ensure_stdio(thread_t *ut) {
@@ -132,11 +146,24 @@ void exec_boot_ensure_stdio(thread_t *ut) {
         }
     }
 
-    if (ut->fds[0] && devfs_is_tty_file(ut->fds[0])) {
+    if (ut->fds[0] && pty_is_file(ut->fds[0])) {
+        int idx = pty_get_index(ut->fds[0]);
+        ut->attached_pty = idx;
+        ut->attached_tty = -1;
+        if (ut->sid > 0)
+            pty_set_controlling_sid(ut->fds[0], ut->sid);
+        if (ut->pgid > 0)
+            (void)pty_set_fg_pgrp(ut->fds[0], ut->pgid);
+        devel_printf("stdio-pty: tid=%llu path=%s pty=%d sid=%d pgid=%d\n",
+            (unsigned long long)(ut->tid ? ut->tid : 1),
+            ut->fds[0]->path ? ut->fds[0]->path : "?",
+            idx, ut->sid, ut->pgid);
+    } else if (ut->fds[0] && devfs_is_tty_file(ut->fds[0])) {
         int tty = devfs_get_tty_index_from_file(ut->fds[0]);
         if (tty < 0)
             tty = devfs_get_active();
         ut->attached_tty = tty;
+        ut->attached_pty = -1;
         /* Do not invent sid/pgid here — getty must call setsid() itself. */
         if (ut->sid > 0)
             (void)devfs_set_tty_controlling_sid(ut->fds[0], ut->sid);
@@ -1737,7 +1764,9 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
     {
         thread_t *tc = thread_current();
         if (elf_needs_private_user_pages(tc)) {
-            uintptr_t tip_lo = final_stack > 0x8000u ? (final_stack - 0x8000u) : final_stack;
+            /* Debian sqv/libgmp alloca several dozen KiB before the first
+             * stack-probe #PF; 32KiB left the return-address page demand-filled. */
+            uintptr_t tip_lo = final_stack > 0x40000u ? (final_stack - 0x40000u) : final_stack;
             if (exec_map_stack_tip(tc, tip_lo, stack_top) != 0)
                 return -1;
         }
@@ -1773,8 +1802,7 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
             sp64[argc + 1 + envc] = 0;
             {
                 uint8_t *rp = base + (random_addr - final_stack);
-                for (size_t i = 0; i < 16; i++)
-                    rp[i] = (uint8_t)(0xA5u ^ (uint8_t)(i * 17u));
+                elf_fill_at_random(rp);
             }
             size_t ax = (size_t)argc + 2 + (size_t)envc;
             sp64[ax + 0] = (uint64_t)AT_PHDR;   sp64[ax + 1] = aux_phdr;
@@ -2238,7 +2266,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
     {
         thread_t *tc = thread_current();
         if (elf_needs_private_user_pages(tc)) {
-            uintptr_t tip_lo = final_stack > 0x8000u ? (final_stack - 0x8000u) : final_stack;
+            uintptr_t tip_lo = final_stack > 0x40000u ? (final_stack - 0x40000u) : final_stack;
             if (exec_map_stack_tip(tc, tip_lo, stack_top) != 0) return -1;
         }
     }
@@ -2274,8 +2302,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         sp64[argc + 1 + envc] = 0;
         {
             uint8_t *rp = base + (random_addr - final_stack);
-            for (size_t i = 0; i < 16; i++)
-                rp[i] = (uint8_t)(0xA5u ^ (uint8_t)(i * 17u));
+            elf_fill_at_random(rp);
         }
         size_t ax = (size_t)argc + 2 + (size_t)envc;
         sp64[ax + 0] = (uint64_t)AT_PHDR;   sp64[ax + 1] = aux_phdr;
@@ -2405,6 +2432,9 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         /* Set foreground so Ctrl+C terminates this process when waiting */
         if (cur_user->attached_tty >= 0) {
             devfs_set_tty_fg_pgrp(cur_user->attached_tty, cur_user->pgid);
+        } else if (cur_user->attached_pty >= 0 && cur_user->fds[0] &&
+                   pty_is_file(cur_user->fds[0])) {
+            (void)pty_set_fg_pgrp(cur_user->fds[0], cur_user->pgid);
         }
         if (cur_user->kernel_stack) {
             tss_set_rsp0(cur_user->kernel_stack);
@@ -2498,6 +2528,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
             ut->sgid = caller->sgid;
             ut->umask = caller->umask;
             ut->attached_tty = caller->attached_tty;
+            ut->attached_pty = caller->attached_pty;
             strncpy(ut->cwd, caller->cwd[0] ? caller->cwd : "/", sizeof(ut->cwd));
             ut->cwd[sizeof(ut->cwd) - 1] = '\0';
             strncpy(ut->fs_root, caller->fs_root[0] ? caller->fs_root : "/", sizeof(ut->fs_root));
@@ -2529,6 +2560,8 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         }
         if (ut->attached_tty >= 0) {
             devfs_set_tty_fg_pgrp(ut->attached_tty, ut->pgid);
+        } else if (ut->attached_pty >= 0 && ut->fds[0] && pty_is_file(ut->fds[0])) {
+            (void)pty_set_fg_pgrp(ut->fds[0], ut->pgid);
         }
         syscall_bind_kstack_for_thread(ut);
         /* Now make the new user thread runnable. */

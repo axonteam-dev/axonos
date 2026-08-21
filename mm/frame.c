@@ -4,7 +4,6 @@
 #include <pmm.h>
 #include <spinlock.h>
 #include <string.h>
-#include <vga.h>
 
 /* 256K slots × 4KiB = 1GiB of Soft_OWNED user pages. 64K (256MiB) was
  * smaller than the PMM arena; apt's cache plus lists exhausted it
@@ -127,24 +126,18 @@ void *frame_alloc(void) {
     void *page = NULL;
     void *raw = NULL;
 
-    /* Prefer PMM (4KiB from reserved arena). If the arena is exhausted,
-     * steal from the object heap so dpkg-deb/xz can still malloc its
-     * dictionary instead of returning LZMA_MEM_ERROR. */
-    if (pmm_ready())
+    /* Prefer PMM (4KiB from reserved arena). Fall back to kmalloc only if
+     * pmm was not carved at boot — never the steady-state path. */
+    if (pmm_ready()) {
         page = pmm_alloc_page();
-    if (!page) {
-        static int steal_once;
-
+        if (!page)
+            return NULL;
+    } else {
         raw = kmalloc((size_t)PAGE_SIZE_4K * 2u);
         if (!raw)
             return NULL;
         page = (void *)(((uintptr_t)raw + PAGE_SIZE_4K - 1u) &
                         ~((uintptr_t)PAGE_SIZE_4K - 1u));
-        if (pmm_ready() && !steal_once) {
-            steal_once = 1;
-            kprintf("frame: PMM exhausted, stealing object-heap pages "
-                    "(xz/dpkg-deb)\n");
-        }
     }
 
     unsigned long flags;

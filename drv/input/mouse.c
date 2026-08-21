@@ -8,6 +8,7 @@
 #include <spinlock.h>
 #include <sysfs.h>
 #include <thread.h>
+#include <input_evdev.h>
 
 #define PS2_CMD_PORT 0x64
 #define PS2_DATA_PORT 0x60
@@ -92,6 +93,7 @@ void mouse_process_byte(uint8_t b) {
         mouse_stream_push(g_pkt[0]);
         mouse_stream_push(g_pkt[1]);
         mouse_stream_push(g_pkt[2]);
+        evdev_ps2_mouse_packet(g_pkt);
         g_pkt_idx = 0;
     }
 }

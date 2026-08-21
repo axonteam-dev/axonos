@@ -73,7 +73,6 @@ extern uint64_t syscall_kernel_rsp0;
 extern uint64_t syscall_kernel_rsp0_by_apic[256];
 extern uint64_t syscall_user_return_rip;
 extern uint64_t syscall_user_return_rax;
-extern uint64_t syscall_exec_trampoline_active;
 extern uint64_t syscall_exit_to_shell_flag;
 enum { MSR_EFER=0xC0000080u, MSR_STAR=0xC0000081u, MSR_LSTAR=0xC0000082u, MSR_FMASK=0xC0000084u, MSR_FS_BASE=0xC0000100u };
 static inline uint64_t msr_read_u64(uint32_t msr){uint32_t lo,hi;__asm__ volatile("rdmsr":"=a"(lo),"=d"(hi):"c"(msr));return ((uint64_t)hi<<32)|lo;}

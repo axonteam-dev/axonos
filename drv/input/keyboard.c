@@ -10,6 +10,7 @@
 #include <pic.h>
 #include <devfs.h>
 #include <mouse.h>
+#include <input_evdev.h>
 
 // Вспомогательные функции для ожидания статусов контроллера PS/2
 static int ps2_wait_input_empty(void) {
@@ -195,6 +196,7 @@ void keyboard_process_scancode(uint8_t scancode) {
 #endif
         /* Ignore ACK/RESEND bytes that can appear after init commands. */
         if (scancode == 0xFA || scancode == 0xFE) return;
+        evdev_ps2_keyboard_byte(scancode);
         if (scancode == 0xE0) {
                 kbd_extended_prefix = true;
                 return;
@@ -202,6 +204,23 @@ void keyboard_process_scancode(uint8_t scancode) {
         if (scancode == 0xE1) {
                 /* Pause/Break sequence start: ignore for now */
                 kbd_extended_prefix = false;
+                return;
+        }
+        /* linux evdev EVIOCGRAB: TTY stops seeing keys while SDL/libinput holds the device. */
+        if (evdev_keyboard_grabbed()) {
+                uint8_t make = scancode & 0x7Fu;
+                int down = !(scancode & 0x80);
+                if (kbd_extended_prefix) {
+                        if (make == 0x1D) ctrl_pressed = down;
+                        else if (make == 0x38) alt_pressed = down;
+                        kbd_extended_prefix = false;
+                        return;
+                }
+                if (make == 0x2A || make == 0x36) shift_pressed = down;
+                else if (make == 0x1D) ctrl_pressed = down;
+                else if (make == 0x38) alt_pressed = down;
+                else if (down && alt_pressed && make >= 0x3B && make <= 0x40)
+                        devfs_switch_tty(make - 0x3B);
                 return;
         }
         // Обрабатываем только нажатие клавиш (не отпускание)

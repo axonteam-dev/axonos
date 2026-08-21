@@ -1013,8 +1013,9 @@ int thread_fd_alloc(struct fs_file *file) {
 
 int thread_fd_close(int fd) {
     static int pipe_fd_trace_left = 160;
-    thread_t *cur = thread_get_current_user();
-    if (!cur) cur = thread_current();
+    thread_t *cur = thread_current();
+    if (!cur || cur->ring != 3)
+        cur = thread_get_current_user();
     if (!cur || fd < 0 || fd >= THREAD_MAX_FD) return -1;
     struct fs_file *f = cur->process ? cur->process->fds[fd] : cur->fds[fd];
     if (!f) return -1;
@@ -1035,8 +1036,9 @@ int thread_fd_close(int fd) {
 }
 
 int thread_fd_dup(int oldfd) {
-    thread_t *cur = thread_get_current_user();
-    if (!cur) cur = thread_current();
+    thread_t *cur = thread_current();
+    if (!cur || cur->ring != 3)
+        cur = thread_get_current_user();
     if (!cur || oldfd < 0 || oldfd >= THREAD_MAX_FD) return -1;
     struct fs_file *f = cur->process ?
         cur->process->fds[oldfd] : cur->fds[oldfd];
@@ -1056,8 +1058,9 @@ int thread_fd_dup(int oldfd) {
 
 int thread_fd_dup2(int oldfd, int newfd) {
     static int pipe_dup_trace_left = 80;
-    thread_t *cur = thread_get_current_user();
-    if (!cur) cur = thread_current();
+    thread_t *cur = thread_current();
+    if (!cur || cur->ring != 3)
+        cur = thread_get_current_user();
     if (!cur || oldfd < 0 || oldfd >= THREAD_MAX_FD || newfd < 0 || newfd >= THREAD_MAX_FD) return -1;
     if (oldfd == newfd) return newfd;
     struct fs_file *f = cur->process ?
@@ -1088,8 +1091,9 @@ int thread_fd_dup2(int oldfd, int newfd) {
 }
 
 int thread_fd_isatty(int fd) {
-    thread_t *cur = thread_get_current_user();
-    if (!cur) cur = thread_current();
+    thread_t *cur = thread_current();
+    if (!cur || cur->ring != 3)
+        cur = thread_get_current_user();
     if (!cur || fd < 0 || fd >= THREAD_MAX_FD) return 0;
     struct fs_file *f = cur->process ? cur->process->fds[fd] : cur->fds[fd];
     if (!f) return 0;
@@ -1146,6 +1150,7 @@ void thread_stop(int pid) {
         acquire_irqsave(&sched_lock, &irqf);
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->tid == pid && threads[i]->state != THREAD_TERMINATED) {
+                        kprintf("thread_stop: stopping tid=%d name=%s\n", pid, threads[i]->name);
                         threads[i]->state = THREAD_TERMINATED;
                     threads[i]->sleep_until = 0;
                     release_irqrestore(&sched_lock, irqf);
@@ -1153,6 +1158,7 @@ void thread_stop(int pid) {
                 }
         }
         release_irqrestore(&sched_lock, irqf);
+        klogprintf("thread_stop: thread %d not found or already terminated\n", pid);
 }
 
 void thread_block(int pid) {

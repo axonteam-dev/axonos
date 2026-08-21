@@ -15,8 +15,12 @@ int fbdev_is_active(void);
 size_t fbdev_byte_len(void);
 
 int fbdev_is_fb0_file(const struct fs_file *f);
+/* Align mmap VA so (va % 2MiB) == (fb_pa % 2MiB); required for 2MiB PTEs. */
+uintptr_t fbdev_mmap_align_va(uintptr_t addr);
 /* Map user [addr, addr+len) to FB bytes [file_off, file_off+len); 2 MiB pages, WC via PCD|PWT. */
 int fbdev_mmap_user(uintptr_t addr, size_t len, size_t file_off);
+/* VMware SVGA (and similar) need FIFO UPDATE after CPU writes through mmap. */
+void fbdev_sync_user_frontbuffer(void);
 
 void fbdev_copy_to(void *dst, size_t offset, size_t n);
 void fbdev_copy_from(size_t offset, const void *src, size_t n);

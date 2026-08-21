@@ -10,8 +10,6 @@
 #include <exec.h>
 #include <mmio.h>
 #include <pit.h>
-#include <ns.h>
-#include <cgroup.h>
 
 extern void kprintf(const char *fmt, ...);
 
@@ -27,7 +25,6 @@ void process_init(void) {
     memset(process_table, 0, sizeof(process_table));
     next_pid = 1;
     release_irqrestore(&process_lock, flags);
-    ns_init();
 }
 
 static process_t *process_alloc_locked(process_t *parent) {
@@ -114,15 +111,9 @@ static process_t *process_alloc_locked(process_t *parent) {
 
 process_t *process_create(process_t *parent) {
     unsigned long flags;
-    process_t *p;
-
-    if (parent && cgroup_can_fork(parent) != 0)
-        return NULL;
     acquire_irqsave(&process_lock, &flags);
-    p = process_alloc_locked(parent);
+    process_t *p = process_alloc_locked(parent);
     release_irqrestore(&process_lock, flags);
-    if (p)
-        ns_process_inherit(p, parent);
     return p;
 }
 
@@ -424,7 +415,6 @@ int process_reap(process_t *parent, process_t *child) {
         }
     }
     release_irqrestore(&process_lock, flags);
-    ns_process_exit(child);
     kfree(child);
     return 0;
 }
@@ -450,7 +440,6 @@ int process_reap_zombie(process_t *child) {
         }
     }
     release_irqrestore(&process_lock, flags);
-    ns_process_exit(child);
     kfree(child);
     return 0;
 }
@@ -479,7 +468,6 @@ int process_discard(process_t *parent, process_t *child) {
         }
     }
     release_irqrestore(&process_lock, flags);
-    ns_process_exit(child);
     kfree(child);
     return 0;
 }
@@ -573,13 +561,13 @@ void process_exec_reset(process_t *process, thread_t *thread) {
 
 uint64_t process_pid(const thread_t *thread) {
     if (thread && thread->process)
-        return ns_pid_local(thread->process);
+        return thread->process->pid;
     return thread ? (thread->tid ? thread->tid : 1) : 0;
 }
 
 uint64_t process_ppid(const thread_t *thread) {
-    if (thread && thread->process)
-        return ns_getppid(thread->process);
+    if (thread && thread->process && thread->process->parent)
+        return thread->process->parent->pid;
     return 0;
 }
 

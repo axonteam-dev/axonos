@@ -73,20 +73,6 @@ int user_vma_is_lazy_anon_page(uint64_t tid, uintptr_t va);
  */
 int user_vma_fork_scrub_lazy_file(mm_t *child_mm, uint64_t from_tid);
 
-/* Compact VMA view for fork copy_page_range.  Avoids USER_VMA_MAX scans
- * and thread-table walks on every populated 4K leaf. */
-#define USER_VMA_FORK_SNAP_MAX 256
-#define USER_VMA_F_SHARED      1u
-#define USER_VMA_F_LAZY_FILE   2u
-#define USER_VMA_F_LAZY_ANON   4u
-typedef struct {
-    uintptr_t addr;
-    uintptr_t end;
-    unsigned flags;
-} user_vma_fork_ent_t;
-int user_vma_fork_snapshot(mm_t *mm, uint64_t tid,
-                           user_vma_fork_ent_t *out, int max);
-
 int user_vma_add(uint64_t tid, uintptr_t addr, size_t len, int prot, int kind);
 int user_vma_add_mm(mm_t *mm, uintptr_t addr, size_t len, int prot, int kind);
 int user_vma_is_shared_page_mm(mm_t *mm, uintptr_t va);

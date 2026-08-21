@@ -21,7 +21,6 @@
 .extern syscall_user_saved_r11
 .extern syscall_exit_to_shell_flag
 .extern syscall_return_to_shell
-.extern syscall_exec_trampoline_active
 .extern syscall_snapshot_user_regs
 .extern syscall_restore_user_fs_before_iretq
 .extern syscall_finalize_user_frame
@@ -185,18 +184,11 @@ syscall_entry64:
 
 .ret_to_user:
 
-    // Store return value into saved rax slot so final pop restores it.
-    // If a trampoline was applied by kernel, assembly should not overwrite the patched
-    // saved-rax slot. Check global flag syscall_exec_trampoline_active.
-    movq    syscall_exec_trampoline_active(%rip), %rdx
-    testq   %rdx, %rdx
-    jz      .L_do_write_rax
-    // clear flag and skip writing rax (preserve patched slot)
-    movq    $0, syscall_exec_trampoline_active(%rip)
-    jmp     .L_skip_write_rax
-.L_do_write_rax:
+    // Always write rax. execve's trampoline rax is 0, same as syscall_do's
+    // success return. A global "skip rax write" flag is stolen by the vfork
+    // parent after the child's execve cond_resched: frame[14] stays SYS_vfork
+    // (58), waitpid(58) is ECHILD.
     movq    %rax, 112(%rsp)
-.L_skip_write_rax:
 
     /*
      * Safety net: normal fork already woke the child in C (wake_up_new_task).

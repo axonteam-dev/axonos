@@ -44,6 +44,7 @@
 #include <klog.h>
 #include <fbdev.h>
 #include <uapi_linux_fb.h>
+#include <input_evdev.h>
 #include <power.h>
 #include <iothread.h>
 #include <stdio.h>
@@ -63,8 +64,6 @@
 #include <user_brk.h>
 #include <user_mm.h>
 #include <utsname_host.h>
-#include <ns.h>
-#include <cgroup.h>
 
 #define mark_user_identity_range_2m_sys user_map_mark_identity_2m
 
@@ -220,14 +219,10 @@ static int wait4_id_matches(const thread_t *c, int pid_arg) {
      * TGID; matching it let a dying apt http worker steal waitpid(gpgv).
      * process_pid() also falls back to that slot once process_t is gone.
      */
-    if (c->linux_tgid > 0 && c->linux_tgid == pid_arg)
-        return 1;
-    if (c->process) {
-        if ((int)c->process->pid == pid_arg)
-            return 1;
-        if ((int)ns_pid_local(c->process) == pid_arg)
-            return 1;
-    }
+    if (c->linux_tgid > 0)
+        return c->linux_tgid == pid_arg;
+    if (c->process)
+        return (int)c->process->pid == pid_arg;
     return 0;
 }
 
@@ -361,8 +356,6 @@ static thread_t *wait4_find_by_tgid(int pid_arg)
         if (c->linux_tgid == pid_arg)
             return c;
         if (c->process && (int)c->process->pid == pid_arg)
-            return c;
-        if (c->process && (int)ns_pid_local(c->process) == pid_arg)
             return c;
     }
     return NULL;
@@ -624,52 +617,6 @@ static void fork_copy_child_regs_from_snapshot(thread_t *child, thread_t *parent
     child->saved_user_rip = child_rip;
     child->user_rip = child_rip;
     child->user_stack = snap[15];
-}
-
-static uint64_t clone_userspace_pid(const thread_t *child);
-
-/*
- * musl/BusyBox vfork: pop %rdx; syscall; push %rdx
- * glibc __libc_vfork: pop %rdi; syscall; push %rdi
- * fork_copy_child_regs_from_snapshot zeroes rdx for _Fork. Restore both
- * so the child returns to the wrapper instead of RIP=0, then execs.
- */
-static void fork_vfork_preserve_retaddr(thread_t *parent, thread_t *child)
-{
-    uint64_t *snap;
-    uint64_t rdi;
-    uint64_t rdx;
-
-    if (!parent || !child)
-        return;
-    snap = parent->syscall_frame_kbuf;
-    if (!snap)
-        snap = parent->saved_syscall_frame;
-    rdi = parent->saved_user_rdi;
-    rdx = parent->saved_user_rdx;
-    if (snap) {
-        rdi = snap[8];
-        rdx = snap[12];
-    }
-    child->saved_user_rdi = rdi;
-    child->fork_gpr_snap[8] = rdi;
-    child->saved_user_rdx = rdx;
-    child->fork_gpr_snap[12] = rdx;
-    child->clone_preserve_rdx = 1;
-}
-
-/* Linux: p->vfork_done is set before wake_up_new_task(). */
-static void fork_arm_vfork_wait(thread_t *parent, thread_t *child)
-{
-    if (!parent || !child || !parent->process || !child->process)
-        return;
-    process_set_vfork_parent(child->process, parent->process);
-    parent->vfork_waiting = 1;
-    parent->vfork_saved_ret = clone_userspace_pid(child);
-    /* Pin so a fast exec+_exit cannot be autoreaped before waitpid. */
-    child->waiter_tid = (int)(parent->tid ? parent->tid : 1);
-    if (parent->state != THREAD_BLOCKED && !thread_block_current_atomic())
-        thread_block((int)(parent->tid ? parent->tid : 1));
 }
 
 static void fork_assign_child_return_rip(thread_t *parent, thread_t *child) {
@@ -1231,8 +1178,6 @@ static void fork_wake_up_new_task(thread_t *parent, thread_t *child)
     parent->fork_child_to_publish = child;
     syscall_deferred_unblocks();
     parent->fork_child_to_publish = NULL;
-    if (child->mm && parent->mm && child->mm == parent->mm)
-        fork_vfork_preserve_retaddr(parent, child);
     thread_unblock_fork_child(ctid);
 }
 
@@ -2613,7 +2558,6 @@ typedef struct {
     net_tcp_conn_t tcp;
     int kref; /* references from fs_file handles sharing this ksock */
     int registry_slot;
-    struct net_namespace *netns;
 } ksock_net_t;
 
 #define KSOCK_REGISTRY_MAX 512
@@ -2774,8 +2718,6 @@ static ksock_net_t *unix_find_listener_by_path(const char *path, int path_len, i
         ksock_net_t *s = g_ksock_registry[i];
         if (!s || !s->unix_domain_stub || !s->unix_listening || !s->unix_bound)
             continue;
-        if (is_abs && !ns_net_same(s->netns, ns_current_net()))
-            continue;
         if (unix_path_equal(s, path, path_len, is_abs)) {
             release_irqrestore(&g_ksock_registry_lock, flags);
             return s;
@@ -2793,7 +2735,6 @@ static ksock_net_t *unix_find_listener_by_path(const char *path, int path_len, i
             if (!f || f->type != SYSCALL_FTYPE_SOCKET || !f->driver_private) continue;
             ksock_net_t *s = (ksock_net_t *)f->driver_private;
             if (!s->unix_domain_stub || !s->unix_listening || !s->unix_bound) continue;
-            if (is_abs && !ns_net_same(s->netns, ns_current_net())) continue;
             if (unix_path_equal(s, path, path_len, is_abs)) return s;
         }
     }
@@ -2988,7 +2929,6 @@ typedef struct {
     uint64_t ctime;
     uint32_t nattch;
     int removed;
-    struct ipc_namespace *ipc_ns;
 } sysv_shm_seg_t;
 
 typedef struct {
@@ -3017,11 +2957,8 @@ static sysv_shm_seg_t *sysv_shm_find_by_id_nolock(int shmid) {
 }
 
 static sysv_shm_seg_t *sysv_shm_find_by_key_nolock(int key) {
-    struct ipc_namespace *ipc = ns_current_ipc();
     for (int i = 0; i < SYSV_SHM_MAX_SEGMENTS; i++) {
-        if (g_sysv_shm[i].used && !g_sysv_shm[i].removed && g_sysv_shm[i].key == key &&
-            ns_ipc_same(g_sysv_shm[i].ipc_ns, ipc))
-            return &g_sysv_shm[i];
+        if (g_sysv_shm[i].used && !g_sysv_shm[i].removed && g_sysv_shm[i].key == key) return &g_sysv_shm[i];
     }
     return NULL;
 }
@@ -3635,7 +3572,13 @@ static int net_reply_icmp_echo_if_needed(const uint8_t *frame, size_t n) {
     const uint8_t *icmp = frame + sizeof(eth_hdr_t) + ihl;
     if (icmp[0] != 8 || icmp[1] != 0) return 0; /* echo request */
     size_t icmp_len = (size_t)tot - ihl;
-
+    if (icmp_dbg_left-- > 0) {
+        uint32_t src_ip_be = be32(ip->src);
+        klogprintf("net: ICMP echo request from %u.%u.%u.%u len=%u\n",
+                   (unsigned)((src_ip_be >> 24) & 0xFF), (unsigned)((src_ip_be >> 16) & 0xFF),
+                   (unsigned)((src_ip_be >> 8) & 0xFF), (unsigned)(src_ip_be & 0xFF),
+                   (unsigned)icmp_len);
+    }
 
     uint8_t *reply = (uint8_t *)kmalloc(icmp_len);
     if (!reply) return 1; /* consume to avoid loops; out of memory */
@@ -3648,6 +3591,7 @@ static int net_reply_icmp_echo_if_needed(const uint8_t *frame, size_t n) {
     uint32_t src_ip_be = be32(ip->src);
     (void)net_send_eth_ipv4(eth->src, src_ip_be, IPPROTO_ICMP_LOCAL, reply, icmp_len);
     kfree(reply);
+    if (icmp_dbg_left >= 0) klogprintf("net: ICMP echo reply sent\n");
     return 1;
 }
 
@@ -4700,8 +4644,6 @@ static ksock_net_t *net_tcp_find_bound_port(uint16_t port) {
         if (s->type_base != SOCK_STREAM_LOCAL ||
             s->protocol != IPPROTO_TCP_LOCAL) continue;
         if (s->local_port != port) continue;
-        if (!ns_net_same(s->netns, ns_current_net()))
-            continue;
         result = s;
         break;
     }
@@ -4714,8 +4656,6 @@ static int lo_tcp_stream_connect(ksock_net_t *client, uint32_t dst_ip_be, uint16
     if (!client) return EINVAL;
     if (client->connected && client->unix_conn) return EISCONN;
     ksock_net_t *listener = net_tcp_find_listener(dport);
-    if (listener && !ns_net_same(listener->netns, client->netns))
-        listener = NULL;
     if (!listener || !listener->tcp_listening) return ECONNREFUSED;
 
     unix_stream_conn_t *conn = (unix_stream_conn_t *)kmalloc(sizeof(*conn));
@@ -5010,8 +4950,6 @@ static int net_tcp_dispatch_incoming(const uint8_t *frame, size_t n) {
         if (heap_free_bytes() < (2u << 20))
             (void)thread_reap_unwaited_zombies();
         ksock_net_t *listener = net_tcp_find_listener(dport);
-        if (listener && !ns_net_is_init(listener->netns))
-            listener = NULL;
         if (!listener) return 0;
         tcp_syn_wait_t *wait = net_tcp_syn_wait_find(dport, rip, sport);
         net_tcp_conn_t *tc = wait ? &wait->tcp : NULL;
@@ -8347,6 +8285,12 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
         if (events & POLLOUT_K) revents |= POLLOUT_K;
         return revents;
     }
+    if (evdev_is_file(f)) {
+        if ((events & POLLIN_K) && evdev_bytes_available(f) > 0)
+            revents |= POLLIN_K;
+        if (events & POLLOUT_K) revents |= POLLOUT_K;
+        return revents;
+    }
     if (f->type == FS_TYPE_PIPE && f->driver_private) {
         pipe_t *p = (pipe_t *)f->driver_private;
         unsigned long fl = 0;
@@ -9181,14 +9125,8 @@ static uint64_t linux_task_tid(const thread_t *task) {
     if (!task) return 0;
     /* Linux: the group leader's tid equals its tgid (gettid()==getpid()). */
     if (task->process && task->process->leader == task)
-        return process_pid(task);
+        return task->process->pid;
     return (uint64_t)(task->tid ? task->tid : 1);
-}
-
-static uint64_t clone_userspace_pid(const thread_t *child) {
-    if (child && child->process)
-        return child->process->pid;
-    return linux_task_tid(child);
 }
 
 static int fork_store_child_tid(thread_t *child, mm_t *parent_mm,
@@ -9449,19 +9387,11 @@ static uint64_t do_linux_fork(thread_t *cur,
                         process_attach_thread(pp, cur);
                 }
                 fork_set_real_parent(child, cur);
-                if (cur->process && cgroup_can_fork(cur->process) != 0) {
-                    fork_stop_child(child);
-                    return ret_err(EAGAIN);
-                }
                 process_t *child_process = process_create(cur->process);
                 if (!child_process) {
                     if (cur->name[0] && strstr(cur->name, "linuxrc"))
                         kprintf("fork-fail: process_create parent_proc=%p\n",
                             (void *)cur->process);
-                    fork_stop_child(child);
-                    return ret_err(ENOMEM);
-                }
-                if (ns_clone_process(cur->process, child_process, args->flags) != 0) {
                     fork_stop_child(child);
                     return ret_err(ENOMEM);
                 }
@@ -9507,8 +9437,16 @@ static uint64_t do_linux_fork(thread_t *cur,
              * garbage and returns to a low address (observed as RIP=0x3 when
              * opkg spawned BusyBox wget).
              */
-            if (args->flags & CLONE_VFORK)
-                fork_vfork_preserve_retaddr(cur, child);
+            if (args->flags & CLONE_VFORK) {
+                uint64_t return_address = cur->saved_user_rdx;
+                if (cur->saved_syscall_frame)
+                    return_address = cur->saved_syscall_frame[12];
+                else if (cur->syscall_frame_kbuf)
+                    return_address = cur->syscall_frame_kbuf[12];
+                child->saved_user_rdx = return_address;
+                child->fork_gpr_snap[12] = return_address;
+                child->clone_preserve_rdx = 1;
+            }
             /*
              * fork_child_user_rip arms Soft_COW/_Fork identity fixes. Linux
              * vfork already shares mm — leave the marker cleared so
@@ -9516,13 +9454,6 @@ static uint64_t do_linux_fork(thread_t *cur,
              */
             if (share_mm)
                 child->fork_child_user_rip = 0;
-            /*
-             * Linux copy_process: initialize vfork_done before wake_up_new_task.
-             * Waking first let gpgv/--version exit before the parent was armed,
-             * so complete_vfork_done was a no-op and waitpid saw ECHILD.
-             */
-            if (args->flags & CLONE_VFORK)
-                fork_arm_vfork_wait(cur, child);
             /*
              * Linux: wake_up_new_task before copy_process returns. Parent then
              * returns the child's pid (or waits in wait_for_vfork_done for VFORK).
@@ -9533,12 +9464,12 @@ static uint64_t do_linux_fork(thread_t *cur,
                 (unsigned long long)(cur->tid ? cur->tid : 1),
                 (unsigned long long)(child->tid ? child->tid : 1), 0);
             fork_dbg(cur, 9, "return pid",
-                (unsigned long long)clone_userspace_pid(child), 0, 0);
+                (unsigned long long)process_pid(child), 0, 0);
             devel_printf("fork-ret: parent=%s child_pid=%llu child_tid=%d\n",
                 cur->name[0] ? cur->name : "?",
-                (unsigned long long)clone_userspace_pid(child),
+                (unsigned long long)process_pid(child),
                 (int)(child->tid ? child->tid : 1));
-            return clone_userspace_pid(child);
+            return process_pid(child);
 }
 
 static uint64_t kernel_clone(thread_t *parent,
@@ -9555,9 +9486,6 @@ static uint64_t kernel_clone(thread_t *parent,
 		return ret_err(EINVAL);
 	if ((args->flags & CLONE_THREAD) &&
 	    !(args->flags & CLONE_SIGHAND))
-		return ret_err(EINVAL);
-	if ((args->flags & CLONE_THREAD) &&
-	    (args->flags & AXON_CLONE_NEWNS_MASK))
 		return ret_err(EINVAL);
 	if ((args->flags & CLONE_VFORK) && !(args->flags & CLONE_VM))
 		return ret_err(EINVAL);
@@ -9597,10 +9525,8 @@ static uint64_t kernel_clone(thread_t *parent,
 		}
 	}
 	if (args->flags & CLONE_PARENT_SETTID) {
-		uint32_t parent_view = (uint32_t)clone_userspace_pid(child);
-
 		if (copy_to_user_safe((void *)(uintptr_t)args->parent_tid,
-				      &parent_view, sizeof(parent_view))) {
+				      &tid, sizeof(tid))) {
 			if (parent->fork_child_to_publish == child)
 				parent->fork_child_to_publish = NULL;
 			fork_stop_child(child);
@@ -9611,8 +9537,12 @@ static uint64_t kernel_clone(thread_t *parent,
 	if (args->flags & CLONE_VFORK) {
 		if (!parent->process)
 			return ret_err(EINVAL);
-		if (!parent->vfork_waiting)
-			fork_arm_vfork_wait(parent, child);
+		/* Linux: child already woken in do_linux_fork; then parent waits. */
+		process_set_vfork_parent(child_process, parent->process);
+		parent->vfork_waiting = 1;
+		parent->vfork_saved_ret = nr;
+		if (!thread_block_current_atomic())
+			thread_block((int)(parent->tid ? parent->tid : 1));
 	}
 
 	return nr;
@@ -9776,8 +9706,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             uint64_t parent_tid_ptr = a3;
             uint64_t child_tid_ptr = a4;
             uint64_t tls = a5;
-            if ((flags & CLONE_THREAD_OLD) && (flags & AXON_CLONE_NEWNS_MASK))
-                return ret_err(EINVAL);
             if ((flags & CLONE_SIGHAND_OLD) && !(flags & CLONE_VM_OLD))
                 return ret_err(EINVAL);
             if ((flags & CLONE_THREAD_OLD) &&
@@ -9939,16 +9867,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         process_t *pp = process_create_init();
                         if (pp) process_attach_thread(pp, cur);
                     }
-                    if (cur->process && cgroup_can_fork(cur->process) != 0) {
-                        thread_stop((int)(child->tid ? child->tid : 1));
-                        return ret_err(EAGAIN);
-                    }
                     process_t *child_process = process_create(cur->process);
                     if (!child_process) {
-                        thread_stop((int)(child->tid ? child->tid : 1));
-                        return ret_err(ENOMEM);
-                    }
-                    if (ns_clone_process(cur->process, child_process, flags) != 0) {
                         thread_stop((int)(child->tid ? child->tid : 1));
                         return ret_err(ENOMEM);
                     }
@@ -9999,12 +9919,18 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
 
                 rebuild_syscall_frame(cur);
-                if ((flags & CLONE_VFORK_OLD) && child->process && cur->process)
-                    fork_arm_vfork_wait(cur, child);
                 if (flags & CLONE_THREAD_OLD) {
                     cur->fork_child_to_publish = child;
                 } else {
                     thread_unblock((int)(child->tid ? child->tid : 1));
+                }
+                /* See clone3: posix_spawn fallback via __clone also uses VFORK. */
+                if ((flags & CLONE_VFORK_OLD) && child->process && cur->process) {
+                    process_set_vfork_parent(child->process, cur->process);
+                    cur->vfork_waiting = 1;
+                    cur->vfork_saved_ret = (uint64_t)child_user_tid;
+                    if (!thread_block_current_atomic())
+                        thread_block((int)(cur->tid ? cur->tid : 1));
                 }
                 {
                     static int clone_ok_left = 8;
@@ -10023,9 +9949,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         cur->name, (unsigned)child_user_tid,
                         (int)(child->tid ? child->tid : 1),
                         (unsigned long long)flags);
-                return (flags & CLONE_THREAD_OLD)
-                    ? (uint64_t)child_user_tid
-                    : clone_userspace_pid(child);
+                return (uint64_t)child_user_tid;
             }
 
             {
@@ -10091,8 +10015,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return ret_err(EINVAL);
             if ((flags & CLONE3_CLONE_THREAD) &&
                 !(flags & CLONE3_CLONE_SIGHAND))
-                return ret_err(EINVAL);
-            if ((flags & CLONE3_CLONE_THREAD) && (flags & AXON_CLONE_NEWNS_MASK))
                 return ret_err(EINVAL);
             if ((flags & CLONE3_PARENT_SETTID) &&
                 !user_range_ok((const void *)(uintptr_t)parent_tid_ptr, 4))
@@ -10241,16 +10163,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         process_t *pp = process_create_init();
                         if (pp) process_attach_thread(pp, cur);
                     }
-                    if (cur->process && cgroup_can_fork(cur->process) != 0) {
-                        thread_stop((int)(child->tid ? child->tid : 1));
-                        return ret_err(EAGAIN);
-                    }
                     process_t *child_process = process_create(cur->process);
                     if (!child_process) {
-                        thread_stop((int)(child->tid ? child->tid : 1));
-                        return ret_err(ENOMEM);
-                    }
-                    if (ns_clone_process(cur->process, child_process, flags) != 0) {
                         thread_stop((int)(child->tid ? child->tid : 1));
                         return ret_err(ENOMEM);
                     }
@@ -10293,13 +10207,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                      * slot. posix_spawn waitpid()'s that value — returning tid
                      * when tid!=pid made waitpid miss the zombie → ECHILD →
                      * fstabinfo treated a successful mount(2) as failure. */
-                    uint64_t child_nr = (flags & CLONE3_CLONE_THREAD)
-                        ? linux_task_tid(child)
-                        : clone_userspace_pid(child);
+                    uint64_t child_nr = linux_task_tid(child);
                     if (child_nr == 0)
                         child_nr = (uint64_t)(child->tid ? child->tid : 1);
-                    if ((flags & CLONE3_CLONE_VFORK) && child->process && cur->process)
-                        fork_arm_vfork_wait(cur, child);
                     /* CLONE_VM harness path: unblock now (per-thread syscall stacks). */
                     if (flags & CLONE3_CLONE_THREAD) {
                         cur->fork_child_to_publish = child;
@@ -10313,6 +10223,19 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             (unsigned long long)ctid,
                             (unsigned long long)child->user_rip,
                             (unsigned long long)child->user_stack);
+                    }
+                    /*
+                     * Linux CLONE_VFORK: freeze parent until child execs/exits.
+                     * glibc posix_spawn (__spawnix) munmaps the child stack as
+                     * soon as clone returns — without this wait the child runs
+                     * on a freed stack → RIP=0 (fstabinfo Oops).
+                     */
+                    if ((flags & CLONE3_CLONE_VFORK) && child->process && cur->process) {
+                        process_set_vfork_parent(child->process, cur->process);
+                        cur->vfork_waiting = 1;
+                        cur->vfork_saved_ret = child_nr;
+                        if (!thread_block_current_atomic())
+                            thread_block((int)(cur->tid ? cur->tid : 1));
                     }
                     return child_nr;
                 }
@@ -11547,6 +11470,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             tv.tv_sec = sec;
             tv.tv_usec = nsec / 1000;
             if (copy_to_user_safe(tv_u, &tv, sizeof(tv)) != 0) return ret_err(EFAULT);
+            fbdev_sync_user_frontbuffer();
             return 0;
         }
         case SYS_time: { /* Linux x86_64 nr 201 — also vsyscall+0x400 */
@@ -11690,6 +11614,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             uint64_t ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
             if (ms == 0 && ts.tv_nsec > 0) ms = 1;
             if (ms > 0) thread_sleep((uint32_t)ms);
+            fbdev_sync_user_frontbuffer();
             return 0;
         }
         case SYS_access: {
@@ -12921,6 +12846,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             uint64_t ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
             if (ms == 0 && ts.tv_nsec > 0) ms = 1;
             if (ms > 0) thread_sleep((uint32_t)(ms > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (uint32_t)ms));
+            fbdev_sync_user_frontbuffer();
             if (thread_has_interrupt_signal(cur)) {
                 if (rem_u) {
                     struct timespec_k zero = { 0, 0 };
@@ -13150,7 +13076,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             s->next_echo_seq = 0;
             s->nonblock = (type & O_NONBLOCK_LINUX) ? 1 : 0;
             s->kref = 1;
-            s->netns = ns_current_net();
             f->path = p;
             f->type = SYSCALL_FTYPE_SOCKET;
             f->driver_private = s;
@@ -14841,10 +14766,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         case SYS_sysinfo: { /* sysinfo(struct sysinfo *) - syscall 99; glibc allocatestack needs sane freeram */
             void *info_u = (void*)(uintptr_t)a1;
             if (!info_u || (uintptr_t)info_u + 112 > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            /* Linux uapi sysinfo x86_64 (gcc aligned): uptime(0), loads[3](8), totalram(32),
-             * freeram(40), sharedram(48), bufferram(56), totalswap(64), freeswap(72), procs(80),
-             * pad(82), 4-byte pad, totalhigh(88), freehigh(96), mem_unit(104). sizeof=112.
-             * mem_unit used to be stored at 100; userspace then read 0 and reported totalram=0. */
+            /* Linux struct sysinfo x86_64: uptime(0), loads[3](8), totalram(32), freeram(40), sharedram(48),
+               bufferram(56), totalswap(64), freeswap(72), procs(80), pad(82), totalhigh(84), freehigh(92),
+               mem_unit(100). glibc advise_stack_range: freesize from freeram*mem_unit; must be >= stack size. */
             uint8_t buf[128];
             memset(buf, 0, sizeof(buf));
             int64_t uptime_sec = (int64_t)(pit_get_time_ms() / 1000);
@@ -14880,9 +14804,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             /* totalswap, freeswap at 64,72 = 0 */
             uint16_t procs = (uint16_t)thread_get_count();
             memcpy(buf + 80, &procs, 2);
-            /* totalhigh @88, freehigh @96 remain 0 */
+            /* totalhigh, freehigh at 84,92 = 0 */
             uint32_t mem_unit = 1;
-            memcpy(buf + 104, &mem_unit, 4);
+            memcpy(buf + 100, &mem_unit, 4);
             if (copy_to_user_safe(info_u, buf, 112) != 0) return ret_err(EFAULT);
             return 0;
         }
@@ -16179,38 +16103,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
             return kernel_clone(cur, &args);
         }
-        case SYS_unshare: {
-            uint64_t flags = a1;
-            uint64_t ign = CLONE_FILES | CLONE_FS | CLONE_SYSVSEM;
-
-            if (!cur->process)
-                return ret_err(EINVAL);
-            if (flags & CLONE_THREAD)
-                return ret_err(EINVAL);
-            if (flags & ~(AXON_CLONE_NEWNS_MASK | ign))
-                return ret_err(EINVAL);
-            if (ns_unshare(cur->process, flags) != 0)
-                return ret_err(ENOMEM);
-            return 0;
-        }
-        case SYS_setns: {
-            int fd = (int)a1;
-            int nstype = (int)a2;
-            struct fs_file *f;
-            int r;
-
-            if (!cur->process)
-                return ret_err(EINVAL);
-            f = syscall_fd_get(cur, fd);
-            if (!f)
-                return ret_err(EBADF);
-            r = ns_setns_file(cur->process, f, nstype);
-            if (r == -22)
-                return ret_err(EINVAL);
-            if (r != 0)
-                return ret_err(ENOMEM);
-            return 0;
-        }
 
         case SYS_wait4: {
             /* waitpid(pid, status*, options, rusage*).
@@ -17062,6 +16954,54 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return 0;
                 }
                 return ret_err(ENOTTY);
+            }
+
+            /* Linux evdev ioctls on /dev/input/eventN (libevdev/libinput/SDL). */
+            if (evdev_is_file(f)) {
+                uint32_t cmd = (uint32_t)req;
+                unsigned nr = cmd & 0xffu;
+                unsigned ioc_type = (cmd >> 8) & 0xffu;
+                unsigned size = (cmd >> 16) & 0x3fffu;
+                unsigned dir = cmd >> 30;
+                uint8_t karg[256];
+                int rc;
+
+                if (req == FIONREAD || cmd == FIONREAD) {
+                    int n;
+                    uint32_t nb;
+                    if (!argp) return ret_err(EFAULT);
+                    n = evdev_bytes_available(f);
+                    if (n < 0) return ret_err(-n);
+                    nb = (uint32_t)n;
+                    if (copy_to_user_safe(argp, &nb, sizeof(nb)) != 0)
+                        return ret_err(EFAULT);
+                    return 0;
+                }
+                if (ioc_type != 'E')
+                    return ret_err(ENOTTY);
+                /* EVIOCGRAB/REVOKE: arg is the flag, not a userspace pointer.
+                 * linux drivers/input/evdev.c evdev_do_ioctl. */
+                if (nr == 0x90 || nr == 0x91) {
+                    int grab = argp ? 1 : 0;
+                    if (nr == 0x91)
+                        grab = 0;
+                    rc = evdev_ioctl(f, cmd, &grab, sizeof(grab));
+                    return rc < 0 ? ret_err(-rc) : 0;
+                }
+                memset(karg, 0, sizeof(karg));
+                if (size > sizeof(karg))
+                    size = sizeof(karg);
+                if ((dir & 1u) && size && argp) {
+                    if (copy_from_user_raw(karg, argp, size) != 0)
+                        return ret_err(EFAULT);
+                }
+                rc = evdev_ioctl(f, cmd, karg, size);
+                if (rc < 0) return ret_err(-rc);
+                if ((dir & 2u) && size && argp) {
+                    if (copy_to_user_safe(argp, karg, size) != 0)
+                        return ret_err(EFAULT);
+                }
+                return 0;
             }
 
             /* Block-device ioctls for /dev/sdX,/dev/srX,/dev/nvmeXnY (mkfs/fdisk/partprobe). */
@@ -18612,9 +18552,16 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             if (timeout == 0) {
                 /* Non-blocking poll: must return immediately (POSIX). Sleeping
-                 * here made ncurses/htop feel laggy — every idle poll cost 10ms. */
+                 * here made ncurses/htop feel laggy — every idle poll cost 10ms.
+                 * Linux still copies revents (including zeros). doomgeneric_linuxvt
+                 * checkKeys() loops on stale POLLIN if we skip the copy. */
                 if (has_net_socket)
                     net_pump_all_tcp(poll_thr);
+                fbdev_sync_user_frontbuffer();
+                if (copy_to_user_safe((void*)ufds, kbuf, bytes) != 0) {
+                    kfree(kbuf);
+                    return ret_err(EFAULT);
+                }
                 kfree(kbuf);
                 return 0;
             }
@@ -18810,6 +18757,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
             }
             if (f && (flags & O_APPEND_MASK)) { f->pos = (off_t)(size_t)f->size; }
+            if (f)
+                f->flags = flags;
             int fd = thread_fd_alloc(f);
             if (fd < 0) { fs_file_free(f); kfree(path); return ret_err(EBADF); }
             (void)fs_file_set_user_path(f, path);
@@ -18952,6 +18901,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
             }
             if (f && (flags & O_APPEND_MASK)) { f->pos = (off_t)(size_t)f->size; }
+            if (f)
+                f->flags = flags;
             int fd = thread_fd_alloc(f);
             if (fd < 0) { fs_file_free(f); return ret_err(EBADF); }
             if (cur->process)
@@ -19819,6 +19770,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                     out_ino = (uint64_t)st.st_ino;
                                 }
                                 if ((st.st_mode & S_IFDIR) == S_IFDIR) out_type = EXT2_FT_DIR;
+                                else if ((st.st_mode & S_IFCHR) == S_IFCHR) out_type = EXT2_FT_CHRDEV;
+                                else if ((st.st_mode & S_IFBLK) == S_IFBLK) out_type = EXT2_FT_BLKDEV;
                                 else out_type = EXT2_FT_REG_FILE;
                             }
                             fs_file_free(ef);
@@ -19837,6 +19790,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 uint8_t dtype = 0; /* DT_UNKNOWN */
                 if (out_type == EXT2_FT_DIR) dtype = 4;       /* DT_DIR */
                 else if (out_type == EXT2_FT_REG_FILE) dtype = 8; /* DT_REG */
+                else if (out_type == EXT2_FT_CHRDEV) dtype = 2; /* DT_CHR */
+                else if (out_type == EXT2_FT_BLKDEV) dtype = 6; /* DT_BLK */
                 else if (out_type == EXT2_FT_SYMLINK) dtype = 10; /* DT_LNK */
 
                 size_t reclen;
@@ -20243,20 +20198,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             errno_out = EBUSY;
                     }
                 }
-            } else if (strcmp(k_type, "cgroup2") == 0 || strcmp(k_type, "cgroup") == 0) {
-                ramfs_mkdir(target);
-                (void)cgroupfs_register();
-                {
-                    struct fs_driver *md = fs_get_mount_driver_exact(target);
-                    if (md && md->ops && md->ops->name &&
-                        strcmp(md->ops->name, "cgroup2") == 0) {
-                        rc = 0;
-                    } else {
-                        rc = cgroupfs_mount(target);
-                        if (rc != 0)
-                            errno_out = EBUSY;
-                    }
-                }
             } else if (strcmp(k_type, "minix") == 0 || strcmp(k_type, "minixfs") == 0 ||
                        strcmp(k_type, "fat32") == 0 || strcmp(k_type, "vfat") == 0 ||
                        strcmp(k_type, "msdos") == 0 || strcmp(k_type, "auto") == 0 ||
@@ -20527,7 +20468,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             seg->ctime = sysv_shm_now_secs();
             seg->nattch = 0;
             seg->removed = 0;
-            seg->ipc_ns = ns_current_ipc();
             int shmid = seg->shmid;
             release_irqrestore(&g_sysv_shm_lock, fl);
 
@@ -21645,6 +21585,23 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             (unsigned long long)(trace_t->tid ? trace_t->tid : 1));
     {
         uint64_t out = syscall_sanitize_user_ret(ret);
+        uint64_t syscall_prof_done = time_monotonic_us();
+        uint64_t syscall_prof_total = syscall_prof_done - syscall_prof_begin;
+        if (syscall_prof_total >= 100000ULL &&
+            (num == SYS_execve || num == SYS_socket ||
+             num == SYS_openat || num == SYS_access)) {
+            static int syscall_slow_profile_left = 256;
+            if (syscall_slow_profile_left-- > 0) {
+                klogprintf("syscall-slow: n=%llu inner=%lluus tail=%lluus total=%lluus ret=0x%llx\n",
+                           (unsigned long long)num,
+                           (unsigned long long)(syscall_prof_inner_done -
+                                                syscall_prof_begin),
+                           (unsigned long long)(syscall_prof_done -
+                                                syscall_prof_inner_done),
+                           (unsigned long long)syscall_prof_total,
+                           (unsigned long long)out);
+            }
+        }
         if (trace_t && trace_t->fork_child_user_rip && trace_t->name[0] &&
             strstr(trace_t->name, "linuxrc") &&
             (num == SYS_getpid || num == SYS_ioctl || num == SYS_execve ||

@@ -32,14 +32,30 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
 
+static int exec_stdio_is_dev_null(const struct fs_file *f) {
+    if (!f || !f->path)
+        return 0;
+    return strcmp(f->path, "/dev/null") == 0 ||
+           strcmp(f->path, "null") == 0;
+}
+
 /*
- * Linux execve(2) does not remap open descriptors. Only closed 0/1/2 need a
- * boot console (BusyBox init). /dev/null is an intentional sink: apt ExecGPGV
- * does dup2(nullfd, STDERR_FILENO) so gpgv's "Good signature" lines stay off
- * the tty. Replacing that with /dev/console leaked them into apt update.
+ * Linux execve keeps the inherited fd table. Reopen only *closed* 0/1/2 onto
+ * the console (BusyBox init with empty inittab otherwise gives ash EOF).
+ * An open /dev/null is a deliberate redirect: apt ExecGPGV dup2's gpgv
+ * stdout/stderr there so "Good signature" does not hit the TTY.
  */
 static int exec_stdio_needs_console(const struct fs_file *f) {
-    return f == NULL;
+    if (!f)
+        return 1;
+    if (f->type == FS_TYPE_PIPE || f->type == FS_TYPE_SOCKET)
+        return 0;
+    if (devfs_is_tty_file((struct fs_file *)f))
+        return 0;
+    if (exec_stdio_is_dev_null(f))
+        return 0;
+    /* Keep open non-tty files (redirections to regular paths). */
+    return 0;
 }
 
 /* Linux AT_RANDOM: 16 bytes used for the stack canary / glibc. */
@@ -67,9 +83,8 @@ void exec_boot_ensure_stdio(thread_t *ut) {
      * an empty inittab console id, spawn never reopens a real tty — ash then
      * sees EOF on stdin and exits, and ::respawn loops forever.
      *
-     * Rebind only *closed* 0/1/2. Never replace pipes, sockets, ttys, or
-     * /dev/null: apt ExecGPGV dup2's gpgv stderr to /dev/null, and putting
-     * the console there printed "Good signature" into apt update.
+     * Rebind only *closed* stdio. Never replace pipes, sockets, ttys, or an
+     * open /dev/null — apt ExecGPGV dup2's gpgv stderr there on purpose.
      *
      * fds 0/1/2 often alias the same fs_file; free each unique pointer once
      * per aliased slot (refcount may be wrong after fork/exec).
@@ -2510,10 +2525,13 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
             process_sync_from_thread(cur_user->process, cur_user);
         }
         /*
-         * Linux execve keeps inherited stdio. Closed 0/1/2 still get a console
-         * so BusyBox ash is not started on EOF; /dev/null redirects stay.
+         * After setsid(), BusyBox init with empty console id leaves /dev/null
+         * on stdio. Re-bind console before entering ash or the shell exits on
+         * EOF and ::respawn spins.
          */
         exec_boot_ensure_stdio(cur_user);
+        if (cur_user->process)
+            process_sync_from_thread(cur_user->process, cur_user);
         /* Set foreground so Ctrl+C terminates this process when waiting */
         if (cur_user->attached_tty >= 0) {
             devfs_set_tty_fg_pgrp(cur_user->attached_tty, cur_user->pgid);

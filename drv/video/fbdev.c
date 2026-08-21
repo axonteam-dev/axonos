@@ -9,6 +9,9 @@
 #include <stdint.h>
 #include <string.h>
 #include <errno.h>
+#include <thread.h>
+#include <mm.h>
+#include <klog.h>
 
 #ifndef EINVAL
 #define EINVAL 22
@@ -28,12 +31,15 @@ static struct {
 	int active;
 } g_fbdev;
 
+static int g_fbdev_user_mapped;
+
 /* Non-NULL devfs char-node private (must not be interpreted as tty or int marker). */
 static char fbdev_devfs_tag;
 
 void fbdev_register_linear(void *kva, uint64_t fb_pa, size_t byte_len,
                            uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp) {
 	memset(&g_fbdev, 0, sizeof(g_fbdev));
+	g_fbdev_user_mapped = 0;
 	if (!kva || byte_len == 0 || fb_pa == 0) {
 		g_fbdev.active = 0;
 		return;
@@ -54,6 +60,7 @@ void fbdev_register_linear(void *kva, uint64_t fb_pa, size_t byte_len,
 
 void fbdev_unregister(void) {
 	g_fbdev.active = 0;
+	g_fbdev_user_mapped = 0;
 	memset(&g_fbdev, 0, sizeof(g_fbdev));
 }
 
@@ -69,6 +76,30 @@ int fbdev_is_fb0_file(const struct fs_file *f) {
 	return f && f->path && strcmp(f->path, "/dev/fb0") == 0;
 }
 
+uintptr_t fbdev_mmap_align_va(uintptr_t addr)
+{
+	uint64_t mask = PAGE_SIZE_2M - 1ULL;
+	uint64_t poff;
+	uint64_t aoff;
+	uintptr_t base;
+
+	if (!g_fbdev.active)
+		return addr;
+	poff = g_fbdev.pa & mask;
+	aoff = (uint64_t)addr & mask;
+	if (aoff == poff)
+		return addr;
+	base = (uintptr_t)(((uint64_t)addr + mask) & ~mask);
+	return base + (uintptr_t)poff;
+}
+
+void fbdev_sync_user_frontbuffer(void)
+{
+	if (!g_fbdev.active || !g_fbdev_user_mapped)
+		return;
+	fbdev_flush_display();
+}
+
 void fbdev_copy_to(void *dst, size_t offset, size_t n) {
 	if (!g_fbdev.active || n == 0 || !dst)
 		return;
@@ -78,6 +109,9 @@ void fbdev_copy_to(void *dst, size_t offset, size_t n) {
 void fbdev_flush_display(void) {
 	if (!g_fbdev.active)
 		return;
+#if defined(__GNUC__) || defined(__clang__)
+	__asm__ volatile("mfence" ::: "memory");
+#endif
 	video_flush_region_pixels(0, 0, g_fbdev.width, g_fbdev.height);
 	video_display_sync();
 }
@@ -90,23 +124,48 @@ void fbdev_copy_from(size_t offset, const void *src, size_t n) {
 }
 
 int fbdev_mmap_user(uintptr_t addr, size_t len, size_t file_off) {
+	thread_t *t;
+	mm_t *mm, *kmm, *share;
+	uint64_t va, end, pa;
+	/* WB like mmio_map_framebuffer — UC/WC on the same PA as kernel VRAM
+	 * (PAT alias) left VMware scanout showing the old fbcon text. */
+	const uint64_t flags = PG_PRESENT | PG_RW | PG_US;
+
 	if (!g_fbdev.active || len == 0)
+		return -1;
+	if ((addr & 0xFFFULL) || (file_off & 0xFFFULL))
 		return -1;
 	if ((uint64_t)file_off + (uint64_t)len > (uint64_t)g_fbdev.len)
 		return -1;
 
-	const uint64_t mask = (uint64_t)PAGE_SIZE_2M - 1ULL;
-	uint64_t fb_start = g_fbdev.pa;
-	uintptr_t end = addr + len;
+	t = thread_get_current_user();
+	if (!t)
+		t = thread_current();
+	kmm = mm_kernel();
+	mm = (t && t->mm) ? t->mm : NULL;
+	share = (t && t->mm_ptemplate && t->mm_ptemplate->pml4) ?
+		t->mm_ptemplate : kmm;
+	if (!mm || !mm->pml4 || !kmm || !kmm->pml4 || mm->pml4 == kmm->pml4 ||
+	    !share || !share->pml4)
+		return -1;
 
-	const uint64_t map_flags = (uint64_t)(PG_PRESENT | PG_RW | PG_US | PG_PCD | PG_PWT);
+	va = (uint64_t)addr;
+	end = va + (uint64_t)len;
+	/* Best-effort: drop identity / leftover leaves. map_user_page replaces them. */
+	(void)mm_unmap_user_range(mm, share->pml4, va, end);
 
-	for (uintptr_t u = addr & ~(uintptr_t)mask; u < end; u += (uintptr_t)PAGE_SIZE_2M) {
-		uint64_t p = fb_start + (uint64_t)file_off + (uint64_t)((intptr_t)u - (intptr_t)addr);
-		uint64_t pa_page = p & ~mask;
-		if (map_page_2m((uint64_t)u, pa_page, map_flags) != 0)
+	pa = g_fbdev.pa + (uint64_t)file_off;
+	for (; va < end; va += 4096ULL, pa += 4096ULL) {
+		if (mm_map_user_page(mm, va, pa, flags) != 0) {
+			klogprintf("fbdev: mmap leaf failed va=0x%llx pa=0x%llx\n",
+				   (unsigned long long)va, (unsigned long long)pa);
 			return -1;
+		}
 	}
+	g_fbdev_user_mapped = 1;
+	klogprintf("fbdev: user mmap va=0x%llx len=0x%zx pa=0x%llx\n",
+		   (unsigned long long)addr, len,
+		   (unsigned long long)(g_fbdev.pa + (uint64_t)file_off));
 	return 0;
 }
 

@@ -93,3 +93,13 @@ void video_display_sync(void) {
 	}
 }
 
+static int g_kd_graphics;
+
+void video_set_kd_mode(int graphics) {
+	g_kd_graphics = graphics ? 1 : 0;
+}
+
+int video_kd_graphics(void) {
+	return g_kd_graphics;
+}
+

@@ -347,9 +347,42 @@ static ssize_t sysfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         uint8_t *out = (uint8_t*)buf;
         struct sysfs_node *child = node->children;
 
+        /* "." / ".." first so glob() on sysfs (Xorg libfbdevhw) works. */
+        {
+            static const char *const dots[] = { ".", ".." };
+            for (int di = 0; di < 2; di++) {
+                const char *nm = dots[di];
+                size_t namelen = strlen(nm);
+                size_t rec_len = (8 + namelen + 3) & ~3u;
+                if (pos + rec_len <= (size_t)offset) {
+                    pos += rec_len;
+                    continue;
+                }
+                if (written >= size)
+                    break;
+                uint8_t tmp[32];
+                memset(tmp, 0, sizeof(tmp));
+                struct ext2_dir_entry de;
+                de.inode = (uint32_t)(node->ino & 0xFFFFFFFFu);
+                de.rec_len = (uint16_t)rec_len;
+                de.name_len = (uint8_t)namelen;
+                de.file_type = EXT2_FT_DIR;
+                memcpy(tmp, &de, 8);
+                memcpy(tmp + 8, nm, namelen);
+                size_t entry_off = ((size_t)offset > pos) ? (size_t)offset - pos : 0;
+                size_t avail = size - written;
+                size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
+                if (tocopy > avail)
+                    tocopy = avail;
+                memcpy(out + written, tmp + entry_off, tocopy);
+                written += tocopy;
+                pos += rec_len;
+            }
+        }
+
         while (child) {
             size_t namelen = strlen(child->name);
-            size_t rec_len = 8 + namelen;
+            size_t rec_len = (8 + namelen + 3) & ~3u;
 
             /* if entry lies entirely before offset, skip */
             if (pos + rec_len <= (size_t)offset) {

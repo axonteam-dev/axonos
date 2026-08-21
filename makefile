@@ -86,7 +86,7 @@ ASCII_PF2_SRC := $(firstword $(wildcard /usr/share/grub/ascii.pf2 /boot/grub/fon
 SYS_CA_PEM := $(BUILD_DIR)/certs/axonos-system-ca.pem
 SYS_CA_BLOB_OBJ := $(BUILD_DIR)/certs/axonos-system-ca.blob.o
 
-.PHONY: all kernel iso clean run run-uefi for-production config oldconfig archive initfs-apt-libs initfs-apt
+.PHONY: all kernel iso clean run run-uefi for-production config oldconfig
 
 all: iso
 

@@ -23,6 +23,7 @@
 #include <mouse.h>
 #include <klog.h>
 #include <pty.h>
+#include <video.h>
 
 #define DEVFS_TTY_COUNT 6
 
@@ -472,6 +473,9 @@ static void devfs_tty_blit_cells(struct devfs_tty *tty, uint32_t x0, uint32_t x1
     uint32_t cols = devfs_tty_cols();
     uint32_t rows = devfs_tty_rows();
     if (!tty || !tty->screen || cols == 0 || rows == 0 || y >= rows)
+        return;
+    /* Linux KD_GRAPHICS: userspace owns the framebuffer (Xorg). */
+    if (video_kd_graphics())
         return;
     if (x0 >= cols)
         return;
@@ -1014,6 +1018,12 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
             f->pos = 0;
             f->refcount = 1;
             *out_file = f;
+            if (strcmp(path, "/dev/fb0") == 0) {
+                static int fb0_open_log = 4;
+                if (fb0_open_log-- > 0)
+                    kprintf("fbdev: open /dev/fb0 active=%d len=%zu\n",
+                            fbdev_is_active(), (size_t)f->size);
+            }
             return 0;
         }
     }

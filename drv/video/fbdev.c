@@ -231,6 +231,20 @@ int fbdev_check_var(const struct fb_var_screeninfo *v) {
 static int g_sysfs_pending;
 static uint8_t g_sysfs_bus, g_sysfs_dev, g_sysfs_fn;
 
+static void fbdev_sysfs_attr_devname(const char *dir) {
+	char path[160];
+	/* Linux: /sys/.../graphics/fb0/dev is "major:minor\n". Xorg libfbdevhw
+	 * globs this after opening the PCI device dir; without it fbdev_open_pci
+	 * discards an already-open /dev/fb0 and PreInit returns no screens. */
+	static struct sysfs_attr attr_dev = { sysfs_show_const, NULL, (void *)"29:0" };
+	static struct sysfs_attr attr_name = { sysfs_show_const, NULL, (void *)"axonfb" };
+
+	snprintf(path, sizeof(path), "%s/dev", dir);
+	(void)sysfs_create_file(path, &attr_dev);
+	snprintf(path, sizeof(path), "%s/name", dir);
+	(void)sysfs_create_file(path, &attr_name);
+}
+
 static int fbdev_sysfs_publish_now(uint8_t bus, uint8_t device, uint8_t function) {
 	char path[128];
 
@@ -242,10 +256,10 @@ static int fbdev_sysfs_publish_now(uint8_t bus, uint8_t device, uint8_t function
 	(void)sysfs_mkdir("/sys/devices");
 	(void)sysfs_mkdir("/sys/devices/platform");
 	(void)sysfs_mkdir("/sys/devices/platform/axonfb.0");
+	fbdev_sysfs_attr_devname("/sys/devices/platform/axonfb.0");
 	(void)sysfs_mkdir("/sys/class/graphics");
-	if (sysfs_create_symlink("/sys/class/graphics/fb0",
-				 "../../devices/platform/axonfb.0") != 0)
-		return -1;
+	(void)sysfs_create_symlink("/sys/class/graphics/fb0",
+				   "../../devices/platform/axonfb.0");
 
 	/* PCI graphics/fb0 — Xorg FBDevPciProbe / fbdev_open_pci. */
 	snprintf(path, sizeof(path),
@@ -261,6 +275,7 @@ static int fbdev_sysfs_publish_now(uint8_t bus, uint8_t device, uint8_t function
 		 bus, device, function);
 	if (sysfs_mkdir(path) != 0)
 		return -1;
+	fbdev_sysfs_attr_devname(path);
 	return 0;
 }
 

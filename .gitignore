@@ -9,3 +9,5 @@ build/
 *.d
 initfs.sfs
 *.iso
+*dsc
+*.xz

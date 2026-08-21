@@ -1225,6 +1225,8 @@ void cirrusfb_putchar(uint8_t ch, uint8_t attr) {
 
 void cirrusfb_update_cursor(void) {
 	if (!g_ready) return;
+	if (video_kd_graphics())
+		return;
 	/* Push damage deferred from tty write batches (ncurses redraws). */
 	if (g_fb_dirty && g_batch_depth == 0)
 		cirrusfb_flush_dirty();

@@ -44,6 +44,10 @@ void video_flush_region_pixels(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 /* Commit display updates after one or more flush_region calls (SVGA SYNC, etc.). */
 void video_display_sync(void);
 
+/* Linux KDSETMODE: KD_TEXT=0, KD_GRAPHICS=1. fbcon must not paint over X. */
+void video_set_kd_mode(int graphics);
+int video_kd_graphics(void);
+
 #endif /* VIDEO_H */
 
 

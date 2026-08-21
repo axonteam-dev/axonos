@@ -44,6 +44,7 @@
 #include <klog.h>
 #include <fbdev.h>
 #include <uapi_linux_fb.h>
+#include <video.h>
 #include <input_evdev.h>
 #include <power.h>
 #include <iothread.h>
@@ -16915,7 +16916,12 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
             /* Linux fbdev ioctls on /dev/fb0 (Xorg Driver "fbdev"). */
             if (fbdev_is_fb0_file(f)) {
-                if (req == FBIOGET_VSCREENINFO) {
+                uint32_t fbcmd = (uint32_t)req & 0xffffu;
+                static int fb0_ioctl_log = 8;
+                if (fb0_ioctl_log-- > 0)
+                    kprintf("fbdev-ioctl: req=0x%llx nr=0x%x active=%d\n",
+                            (unsigned long long)req, fbcmd, fbdev_is_active());
+                if (req == FBIOGET_VSCREENINFO || fbcmd == 0x4600) {
                     struct fb_var_screeninfo v;
                     if (!argp) return ret_err(EFAULT);
                     if (!fbdev_is_active()) return ret_err(ENODEV);
@@ -16923,14 +16929,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (copy_to_user_safe(argp, &v, sizeof(v)) != 0) return ret_err(EFAULT);
                     return 0;
                 }
-                if (req == FBIOPUT_VSCREENINFO) {
+                if (req == FBIOPUT_VSCREENINFO || fbcmd == 0x4601) {
                     struct fb_var_screeninfo v;
                     if (!argp) return ret_err(EFAULT);
                     if (copy_from_user_raw(&v, argp, sizeof(v)) != 0) return ret_err(EFAULT);
                     int rc = fbdev_check_var(&v);
                     return rc < 0 ? ret_err(-rc) : 0;
                 }
-                if (req == FBIOGET_FSCREENINFO) {
+                if (req == FBIOGET_FSCREENINFO || fbcmd == 0x4602) {
                     struct fb_fix_screeninfo fi;
                     if (!argp) return ret_err(EFAULT);
                     if (!fbdev_is_active()) return ret_err(ENODEV);
@@ -16938,6 +16944,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (copy_to_user_safe(argp, &fi, sizeof(fi)) != 0) return ret_err(EFAULT);
                     return 0;
                 }
+                if (req == FBIOGETCMAP || req == FBIOPUTCMAP)
+                    return 0;
                 if (req == FBIOPAN_DISPLAY) {
                     struct fb_var_screeninfo v;
                     if (!argp) return ret_err(EFAULT);
@@ -16955,6 +16963,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 return ret_err(ENOTTY);
             }
+
+            /* Stub DRM node: exist() succeeds for tests; ioctls fail so Xorg
+             * modesetting/vmware skip it and use Driver "fbdev". */
+            if (f->path && strcmp(f->path, "/dev/dri/card0") == 0)
+                return ret_err(ENODEV);
 
             /* Linux evdev ioctls on /dev/input/eventN (libevdev/libinput/SDL). */
             if (evdev_is_file(f)) {
@@ -17589,6 +17602,82 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 (void)argp;
                 return 0;
             }
+
+            /*
+             * KDSETMODE (0x4B3A) / KDGETMODE (0x4B3B) — include/uapi/linux/kd.h
+             * Xorg fbdev: KD_GRAPHICS so the console stops painting over mmap.
+             */
+            if (req == 0x4B3A || req == 0x4B3B) {
+                static int kd_mode = 0; /* KD_TEXT */
+                if (!devfs_is_tty_file(f))
+                    return ret_err(ENOTTY);
+                if (req == 0x4B3B) {
+                    if (!argp || !user_range_ok(argp, sizeof(int)))
+                        return ret_err(EFAULT);
+                    if (copy_to_user_safe(argp, &kd_mode, sizeof(kd_mode)) != 0)
+                        return ret_err(EFAULT);
+                    return 0;
+                }
+                {
+                    int mode = (int)(intptr_t)argp;
+                    if (mode < 0 || mode > 3)
+                        return ret_err(EINVAL);
+                    kd_mode = mode;
+                    video_set_kd_mode(mode == 1); /* KD_GRAPHICS */
+                    return 0;
+                }
+            }
+
+            /* VT_OPENQRY (0x5600): next free VT number. */
+            if (req == 0x5600) {
+                int next = 2;
+                if (!argp || !user_range_ok(argp, sizeof(int)))
+                    return ret_err(EFAULT);
+                if (copy_to_user_safe(argp, &next, sizeof(next)) != 0)
+                    return ret_err(EFAULT);
+                return 0;
+            }
+            /* VT_GETMODE (0x5601) / VT_SETMODE (0x5602) */
+            if (req == 0x5601 || req == 0x5602) {
+                static struct {
+                    char mode;
+                    char waitv;
+                    short relsig;
+                    short acqsig;
+                    short frsig;
+                } vt_mode = { 0, 0, 0, 0, 0 }; /* VT_AUTO */
+                if (!devfs_is_tty_file(f))
+                    return ret_err(ENOTTY);
+                if (!argp || !user_range_ok(argp, sizeof(vt_mode)))
+                    return ret_err(EFAULT);
+                if (req == 0x5601) {
+                    if (copy_to_user_safe(argp, &vt_mode, sizeof(vt_mode)) != 0)
+                        return ret_err(EFAULT);
+                    return 0;
+                }
+                if (copy_from_user_raw(&vt_mode, argp, sizeof(vt_mode)) != 0)
+                    return ret_err(EFAULT);
+                return 0;
+            }
+            /* VT_GETSTATE (0x5603) */
+            if (req == 0x5603) {
+                struct {
+                    unsigned short v_active;
+                    unsigned short v_signal;
+                    unsigned short v_state;
+                } st;
+                if (!argp || !user_range_ok(argp, sizeof(st)))
+                    return ret_err(EFAULT);
+                st.v_active = 1;
+                st.v_signal = 0;
+                st.v_state = 1; /* VT 1 active */
+                if (copy_to_user_safe(argp, &st, sizeof(st)) != 0)
+                    return ret_err(EFAULT);
+                return 0;
+            }
+            /* VT_RELDISP (0x5605): ACK of VT switch in VT_PROCESS mode. */
+            if (req == 0x5605)
+                return 0;
 
             /* For the remaining tty-specific ioctls, require a real tty file. */
             if (!devfs_is_tty_file(f)) {
@@ -21585,38 +21674,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             (unsigned long long)(trace_t->tid ? trace_t->tid : 1));
     {
         uint64_t out = syscall_sanitize_user_ret(ret);
-        uint64_t syscall_prof_done = time_monotonic_us();
-        uint64_t syscall_prof_total = syscall_prof_done - syscall_prof_begin;
-        if (syscall_prof_total >= 100000ULL &&
-            (num == SYS_execve || num == SYS_socket ||
-             num == SYS_openat || num == SYS_access)) {
-            static int syscall_slow_profile_left = 256;
-            if (syscall_slow_profile_left-- > 0) {
-                klogprintf("syscall-slow: n=%llu inner=%lluus tail=%lluus total=%lluus ret=0x%llx\n",
-                           (unsigned long long)num,
-                           (unsigned long long)(syscall_prof_inner_done -
-                                                syscall_prof_begin),
-                           (unsigned long long)(syscall_prof_done -
-                                                syscall_prof_inner_done),
-                           (unsigned long long)syscall_prof_total,
-                           (unsigned long long)out);
-            }
-        }
-        if (trace_t && trace_t->fork_child_user_rip && trace_t->name[0] &&
-            strstr(trace_t->name, "linuxrc") &&
-            (num == SYS_getpid || num == SYS_ioctl || num == SYS_execve ||
-             num == SYS_write || num == SYS_writev || num == SYS_clock_gettime ||
-             num == 202 /* futex */ || num == SYS_socket || num == 42 /* connect */ ||
-             num == SYS_openat || num == SYS_open)) {
-            static int linuxrc_child_retuser_left = 8;
-            if (linuxrc_child_retuser_left-- > 0)
-                devel_printf("fork-child-retuser: tid=%llu nr=%llu ret=0x%llx rip=0x%llx pending=0x%llx\n",
-                    (unsigned long long)(trace_t->tid ? trace_t->tid : 1),
-                    (unsigned long long)num,
-                    (unsigned long long)out,
-                    (unsigned long long)trace_t->saved_user_rip,
-                    (unsigned long long)trace_t->pending_signals);
-        }
         return out;
     }
 }

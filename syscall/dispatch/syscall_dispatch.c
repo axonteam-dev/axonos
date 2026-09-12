@@ -363,6 +363,7 @@ static thread_t *wait4_find_by_tgid(int pid_arg)
 }
 
 static uint64_t wait4_reap_found_thread(thread_t *waiter, thread_t *zombie);
+
 static uint64_t wait4_wait_one_tgid(thread_t *waiter);
 
 void syscall_user_fatal_exit(int signo) {
@@ -7570,8 +7571,6 @@ static uint64_t wait4_wait_one_tgid(thread_t *waiter)
 
         if (options & WNOHANG)
             return 0;
-        if (wait4_eintr_pending(waiter))
-            return ret_err(EINTR);
         if (c)
             c->waiter_tid = waiter_slot;
         wait4_arm_children(waiter, tgid);
@@ -8606,7 +8605,13 @@ static uint64_t signal_pick_handler_rsp(thread_t *cur, const user_sigaction_t *s
 #define AXON_KERNEL_SIGSET_BYTES 8u
 
 static void sigwait_restore_saved_mask(thread_t *t) {
-    if (!t || !t->restore_sigmask)
+    if (!t)
+        return;
+    if (t->suspend_active) {
+        t->saved_sig_mask = t->suspend_old_mask;
+        t->suspend_active = 0;
+    }
+    if (!t->restore_sigmask)
         return;
     t->saved_sig_mask = t->saved_sigmask_orig;
     t->restore_sigmask = 0;
@@ -8650,6 +8655,7 @@ static int syscall_is_norestart(uint64_t nr) {
     case 270: /* pselect6 */
     case 271: /* ppoll */
     case 281: /* epoll_pwait */
+    case SYS_rt_sigsuspend: /* Linux rt_sigsuspend always EINTRs, never restarts */
         return 1;
     default:
         return 0;
@@ -8756,7 +8762,8 @@ static uintptr_t signal_write_rt_frame(thread_t *cur, int sig, const user_sigact
     uc.uc_stack_ss_sp = cur->sas_ss_sp;
     uc.uc_stack_ss_size = cur->sas_ss_size;
     uc.uc_stack_ss_flags = (uint32_t)cur->sas_ss_flags;
-    uc.uc_sigmask[0] = cur->restore_sigmask ? cur->saved_sigmask_orig : cur->saved_sig_mask;
+    uc.uc_sigmask[0] = cur->suspend_active ? cur->suspend_old_mask :
+                       (cur->restore_sigmask ? cur->saved_sigmask_orig : cur->saved_sig_mask);
     if (copy_to_user_safe((void *)(uintptr_t)(frame_start + RT_SIGFRAME_UC_OFF),
                           &uc, sizeof(uc)) != 0)
         return 0;
@@ -8779,7 +8786,9 @@ static uintptr_t signal_write_rt_frame(thread_t *cur, int sig, const user_sigact
 static void signal_commit_delivery(thread_t *cur, int sig, const user_sigaction_t *sa) {
     if (!cur || !sa || sig <= 0) return;
     cur->pending_signals &= ~(1ULL << (sig - 1));
-    cur->saved_sig_mask = cur->saved_sig_mask | sa->mask;
+    uint64_t base = cur->suspend_active ? cur->suspend_old_mask : cur->saved_sig_mask;
+    cur->suspend_active = 0;
+    cur->saved_sig_mask = base | sa->mask;
     if (!(sa->flags & SA_NODEFER))
         cur->saved_sig_mask |= (1ULL << (sig - 1));
 }
@@ -15752,23 +15761,45 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return ret_err(EFAULT);
             thread_t *tcur = cur;
             if (!tcur) return ret_err(EINVAL);
-            uint64_t old_mask = tcur->saved_sig_mask;
+            /* rt_sigsuspend atomically installs the mask for the whole wait.
+             * Persist it (and the mask to restore) in the thread object: after
+             * thread_yield() this CPU runs other syscalls that may reuse stack
+             * slots, so the loop must not trust C locals across the schedule.
+             * A wakeup can also arrive between the pending check and
+             * thread_block() — re-check pending before yielding. This mirrors
+             * the wait4 paths. */
+            tcur->suspend_old_mask = tcur->saved_sig_mask;
+            tcur->suspend_new_mask = new_mask;
             tcur->saved_sig_mask = new_mask;
-            int wait_tid = (int)(tcur->tid ? tcur->tid : 1);
+            tcur->suspend_active = 1;
             for (;;) {
-                uint64_t pending = tcur->pending_signals & ~new_mask;
-                if (pending)
+                if (!tcur || tcur->ring != 3)
+                    tcur = thread_get_current_user();
+                if (!tcur) return ret_err(EINVAL);
+                int wait_tid = (int)(tcur->tid ? tcur->tid : 1);
+                new_mask = tcur->suspend_new_mask;
+                uint64_t unblocked = tcur->pending_signals & ~new_mask;
+                if (unblocked)
                     break;
-                if (!(new_mask & (1ULL << (SIGCHLD - 1))) && find_terminated_child(tcur)) {
+                if (!(new_mask & (1ULL << (SIGCHLD - 1))) &&
+                    find_terminated_child(tcur)) {
                     thread_set_pending_signal(tcur, SIGCHLD);
                     break;
                 }
                 thread_block(wait_tid);
-                if (tcur->state == THREAD_BLOCKED)
+                /* Lost-wakeup guard: if SIGCHLD became pending between the
+                 * check above and thread_block(), no one will unblock us — do
+                 * not yield, loop back and take the pending signal. */
+                if (!(tcur->pending_signals & ~new_mask) &&
+                    tcur->state == THREAD_BLOCKED)
                     thread_yield();
                 syscall_restore_live_frame_from_snapshot(tcur, "rt_sigsuspend");
             }
-            tcur->saved_sig_mask = old_mask;
+            /* Keep saved_sig_mask == suspend-set so syscall-return delivery
+             * (maybe_deliver_pending_signal) can run the SIGCHLD handler while
+             * SIGCHLD is unblocked — Linux rt_sigsuspend delivers before EINTR.
+             * The old mask is restored at delivery commit or on the no-delivery
+             * exit (sigwait_restore_saved_mask). */
             return ret_err(EINTR);
         }
         case SYS_execve: {

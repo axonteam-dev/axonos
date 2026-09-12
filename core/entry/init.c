@@ -265,29 +265,29 @@ static void boot_load_system_certs(void)
         /* Linux: late_initcall(load_system_certificate_list) copies
          * CONFIG_SYSTEM_TRUSTED_KEYS into .builtin_trusted_keys. It does
          * not run ECDSA keygen on the boot CPU. */
-        kprintf("certs: installing built-in system CA (Linux load_system_certificate_list)\n");
+        klogprintf("certs: installing built-in system CA (Linux load_system_certificate_list)\n");
         if (keyring_load_system_certs() != 0)
-                kprintf("certs: keyring init failed\n");
+                klogprintf("certs: keyring init failed\n");
         if (keyring_install_system_ca(pem, pem_len) != 0)
-                kprintf("certs: warning: cannot cache CA on .builtin_trusted_keys\n");
+                klogprintf("certs: warning: cannot cache CA on .builtin_trusted_keys\n");
         (void)ramfs_mkdir_p("/etc/ssl/certs");
         (void)ramfs_mkdir_p("/etc/ssl/private");
         if (boot_write_bytes("/etc/ssl/openssl.cnf", openssl_cnf,
                              sizeof(openssl_cnf) - 1) != 0)
-                kprintf("certs: warning: cannot write /etc/ssl/openssl.cnf\n");
+                klogprintf("certs: warning: cannot write /etc/ssl/openssl.cnf\n");
         if (pem_len == 0) {
-                kprintf("certs: built-in CA PEM empty (host openssl missing at build)\n");
+                klogprintf("certs: built-in CA PEM empty (host openssl missing at build)\n");
                 return;
         }
         if (boot_write_bytes("/etc/ssl/certs/ca-certificates.crt", pem, pem_len) != 0)
-                kprintf("certs: warning: cannot write ca-certificates.crt\n");
+                klogprintf("certs: warning: cannot write ca-certificates.crt\n");
         if (boot_write_bytes("/etc/ssl/certs/axonos-system-ca.pem", pem, pem_len) != 0)
-                kprintf("certs: warning: cannot write axonos-system-ca.pem\n");
+                klogprintf("certs: warning: cannot write axonos-system-ca.pem\n");
         (void)fs_unlink("/etc/ssl/cert.pem");
         if (overlayfs_symlink("/etc/ssl/cert.pem",
                               "/etc/ssl/certs/ca-certificates.crt") != 0)
                 (void)boot_write_bytes("/etc/ssl/cert.pem", pem, pem_len);
-        kprintf("certs: system CA ready (%zu bytes PEM) in .builtin_trusted_keys\n",
+        klogprintf("certs: system CA ready (%zu bytes PEM) in .builtin_trusted_keys\n",
                 pem_len);
 }
 
@@ -330,9 +330,6 @@ static void ramfs_install_libnss_dns(void)
                 (void)ramfs_write_blob("/usr/lib/x86_64-linux-gnu/libnss_dns.so.2",
                                                            nss_dns_so_blob_start, dns_len);
         }
-
-        kprintf("nss-fix: unlink files=%d dns_ma=%d files_stub=%zu dns_lib=%zu\n",
-                        u_files, u_dns_ma, files_len, dns_len);
 }
 
 static inline uintptr_t align_up_uintptr(uintptr_t v, uintptr_t a) {
@@ -1315,9 +1312,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
          * Final verify + remount happens after /proc is up (see below). */
         (void)ramfs_mkdir("/run");
         if (tmpfs_mount("/run") != 0)
-                kprintf("boot: warning: failed to mount tmpfs on /run (will retry)\n");
+                klogprintf("boot: warning: failed to mount tmpfs on /run (will retry)\n");
         else
-                kprintf("boot: tmpfs mounted on /run\n");
+                klogprintf("boot: tmpfs mounted on /run\n");
         (void)ramfs_mkdir("/run/lock");
         (void)ramfs_mkdir("/run/openrc");
         /* opkg state must live on a writable upper/tmpfs. Keeping it below
@@ -1341,9 +1338,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 size_t sz = 0;
                 if (squashfs_get_image(&img, &sz) == 0 && img && sz > 0) {
                         if (ramfs_create_borrowed_file("/run/live/initfs.sfs", img, sz) == 0)
-                                kprintf("boot: /run/live/initfs.sfs (%zu bytes)\n", sz);
+                                klogprintf("boot: /run/live/initfs.sfs (%zu bytes)\n", sz);
                         else
-                                kprintf("boot: warning: failed to export /run/live/initfs.sfs\n");
+                                klogprintf("boot: warning: failed to export /run/live/initfs.sfs\n");
                 }
         }
         {
@@ -1379,17 +1376,17 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
          * tmp — not an overlay merged dir with fake 0755. */
         (void)ramfs_mkdir("/tmp");
         if (tmpfs_mount("/tmp") != 0)
-                kprintf("boot: warning: failed to mount tmpfs on /tmp\n");
+                klogprintf("boot: warning: failed to mount tmpfs on /tmp\n");
         else
-                kprintf("boot: tmpfs mounted on /tmp\n");
+                klogprintf("boot: tmpfs mounted on /tmp\n");
         /* Linux POSIX shm: shm_open() creates files under /dev/shm. Without a
          * writable tmpfs here, postgres initdb dies on posix_fallocate ENOSYS
          * after opening the stub devfs directory. */
         if (tmpfs_mount("/dev/shm") != 0)
-                kprintf("boot: warning: failed to mount tmpfs on /dev/shm\n");
+                klogprintf("boot: warning: failed to mount tmpfs on /dev/shm\n");
         else {
                 (void)ramfs_chmod("/dev/shm", 01777);
-                kprintf("boot: tmpfs mounted on /dev/shm\n");
+                klogprintf("boot: tmpfs mounted on /dev/shm\n");
         }
         (void)ramfs_mkdir("/var/tmp");
         /* Materialize apt/dpkg dirs in the ramfs upper. squashfs already has
@@ -1852,47 +1849,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         kernel_sysfs_populate_default();
                 else
                         klogprintf("boot: warning: failed to mount /sys\n");
-        }
-        /* Confirm /run is visible the way OpenRC mountinfo reads it. Retry mount
-         * here (after /proc) so a transient early failure still leaves tmpfs on
-         * /run before openrc-init starts. Dump the VFS mount table to the console. */
-        {
-                (void)ramfs_mkdir("/run");
-                if (tmpfs_mount("/run") != 0)
-                        kprintf("boot: RETRY failed: tmpfs on /run\n");
-                struct fs_driver *md = fs_get_mount_driver_exact("/run");
-                if (!md || !md->ops || !md->ops->name || strcmp(md->ops->name, "tmpfs") != 0)
-                        kprintf("boot: /run NOT tmpfs in mount table — OpenRC will try mount\n");
-                else
-                        kprintf("boot: /run ready for mountinfo (tmpfs)\n");
-                {
-                        int n = fs_mount_count();
-                        kprintf("boot: VFS mounts (%d):\n", n);
-                        for (int i = 0; i < n; i++) {
-                                char mp[64], dn[32];
-                                if (fs_mount_get(i, mp, sizeof(mp), dn, sizeof(dn)) == 0)
-                                        kprintf("  [%d] %s on %s\n", i, dn, mp);
-                        }
-                }
-                /* Exact bytes OpenRC mountinfo parses via fopen("/proc/mounts"). */
-                {
-                        struct fs_file *mf = fs_open("/proc/mounts");
-                        if (!mf) {
-                                kprintf("boot: FATAL cannot open /proc/mounts\n");
-                        } else {
-                                char buf[1024];
-                                ssize_t nr = fs_read(mf, buf, sizeof(buf) - 1, 0);
-                                fs_file_free(mf);
-                                if (nr <= 0) {
-                                        kprintf("boot: FATAL /proc/mounts empty (read=%zd)\n", nr);
-                                } else {
-                                        buf[nr] = '\0';
-                                        kprintf("boot: /proc/mounts (%zd bytes):\n%s", nr, buf);
-                                        if (!strstr(buf, " /run "))
-                                                kprintf("boot: FATAL /proc/mounts missing ' /run '\n");
-                                }
-                        }
-                }
         }
 
         /* Final printk snapshot for /var/log/kernel (ring stays authoritative via /dev/kmsg). */

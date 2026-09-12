@@ -987,10 +987,8 @@ static void initfs_debug_list_vfs_dir(const char *dirpath, int depth, int *count
 }
 
 void initfs_debug_list_vfs(void) {
-    qemu_debug_printf("initfs: --- VFS contents after unpack ---\n");
     int count = 0;
     initfs_debug_list_vfs_dir("/", 0, &count, 500);
-    qemu_debug_printf("initfs: --- VFS total %d entries ---\n", count);
 }
 
 /* Keep the compressed image in place and expose a writable ramfs upper. */

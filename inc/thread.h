@@ -168,6 +168,14 @@ typedef struct thread {
         int wait_upid;
         int wait_options;
         uint64_t wait_status_u;
+        /* rt_sigsuspend mask state. Persisted so the block/yield/restore loop
+         * never trusts stack locals after a schedule (wait4 defensive pattern). */
+        uint64_t suspend_new_mask;
+        uint64_t suspend_old_mask;
+        /* 1 == rt_sigsuspend is returning EINTR and delivery must still see the
+         * suspend-set (new) mask; the old mask is restored at delivery commit or
+         * on the no-delivery exit. Mirrors Linux rt_sigsuspend semantics. */
+        uint8_t suspend_active;
         
         /* exit status encoded like wait(2) returns (status word) */
         int exit_status;

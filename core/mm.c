@@ -1710,6 +1710,18 @@ static int mm_va_in_brk(const mm_t *mm, uint64_t va) {
     return (va >= lo && va < hi) ? 1 : 0;
 }
 
+/* True if [lo,hi) intersects mm's brk range. */
+static int mm_range_in_brk(const mm_t *mm, uint64_t lo, uint64_t hi) {
+    uint64_t blo, bhi;
+    if (!mm || !mm->brk_base)
+        return 0;
+    blo = (uint64_t)mm->brk_base;
+    bhi = mm_brk_fork_hi(mm);
+    if (bhi <= blo)
+        return 0;
+    return (hi > blo && lo < bhi) ? 1 : 0;
+}
+
 /* Primary stack + TLS: keep the parent RW across clone (VMware triple-faulted
  * when the syscall-return stack was Soft_COW).  All other private leaves follow
  * Linux copy_page_range (share RO; Soft_COW writable). */
@@ -1722,10 +1734,17 @@ static int mm_fork_va_is_primary_stack(uint64_t va) {
 static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
                                   uint64_t *parent_l4, uint64_t owner_tid,
                                   uint64_t va, uint64_t parent_pa,
-                                  uint64_t parent_pte, int protect_parent) {
-    int shared = parent &&
-        (user_vma_is_shared_page_mm(parent, (uintptr_t)va) ||
-         user_vma_is_shared_page(owner_tid, (uintptr_t)va));
+                                  uint64_t parent_pte, int protect_parent,
+                                  int shared_hint) {
+    /*
+     * shared_hint comes from the fork snapshot probe (MV_SNAP_SHARED) computed
+     * once per page BESIDE the walk, not from a fresh O(USER_VMA_MAX=4096) scan
+     * here.  The old per-leaf user_vma_is_shared_page_mm()/_page() pair was the
+     * residual fork() hot path after the snapshot skip: ~2x4096 slot compares
+     * per COW'd leaf made `( : ) & wait $!` cost ~20ms.  parent==NULL (vfork
+     * child-writable pass) never shares, matching the old parent&& short-cut.
+     */
+    int shared = parent && shared_hint;
     int owned = (parent_pte & PG_SOFT_OWNED) != 0;
     uint64_t child_pa = parent_pa & PG_ADDR_MASK;
     uint64_t flags = parent_pte &
@@ -1834,6 +1853,68 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
     return 0;
 }
 
+#define MV_SNAP_CAP 256        /* > real VMA count for any process (barring
+                                  >256-mmap apps, which fall back to the exact
+                                  predicate path). */
+#define MV_SNAP_VMA       0x01u
+#define MV_SNAP_SHARED    0x02u
+#define MV_SNAP_LAZY_FILE 0x04u
+#define MV_SNAP_LAZY_ANON 0x08u
+
+/* Compact probe over the fork snapshot.  g_user_vmas entries (i<g_cnt) carry
+ * the full flag set; mm-only entries (i>=g_cnt) contribute SHARED (mm-scoped
+ * SHM is authoritative) and otherwise only set *any_mm_only so the caller does
+ * not fast-skip a chunk on g/mm divergence. */
+static unsigned mm_mv_probe(const user_vma_t *v, int total, int g_cnt,
+                            uintptr_t lo, uintptr_t hi, int *any_mm_only) {
+    unsigned f = 0;
+    int guard = 0;
+    for (int i = 0; i < total; ++i) {
+        const user_vma_t *ve = &v[i];
+        if (!ve->used)
+            continue;
+        uintptr_t a = ve->addr;
+        uintptr_t e = a + ve->len;
+        if (!(e > a && lo < e && hi > a))
+            continue;
+        if (i < g_cnt) {
+            f |= MV_SNAP_VMA;
+            if (ve->kind == USER_VMA_KIND_SHM)
+                f |= MV_SNAP_SHARED;
+            if (ve->file && (ve->kind == USER_VMA_KIND_MMAP_LAZY ||
+                             ve->kind == USER_VMA_KIND_ELF_LOAD ||
+                             ve->kind == USER_VMA_KIND_MMAP ||
+                             ve->kind == USER_VMA_KIND_SHM))
+                f |= MV_SNAP_LAZY_FILE;
+            if (ve->kind == USER_VMA_KIND_MMAP_LAZY && !ve->file)
+                f |= MV_SNAP_LAZY_ANON;
+        } else {
+            if (ve->kind == USER_VMA_KIND_SHM)
+                f |= MV_SNAP_SHARED;
+            guard = 1;
+        }
+    }
+    if (any_mm_only)
+        *any_mm_only = guard;
+    return f;
+}
+
+static unsigned mm_mv_page_exact(uint64_t owner_tid, mm_t *parent_for_vma,
+                                 uintptr_t va) {
+    unsigned f = 0;
+    if (parent_for_vma && user_vma_is_shared_page_mm(parent_for_vma, va))
+        f |= MV_SNAP_SHARED;
+    if (user_vma_is_shared_page(owner_tid, va))
+        f |= MV_SNAP_SHARED;
+    if (user_vma_covers_page(owner_tid, va))
+        f |= MV_SNAP_VMA;
+    if (user_vma_is_lazy_file_page(owner_tid, va))
+        f |= MV_SNAP_LAZY_FILE;
+    if (user_vma_is_lazy_anon_page(owner_tid, va))
+        f |= MV_SNAP_LAZY_ANON;
+    return f;
+}
+
 static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                                               uint64_t *parent_l4, uint64_t owner_tid,
                                               int protect_parent) {
@@ -1844,6 +1925,27 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
     uint64_t limit = (uint64_t)USER_STACK_TOP;
     if (limit > (uint64_t)MMIO_IDENTITY_LIMIT)
         limit = (uint64_t)MMIO_IDENTITY_LIMIT;
+
+    /*
+     * Snapshot the owner's VMAs once, under one lock grab.  The old code called
+     * user_vma_is_shared_page(_mm) / user_vma_covers_page / user_vma_is_lazy_*
+     * per 4K page — each an O(USER_VMA_MAX=4096) scan under irqsave, so every
+     * fork() of a bash-sized process cost ~150ms sweeping ~1.5GiB of identity
+     * RAM.  The frozen parent guarantees the snapshot's lifetime.
+     */
+    user_vma_t *snap = NULL;
+    int snap_cnt = 0, snap_g = 0, snap_full = 0;
+    snap = (user_vma_t *)kmalloc(sizeof(user_vma_t) * (size_t)MV_SNAP_CAP);
+    if (!snap) {
+        snap_full = 1;
+    } else {
+        int mm_only = 0;
+        snap_cnt = user_vma_snapshot(owner_tid, parent_for_vma,
+                                     snap, (size_t)MV_SNAP_CAP, &mm_only);
+        snap_g = snap_cnt - mm_only;
+        if (snap_cnt >= MV_SNAP_CAP || snap_g < 0 || snap_g > snap_cnt)
+            snap_full = 1;
+    }
 
     /*
      * Walk parent PTs under swapper (Linux direct map): process CR3 may have
@@ -1882,50 +1984,54 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                     if (!(e2 & PG_US))
                         continue;
                     uint64_t leaf2 = e2 & PG_ADDR_MASK_2M;
+                    uint64_t chunk_end = va_l2 + PAGE_SIZE_2M;
+                    if (chunk_end > limit)
+                        chunk_end = limit;
+                    /*
+                     * Fast path: a bare-identity 2MiB chunk with no VMA, SHM,
+                     * lazy reservation or brk anywhere in it cannot feed a
+                     * single mm_fork_copy_user_leaf — every 4K subpage hits the
+                     * identity continue below.  Skip it with one compact probe.
+                     */
+                    if (!snap_full && leaf2 == va_l2 &&
+                        !(e2 & PG_SOFT_OWNED)) {
+                        int any_mm = 0;
+                        unsigned pf = mm_mv_probe(snap, snap_cnt, snap_g,
+                                                  va_l2, chunk_end, &any_mm);
+                        if (pf == 0 && !any_mm &&
+                            !(parent_for_vma &&
+                              mm_range_in_brk(parent_for_vma, va_l2, chunk_end)))
+                            continue;
+                    }
                     /* Entire 2MiB identity window — not a privatized user leaf.
                      * Exception: MAP_SHARED anon also uses identity VA==PA and
                      * must be installed into the child (nginx shm zones).
                      * Also copy ELF_LOAD / other VMA-backed identity pages: PID1
                      * used to load without Soft_OWNED; skipping left the child
                      * with demoted U=0 text and #PF right after clone/_Fork. */
-                    int shared_2m = parent_for_vma &&
-                        (user_vma_is_shared_page_mm(parent_for_vma, (uintptr_t)va_l2) ||
-                         user_vma_is_shared_page(owner_tid, (uintptr_t)va_l2));
-                    int vma_backed = user_vma_covers_page(owner_tid, (uintptr_t)va_l2);
-                    int brk_2m = parent_for_vma && mm_va_in_brk(parent_for_vma, va_l2);
-                    int lazy_file_2m = user_vma_is_lazy_file_page(owner_tid, (uintptr_t)va_l2);
-                    int lazy_anon_2m = user_vma_is_lazy_anon_page(owner_tid, (uintptr_t)va_l2);
-                    /*
-                     * File-backed MMAP_LAZY: only Soft_OWNED leaves hold real
-                     * file bytes.  Identity PG_US leftovers (or 2MiB siblings
-                     * after a 4K split) are physical RAM, not libc.so — copying
-                     * them made grub-install's fork children execute junk at
-                     * ~0x808xxxx (add [rsi],al → #PF cr2=0) then the parent
-                     * continued after two SIGSEGVs.
-                     * Anonymous MMAP_LAZY (apt Dynamic MMap) is the same: only
-                     * faulted Soft_OWNED pages are user data.
-                     */
-                    if ((lazy_file_2m || lazy_anon_2m) && !(e2 & PG_SOFT_OWNED) &&
-                        leaf2 == va_l2)
-                        continue;
-                    if (leaf2 == va_l2 && !(e2 & PG_SOFT_OWNED) && !shared_2m &&
-                        !vma_backed && !brk_2m)
-                        continue;
-                    uint64_t chunk_end = va_l2 + PAGE_SIZE_2M;
-                    if (chunk_end > limit)
-                        chunk_end = limit;
                     for (uint64_t va = va_l2; va < chunk_end; va += PAGE_SIZE_4K) {
                         uint64_t pa = leaf2 + (va - va_l2);
-                        int shared_pg = shared_2m ||
-                            (parent_for_vma &&
-                             (user_vma_is_shared_page_mm(parent_for_vma, (uintptr_t)va) ||
-                              user_vma_is_shared_page(owner_tid, (uintptr_t)va)));
-                        int page_vma = vma_backed || user_vma_covers_page(owner_tid, (uintptr_t)va);
-                        int in_brk = parent_for_vma && mm_va_in_brk(parent_for_vma, va);
-                        int lazy_file = lazy_file_2m ||
-                            user_vma_is_lazy_file_page(owner_tid, (uintptr_t)va);
-                        int lazy_anon = lazy_anon_2m ||
-                            user_vma_is_lazy_anon_page(owner_tid, (uintptr_t)va);
+                        int any_mm = 0;
+                        unsigned pf = snap_full
+                            ? mm_mv_page_exact(owner_tid, parent_for_vma, va)
+                            : mm_mv_probe(snap, snap_cnt, snap_g,
+                                          va, va + PAGE_SIZE_4K, &any_mm);
+                        int shared_pg = !!(pf & MV_SNAP_SHARED);
+                        int page_vma = !!(pf & MV_SNAP_VMA);
+                        int in_brk = parent_for_vma &&
+                            mm_va_in_brk(parent_for_vma, va);
+                        int lazy_file = !!(pf & MV_SNAP_LAZY_FILE);
+                        int lazy_anon = !!(pf & MV_SNAP_LAZY_ANON);
+                        /*
+                         * File-backed MMAP_LAZY: only Soft_OWNED leaves hold real
+                         * file bytes.  Identity PG_US leftovers (or 2MiB siblings
+                         * after a 4K split) are physical RAM, not libc.so —
+                         * copying them made grub-install's fork children execute
+                         * junk at ~0x808xxxx (add [rsi],al → #PF cr2=0) then the
+                         * parent continued after two SIGSEGVs.
+                         * Anonymous MMAP_LAZY (apt Dynamic MMap) is the same:
+                         * only faulted Soft_OWNED pages are user data.
+                         */
                         if ((lazy_file || lazy_anon) &&
                             (!(e2 & PG_SOFT_OWNED) || pa == (va & ~0xFFFULL)))
                             continue;
@@ -1934,13 +2040,35 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                             continue;
                         if (mm_fork_copy_user_leaf(child, parent_for_vma,
                                 parent_l4, owner_tid, va, pa, e2,
-                                protect_parent) != 0)
+                                protect_parent,
+                                (parent_for_vma ? shared_pg : 0)) != 0)
                             goto out;
                     }
                     continue;
                 }
                 if (!pt_page_pa_ok(e2))
                     continue;
+                {
+                    uint64_t chunk_end = va_l2 + PAGE_SIZE_2M;
+                    if (chunk_end > limit)
+                        chunk_end = limit;
+                    /*
+                     * Fast path (4K-table form): if nothing mapped, shared or
+                     * brked in the whole 2MiB L2 span, all 512 leaves are bare
+                     * identity — the per-leaf loop below can only skip them.
+                     * Privatization always registers a VMA, so this cannot drop
+                     * a Soft_OWNED / eagerly-copied leaf.
+                     */
+                    if (!snap_full) {
+                        int any_mm = 0;
+                        unsigned pf = mm_mv_probe(snap, snap_cnt, snap_g,
+                                                  va_l2, chunk_end, &any_mm);
+                        if (pf == 0 && !any_mm &&
+                            !(parent_for_vma &&
+                              mm_range_in_brk(parent_for_vma, va_l2, chunk_end)))
+                            continue;
+                    }
+                }
                 uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
                 for (int l1i = 0; l1i < 512; ++l1i) {
                     uint64_t va = va_l2 | ((uint64_t)l1i << 12);
@@ -1953,15 +2081,17 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                     uint64_t pa = e1 & PG_ADDR_MASK;
                     if (pa >= (uint64_t)MMIO_IDENTITY_LIMIT || !pt_page_pa_ok(e1))
                         continue;
-                    /* Skip bare identity leaves unless MAP_SHARED (nginx shm),
-                     * a tracked VMA (ELF_LOAD / mmap), or the brk heap. */
-                    int shared_4k = parent_for_vma &&
-                        (user_vma_is_shared_page_mm(parent_for_vma, (uintptr_t)va) ||
-                         user_vma_is_shared_page(owner_tid, (uintptr_t)va));
-                    int page_vma = user_vma_covers_page(owner_tid, (uintptr_t)va);
-                    int in_brk = parent_for_vma && mm_va_in_brk(parent_for_vma, va);
-                    int lazy_file = user_vma_is_lazy_file_page(owner_tid, (uintptr_t)va);
-                    int lazy_anon = user_vma_is_lazy_anon_page(owner_tid, (uintptr_t)va);
+                    int any_mm = 0;
+                    unsigned pf = snap_full
+                        ? mm_mv_page_exact(owner_tid, parent_for_vma, va)
+                        : mm_mv_probe(snap, snap_cnt, snap_g,
+                                      va, va + PAGE_SIZE_4K, &any_mm);
+                    int shared_4k = !!(pf & MV_SNAP_SHARED);
+                    int page_vma = !!(pf & MV_SNAP_VMA);
+                    int in_brk = parent_for_vma &&
+                        mm_va_in_brk(parent_for_vma, va);
+                    int lazy_file = !!(pf & MV_SNAP_LAZY_FILE);
+                    int lazy_anon = !!(pf & MV_SNAP_LAZY_ANON);
                     /* Unpopulated or bogus Soft_OWNED-on-identity: skip. */
                     if ((lazy_file || lazy_anon) &&
                         (!(e1 & PG_SOFT_OWNED) || pa == (va & ~0xFFFULL)))
@@ -1971,7 +2101,8 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                         continue;
                     if (mm_fork_copy_user_leaf(child, parent_for_vma,
                             parent_l4, owner_tid, va, pa, e1,
-                            protect_parent) != 0)
+                            protect_parent,
+                            (parent_for_vma ? shared_4k : 0)) != 0)
                         goto out;
                 }
             }
@@ -1979,6 +2110,8 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
     }
     rc = 0;
 out:
+    if (snap)
+        kfree(snap);
     mm_leave_direct_map(dm);
     return rc;
 }
@@ -2041,7 +2174,9 @@ static int mm_dup_ensure_brk_copied(mm_t *child, mm_t *parent, uint64_t owner_ti
 			continue;
 
 		if (mm_fork_copy_user_leaf(child, parent, parent->pml4, owner_tid,
-					   (uint64_t)va, pa, parent_pte, 0) != 0) {
+					   (uint64_t)va, pa, parent_pte, 0,
+					   user_vma_is_shared_page_mm(parent, (uintptr_t)va) ||
+					   user_vma_is_shared_page(owner_tid, (uintptr_t)va)) != 0) {
 			mm_leave_direct_map(dm);
 			return -1;
 		}

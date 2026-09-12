@@ -930,6 +930,41 @@ int user_vma_is_shared_page(uint64_t tid, uintptr_t va) {
     return shared;
 }
 
+/* Snapshot the VMAs the fork-COW walk needs, under one lock grab:
+ * - g_user_vmas entries for `tid` (authoritative for covers/lazy/shared)
+ * - the per-mm storage of `mm` (authoritative for mm-scoped SHM)
+ * Entries are plain struct copies; the frozen parent guarantees lifetime.
+ * Returns entry count (both stores, duplicates possible when in sync). */
+int user_vma_snapshot(uint64_t tid, mm_t *mm, user_vma_t *dst, size_t max,
+                      int *mm_only_out) {
+    if (!dst || max == 0)
+        return 0;
+    size_t n = 0;
+    unsigned long fl;
+    int mm_only = 0;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    for (int i = 0; i < USER_VMA_MAX && n < max; i++) {
+        if (!g_user_vmas[i].used || g_user_vmas[i].tid != tid)
+            continue;
+        dst[n++] = g_user_vmas[i];
+    }
+    if (n < max && mm) {
+        user_vma_t *vmas = user_vma_mm_storage(mm, 0);
+        if (vmas) {
+            for (int i = 0; i < USER_VMA_MAX && n < max; i++) {
+                if (!vmas[i].used)
+                    continue;
+                dst[n++] = vmas[i];
+                mm_only++;
+            }
+        }
+    }
+    if (mm_only_out)
+        *mm_only_out = mm_only;
+    release_irqrestore(&g_user_vma_lock, fl);
+    return (int)n;
+}
+
 int user_vma_fork_privatize_mapped(mm_t *child_mm, mm_t *parent_mm,
                                    uint64_t *parent_l4, uint64_t from_tid) {
     if (!child_mm || !parent_mm || !parent_l4) return -1;

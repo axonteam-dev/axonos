@@ -47,6 +47,11 @@ int user_vma_fork_privatize_mapped(mm_t *child_mm, mm_t *parent_mm,
                                    uint64_t *parent_l4, uint64_t from_tid);
 /* True if VA falls in a MAP_SHARED / SysV SHM VMA for this tid (must not COW). */
 int user_vma_is_shared_page(uint64_t tid, uintptr_t va);
+/* One-lock snapshot of tid's g_user_vmas + mm's per-mm storage, for the fork
+ * COW walk.  Returns count (duplicates possible across stores); *mm_only_out
+ * receives how many entries came from mm storage after the g entries. */
+int user_vma_snapshot(uint64_t tid, mm_t *mm, user_vma_t *dst, size_t max,
+                      int *mm_only_out);
 /* True if runner's address space has a VMA covering va with PROT_WRITE. */
 int user_vma_allows_write(thread_t *runner, uintptr_t va);
 /* True if tid has any VMA covering va (ELF/mmap). Used by fork to not skip

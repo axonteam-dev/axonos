@@ -42,6 +42,12 @@
 #define TTY_CFLAG_SANE 0x00000CB7u /* CS8|CREAD|CLOCAL */
 #define TTY_LFLAG_SANE (TTY_ISIG | TTY_ICANON | TTY_ECHO)
 
+/* Fallback wait (ms) when the tty waiters[] table is full.  An unregistered
+ * reader must never sleep unbounded (the keyboard ISR wakes only listed tids);
+ * this bounds the retry so the read loop re-checks the buffer and re-arms
+ * until a waiter slot opens (Linux add_wait_queue never fails this way). */
+#define TTY_WAIT_FULL_FALLBACK_MS 100u
+
 static struct devfs_tty dev_ttys[DEVFS_TTY_COUNT];
 static int devfs_active = 0;
 static int devfs_ready = 0;
@@ -1538,22 +1544,55 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             int tid = (int)cur->tid;
             int already = 0;
             for (int i = 0; i < t->waiters_count; i++) if (t->waiters[i] == tid) { already = 1; break; }
+            int registered = already;
             if (!already && t->waiters_count < (int)(sizeof(t->waiters)/sizeof(t->waiters[0]))) {
                 t->waiters[t->waiters_count++] = tid;
+                registered = 1;
             }
             /* ISR may have parked bytes in irq_ovf while we held in_lock. */
             if (tty_pending_locked(t) > 0) {
                 release_irqrestore(&t->in_lock, flags);
                 continue;
             }
-            release_irqrestore(&t->in_lock, flags);
             if (tid == thread_get_init_user_tid())
                 kprintf("pid1: waiting for tty input\n");
-            if (!is_canonical && vtime > 0 && got == 0)
-                thread_block_with_timeout((int)cur->tid, (uint32_t)vtime * 100u);
-            else
-                thread_block((int)cur->tid);
-            thread_yield();
+            if (!registered) {
+                /*
+                 * waiters[] is full.  Never sleep unregistered: the keyboard
+                 * ISR only wakes the listed tids, so this thread would sleep
+                 * forever.  Fall back to a short timed block; the loop then
+                 * re-checks the buffer and retries the registration until a
+                 * slot opens (Linux add_wait_queue cannot fail that way).
+                 */
+                release_irqrestore(&t->in_lock, flags);
+                thread_block_with_timeout((int)cur->tid, TTY_WAIT_FULL_FALLBACK_MS);
+                thread_yield();
+            } else {
+                /*
+                 * Registered.  Block while STILL holding in_lock so that a
+                 * keyboard push that takes the same lock (devfs_tty_push_input,
+                 * push_seq, the SIGINT branch of push_input_noblock) cannot
+                 * interleave between the pending check above and the BLOCKED
+                 * state: it would thread_unblock a RUNNING task — a no-op —
+                 * and leave the reader blocked forever although bytes are in
+                 * the buffer (lost wakeup).
+                 *
+                 * The ISR lock-free fallback (push_input_noblock try_acquire
+                 * failure) parks the byte in irq_ovf and wakes waiters without
+                 * in_lock; it can still miss this thread while it is RUNNING.
+                 * So re-check pending AFTER state=BLOCKED and wake ourselves:
+                 * parked bytes are never left unread.  tty_pending_locked()
+                 * drains irq_ovf into inbuf first, so nothing escapes.
+                 */
+                if (!is_canonical && vtime > 0 && got == 0)
+                    thread_block_with_timeout((int)cur->tid, (uint32_t)vtime * 100u);
+                else
+                    thread_block((int)cur->tid);
+                if (tty_pending_locked(t) > 0)
+                    thread_unblock((int)cur->tid);
+                release_irqrestore(&t->in_lock, flags);
+                thread_yield();
+            }
             /* Woke: if still no data but have pending SIGINT (Ctrl+C), return EINTR
                so read() returns and maybe_deliver_pending_signal can terminate the process. */
             acquire_irqsave(&t->in_lock, &flags);

@@ -3,6 +3,7 @@ build/
 iso/boot/initfs.cpio
 iso/boot/initfs.sfs
 iso/boot/axonos.elf
+iso/boot/grub/i386-pc
 build/
 *.o
 *.deb
@@ -11,3 +12,4 @@ initfs.sfs
 *.iso
 *dsc
 *.xz
+.cursor/

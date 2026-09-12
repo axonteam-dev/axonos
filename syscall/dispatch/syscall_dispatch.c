@@ -1171,14 +1171,36 @@ int syscall_publish_deferred_fork_child(void) {
  * continues. Per-thread syscall stacks make an immediate wake safe; the old
  * "defer until ring3/timer" gate was not Linux semantics and delayed vfork/ls.
  */
-static void fork_wake_up_new_task(thread_t *parent, thread_t *child)
+static void fork_wake_up_new_task(thread_t *parent, thread_t *child,
+                                  int defer_wake)
 {
     if (!parent || !child)
         return;
     int ctid = (int)(child->tid ? child->tid : 1);
-    /* Refresh child GPRs from the parent's syscall snapshot while blocked. */
+    /*
+     * Refresh child GPRs from the parent's syscall snapshot while blocked.
+     * For defer_wake (Linux vfork) the copy is repeated in the syscall epilogue
+     * while the child is still blocked — both copies are safe, the last wins.
+     */
     parent->fork_child_to_publish = child;
     syscall_deferred_unblocks();
+    /*
+     * Linux vfork: the parent must arm wait_for_vfork_done (vfork_waiting +
+     * process vfork_parent_blocked) and enter its own block BEFORE the child is
+     * made runnable. Waking the child first opens a race: the shared-mm child
+     * can be scheduled and exec/exit while the parent is still RUNNING; the
+     * child's process_release_vfork_parent then reads vfork_parent_blocked==0,
+     * emits no wakeup, and the parent blocks forever (lost wakeup). The child
+     * also shares the parent's user stack, so its ring-3 entry before the
+     * parent parks corrupts the parent's iretq frame (argc/envp garbage).
+     * Keep the child BLOCKED here; the syscall epilogue publishes it after the
+     * parent has blocked, matching Linux's ordering of wake_up_new_task vs
+     * wait_for_vfork_done.
+     */
+    if (defer_wake) {
+        parent->fork_child_to_publish = child;
+        return;
+    }
     parent->fork_child_to_publish = NULL;
     thread_unblock_fork_child(ctid);
 }
@@ -9469,7 +9491,8 @@ static uint64_t do_linux_fork(thread_t *cur,
              * returns the child's pid (or waits in wait_for_vfork_done for VFORK).
              * Child enters userspace via fork_child_return_entry with rax=0.
              */
-            fork_wake_up_new_task(cur, child);
+            fork_wake_up_new_task(cur, child,
+                (args->flags & CLONE_VFORK) != 0);
             fork_dbg(cur, 8, "wake_up_new_task",
                 (unsigned long long)(cur->tid ? cur->tid : 1),
                 (unsigned long long)(child->tid ? child->tid : 1), 0);
@@ -9929,18 +9952,23 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
 
                 rebuild_syscall_frame(cur);
-                if (flags & CLONE_THREAD_OLD) {
-                    cur->fork_child_to_publish = child;
-                } else {
-                    thread_unblock((int)(child->tid ? child->tid : 1));
-                }
-                /* See clone3: posix_spawn fallback via __clone also uses VFORK. */
+                /* Linux vfork: arm + block the parent BEFORE the child runs.
+                 * Waking the child first lets it exec/exit while the parent is
+                 * still RUNNING — release then sees vfork_parent_blocked==0 and
+                 * never wakes the parent (lost wakeup; vfork hangs forever).
+                 * Defer publication; the syscall epilogue unblocks the child
+                 * after the parent has entered its block. */
                 if ((flags & CLONE_VFORK_OLD) && child->process && cur->process) {
                     process_set_vfork_parent(child->process, cur->process);
                     cur->vfork_waiting = 1;
                     cur->vfork_saved_ret = (uint64_t)child_user_tid;
+                    cur->fork_child_to_publish = child;
                     if (!thread_block_current_atomic())
                         thread_block((int)(cur->tid ? cur->tid : 1));
+                } else if (flags & CLONE_THREAD_OLD) {
+                    cur->fork_child_to_publish = child;
+                } else {
+                    thread_unblock((int)(child->tid ? child->tid : 1));
                 }
                 {
                     static int clone_ok_left = 8;
@@ -10220,8 +10248,25 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     uint64_t child_nr = linux_task_tid(child);
                     if (child_nr == 0)
                         child_nr = (uint64_t)(child->tid ? child->tid : 1);
-                    /* CLONE_VM harness path: unblock now (per-thread syscall stacks). */
-                    if (flags & CLONE3_CLONE_THREAD) {
+                    /* Linux CLONE_VFORK: freeze parent until child execs/exits.
+                     * glibc posix_spawn (__spawnix) munmaps the child stack as
+                     * soon as clone returns — without this wait the child runs
+                     * on a freed stack → RIP=0 (fstabinfo Oops).
+                     *
+                     * Arm + block BEFORE waking the child: an early wake lets
+                     * the child exec/exit while the parent is still RUNNING,
+                     * release then sees vfork_parent_blocked==0 and never wakes
+                     * the parent (lost wakeup). Defer publication to the syscall
+                     * epilogue, which unblocks the child after the parent has
+                     * entered its block (Linux wake_up_new_task tail). */
+                    if ((flags & CLONE3_CLONE_VFORK) && child->process && cur->process) {
+                        process_set_vfork_parent(child->process, cur->process);
+                        cur->vfork_waiting = 1;
+                        cur->vfork_saved_ret = child_nr;
+                        cur->fork_child_to_publish = child;
+                        if (!thread_block_current_atomic())
+                            thread_block((int)(cur->tid ? cur->tid : 1));
+                    } else if (flags & CLONE3_CLONE_THREAD) {
                         cur->fork_child_to_publish = child;
                         clone3_dbg(cur, 4, "defer child",
                             (unsigned long long)ctid,
@@ -10233,19 +10278,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             (unsigned long long)ctid,
                             (unsigned long long)child->user_rip,
                             (unsigned long long)child->user_stack);
-                    }
-                    /*
-                     * Linux CLONE_VFORK: freeze parent until child execs/exits.
-                     * glibc posix_spawn (__spawnix) munmaps the child stack as
-                     * soon as clone returns — without this wait the child runs
-                     * on a freed stack → RIP=0 (fstabinfo Oops).
-                     */
-                    if ((flags & CLONE3_CLONE_VFORK) && child->process && cur->process) {
-                        process_set_vfork_parent(child->process, cur->process);
-                        cur->vfork_waiting = 1;
-                        cur->vfork_saved_ret = child_nr;
-                        if (!thread_block_current_atomic())
-                            thread_block((int)(cur->tid ? cur->tid : 1));
                     }
                     return child_nr;
                 }

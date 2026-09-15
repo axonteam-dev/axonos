@@ -127,6 +127,11 @@ int devfs_tty_count(void);
 void devfs_tty_console_write(const char *s, size_t n);
 /* Same kernel-console path with tty->out_lock already held by the caller. */
 void devfs_tty_console_write_locked(const char *s, size_t n);
+/* Console paint re-entrancy guard: 1 allows taking out_lock, 0 drops a nested
+ * kprintf/klog output fired from a fault inside an active paint. */
+extern volatile int devfs_tty_render_depth;
+int devfs_tty_console_enter(void);
+void devfs_tty_console_leave(void);
 /* Return index of currently active tty */
 int devfs_get_active(void);
 /* Process-context input injection; may take the tty lock. */

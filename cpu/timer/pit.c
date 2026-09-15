@@ -88,11 +88,18 @@ void pit_handler(cpu_registers_t* regs) {
                 return;
         }
         
-        /* SMP: never thread_schedule() from IRQ — nested scheduler + sched_lock corrupts state.
-           Idle loops + IPI wake other CPUs; BSP is driven by syscalls/yield. */
-        if ((pit_ticks % 10) == 0 && smp_cpu_count() <= 1) {
-                thread_schedule();
-        }
+/* SMP: never thread_schedule() from IRQ — nested scheduler + sched_lock corrupts state.
+   Idle loops + IPI wake other CPUs; BSP is driven by syscalls/yield.
+
+   Ring-0 must not be preempted from IRQ either: filesystem write paths (ramfs
+   write/ftruncate) hold node/block spinlocks with plain acquire() (IF stays 1)
+   so that a large memset or kmalloc inside the critical section doesn't starve
+   IRQs.  If the PIT handler switches away from such a holder, a peer spinning
+   acquire_irqsave() on the same lock disables IF, preventing the timer IRQ
+   from ever rescheduling the holder — the system wedges permanently (the tmux
+   + vim :w hard freeze).  Scheduler entry stays at ring-3 preemption, syscall
+   return, thread_block and thread_yield. */
+        (void)0;
 }
 
 // Initialize PIT with default frequency (100 Hz)

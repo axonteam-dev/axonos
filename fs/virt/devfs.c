@@ -715,16 +715,41 @@ void devfs_tty_console_write_locked(const char *s, size_t n) {
     tty->insert_mode = saved_insert;
 }
 
+/*
+ * Console paint re-entrancy guard.  Both kprintf (drv/video/vga.c) and
+ * devfs_tty_console_write take tty->out_lock with IF=0 for the whole paint.
+ * If an exception (page fault / GPF / stray font pointer) fires while a paint
+ * is in progress, the fault handler's kprintf/klogprintf would re-enter that
+ * spinlock on the same CPU and spin forever with IRQs disabled — a permanent
+ * total freeze ("hang while printing").  Enter() returns 0 for the nested
+ * call and the output is dropped instead.
+ */
+volatile int devfs_tty_render_depth = 0;
+
+int devfs_tty_console_enter(void) {
+    if (devfs_tty_render_depth)
+        return 0;
+    devfs_tty_render_depth = 1;
+    return 1;
+}
+
+void devfs_tty_console_leave(void) {
+    devfs_tty_render_depth = 0;
+}
+
 void devfs_tty_console_write(const char *s, size_t n) {
     if (!s || n == 0)
         return;
     struct devfs_tty *tty = devfs_get_tty_by_index(devfs_get_active());
     if (!tty)
         return;
+    if (!devfs_tty_console_enter())
+        return;
     unsigned long flags = 0;
     acquire_irqsave(&tty->out_lock, &flags);
     devfs_tty_console_write_locked(s, n);
     release_irqrestore(&tty->out_lock, flags);
+    devfs_tty_console_leave();
 }
 
 static void devfs_tty_emit_byte_impl(struct devfs_tty *tty, int tty_on_vga, uint8_t ch);
@@ -1290,7 +1315,15 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                     copied += seg;
                 }
                 s += chunk_sectors;
-                if (s < nsectors) thread_yield();
+                if (s < nsectors) {
+                    /* Never deschedule while still holding io_lock with IF=0:
+                     * a peer spinning acquire_irqsave on the same lock would
+                     * prevent any IRQ from firing and leave the holder
+                     * stranded forever.  Release, yield, re-acquire. */
+                    release_irqrestore(&b->io_lock, flags);
+                    thread_yield();
+                    acquire_irqsave(&b->io_lock, &flags);
+                }
             }
             kfree(chunk);
             release_irqrestore(&b->io_lock, flags);
@@ -1815,7 +1848,11 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                     return -1;
                 }
                 cur_sector += chunk_sectors;
-                if (cur_sector < nsectors) thread_yield();
+                if (cur_sector < nsectors) {
+                    release_irqrestore(&b->io_lock, flags);
+                    thread_yield();
+                    acquire_irqsave(&b->io_lock, &flags);
+                }
             }
             kfree(tmp);
             release_irqrestore(&b->io_lock, flags);

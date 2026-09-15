@@ -791,6 +791,11 @@ void kprintf(const char* fmt, ...)
         if (devfs_is_ready()) {
                 tty = devfs_get_tty_by_index(devfs_get_active());
         }
+        /* Re-entrancy guard: a kprintf fired from a fault while another paint is
+         * already under way would re-enter out_lock with IF=0 and self-deadlock.
+         * Drop the nested output instead (see devfs_tty_console_enter). */
+        if (tty && !devfs_tty_console_enter())
+                return;
         unsigned long output_fl;
         if (tty) {
                 /*
@@ -967,6 +972,7 @@ PRINT_NUMBER_BASE10:
         if (tty) {
                 console_end_tty_batch();
                 release_irqrestore(&tty->out_lock, output_fl);
+                devfs_tty_console_leave();
         } else {
                 if (!cirrusfb_is_ready() && !vbe_is_available())
                         flush_cursor_nolock();

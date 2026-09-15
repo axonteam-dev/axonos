@@ -51,5 +51,8 @@ int e1000_link_is_up(void);
 /* Debug: print RX ring state. */
 void e1000_debug_rx(void);
 
+/* Debug: print raw CTRL/STATUS registers. */
+void e1000_debug_regs(void);
+
 /* Snapshot driver counters. */
 int e1000_get_stats(e1000_stats_t *out_stats);

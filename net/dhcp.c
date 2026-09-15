@@ -475,8 +475,14 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
 
     /* Wait for link (VMware bridged WiFi can take many seconds after host roam). */
     uint64_t link_wait = pit_get_time_ms();
-    while (!e1000_is_ready() && (pit_get_time_ms() - link_wait) < DHCP_LINK_WAIT_MS)
+    int link_ever_up = 0;
+    while (!e1000_is_ready() && (pit_get_time_ms() - link_wait) < DHCP_LINK_WAIT_MS) {
+        if (e1000_link_is_up())
+            link_ever_up = 1;
         dhcp_sleep_ms(50);
+    }
+    if (e1000_link_is_up())
+        link_ever_up = 1;
     if (!e1000_is_ready())
         klogprintf("dhcp: link not up after %us, proceeding anyway\n",
                    (unsigned)(DHCP_LINK_WAIT_MS / 1000u));
@@ -500,11 +506,21 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
         if (dhcp_wait_kind(1, DHCP_RX_TIMEOUT_MS, &offered_ip, &server_id,
                            &netmask, &router, &dns) == 1)
             break;
+        {
+            e1000_stats_t st;
+            e1000_get_stats(&st);
+            klogprintf("dhcp: DISCOVER try=%d timeout link=%d tx=%llu rx=%llu txe=%llu rxe=%llu\n",
+                       disc_try, e1000_link_is_up(),
+                       (unsigned long long)st.tx_packets, (unsigned long long)st.rx_packets,
+                       (unsigned long long)st.tx_errors, (unsigned long long)st.rx_errors);
+        }
         offered_ip = 0;
     }
 
     if (!offered_ip) {
-        klogprintf("dhcp: failed - no OFFER\n");
+        e1000_debug_regs();
+        klogprintf("dhcp: failed - no OFFER%s\n",
+                   link_ever_up ? "" : " (link never up: check the VM's NIC is connected)");
         dhcp_cap_reset(0);
         return -1;
     }
@@ -543,6 +559,13 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
         }
     }
 
+    {   e1000_stats_t st;
+        e1000_get_stats(&st);
+        klogprintf("dhcp: REQUEST timeout link=%d tx=%llu rx=%llu txe=%llu rxe=%llu\n",
+                   e1000_link_is_up(),
+                   (unsigned long long)st.tx_packets, (unsigned long long)st.rx_packets,
+                   (unsigned long long)st.tx_errors, (unsigned long long)st.rx_errors);
+    }
     klogprintf("dhcp: failed - no ACK\n");
     dhcp_cap_reset(0);
     return -1;

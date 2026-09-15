@@ -318,6 +318,19 @@ int e1000_init(void) {
         ctrl |= (E1000_CTRL_SLU | E1000_CTRL_ASDE);
         e1000_write32(E1000_REG_CTRL, ctrl);
     }
+    /* Wait a bounded time for LU: some VMware 8254x variants flop it only after
+       the forced-up state settles; QEMU reports up immediately. */
+    for (int w = 0; w < 20000; w++) {
+        if (e1000_read32(E1000_REG_STATUS) & E1000_STATUS_LU)
+            break;
+        if ((w & 4095) == 0) {
+            uint32_t ctrl = e1000_read32(E1000_REG_CTRL);
+            ctrl |= (E1000_CTRL_SLU | E1000_CTRL_ASDE);
+            e1000_write32(E1000_REG_CTRL, ctrl);
+        }
+        for (volatile int d = 0; d < 2000; d++)
+            ;
+    }
 
     /* Disable and clear interrupts for polling-mode driver operation. */
     e1000_write32(E1000_REG_IMC, 0xFFFFFFFFu);
@@ -364,7 +377,14 @@ int e1000_init(void) {
 
 int e1000_is_ready(void) {
     if (!g_e1000.initialized) return 0;
-    return (e1000_read32(E1000_REG_STATUS) & E1000_STATUS_LU) ? 1 : 0;
+    if (e1000_read32(E1000_REG_STATUS) & E1000_STATUS_LU)
+        return 1;
+    /* Some VMware 8254x variants drop the forced link-up state after reset;
+       re-asserting SLU|ASDE nudges the LU bit to transition. */
+    uint32_t ctrl = e1000_read32(E1000_REG_CTRL);
+    if (!(ctrl & (E1000_CTRL_SLU | E1000_CTRL_ASDE)))
+        e1000_write32(E1000_REG_CTRL, ctrl | E1000_CTRL_SLU | E1000_CTRL_ASDE);
+    return 0;
 }
 
 int e1000_get_mac(uint8_t out_mac[6]) {
@@ -576,6 +596,17 @@ void e1000_debug_rx(void) {
     volatile e1000_rx_desc_t *d = (volatile e1000_rx_desc_t *)&g_e1000.rx_desc[idx];
     uint8_t st = d->status;
     klogprintf("e1000: RDH=%u RDT=%u rx_next=%u status=0x%02x\n", rdh, rdt, idx, st);
+}
+
+/* Debug: print raw CTRL/STATUS so VMware's emulated link state is observable. */
+void e1000_debug_regs(void) {
+    if (!g_e1000.initialized) { klogprintf("e1000: not initialized\n"); return; }
+    uint32_t ctrl = e1000_read32(E1000_REG_CTRL);
+    uint32_t st = e1000_read32(E1000_REG_STATUS);
+    klogprintf("e1000: dev=%04x ctrl=0x%08x (slu=%d asde=%d ) status=0x%08x lu=%d\n",
+               g_e1000.pdev ? g_e1000.pdev->device_id : 0,
+               ctrl, (int)((ctrl >> 6) & 1u), (int)((ctrl >> 5) & 1u),
+               st, (int)((st >> 1) & 1u));
 }
 
 int e1000_get_stats(e1000_stats_t *out_stats) {

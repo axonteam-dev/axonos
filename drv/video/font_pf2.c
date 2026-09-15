@@ -229,6 +229,7 @@ int font_load_pf2(const void *data, size_t len) {
 		kfree(bits);
 		return -1;
 	}
+	con_unimap_add_default(); /* keep ASCII/box-drawing gaps after a pf2 swap */
 	klogprintf("font: loaded pf2 \"%s\" cell=%ux%u (maxw=%u) ascent=%u\n",
 		   f.name, (unsigned)cell_w, (unsigned)maxh, (unsigned)maxw,
 		   (unsigned)asce);

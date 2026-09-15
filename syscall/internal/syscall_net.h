@@ -26,6 +26,13 @@
 #define ETH_TYPE_IPV4         0x0800
 #define ETH_TYPE_ARP          0x0806
 
+typedef struct {
+    size_t pos;              /* cumulative stream byte position SCM_RIGHTS attaches to */
+    struct fs_file *fds[4];
+    int nfds;
+    int used;
+} unix_fdpass_t;
+
 typedef struct unix_stream_conn {
     uint8_t q01[8192];
     size_t q01_head;
@@ -38,6 +45,12 @@ typedef struct unix_stream_conn {
     int closed[2];
     int refs;
     spinlock_t lock;
+    /* SCM_RIGHTS ancillary queue, per direction (0=q01, 1=q10). Entries are
+     * byte-position-attached so a recv spanning the position delivers them. */
+    size_t written_bytes[2];
+    size_t read_bytes[2];
+    unix_fdpass_t fdpass[2][8];
+    int fdpass_count[2];
 } unix_stream_conn_t;
 
 typedef struct __attribute__((packed)) {

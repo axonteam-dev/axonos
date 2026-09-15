@@ -82,6 +82,11 @@ struct devfs_tty {
     uint8_t term_vtime; /* deciseconds */
     /* echo: skip escape sequences (0=normal, 1=after ESC, 2=after ESC [ or ESC O) */
     uint8_t echo_escape_state;
+    /* UTF-8 output decode state: continuations still expected + accumulated codepoint.
+     * Ground-state bytes >=0x80 are folded here and mapped through the console
+     * unimap; codepoints with no glyph fall back to '?'. */
+    uint8_t utf8_n;
+    uint32_t utf8_cp;
     /* single-byte pushback for readers (e.g. kgetc escape handling); -1 = none */
     int unget_char;
     /*
@@ -146,6 +151,8 @@ void devfs_tty_remove_waiter(int tty, int tid);
 void devfs_tty_remove_waiter_from_all_ttys(int tid);
 /* Restore main TTY buffer after smcup/rmcup or fatal exit (htop/nano). */
 void devfs_tty_leave_alt_screen(int tty);
+/* Force the active tty's backing store back onto the visible console. */
+void devfs_tty_force_reblit(int tty);
 /* ICANON|ECHO|ISIG after apt/dpkg raw-mode (StartPtyMagic) or a crash. */
 void devfs_tty_restore_sane(int tty);
 /* Check whether an fs_file is a devfs tty device */

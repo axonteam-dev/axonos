@@ -13,6 +13,8 @@
 #include <fs.h>
 #include <pagecache.h>
 #include <frame.h>
+#include <vga.h>
+#include <klog.h>
 
 static user_vma_t g_user_vmas[USER_VMA_MAX];
 static spinlock_t g_user_vma_lock;
@@ -141,6 +143,44 @@ static user_vma_t *user_vma_find_containing_nolock(uint64_t tid, uintptr_t va) {
         if (va >= a && va < e) return &g_user_vmas[i];
     }
     return NULL;
+}
+
+/* TEMP: dump all VMAs of a thread (debug; remove after fix). */
+void user_vma_dump_for_tid(uint64_t tid, uintptr_t hit_va) {
+    int printed = 0;
+    unsigned long fl;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < USER_VMA_MAX; i++) {
+            const user_vma_t *v;
+            if (pass == 0) {
+                if (!g_user_vmas[i].used || g_user_vmas[i].tid != tid)
+                    continue;
+                v = &g_user_vmas[i];
+            } else {
+                thread_t *ct = thread_get_current_user();
+                if (!ct || !ct->mm || !ct->mm->vma_storage)
+                    continue;
+                const user_vma_t *mv = (const user_vma_t *)ct->mm->vma_storage;
+                if (!mv[i].used)
+                    continue;
+                v = &mv[i];
+            }
+            const char *nm = (v->file && v->file->path) ? v->file->path : "-";
+            const char *tag = (hit_va >= v->addr && hit_va < v->addr + v->len) ? " <==HIT" : "";
+            if (printed > 0 && tag[0] == '\0' && printed > 18)
+                continue;
+            kprintf("xorg-map: va=0x%llx end=0x%llx prot=%d kind=%d off=0x%llx %s%s\n",
+                    (unsigned long long)v->addr,
+                    (unsigned long long)(v->addr + v->len),
+                    v->prot, v->kind,
+                    (unsigned long long)v->file_off,
+                    nm ? nm : "-", tag);
+            printed++;
+        }
+    }
+    release_irqrestore(&g_user_vma_lock, fl);
+    kprintf("xorg-map: dumped=%d\n", printed);
 }
 
 static int user_vma_add_nolock(uint64_t tid, uintptr_t addr, size_t len, int prot, int kind) {

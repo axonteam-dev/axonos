@@ -34,6 +34,8 @@ int user_vma_add_file(uint64_t tid, uintptr_t addr, size_t len, int prot, int ki
 int user_vma_lookup_after(thread_t *runner, uintptr_t addr,
     uintptr_t *vm_start, uintptr_t *vm_end, int *kind, int *prot,
     struct fs_file **file, uint64_t *file_off);
+/* TEMP: debug dump of thread VMAs (remove after fix). */
+void user_vma_dump_for_tid(uint64_t tid, uintptr_t hit_va);
 /* Extend a VMA that starts at addr with length old_len (Linux mremap in-place). */
 int user_vma_grow(thread_t *runner, uintptr_t addr, size_t old_len, size_t new_len);
 

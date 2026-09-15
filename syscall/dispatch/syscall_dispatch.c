@@ -66,6 +66,29 @@
 #include <user_mm.h>
 #include <utsname_host.h>
 
+/* Console keyboard/mode state (ioctl KDSETMODE/KDGETMODE, KDSKBMODE).
+ * Xorg switches the VC to KD_GRAPHICS + K_OFF; if it dies we must restore
+ * this so the console stops being "dead" (no repaint / no input).
+ * File-scope (not function-static) so the fatal-exit paths can reset it. */
+static int console_kbd_mode = 0x01; /* K_XLATE — Linux default */
+static int kd_mode = 0;             /* KD_TEXT */
+
+/* Reset the console after a holding process (e.g. Xorg fbdev) died: drop
+ * KD_GRAPHICS back to KD_TEXT, K_OFF back to K_XLATE, and force the active
+ * tty's backing store onto the screen so the shell text reappears. */
+static void console_kd_reset_for_dead_owner(int tty_idx) {
+    if (video_kd_graphics()) {
+        video_set_kd_mode(0); /* KD_GRAPHICS -> KD_TEXT */
+    }
+    kd_mode = 0;             /* KD_TEXT */
+    console_kbd_mode = 0x01; /* K_XLATE */
+    if (tty_idx >= 0 && tty_idx < DEVFS_TTY_COUNT) {
+        devfs_tty_restore_sane(tty_idx);
+        devfs_tty_leave_alt_screen(tty_idx);
+        devfs_tty_force_reblit(tty_idx);
+    }
+}
+
 #define mark_user_identity_range_2m_sys user_map_mark_identity_2m
 
 #ifndef S_IFSOCK
@@ -403,8 +426,7 @@ void syscall_user_fatal_exit(int signo) {
          * wedged the shell (no prompt after curl's DNS worker #PF).
          */
         if (leader->attached_tty >= 0) {
-            devfs_tty_leave_alt_screen(leader->attached_tty);
-            devfs_tty_restore_sane(leader->attached_tty);
+            console_kd_reset_for_dead_owner(leader->attached_tty);
         }
         {
             int nt = thread_get_count();
@@ -1307,6 +1329,26 @@ void syscall_finalize_user_frame(uint64_t *frame) {
 }
 
 void syscall_epilogue_probe(uint64_t *frame) {
+    /* TEMP: last C helper before iretq. Mark if Xorg reaches it. */
+    if (frame) {
+        thread_t *px = thread_current();
+        if (!px || px->ring != 3) px = thread_get_current_user();
+        if (px && px->name && px->name[0]) {
+            const char *z = px->name;
+            int xr = 0;
+            for (; *z; z++) {
+                if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { xr = 1; break; }
+            }
+            if (xr) {
+                static int xorg_epi_left = 100;
+                if (xorg_epi_left-- > 0)
+                    kprintf("xorg-epi: rip=0x%llx rsp=0x%llx rax=0x%llx\n",
+                            (unsigned long long)frame[13],
+                            (unsigned long long)frame[15],
+                            (unsigned long long)frame[14]);
+            }
+        }
+    }
     if (!frame || !syscall_pipe_watch_active)
         return;
     thread_t *cur = thread_current();
@@ -1969,8 +2011,7 @@ static int force_fatal_signal_thread_group(thread_t *any, int sig)
     }
 
     if (leader->attached_tty >= 0) {
-        devfs_tty_leave_alt_screen(leader->attached_tty);
-        devfs_tty_restore_sane(leader->attached_tty);
+        console_kd_reset_for_dead_owner(leader->attached_tty);
     }
     thread_close_all_fds(leader);
     if (leader->parent_tid >= 0) {
@@ -2075,6 +2116,7 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define E2BIG 7
 #endif
 #define EDESTADDRREQ 89
+#define EMSGSIZE 90
 #define ENETDOWN 100
 #define ENETUNREACH 101
 #define EHOSTUNREACH 113
@@ -2447,6 +2489,13 @@ static inline int fs_open_nonblock(const struct fs_file *f)
 #define ETH_TYPE_ARP          0x0806
 #define ETH_P_ALL_HOST        0x0003
 
+typedef struct {
+    size_t pos;              /* cumulative stream byte position SCM_RIGHTS attaches to */
+    struct fs_file *fds[4];
+    int nfds;
+    int used;
+} unix_fdpass_t;
+
 typedef struct unix_stream_conn {
     uint8_t q01[8192];
     size_t q01_head;
@@ -2459,6 +2508,12 @@ typedef struct unix_stream_conn {
     int closed[2];
     int refs;
     spinlock_t lock;
+    /* SCM_RIGHTS ancillary queue, per direction (0=q01, 1=q10). Entries are
+     * byte-position-attached so a recv spanning the position delivers them. */
+    size_t written_bytes[2];
+    size_t read_bytes[2];
+    unix_fdpass_t fdpass[2][8];
+    int fdpass_count[2];
 } unix_stream_conn_t;
 
 typedef struct __attribute__((packed)) {
@@ -2787,20 +2842,55 @@ static int unix_stream_peer_closed(const ksock_net_t *s) {
     return c->closed[peer] ? 1 : 0;
 }
 
-static ssize_t unix_stream_write_from_user(ksock_net_t *s, const void *buf_u, size_t len) {
-    if (!s || !s->unix_conn) return -ENOTCONN;
-    if (len == 0) return 0;
-    if (!buf_u) return -EINVAL;
-    if (!user_range_ok(buf_u, len)) return -EFAULT;
+static ssize_t unix_stream_write_from_user_ex(ksock_net_t *s, const void *buf_u, size_t len,
+                                              struct fs_file **pass_fds, int pass_nfds) {
+    if (!s || !s->unix_conn) {
+        for (int i = 0; i < pass_nfds; i++) fs_file_free(pass_fds[i]);
+        return -ENOTCONN;
+    }
+    if (len == 0) {
+        for (int i = 0; i < pass_nfds; i++) fs_file_free(pass_fds[i]);
+        return 0;
+    }
+    if (!buf_u) {
+        for (int i = 0; i < pass_nfds; i++) fs_file_free(pass_fds[i]);
+        return -EINVAL;
+    }
+    if (!user_range_ok(buf_u, len)) {
+        for (int i = 0; i < pass_nfds; i++) fs_file_free(pass_fds[i]);
+        return -EFAULT;
+    }
     unix_stream_conn_t *c = s->unix_conn;
     int from = s->unix_end;
     int to = (from == 0) ? 1 : 0;
+    int dir = (from == 0) ? 0 : 1;
     uint8_t *q = (from == 0) ? c->q01 : c->q10;
     size_t cap = (from == 0) ? sizeof(c->q01) : sizeof(c->q10);
     size_t *head = (from == 0) ? &c->q01_head : &c->q10_head;
     size_t *tail = (from == 0) ? &c->q01_tail : &c->q10_tail;
     size_t *count = (from == 0) ? &c->q01_count : &c->q10_count;
+    (void)tail;
     size_t written = 0;
+    if (pass_nfds > 0) {
+        unsigned long fl = 0;
+        acquire_irqsave(&c->lock, &fl);
+        unix_fdpass_t *slot = NULL;
+        for (int i = 0; i < 8; i++) {
+            if (!c->fdpass[dir][i].used) { slot = &c->fdpass[dir][i]; break; }
+        }
+        if (slot != NULL) {
+            int n = pass_nfds > 4 ? 4 : pass_nfds;
+            slot->pos = c->written_bytes[dir];
+            slot->nfds = n;
+            for (int i = 0; i < n; i++) slot->fds[i] = pass_fds[i];
+            slot->used = 1;
+            for (int i = n; i < 4; i++) slot->fds[i] = NULL;
+        }
+        release_irqrestore(&c->lock, fl);
+        if (slot == NULL) {
+            for (int i = 0; i < pass_nfds; i++) fs_file_free(pass_fds[i]);
+        }
+    }
     while (written < len) {
         unsigned long fl = 0;
         acquire_irqsave(&c->lock, &fl);
@@ -2840,11 +2930,158 @@ static ssize_t unix_stream_write_from_user(ksock_net_t *s, const void *buf_u, si
         }
         *head = (h + n) % cap;
         *count += n;
-        (void)tail;
+        c->written_bytes[dir] += n;
         release_irqrestore(&c->lock, fl);
         written += n;
     }
     return (ssize_t)written;
+}
+
+static ssize_t unix_stream_write_from_user(ksock_net_t *s, const void *buf_u, size_t len) {
+    return unix_stream_write_from_user_ex(s, buf_u, len, NULL, 0);
+}
+
+#define SOL_SOCKET_LINUX 1
+#define SCM_RIGHTS_LINUX 1
+#define MSG_PEEK_LINUX   0x2
+#define MSG_CTRUNC_LINUX 0x8
+#define MSG_CMSG_CLOEXEC_LINUX 0x40000000u
+
+typedef struct {
+    size_t cmsg_len;
+    int cmsg_level;
+    int cmsg_type;
+    /* total 16 bytes on x86_64, matching Linux struct cmsghdr */
+} cmsghdr_k;
+
+static struct fs_file *scm_fd_lookup(thread_t *t, int fd) {
+    if (!t || fd < 0 || fd >= THREAD_MAX_FD) return NULL;
+    if (t->process && t->process->fds[fd]) return t->process->fds[fd];
+    return t->fds[fd];
+}
+
+/* Parse SCM_RIGHTS cmsgs from user control buffer, resolve sender fds and
+ * take a reference via fs_file_get() on each. Returns count, or negative
+ * errno. On error all already-collected refs are released. */
+static int scm_rights_to_files(thread_t *t, const void *ctl_u, size_t ctllen,
+                               struct fs_file **out, int maxout) {
+    if (ctllen == 0) return 0;
+    if (!ctl_u) return -EFAULT;
+    if (!user_range_ok(ctl_u, ctllen)) return -EFAULT;
+    size_t off = 0;
+    int total = 0;
+    while (off + sizeof(cmsghdr_k) <= ctllen) {
+        cmsghdr_k h;
+        if (copy_from_user_raw(&h, (const uint8_t *)ctl_u + off, sizeof(h)) != 0)
+            return -EFAULT;
+        size_t clen = h.cmsg_len;
+        if (clen < sizeof(cmsghdr_k)) return -EINVAL;
+        if (clen > ctllen - off) return -EINVAL;
+        if (h.cmsg_level == SOL_SOCKET_LINUX && h.cmsg_type == SCM_RIGHTS_LINUX) {
+            int nfds = (int)((clen - sizeof(cmsghdr_k)) / 4u);
+            if (nfds > maxout - total) return -EINVAL;
+            for (int i = 0; i < nfds; i++) {
+                int32_t fdn = -1;
+                if (copy_from_user_raw(&fdn, (const uint8_t *)ctl_u + off + sizeof(cmsghdr_k) + (size_t)i * 4, 4) != 0) {
+                    for (int j = 0; j < total; j++) fs_file_free(out[j]);
+                    return -EFAULT;
+                }
+                struct fs_file *f = scm_fd_lookup(t, (int)fdn);
+                if (!f || f->refcount <= 0) {
+                    for (int j = 0; j < total; j++) fs_file_free(out[j]);
+                    return -EBADF;
+                }
+                fs_file_get(f);
+                out[total++] = f;
+            }
+        }
+        size_t alen = (off + clen + 7) & ~(size_t)7;
+        if (alen <= off) break;
+        off = alen;
+        if (off >= ctllen) break;
+    }
+    return total;
+}
+
+/* Kernel-buffer twin of unix_stream_read_to_user: copies into a kernel
+ * buffer (no user-range check / copy_to_user). recvmsg(47) gathers the
+ * bytes into its own kmalloc tmp and fans them out to the msghdr iov. */
+static ssize_t unix_stream_read_to_kernel_ex(ksock_net_t *s, void *kbuf, size_t len, int peek,
+                                             struct fs_file **out_fds, int *out_nfds) {
+    if (out_nfds) *out_nfds = 0;
+    if (!s || !s->unix_conn) return -ENOTCONN;
+    if (len == 0) return 0;
+    if (!kbuf) return -EINVAL;
+    unix_stream_conn_t *c = s->unix_conn;
+    int from = (s->unix_end == 0) ? 1 : 0;
+    int dir = (from == 0) ? 0 : 1;
+    uint8_t *q = (from == 0) ? c->q01 : c->q10;
+    size_t cap = (from == 0) ? sizeof(c->q01) : sizeof(c->q10);
+    size_t *head = (from == 0) ? &c->q01_head : &c->q10_head;
+    size_t *tail = (from == 0) ? &c->q01_tail : &c->q10_tail;
+    size_t *count = (from == 0) ? &c->q01_count : &c->q10_count;
+    (void)head;
+    for (;;) {
+        unsigned long fl = 0;
+        acquire_irqsave(&c->lock, &fl);
+        if (*count > 0) {
+            size_t start = c->read_bytes[dir];
+            size_t n = len;
+            if (n > *count) n = *count;
+            size_t t = *tail;
+            size_t first = (t + n <= cap) ? n : (cap - t);
+            uint8_t tmp[256];
+            size_t off = 0;
+            while (off < n) {
+                size_t ch = n - off;
+                if (ch > sizeof(tmp)) ch = sizeof(tmp);
+                if (off < first) {
+                    size_t p = first - off;
+                    if (p > ch) p = ch;
+                    memcpy(tmp, q + t + off, p);
+                    if (p < ch) memcpy(tmp + p, q, ch - p);
+                } else {
+                    memcpy(tmp, q + (off - first), ch);
+                }
+                memcpy((uint8_t *)kbuf + off, tmp, ch);
+                off += ch;
+            }
+            if (!peek) {
+                *tail = (t + n) % cap;
+                *count -= n;
+                c->read_bytes[dir] += n;
+                int got = 0;
+                for (int i = 0; i < 8; i++) {
+                    unix_fdpass_t *e = &c->fdpass[dir][i];
+                    if (!e->used) continue;
+                    if (e->pos >= start && e->pos < start + n) {
+                        for (int j = 0; j < e->nfds && got < 4; j++) {
+                            if (out_fds) out_fds[got] = e->fds[j];
+                            got++;
+                        }
+                        e->used = 0;
+                    }
+                }
+                if (out_nfds) *out_nfds = got;
+                if (out_fds) {
+                    for (int i = got; i < 4; i++) out_fds[i] = NULL;
+                }
+            }
+            release_irqrestore(&c->lock, fl);
+            return (ssize_t)n;
+        }
+        if (c->closed[from]) {
+            release_irqrestore(&c->lock, fl);
+            return 0;
+        }
+        release_irqrestore(&c->lock, fl);
+        if (s->nonblock) return -EAGAIN;
+        thread_sleep(1);
+    }
+}
+
+static ssize_t unix_stream_read_to_kernel(ksock_net_t *s, void *kbuf, size_t len, int peek) {
+    return unix_stream_read_to_kernel_ex(s, kbuf, len, peek, NULL, NULL);
 }
 
 static ssize_t unix_stream_read_to_user(ksock_net_t *s, void *buf_u, size_t len, int peek) {
@@ -2921,6 +3158,14 @@ static void unix_socket_cleanup(ksock_net_t *s) {
         unix_stream_conn_t *c = s->unix_conn;
         unsigned long fl = 0;
         acquire_irqsave(&c->lock, &fl);
+        for (int d = 0; d < 2; d++) {
+            for (int i = 0; i < 8; i++) {
+                unix_fdpass_t *e = &c->fdpass[d][i];
+                if (!e->used) continue;
+                for (int j = 0; j < e->nfds; j++) fs_file_free(e->fds[j]);
+                e->used = 0;
+            }
+        }
         c->closed[s->unix_end] = 1;
         c->refs--;
         int refs = c->refs;
@@ -7158,6 +7403,23 @@ static const char *task_fs_root(thread_t *cur) {
     return "/";
 }
 
+/* TEMP: warn the moment Xorg stats /dev/tty0 so we know the resolve step ran. */
+static void is_in_tty0_stat_xorg_warn(const char *path) {
+    static int xorg_mark2 = 0;
+    thread_t *cur = thread_current();
+    int xorg_nf = 0;
+    if (cur && cur->name && cur->name[0]) {
+        const char *z = cur->name;
+        for (; *z; z++) {
+            if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { xorg_nf = 1; break; }
+        }
+    }
+    if (xorg_nf && xorg_mark2 < 300) {
+        xorg_mark2++;
+        kprintf("nf: MARK2 about-to-stat path=%s\n", path ? path : "<?>");
+    }
+}
+
 static int path_is_beneath_root(const char *path, const char *root) {
     if (!path || !root) return 0;
     if (strcmp(root, "/") == 0) return path[0] == '/';
@@ -8824,6 +9086,26 @@ int maybe_deliver_pending_signal(uint64_t syscall_ret) {
         return 0;
     }
 
+    /* TEMP: only Xorg, only when it actually has a pending signal. */
+    for (int si = 1; si <= 64; si++) {
+        if (cur->pending_signals & (1ULL << (si - 1))) {
+            int xr = 0;
+            if (cur->name && cur->name[0]) {
+                const char *z = cur->name;
+                for (; *z; z++) {
+                    if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { xr = 1; break; }
+                }
+            }
+            if (xr) {
+                static int xorg_sig_left = 50;
+                if (xorg_sig_left-- > 0)
+                    kprintf("xorg-sigcheck: pending=%d ret-scan-0x%llx\n",
+                            si, (unsigned long long)syscall_ret);
+            }
+            break;
+        }
+    }
+
     for (;;) {
         int sig = 0;
         user_sigaction_t sa;
@@ -8915,6 +9197,33 @@ int maybe_deliver_pending_signal(uint64_t syscall_ret) {
     }
 }
 
+/* Ring0 trampoline entered via iretq-redirect when a user thread dies during
+ * an IRQ return. The IRQ handler must NOT context_switch (see idle_task_entry
+ * comment in cpu/thread.c); instead the iretq frame is rewritten to land here
+ * in plain kernel context, which reschedules from a normal (non-IRQ) context
+ * until the scheduler switches to a live thread. The dying thread is never
+ * resumed, so this loop leaks away harmlessly. */
+static void syscall_fatal_die_trampoline(void) {
+        for (;;) {
+                thread_schedule();
+                asm volatile("sti; hlt" ::: "memory");
+        }
+}
+
+/* Redirect the interrupted-frame iretq into the ring0 reschedule loop above.
+ * Returns 1 if the frame was rewritten, 0 if no usable kernel stack exists
+ * (caller must fall back to its own local halt loop). */
+static int redirect_dying_thread_to_trampoline(cpu_registers_t *regs, thread_t *cur) {
+        if (!regs || !cur || !cur->kernel_stack)
+                return 0;
+        regs->cs = (uint64_t)KERNEL_CS;
+        regs->ss = (uint64_t)KERNEL_DS;
+        regs->rip = (uint64_t)(uintptr_t)&syscall_fatal_die_trampoline;
+        regs->rsp = cur->kernel_stack;      /* top of the doomed thread's kernel stack */
+        regs->rflags |= 0x200u;             /* IF: leave interrupts enabled in the loop */
+        return 1;
+}
+
 /* Deliver pending signal by rewriting the interrupt return frame (ring3). */
 int maybe_deliver_pending_signal_iretq(cpu_registers_t *regs) {
     if (!regs || (regs->cs & 3) != 3) return 0;
@@ -8929,9 +9238,11 @@ int maybe_deliver_pending_signal_iretq(cpu_registers_t *regs) {
     }
     if (cur->state == THREAD_TERMINATED) {
         sigwait_restore_saved_mask(cur);
-        thread_schedule();
-        for (;;)
-            asm volatile("sti; hlt" ::: "memory");
+        if (!redirect_dying_thread_to_trampoline(regs, cur)) {
+            for (;;)
+                asm volatile("sti; hlt" ::: "memory");
+        }
+        return 0;
     }
 
     for (;;) {
@@ -8944,9 +9255,11 @@ int maybe_deliver_pending_signal_iretq(cpu_registers_t *regs) {
         }
         if (prep == -2 || cur->state == THREAD_TERMINATED) {
             sigwait_restore_saved_mask(cur);
-            thread_schedule();
-            for (;;)
-                asm volatile("sti; hlt" ::: "memory");
+            if (!redirect_dying_thread_to_trampoline(regs, cur)) {
+                for (;;)
+                    asm volatile("sti; hlt" ::: "memory");
+            }
+            return 0;
         }
         if (prep < 0) continue;
 
@@ -9676,6 +9989,23 @@ static int rlimit_set(thread_t *cur, int resource, uint64_t soft, uint64_t hard)
     }
 }
 
+/* TEMP: TCGETS progress markers for Xorg (remove after hang resolved). */
+static void xorg_tcgets_mark(const char *tag, uint64_t req, uintptr_t arg) {
+    static int tcg_left = 60;
+    thread_t *ct = thread_current();
+    int x = 0;
+    if (ct && ct->name && ct->name[0]) {
+        const char *z = ct->name;
+        for (; *z; z++) {
+            if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { x = 1; break; }
+        }
+    }
+    if (x && tcg_left-- > 0)
+        kprintf("xorg-tcgets: %s req=0x%llx arg=0x%llx ms=%llu\n",
+                tag, (unsigned long long)req, (unsigned long long)arg,
+                (unsigned long long)time_monotonic_ms());
+}
+
 static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
     /* IMPORTANT:
        current_user can be stale if some subsystem (e.g. tty switching) overwrote it.
@@ -9710,6 +10040,65 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
     /* record last syscall for debug logging of ENOSYS */
     last_syscall_debug = num;
+
+    /* TEMP: trace Xorg startup to find the probe hang (remove after fix).
+       No budget cap: the LAST line printed equals the syscall that hangs. */
+    {
+        int is_xorg = 0;
+        if (cur->name && cur->name[0]) {
+            const char *n = cur->name;
+            for (; *n && !is_xorg; n++)
+                if (*n == 'X' && n[1] == 'o' && n[2] == 'r' && n[3] == 'g')
+                    is_xorg = 1;
+        }
+        if (is_xorg) {
+            unsigned long ptake = (unsigned long)num;
+            if (ptake == 16) {
+                /* ioctl: fd (a1), request (a2), arg (a3). */
+kprintf("xorg-ioctl: fd=%llu req=0x%llx arg=0x%llx ms=%llu\n",
+                    (unsigned long long)a1, (unsigned long long)a2,
+                    (unsigned long long)a3,
+                    (unsigned long long)time_monotonic_ms());
+                goto xorg_trace_done;
+            }
+            const void *pp_u = NULL;
+            switch (ptake) {
+                case 2:   /* open(path, ...) */
+                case 4:   /* stat(path, ...) */
+                case 6:   /* lstat(path, ...) */
+                case 21:  /* access(path, ...) */
+                case 137: /* statfs(path, ...) */
+                case 257: /* openat(dirfd, path, ...) */
+                case 262: /* newfstatat(dirfd, path, ...) */
+                    pp_u = (ptake == 257 || ptake == 262)
+                               ? (const void*)(uintptr_t)a2
+                               : (const void*)(uintptr_t)a1;
+                    break;
+                default:
+                    break;
+            }
+            char pbuf[96];
+            pbuf[0] = '\0';
+            if (pp_u && cur->ring == 3) {
+                size_t pl = 0;
+                while (pl < sizeof(pbuf) - 2) {
+                    char c;
+                    if (copy_from_user_raw(&c, (const char*)pp_u + pl, 1) != 0)
+                        break;
+                    if (c == '\0')
+                        break;
+                    pbuf[pl++] = c;
+                }
+                pbuf[pl] = '\0';
+            }
+            kprintf("xorg-sys: tid=%llu nr=%llu a1=0x%llx ms=%llu%s%s\n",
+                    (unsigned long long)cur->tid, (unsigned long long)num,
+                    (unsigned long long)a1,
+                    (unsigned long long)time_monotonic_ms(),
+                    pbuf[0] ? " path=" : "", pbuf);
+        }
+xorg_trace_done:;
+    }
 
     /* Uncomment if there is some syscall issue — floods the console and
      * hides the shell prompt (ash setjobctl alone is getpgrp/kill/ioctl). */
@@ -12835,7 +13224,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 if (poll_in_waiters_any(&inw) && !has_net_socket) {
                     if (timeout_ms < 0) {
-                        thread_block(cur_tid);
+                        /* Infinite select: tty/pty input wakes immediately, and
+                         * the full fd set (incl. unix sockets not in the waiter
+                         * list) is re-scanned every ~10ms so a peer message
+                         * never leaves select(-1) parked forever. */
+                        thread_block_with_timeout(cur_tid, 10);
                         thread_yield();
                         poll_in_waiters_remove(&inw, cur_tid);
                         goto auto_select_check;
@@ -13862,6 +14255,25 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (copy_to_user_safe(optlen_u, &olen, 4) != 0) return ret_err(EFAULT);
                 return 0;
             }
+            if (level == SOL_SOCKET_LOCAL && optname == 17 /* SO_PEERCRED */) {
+                /* Linux struct ucred: pid_t pid; uid_t uid; gid_t gid. tmux
+                 * server_acl_join reads peer uid; unset creds previously let
+                 * stack garbage decide → flaky "access not allowed". */
+                uint32_t ucred[3];
+                ucred[0] = (t && t->tid) ? (uint32_t)t->tid : 1u;
+                ucred[1] = 0; /* uid: root */
+                ucred[2] = 0; /* gid */
+                if (olen >= sizeof(ucred) && optval_u &&
+                    user_range_ok(optval_u, sizeof(ucred))) {
+                    if (copy_to_user_safe(optval_u, ucred, sizeof(ucred)) != 0)
+                        return ret_err(EFAULT);
+                    olen = sizeof(ucred);
+                } else {
+                    olen = sizeof(ucred);
+                }
+                if (copy_to_user_safe(optlen_u, &olen, 4) != 0) return ret_err(EFAULT);
+                return 0;
+            }
             if (optval_u && olen >= 4) {
                 uint32_t zero = 0;
                 if (copy_to_user_safe(optval_u, &zero, 4) != 0) return ret_err(EFAULT);
@@ -14279,10 +14691,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 int32_t __pad1;
             } m;
             if (copy_from_user_raw(&m, msg_u, sizeof(m)) != 0) return ret_err(EFAULT);
-            if (!m.msg_iov || m.msg_iovlen < 1 || m.msg_iovlen > 64 ||
+            if (!m.msg_iov || m.msg_iovlen < 1 || m.msg_iovlen > 256 ||
                 !user_range_ok(m.msg_iov, (size_t)m.msg_iovlen * 16u))
-                return ret_err(EFAULT);
-            struct iovec_k { void *base; uint64_t len; } iov[64];
+                return ret_err(EMSGSIZE);
+            struct iovec_k { void *base; uint64_t len; } iov[256];
             if (copy_from_user_raw(iov, m.msg_iov, (size_t)m.msg_iovlen * sizeof(iov[0])) != 0)
                 return ret_err(EFAULT);
             uint64_t sum64 = 0;
@@ -14337,11 +14749,21 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     kfree(flat);
                     return (uint64_t)sum;
                 }
+                struct fs_file *pass[4];
+                int npass = 0;
+                if (m.msg_controllen > 0 && m.msg_control) {
+                    npass = scm_rights_to_files(t, m.msg_control, (size_t)m.msg_controllen, pass, 4);
+                    if (npass < 0) {
+                        kfree(flat);
+                        return ret_err(-npass);
+                    }
+                }
                 size_t written = 0;
                 for (uint64_t i = 0; i < m.msg_iovlen; i++) {
                     size_t ilen = (size_t)iov[i].len;
                     if (ilen == 0) continue;
-                    ssize_t part = unix_stream_write_from_user(s, iov[i].base, ilen);
+                    ssize_t part = unix_stream_write_from_user_ex(s, iov[i].base, ilen,
+                                        (i == 0) ? pass : NULL, (i == 0) ? npass : 0);
                     if (part < 0) {
                         kfree(flat);
                         return written ? (uint64_t)written : ret_err((int)(-part));
@@ -14483,10 +14905,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 int32_t __pad1;
             } m;
             if (copy_from_user_raw(&m, msg_u, sizeof(m)) != 0) return ret_err(EFAULT);
-            if (!m.msg_iov || m.msg_iovlen < 1 || m.msg_iovlen > 64 ||
+            if (!m.msg_iov || m.msg_iovlen < 1 || m.msg_iovlen > 256 ||
                 !user_range_ok(m.msg_iov, (size_t)m.msg_iovlen * 16u))
-                return ret_err(EFAULT);
-            struct iovec_k { void *base; uint64_t len; } iov[64];
+                return ret_err(EMSGSIZE);
+            struct iovec_k { void *base; uint64_t len; } iov[256];
             if (copy_from_user_raw(iov, m.msg_iov, (size_t)m.msg_iovlen * sizeof(iov[0])) != 0)
                 return ret_err(EFAULT);
             thread_t *t = thread_get_current_user();
@@ -14568,7 +14990,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 size_t cap = (want64 > 65536u) ? 65536u : (size_t)want64;
                 uint8_t *tmp = (uint8_t *)kmalloc(cap);
                 if (!tmp) return ret_err(ENOMEM);
-                ssize_t rr = unix_stream_read_to_user(s, tmp, cap, (flags & 0x2) ? 1 : 0);
+                struct fs_file *got_fds[4];
+                int got_n = 0;
+                ssize_t rr = unix_stream_read_to_kernel_ex(s, tmp, cap, (flags & MSG_PEEK_LINUX) ? 1 : 0,
+                                                           got_fds, &got_n);
                 if (rr < 0) {
                     kfree(tmp);
                     return ret_err((int)(-rr));
@@ -14589,6 +15014,50 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         break;
                 }
                 kfree(tmp);
+                if (got_n > 0) {
+                    int install[4];
+                    int ninst = 0;
+                    for (int g = 0; g < got_n; g++) {
+                        int nfd = thread_fd_alloc(got_fds[g]);
+                        if (nfd < 0) {
+                            fs_file_free(got_fds[g]);
+                            continue;
+                        }
+                        if (flags & MSG_CMSG_CLOEXEC_LINUX) {
+                            if (t && t->process && nfd >= 0 && nfd < THREAD_MAX_FD)
+                                t->process->fd_cloexec[nfd] = 1;
+                        }
+                        install[ninst++] = nfd;
+                    }
+                    size_t need_space = ((16u + (size_t)ninst * 4u) + 7u) & ~(size_t)7u;
+                    size_t need_len = 16u + (size_t)ninst * 4u;
+                    if (ninst > 0 && m.msg_control && m.msg_controllen &&
+                        user_range_ok(m.msg_control, need_space >= m.msg_controllen ? m.msg_controllen : need_space)) {
+                        if (need_space <= m.msg_controllen) {
+                            uint8_t cbuf[64];
+                            cmsghdr_k ch;
+                            ch.cmsg_len = need_len;
+                            ch.cmsg_level = SOL_SOCKET_LINUX;
+                            ch.cmsg_type = SCM_RIGHTS_LINUX;
+                            memcpy(cbuf, &ch, sizeof(ch));
+                            for (int g = 0; g < ninst; g++)
+                                memcpy(cbuf + sizeof(cmsghdr_k) + (size_t)g * 4, &install[g], 4);
+                            size_t wlen = 16u + (size_t)ninst * 4u;
+                            if (copy_to_user_safe(m.msg_control, cbuf, wlen) != 0) {
+                                for (int g = 0; g < ninst; g++) thread_fd_close(install[g]);
+                                return ret_err(EFAULT);
+                            }
+                            m.msg_controllen = need_space;
+                        } else {
+                            m.msg_controllen = need_space;
+                            m.msg_flags |= MSG_CTRUNC_LINUX;
+                        }
+                        (void)copy_to_user_safe(msg_u, &m, sizeof(m));
+                    } else {
+                        m.msg_controllen = 0;
+                        (void)copy_to_user_safe(msg_u, &m, sizeof(m));
+                    }
+                }
                 if (m.msg_name && m.msg_namelen >= 2 && user_range_ok(m.msg_name, 2)) {
                     uint16_t fam = 1;
                     (void)copy_to_user_safe(m.msg_name, &fam, sizeof(fam));
@@ -16645,6 +17114,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 cur = waiter;
             }
         }
+
         case SYS_ioctl: {
             int fd = (int)a1;
             uint64_t req = a2;
@@ -16677,6 +17147,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         thread_fd_path(cur, 2) ? thread_fd_path(cur, 2) : "-");
                 return ret_err(EBADF);
             }
+            if (fbdev_is_fb0_file(f))
+                kprintf("fb-ioctl: fd=%d req=0x%llx arg=0x%llx path=%s\n",
+                    fd, (unsigned long long)req,
+                    (unsigned long long)(uintptr_t)argp,
+                    f->path ? f->path : "-");
 
             /* Common ioctl numbers on Linux x86_64 */
             enum {
@@ -16780,6 +17255,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         uint32_t c_ispeed, c_ospeed;
                     } tio;
                     if (!argp) return ret_err(EFAULT);
+                    xorg_tcgets_mark("pty-pre-copy", req, (uintptr_t)argp);
                     memset(&tio, 0, sizeof(tio));
                     pty_get_termios(f, &tio.c_iflag, &tio.c_oflag, &tio.c_cflag,
                                     &tio.c_lflag, tio.c_cc, sizeof(tio.c_cc));
@@ -16787,6 +17263,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     tio.c_ospeed = 9600;
                     /* 36 bytes = Linux struct termios (flags + c_line + NCCS=19). */
                     if (copy_to_user_safe(argp, &tio, 36) != 0) return ret_err(EFAULT);
+                    xorg_tcgets_mark("pty-post-copy", req, (uintptr_t)argp);
                     return 0;
                 }
                 if (req == TCSETS || req == TCSETSW || req == TCSETSF ||
@@ -16980,7 +17457,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             /* Linux fbdev ioctls on /dev/fb0 (Xorg Driver "fbdev"). */
             if (fbdev_is_fb0_file(f)) {
                 uint32_t fbcmd = (uint32_t)req & 0xffffu;
-                static int fb0_ioctl_log = 8;
+                static int fb0_ioctl_log = 64;
                 if (fb0_ioctl_log-- > 0)
                     kprintf("fbdev-ioctl: req=0x%llx nr=0x%x active=%d\n",
                             (unsigned long long)req, fbcmd, fbdev_is_active());
@@ -17007,9 +17484,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (copy_to_user_safe(argp, &fi, sizeof(fi)) != 0) return ret_err(EFAULT);
                     return 0;
                 }
-                if (req == FBIOGETCMAP || req == FBIOPUTCMAP)
+                if (req == FBIOGETCMAP || req == FBIOPUTCMAP || fbcmd == 0x4604 || fbcmd == 0x4605)
                     return 0;
-                if (req == FBIOPAN_DISPLAY) {
+                if (req == FBIOPAN_DISPLAY || fbcmd == 0x4606) {
                     struct fb_var_screeninfo v;
                     if (!argp) return ret_err(EFAULT);
                     if (copy_from_user_raw(&v, argp, sizeof(v)) != 0) return ret_err(EFAULT);
@@ -17302,6 +17779,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 /* isatty(3) is TCGETS success. Lying here for /dev/null made ash
                  * think stdin was interactive, read EOF, exit, and respawn-loop. */
                 if (!devfs_is_tty_file(f)) return ret_err(ENOTTY);
+                xorg_tcgets_mark("pre-copy", req, (uintptr_t)argp);
                 struct termios_k tio;
                 memset(&tio, 0, sizeof(tio));
                 tio.c_iflag = 0x00000100u /* ICRNL */ | 0x00000400u /* IXON */;
@@ -17326,6 +17804,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 size_t safe_sz = 36;
                 if (safe_sz > sizeof(tio)) safe_sz = sizeof(tio);
                 if (copy_to_user_safe(argp, &tio, safe_sz) != 0) return ret_err(EFAULT);
+                xorg_tcgets_mark("post-copy", req, (uintptr_t)argp);
                 return 0;
             }
             if (req == FIONREAD && devfs_is_tty_file(f)) {
@@ -17638,7 +18117,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
              * mode as the ioctl arg value, get writes through an int*.
              */
             if (req == 0x4B44 || req == 0x4B45) {
-                static int console_kbd_mode = 0x01; /* K_XLATE */
                 if (!devfs_is_tty_file(f))
                     return ret_err(ENOTTY);
                 if (req == 0x4B44) {
@@ -17671,7 +18149,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
              * Xorg fbdev: KD_GRAPHICS so the console stops painting over mmap.
              */
             if (req == 0x4B3A || req == 0x4B3B) {
-                static int kd_mode = 0; /* KD_TEXT */
                 if (!devfs_is_tty_file(f))
                     return ret_err(ENOTTY);
                 if (req == 0x4B3B) {
@@ -17806,6 +18283,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     }
                     int rc = con_unimap_set(ud.entry_ct, pairs);
                     kfree(pairs);
+                    con_unimap_add_default(); /* keep box-drawing gaps after setfont */
                     return rc < 0 ? ret_err(-rc) : 0;
                 }
                 if (req == GIO_UNIMAP_I) {
@@ -18746,9 +19224,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                          * user_itimer_interval_ms is still global, so Xvfb's
                          * 500ms setitimer made every shell tty wake in 500ms
                          * batches. Keyboard input and signals unblock this
-                         * waiter directly.
+                         * waiter directly. But the set may also contain fds
+                         * that are NOT waiters (unix sockets, pipes): a
+                         * server→client message over a socket must not leave
+                         * a poll(-1) parked forever, so block is BOUNDED and
+                         * the full set is re-scanned each iteration.
                          */
-                        thread_block(cur_tid);
+                        thread_block_with_timeout(cur_tid, 10);
                         thread_yield(); /* must yield so keyboard ISR can run and unblock */
                         poll_in_waiters_remove(&inw, cur_tid);
                         goto auto_check;
@@ -19556,6 +20038,20 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (!path_u) return ret_err(EFAULT);
                 char *kpath = copy_user_cstr(path_u, 256);
                 if (!kpath) return ret_err(EFAULT);
+                {
+                    static int xorg_nf_mark = 0;
+                    int xorg_nf = 0;
+                    if (xorg_nf_mark < 300 && cur && cur->name && cur->name[0]) {
+                        const char *z = cur->name;
+                        for (; *z; z++) {
+                            if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { xorg_nf = 1; break; }
+                        }
+                    }
+                    if (xorg_nf) {
+                        xorg_nf_mark++;
+                        kprintf("nf: MARK1 kpath=%s\n", kpath);
+                    }
+                }
                 char path[256];
                 int rc_resolve = 0;
                 if (kpath[0] == '/') {
@@ -19599,7 +20095,23 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                    st_dev/st_ino consistent with fstat(fd) on the resolved object. */
                 if (cur && cur->ring == 3 && strstr(path, ".so") != NULL)
                     flags &= ~AT_SYMLINK_NOFOLLOW;
+                is_in_tty0_stat_xorg_warn(path);
                 int sr = (flags & AT_SYMLINK_NOFOLLOW) ? vfs_lstat(path, &st) : vfs_stat(path, &st);
+                {
+                    static int xorg_mark3 = 0;
+                    thread_t *cur3 = thread_current();
+                    int x3 = 0;
+                    if (cur3 && cur3->name && cur3->name[0]) {
+                        const char *z = cur3->name;
+                        for (; *z; z++) {
+                            if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { x3 = 1; break; }
+                        }
+                    }
+                    if (x3 && xorg_mark3 < 300) {
+                        xorg_mark3++;
+                        kprintf("nf: MARK3 stat-returned sr=%d path=%s\n", sr, path);
+                    }
+                }
                 if (sr != 0) {
                     if (is_init_user(cur) || (cur && cur->name[0] && strstr(cur->name, "openrc")))
                         devel_printf("pid1 newfstatat ENOENT path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
@@ -19656,6 +20168,21 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 memcpy(tmp, &cs, sizeof(cs));
                 memset(tmp + sizeof(cs), 0, STAT_COPY_SIZE - sizeof(cs));
                 if (copy_to_user_safe(st_u, tmp, STAT_COPY_SIZE) != 0) return ret_err(EFAULT);
+            }
+            {
+                static int xorg_mark4 = 0;
+                thread_t *cur4 = thread_current();
+                int x4 = 0;
+                if (cur4 && cur4->name && cur4->name[0]) {
+                    const char *z = cur4->name;
+                    for (; *z; z++) {
+                        if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { x4 = 1; break; }
+                    }
+                }
+                if (x4 && xorg_mark4 < 300) {
+                    xorg_mark4++;
+                    kprintf("nf: MARK4 copyout-done newfstatat\n");
+                }
             }
             return 0;
         }
@@ -21058,6 +21585,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     mm_release(cur->mm_ptemplate);
                     cur->mm_ptemplate = NULL;
                 }
+                if (cur->attached_tty >= 0)
+                    console_kd_reset_for_dead_owner(cur->attached_tty);
                 if (cur->mm && cur->mm != mm_kernel()) {
                     mm_t *dead_mm = cur->mm;
                     cur->mm = NULL;
@@ -21159,6 +21688,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     mm_release(cur->mm_ptemplate);
                     cur->mm_ptemplate = NULL;
                 }
+                if (cur->attached_tty >= 0)
+                    console_kd_reset_for_dead_owner(cur->attached_tty);
                 if (cur->mm && cur->mm != mm_kernel()) {
                     mm_t *dead_mm = cur->mm;
                     cur->mm = NULL;
@@ -21425,6 +21956,22 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             return ret_err(ENOSYS);
     }
+    {
+        static int xorg_mark5 = 0;
+        thread_t *cur5 = thread_current();
+        int x5 = 0;
+        if (cur5 && cur5->name && cur5->name[0]) {
+            const char *z = cur5->name;
+            for (; *z; z++) {
+                if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { x5 = 1; break; }
+            }
+        }
+        if (x5 && xorg_mark5 < 300) {
+            xorg_mark5++;
+            kprintf("xorg-ret: nr=%llu\n", (unsigned long long)num);
+        }
+    }
+    return 0;
 }
 
 uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
@@ -21611,7 +22158,24 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             (unsigned long long)a6);
     }
     uint64_t ret = syscall_do_inner(num, a1, a2, a3, a4, a5, a6);
-    uint64_t syscall_prof_inner_done = time_monotonic_us();
+    {
+        /* TEMP: xorg-done only for ioctl after console phase (arm by KDSETMODE). */
+        static int xorg_done_left = 800;
+        static int xorg_done_armed = 0;
+        if (num == SYS_ioctl && a2 == 0x4b3a)
+            xorg_done_armed = 1;
+        thread_t *dt = thread_current();
+        int dx = 0;
+        if (dt && dt->name && dt->name[0]) {
+            const char *z = dt->name;
+            for (; *z; z++) {
+                if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { dx = 1; break; }
+            }
+        }
+        if (dx && xorg_done_armed && num == SYS_ioctl && xorg_done_left-- > 0)
+            kprintf("xorg-done: nr=%llu ret=0x%llx\n",
+                    (unsigned long long)num, (unsigned long long)ret);
+    }
     if (trace_t && trace_t->fork_child_user_rip && trace_t->name[0] &&
         strstr(trace_t->name, "linuxrc")) {
         static int linuxrc_child_done_left = 48;

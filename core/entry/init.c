@@ -240,6 +240,32 @@ static int boot_write_bytes(const char *path, const void *data, size_t len)
         return 0;
 }
 
+/* Load /usr/share/fonts/console.psf (PSF1, e.g. from Debian consolefonts) into
+ * the console font + unimap so UTF-8 output (tmux panes, cyrillic, …) renders
+ * properly instead of byte-smeared garbage.  Missing file is fine. */
+static void boot_load_console_font(void) {
+        struct stat st;
+        if (vfs_stat("/usr/share/fonts/console.psf", &st) != 0 || st.st_size <= 0) {
+                klogprintf("font: /usr/share/fonts/console.psf absent — keeping default map\n");
+                return;
+        }
+        if (st.st_size > 4096 * 1024)
+                return;
+        struct fs_file *f = fs_open("/usr/share/fonts/console.psf");
+        if (!f)
+                return;
+        void *buf = kmalloc((size_t)st.st_size);
+        if (!buf) {
+                fs_file_free(f);
+                return;
+        }
+        ssize_t n = fs_read(f, buf, (size_t)st.st_size, 0);
+        fs_file_free(f);
+        if (n == st.st_size)
+                (void)font_load_psf(buf, (size_t)st.st_size);
+        kfree(buf);
+}
+
 /*
  * Linux kernel_init: late_initcall(load_system_certificate_list) then
  * integrity_load_keys(), still before run_init_process. Export the same
@@ -488,8 +514,10 @@ static int boot_try_run_init(void) {
                         "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
                         "SHELL=/bin/sh",
                         "TERM=linux",
-                        "LC_ALL=C",
-                        "LANG=C",
+                        "LC_ALL=C.UTF-8",
+                        "LANG=C.UTF-8",
+                        "LOCPATH=/usr/lib/locale",
+                        "TERMINFO_DIRS=/usr/share/terminfo",
                         "USER=root",
                         "PS1=\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[0;37m\\w\\033[0m\\$ ",
                         NULL
@@ -546,7 +574,6 @@ static int boot_try_run_init(void) {
 }
 
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
-        qemu_debug_printf("Kernel started\n");
         enable_cursor();
         sysinfo_init(multiboot_magic, multiboot_info);
 
@@ -875,6 +902,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                                 (void*)(uintptr_t)mods_end);
                 /* Default 8x16 until VFS/console.pf2 (or explicit pf2 load). */
                 font_init_default();
+                /* Built-in box-drawing/identity map so UTF-8 never smears trash. */
+                con_unimap_default_only();
         }
 
         gdt_init();
@@ -1650,9 +1679,11 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         "export USER=root\n"
                         "export LOGNAME=root\n"
                         "export HOME=/root\n"
-                        "export LANG=C\n"
-                        "export LC_ALL=C\n"
-                        "export PS1='\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[1;37m\\w\\033[0m \\$ '\n"
+                        "export LANG=C.UTF-8\n"
+                        "export LC_ALL=C.UTF-8\n"
+                        "export LOCPATH=/usr/lib/locale\n"
+                        "export TERMINFO_DIRS=/usr/share/terminfo\n"
+                        "export PS1='\\w \\$ '\n"
                         "export OPENSSL_CONF=/etc/ssl/openssl.cnf\n"
                         "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n"
                         "export SSL_CERT_DIR=/etc/ssl/certs\n"
@@ -1666,12 +1697,14 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
          * offsets and #GPs (apt install). Built-in C locale needs no files.
          * BusyBox login clearenv(); ~/.profile is sourced after /etc/profile. */
         {
-                static const char loc[] = "LANG=C\nLC_ALL=C\n";
+                static const char loc[] = "LANG=C.UTF-8\nLC_ALL=C.UTF-8\nLOCPATH=/usr/lib/locale\nTERMINFO_DIRS=/usr/share/terminfo\n";
                 static const char rprofile[] =
-                        "export LANG=C\n"
-                        "export LC_ALL=C\n"
+                        "export LANG=C.UTF-8\n"
+                        "export LC_ALL=C.UTF-8\n"
+                        "export LOCPATH=/usr/lib/locale\n"
+                        "export TERMINFO_DIRS=/usr/share/terminfo\n"
                         "export PS1='\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[1;37m\\w\\033[0m \\$ '\n";
-                static const char locsh[] = "export LANG=C\nexport LC_ALL=C\n";
+                static const char locsh[] = "export LANG=C.UTF-8\nexport LC_ALL=C.UTF-8\nexport LOCPATH=/usr/lib/locale\nexport TERMINFO_DIRS=/usr/share/terminfo\n";
                 (void)ramfs_mkdir("/etc/default");
                 (void)ramfs_mkdir("/root");
                 (void)ramfs_mkdir("/etc/profile.d");
@@ -1853,6 +1886,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
         /* Final printk snapshot for /var/log/kernel (ring stays authoritative via /dev/kmsg). */
         klog_sync_varlog();
+        boot_load_console_font();
 
         // Prefer OpenRC (openrc-init) over BusyBox linuxrc; shell is last resort.
         if (boot_try_run_init() != 0) {

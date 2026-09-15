@@ -109,6 +109,7 @@ static inline void msr_write_u64(uint32_t msr,uint64_t v){uint32_t lo=(uint32_t)
 #define ESOCKTNOSUPPORT 94
 #define EOPNOTSUPP 95
 #define EDESTADDRREQ 89
+#define EMSGSIZE 90
 #define ENETDOWN 100
 #define ENETUNREACH 101
 #define ENOTCONN 107

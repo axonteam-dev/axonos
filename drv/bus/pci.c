@@ -340,6 +340,52 @@ static ssize_t sysfs_show_pci_irq(char *buf, size_t size, void *priv) {
     return (ssize_t)snprintf(buf, size, "%u\n", irq);
 }
 
+/* Linux exposes the raw PCI config space as a binary "config" file under
+ * /sys/bus/pci/devices/<BDF>/.  libpciaccess (used by Xorg's xf86ScanPciBuses)
+ * reads vendor/device/class/revision/subsystem straight out of this file and
+ * drops the whole device list if it cannot read it. */
+static uint32_t pci_dev_config_dword(const pci_device_t *dev, uint8_t off) {
+    return pci_config_read_dword(dev->bus, dev->device, dev->function, off);
+}
+
+static ssize_t sysfs_show_pci_config(char *buf, size_t size, void *priv) {
+    if (!buf || size == 0 || !priv) return 0;
+    pci_device_t *dev = (pci_device_t*)priv;
+    size_t want = (size < 256) ? size : 256;
+    size_t off;
+    for (off = 0; off + 4 <= want; off += 4) {
+        uint32_t d = pci_dev_config_dword(dev, (uint8_t)off);
+        buf[off + 0] = (char)((d >>  0) & 0xFF);
+        buf[off + 1] = (char)((d >>  8) & 0xFF);
+        buf[off + 2] = (char)((d >> 16) & 0xFF);
+        buf[off + 3] = (char)((d >> 24) & 0xFF);
+    }
+    while (off < want)
+        buf[off++] = '\0';
+    return (ssize_t)want;
+}
+
+static ssize_t sysfs_show_pci_revision(char *buf, size_t size, void *priv) {
+    if (!buf || size == 0 || !priv) return 0;
+    pci_device_t *dev = (pci_device_t*)priv;
+    uint8_t rev = (uint8_t)(pci_dev_config_dword(dev, 0x08) & 0xFF);
+    return (ssize_t)snprintf(buf, size, "0x%02x\n", rev);
+}
+
+static ssize_t sysfs_show_pci_subvendor(char *buf, size_t size, void *priv) {
+    if (!buf || size == 0 || !priv) return 0;
+    pci_device_t *dev = (pci_device_t*)priv;
+    uint16_t v = (uint16_t)(pci_dev_config_dword(dev, 0x2C) & 0xFFFF);
+    return (ssize_t)snprintf(buf, size, "0x%04x\n", v);
+}
+
+static ssize_t sysfs_show_pci_subdevice(char *buf, size_t size, void *priv) {
+    if (!buf || size == 0 || !priv) return 0;
+    pci_device_t *dev = (pci_device_t*)priv;
+    uint16_t d = (uint16_t)((pci_dev_config_dword(dev, 0x2C) >> 16) & 0xFFFF);
+    return (ssize_t)snprintf(buf, size, "0x%04x\n", d);
+}
+
 struct pci_resource_ctx {
     pci_device_t *dev;
     int index;
@@ -410,11 +456,19 @@ void pci_sysfs_init(void) {
         struct sysfs_attr class_attr = { sysfs_show_pci_class, NULL, dev };
         struct sysfs_attr irq_attr = { sysfs_show_pci_irq, NULL, dev };
         struct sysfs_attr resource_attr = { sysfs_show_pci_resource, NULL, dev };
+        struct sysfs_attr config_attr = { sysfs_show_pci_config, NULL, dev };
+        struct sysfs_attr revision_attr = { sysfs_show_pci_revision, NULL, dev };
+        struct sysfs_attr subvendor_attr = { sysfs_show_pci_subvendor, NULL, dev };
+        struct sysfs_attr subdevice_attr = { sysfs_show_pci_subdevice, NULL, dev };
         create_attr_file(dir_path, "vendor", &vendor);
         create_attr_file(dir_path, "device", &device_attr);
         create_attr_file(dir_path, "class", &class_attr);
         create_attr_file(dir_path, "irq", &irq_attr);
         create_attr_file(dir_path, "resource", &resource_attr);
+        create_attr_file(dir_path, "config", &config_attr);
+        create_attr_file(dir_path, "revision", &revision_attr);
+        create_attr_file(dir_path, "subsystem_vendor", &subvendor_attr);
+        create_attr_file(dir_path, "subsystem_device", &subdevice_attr);
         static struct pci_resource_ctx res_ctx[256][6];
         for (int bar = 0; bar < 6; bar++) {
             if (i >= (int)(sizeof(res_ctx) / sizeof(res_ctx[0])))
@@ -428,4 +482,5 @@ void pci_sysfs_init(void) {
         }
     }
     pci_sysfs_initialized = 1;
+    kprintf("pci-sysfs: published config+attrs for %d devs (xorg-trace build)\n", count);
 }

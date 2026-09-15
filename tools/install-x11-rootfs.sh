@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install a fbdev-only X11 userspace into $HOME/rootfs (Debian Trixie ABI).
+# Install a minimal desktop (openbox + tint2 + pcmanfm) into $HOME/rootfs (Debian Trixie ABI).
 # Copies files from the host dpkg database; downloads missing .debs.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -9,7 +9,7 @@ mkdir -p "$DEST" "$ARCHIVES/partial" "$DEST/var/lib/dpkg/info" \
          "$DEST/etc/X11/xorg.conf.d" "$DEST/root" "$DEST/tmp/.X11-unix" \
          "$DEST/usr/share/X11" "$DEST/etc/X11/xkb"
 
-log() { printf 'x11-rootfs: %s\n' "$*"; }
+log() { printf 'desktop-rootfs: %s\n' "$*"; }
 
 SEEDS=(
     xserver-xorg-core
@@ -17,7 +17,6 @@ SEEDS=(
     xserver-xorg-input-evdev
     xinit
     xterm
-    twm
     x11-xserver-utils
     xfonts-base
     xfonts-utils
@@ -34,6 +33,10 @@ SEEDS=(
     libmtdev1
     libevdev2
     xauth
+    openbox
+    tint2
+    pcmanfm
+    dbus-x11
 )
 
 python3 - "$DEST" "${SEEDS[@]}" <<'PY'
@@ -160,7 +163,7 @@ os.makedirs(os.path.dirname(status_path), exist_ok=True)
 existing = ""
 if os.path.isfile(status_path):
     existing = open(status_path).read()
-# Append X packages not already recorded.
+# Append desktop packages not already recorded.
 have_status = set()
 cur = None
 for line in existing.splitlines():
@@ -193,7 +196,7 @@ PY
 MISSING_FILE="$DEST/var/tmp/x11-missing-pkgs.txt"
 if [[ -s "$MISSING_FILE" ]]; then
     log "downloading missing packages"
-    # shellcheck disable=SC2046
+    # shellcheck disable=SC2024
     ( cd "$ARCHIVES" && apt-get download $(tr '\n' ' ' < "$MISSING_FILE") )
     shopt -s nullglob
     for deb in "$ARCHIVES"/*.deb; do
@@ -275,11 +278,36 @@ Section "ServerLayout"
 EndSection
 EOF
 
+# Desktop session: openbox + tint2 panel + xterm terminal
 cat > "$DEST/root/.xinitrc" <<'EOF'
 #!/bin/sh
 export DISPLAY="${DISPLAY:-:0}"
+export XDG_SESSION_TYPE=x11
+
+# Ensure dbus session bus for desktop services
+if command -v dbus-launch >/dev/null && [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
+    eval $(dbus-launch --sh-syntax)
+    export DBUS_SESSION_BUS_ADDRESS
+fi
+
+# Openbox window manager
+exec openbox-session &
+sleep 0.3
+
+# Tint2 panel (taskbar + clock)
+if command -v tint2 >/dev/null; then
+    tint2 &
+fi
+
+# PCManFM as desktop (root windows for file icons)
+if command -v pcmanfm >/dev/null; then
+    pcmanfm --desktop --profile file-manager &
+fi
+
+# xterm terminal
 xterm -geometry 80x24+40+40 &
-exec twm
+
+wait
 EOF
 chmod 755 "$DEST/root/.xinitrc"
 

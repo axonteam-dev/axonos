@@ -45,6 +45,9 @@ int font_load_pf2_path(const char *path);
  */
 int font_load_kd(uint32_t width, uint32_t height, uint32_t charcount,
 		 const uint8_t *data, uint32_t vpitch);
+/* Linux PSF1 console font (setfont payload): magic 36 04, 8x8/8x14/8x16,
+ * optional embedded Unicode table which becomes the console unimap. */
+int font_load_psf(const void *data, size_t len);
 /* Export current font into KD layout; data may be NULL to query sizes only. */
 int font_export_kd(uint32_t *width, uint32_t *height, uint32_t *charcount,
 		   uint8_t *data, size_t data_bytes, uint32_t vpitch);
@@ -74,3 +77,8 @@ void con_unimap_clear(void);
 int con_unimap_set(unsigned entry_ct, const void *entries /* unipair[] */);
 int con_unimap_get(unsigned *entry_ct, void *out /* unipair[] */, unsigned out_max);
 int con_unimap_lookup(uint32_t unicode); /* fontpos or -1 */
+/* Build-in fallback map: ASCII/Latin-1 identity + CP437 box/block drawing for
+ * the codepoints a loaded font does not cover.  Merges into the active map. */
+void con_unimap_add_default(void);
+/* Replace the active map with the built-in table only. */
+void con_unimap_default_only(void);

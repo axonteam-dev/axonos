@@ -4,7 +4,7 @@
 
 #define OS_NAME "axonOS"
 #define OS_VERSION "4.0.1"
-#define OS_PREFIX "stable.b1"
+#define OS_PREFIX "beta"
 #define OS_AUTHORS "Axon Team"
 
 /* Syscall globals (defined in syscall64/syscall.c). */

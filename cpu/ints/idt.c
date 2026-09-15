@@ -485,6 +485,28 @@ static void page_fault_handler(cpu_registers_t* regs) {
         uint64_t cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
         int user = (regs->cs & 3) == 3;
+        if (user) {
+                extern thread_t *thread_current(void);
+                extern thread_t *thread_get_current_user(void);
+                thread_t *pft = thread_current();
+                if (!pft || pft->ring != 3) pft = thread_get_current_user();
+                if (pft && pft->name && pft->name[0]) {
+                        const char *z = pft->name;
+                        int xpf = 0;
+                        for (; *z; z++) {
+                                if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { xpf = 1; break; }
+                        }
+                        if (xpf) {
+                                static int xorg_pf_left = 200;
+                                if (xorg_pf_left-- > 0)
+                                        kprintf("xorg-pf: tid=%llu va=0x%llx rip=0x%llx err=0x%llx\n",
+                                                (unsigned long long)(pft->tid ? pft->tid : 1),
+                                                (unsigned long long)cr2,
+                                                (unsigned long long)regs->rip,
+                                                (unsigned long long)regs->error_code);
+                        }
+                }
+        }
         if (user && syscall_pipe_watch_active) {
                 static int pf_all_left = 24;
                 if (pf_all_left-- > 0)

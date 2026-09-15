@@ -24,6 +24,7 @@
 #include <klog.h>
 #include <pty.h>
 #include <video.h>
+#include <font.h>
 
 #define DEVFS_TTY_COUNT 6
 
@@ -148,6 +149,13 @@ static void devfs_tty_blit_to_console(struct devfs_tty *tty) {
     console_set_cursor(tty->cursor_x, tty->cursor_y);
 }
 
+/* Force the active tty's backing store back onto the visible console. */
+void devfs_tty_force_reblit(int tty_idx) {
+    if (tty_idx < 0 || tty_idx >= DEVFS_TTY_COUNT) return;
+    if (tty_idx != devfs_get_active()) return;
+    devfs_tty_blit_to_console(&dev_ttys[tty_idx]);
+}
+
 void devfs_tty_restore_sane(int tty_idx) {
     if (tty_idx < 0 || tty_idx >= DEVFS_TTY_COUNT) return;
     struct devfs_tty *t = &dev_ttys[tty_idx];
@@ -217,6 +225,12 @@ static void tty_echo_input_byte(struct devfs_tty *t, unsigned char uc) {
         return;
     if (tty_echo_skip_esc(t, uc))
         return;
+    /* ICRNL folded Enter to LF; echo it as CRLF so the console cursor returns
+     * to column 0 on the next line.  LF alone now preserves the column. */
+    if (uc == '\n') {
+        unsigned char cr = '\r';
+        devfs_tty_echo_bytes(t, &cr, 1);
+    }
     if (uc == '\n' || uc == '\t' || uc >= 32u)
         devfs_tty_echo_bytes(t, &uc, 1);
 }
@@ -419,7 +433,10 @@ static void devfs_tty_newline(struct devfs_tty *tty, int tty_on_vga) {
     } else if (tty->cursor_y + 1 < rows) {
         tty->cursor_y++;
     }
-    tty->cursor_x = 0;
+    /* LF advances the row but preserves the column (VT100/xterm).  The column
+     * is only reset by an explicit CR; tmux repaints panes with bare LF and
+     * relies on the column (e.g. 82) surviving so its per-column erase stays
+     * inside the pane instead of wiping the screen from column 0. */
     tty->need_wrap = 0;
     if (tty_on_vga)
         console_set_cursor(tty->cursor_x, tty->cursor_y);
@@ -580,7 +597,6 @@ static void devfs_tty_virtual_putc(struct devfs_tty *tty, uint8_t c) {
     if (!tty || !tty->screen || cols == 0 || rows == 0) return;
 
     if (c == '\n') {
-        tty->cursor_x = 0;
         if (tty->cursor_y + 1 < rows) tty->cursor_y++;
         return;
     }
@@ -686,6 +702,8 @@ void devfs_tty_console_write_locked(const char *s, size_t n) {
     console_begin_tty_batch();
     for (size_t i = 0; i < n; i++) {
         uint8_t ch = (uint8_t)s[i];
+        if (ch == '\n')
+            devfs_tty_emit_byte(tty, 1, '\r');
         if (ch == '\b' || ch == '\t' || ch == '\n' || ch == '\r' ||
             ch == 0x0B || ch == 0x0C ||
             (ch >= 0x20 && ch != 0x7F))
@@ -709,7 +727,92 @@ void devfs_tty_console_write(const char *s, size_t n) {
     release_irqrestore(&tty->out_lock, flags);
 }
 
-static void devfs_tty_emit_byte(struct devfs_tty *tty, int tty_on_vga, uint8_t ch) {
+static void devfs_tty_emit_byte_impl(struct devfs_tty *tty, int tty_on_vga, uint8_t ch);
+static void devfs_tty_put_glyph(struct devfs_tty *tty, int tty_on_vga, uint8_t glyph);
+
+/*
+ * UTF-8 output folding for the console.  Ground-state bytes >=0x80 are assembled
+ * into codepoints; each completed codepoint is mapped to a font glyph through
+ * con_unimap_lookup().  A codepoint with no glyph (or invalid UTF-8) renders '?'.
+ *
+ * Returns:
+ *   0 -> `*out` holds a byte/glyph for the caller to render;
+ *   1 -> the byte was consumed as (part of) a multi-byte sequence, nothing to render.
+ *   On an invalid lead followed by a non-continuation, the broken sequence renders
+ *   '?' and 0xFF is returned so the caller emits the fresh byte afterwards.
+ */
+static int devfs_tty_utf8_fold(struct devfs_tty *tty, uint8_t raw, uint8_t *out) {
+    if (raw < 0x80) {
+        if (tty->utf8_n) { /* truncation of an unfinished sequence */
+            tty->utf8_n = 0;
+            tty->utf8_cp = 0;
+            *out = '?';
+            return 0;
+        }
+        *out = raw;
+        return 0;
+    }
+    if (tty->utf8_n == 0) {
+        if ((raw & 0xE0) == 0xC0)   { tty->utf8_n = 1; tty->utf8_cp = raw & 0x1Fu; return 1; }
+        if ((raw & 0xF0) == 0xE0)   { tty->utf8_n = 2; tty->utf8_cp = raw & 0x0Fu; return 1; }
+        if ((raw & 0xF8) == 0xF0)   { tty->utf8_n = 3; tty->utf8_cp = raw & 0x07u; return 1; }
+        /* Lone continuation byte or 0xFC/0xFD/0xFE/0xFF: no glyph for it. */
+        *out = '?';
+        return 0;
+    }
+    if ((raw & 0xC0) != 0x80) {
+        /* Invalid continuation: the pending sequence dies, then reprocess `raw`. */
+        tty->utf8_n = 0;
+        tty->utf8_cp = 0;
+        *out = 0xFF;
+        return 0;
+    }
+    tty->utf8_cp = (tty->utf8_cp << 6) | (raw & 0x3Fu);
+    if (--tty->utf8_n)
+        return 1;
+    uint32_t cp = tty->utf8_cp;
+    tty->utf8_cp = 0;
+    int g = con_unimap_lookup(cp);
+    *out = (g >= 0 && g < 256) ? (uint8_t)g : (uint8_t)'?';
+    return 0;
+}
+
+/* Store/advance a printable glyph (after UTF-8 decode + ACS). */
+static void devfs_tty_put_glyph(struct devfs_tty *tty, int tty_on_vga, uint8_t glyph) {
+    if (tty->need_wrap) {
+        tty->cursor_x = 0;
+        devfs_tty_newline(tty, tty_on_vga);
+    }
+    /* IRM: shift line right before writing, like Linux vt / xterm. */
+    if (tty->insert_mode)
+        devfs_tty_insert_cells(tty, tty_on_vga, tty->cursor_x, tty->cursor_y, 1);
+    devfs_tty_store_at_cursor(tty, glyph);
+    if (tty_on_vga) {
+        if (cirrusfb_is_ready())
+            cirrusfb_putch_xy(tty->cursor_x, tty->cursor_y, glyph, tty->current_attr);
+        else
+            console_putch_xy(tty->cursor_x, tty->cursor_y, glyph, tty->current_attr);
+        devfs_tty_advance_cursor(tty);
+        /* Keep fbcon SW cursor on the cell after the glyph (echo has no end_batch). */
+        console_set_cursor(tty->cursor_x, tty->cursor_y);
+    } else {
+        devfs_tty_advance_cursor(tty);
+    }
+}
+
+static void devfs_tty_emit_byte_impl(struct devfs_tty *tty, int tty_on_vga, uint8_t raw) {
+    uint8_t ch;
+    /* Fold UTF-8 first; 0xFF flags "render '?' then reprocess the same byte". */
+    for (;;) {
+        int r = devfs_tty_utf8_fold(tty, raw, &ch);
+        if (r)
+            return; /* consumed as a continuation — nothing to paint yet */
+        if (ch == 0xFF) {
+            devfs_tty_put_glyph(tty, tty_on_vga, '?');
+            continue; /* reprocess the invalid byte as a fresh sequence */
+        }
+        break;
+    }
     ch = devfs_tty_acs_translate(ch, tty->acs_mode);
     /*
      * Linux VT C0 handling: controls act on the terminal and are never
@@ -749,25 +852,12 @@ static void devfs_tty_emit_byte(struct devfs_tty *tty, int tty_on_vga, uint8_t c
             console_set_cursor(tty->cursor_x, tty->cursor_y);
         return;
     }
-    if (tty->need_wrap) {
-        tty->cursor_x = 0;
-        devfs_tty_newline(tty, tty_on_vga);
-    }
-    /* IRM: shift line right before writing, like Linux vt / xterm. */
-    if (tty->insert_mode)
-        devfs_tty_insert_cells(tty, tty_on_vga, tty->cursor_x, tty->cursor_y, 1);
-    devfs_tty_store_at_cursor(tty, ch);
-    if (tty_on_vga) {
-        if (cirrusfb_is_ready())
-            cirrusfb_putch_xy(tty->cursor_x, tty->cursor_y, ch, tty->current_attr);
-        else
-            console_putch_xy(tty->cursor_x, tty->cursor_y, ch, tty->current_attr);
-        devfs_tty_advance_cursor(tty);
-        /* Keep fbcon SW cursor on the cell after the glyph (echo has no end_batch). */
-        console_set_cursor(tty->cursor_x, tty->cursor_y);
-    } else {
-        devfs_tty_advance_cursor(tty);
-    }
+    devfs_tty_put_glyph(tty, tty_on_vga, ch);
+}
+
+/* Entry point kept for callers; the UTF-8 decode is orthogonal to the ACS shift. */
+static void devfs_tty_emit_byte(struct devfs_tty *tty, int tty_on_vga, uint8_t ch) {
+    devfs_tty_emit_byte_impl(tty, tty_on_vga, ch);
 }
 
 static void devfs_tty_echo_bytes(struct devfs_tty *tty, const uint8_t *bytes,
@@ -2517,6 +2607,34 @@ int devfs_fill_stat(struct fs_file *file, struct stat *st) {
     st->st_uid = 0;
     st->st_gid = 0;
     st->st_size = 0;
+    /* Linux: /dev/ttyN = char 4:N, /dev/console = char 5:1, /dev/tty = 5:0.
+       Xorg's xf86HasTTYs() requires major(st_rdev)==TTY_MAJOR (4) for /dev/tty0. */
+    if (strcmp(p, "/dev/console") == 0) {
+        st->st_rdev = MKDEV(5, 1);
+    } else {
+        int ttyi = devfs_path_to_tty(p);
+        if (ttyi >= 0 && ttyi < DEVFS_TTY_COUNT)
+            st->st_rdev = MKDEV(4, (unsigned)ttyi);
+    }
+    /* Special device nodes need Linux rdev numbers. glibc daemon() validates
+     * /dev/null via fstat: st_mode S_IFCHR and st_rdev == makedev(1,3), else
+     * it returns -1/ENODEV ("No such device: daemon failed" from tmux). */
+    if (strcmp(p, "/dev/null") == 0)
+        st->st_rdev = MKDEV(1, 3);
+    else if (strcmp(p, "/dev/zero") == 0)
+        st->st_rdev = MKDEV(1, 5);
+    else if (strcmp(p, "/dev/full") == 0)
+        st->st_rdev = MKDEV(1, 7);
+    else if (strcmp(p, "/dev/random") == 0)
+        st->st_rdev = MKDEV(1, 8);
+    else if (strcmp(p, "/dev/urandom") == 0)
+        st->st_rdev = MKDEV(1, 9);
+    else if (strcmp(p, "/dev/kmsg") == 0)
+        st->st_rdev = MKDEV(1, 11);
+    else if (strcmp(p, "/dev/tty") == 0)
+        st->st_rdev = MKDEV(5, 0);
+    else if (strcmp(p, "/dev/ptmx") == 0)
+        st->st_rdev = MKDEV(5, 2);
     return 0;
 }
 

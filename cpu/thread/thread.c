@@ -27,6 +27,9 @@ int thread_count = 0;
 static thread_t *volatile current_cpu[SMP_MAX_CPUS];
 static spinlock_t sched_lock = { 0 };
 static uint32_t sched_fifo_counter;
+/* Set by thread_wake_expired_timeouts() (runs every timer tick): the global
+ * timeout scan is already done, so the next thread_schedule may skip it. */
+static int g_timeouts_scanned;
 /*
  * The active ring-3 task is CPU-local.  Keeping one global pointer lets a
  * sibling CPU's fork/vfork child replace the caller seen by wait4(), signal
@@ -77,6 +80,9 @@ void thread_wake_expired_timeouts(void) {
                         thread_note_ready_nolock(t);
                 }
         }
+        /* The scan is global (touches the whole table), so the very next
+         * thread_schedule on any CPU may skip repeating it. */
+        g_timeouts_scanned = 1;
         release_irqrestore(&sched_lock, irqf);
 }
 
@@ -358,6 +364,26 @@ int thread_reap(int pid) {
                 return 0;
         }
         return -1;
+}
+
+/* NULL out ->process/linux_tgid on every thread still pointing at `p`. Called
+ * by process_reap/reap_zombie/discard immediately before the process_t is
+ * freed: without it, CLONE_THREAD peers and TERMINATED-not-yet-reaped slots
+ * keep a dangling process pointer that scheduler autoreap (thread_zombie_
+ * autoreap_ok) and thread_wait_parent_alive dereference → UAF (T25). */
+void thread_detach_process(process_t *p) {
+        if (!p)
+                return;
+        unsigned long irqf;
+        acquire_irqsave(&sched_lock, &irqf);
+        for (int i = 0; i < thread_count; ++i) {
+                thread_t *t = threads[i];
+                if (!t || t->process != p)
+                        continue;
+                t->process = NULL;
+                t->linux_tgid = 0;
+        }
+        release_irqrestore(&sched_lock, irqf);
 }
 
 /* True if a living waiter still owns this zombie (wait4 must reap it). */
@@ -1235,35 +1261,34 @@ void thread_schedule() {
         unsigned long irqf;
         acquire_irqsave(&sched_lock, &irqf);
 
-        /* Auto-reap zombies that no living parent will wait4. */
+        /* Auto-reap zombies and wake expired timers.  The timer tick already
+         * ran the global timeout scan (thread_wake_expired_timeouts), so on the
+         * common IRQ-driven path that half is skipped; yield/block-only calls
+         * still get it inline.  One merged pass instead of two full scans. */
+        int do_timeout = !g_timeouts_scanned;
+        g_timeouts_scanned = 0;
+        uint32_t now = (uint32_t)pit_get_time_ms();
         for (int i = 1; i < thread_count; ++i) {
                 thread_t *t = threads[i];
                 if (!t) continue;
-                if (!thread_zombie_autoreap_ok(t)) continue;
-                /* Remove from table under lock; free after releasing lock. */
-                threads[i] = NULL;
-                /* shrink high-water mark when top slots are empty */
-                while (thread_count > 1 && threads[thread_count - 1] == NULL)
-                        thread_count--;
-                release_irqrestore(&sched_lock, irqf);
-                thread_free_resources(t);
-                acquire_irqsave(&sched_lock, &irqf);
-                /* restart scan because arrays changed */
-                i = 0;
-        }
-
-        uint32_t now = (uint32_t)pit_get_time_ms();
-        for (int i = 0; i < thread_count; ++i) {
-                if (threads[i] && threads[i]->state == THREAD_SLEEPING) {
-                        if (thread_time_after_eq32(now, threads[i]->sleep_until)) {
-                                threads[i]->sleep_until = 0;
-                                thread_note_ready_nolock(threads[i]);
-                        }
-                } else if (threads[i] && threads[i]->state == THREAD_BLOCKED && threads[i]->sleep_until != 0) {
-                        if (thread_time_after_eq32(now, threads[i]->sleep_until)) {
-                                threads[i]->sleep_until = 0;
-                                thread_note_ready_nolock(threads[i]);
-                        }
+                if (thread_zombie_autoreap_ok(t)) {
+                        /* Remove from table under lock; free after releasing lock. */
+                        threads[i] = NULL;
+                        /* shrink high-water mark when top slots are empty */
+                        while (thread_count > 1 && threads[thread_count - 1] == NULL)
+                                thread_count--;
+                        release_irqrestore(&sched_lock, irqf);
+                        thread_free_resources(t);
+                        acquire_irqsave(&sched_lock, &irqf);
+                        /* restart scan because arrays changed */
+                        i = 0;
+                        continue;
+                }
+                if (do_timeout && t->sleep_until != 0 &&
+                    (t->state == THREAD_SLEEPING || t->state == THREAD_BLOCKED) &&
+                    thread_time_after_eq32(now, t->sleep_until)) {
+                        t->sleep_until = 0;
+                        thread_note_ready_nolock(t);
                 }
         }
 

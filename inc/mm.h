@@ -72,6 +72,12 @@ int mm_make_private_range(mm_t *mm, uint64_t va_begin, uint64_t va_end, int copy
 /* Same as mm_make_private_range but never thread_yield (safe inside syscall_do). */
 int mm_make_private_range_noyield(mm_t *mm, uint64_t va_begin, uint64_t va_end, int copy_old,
                                   mm_t *share_cmp_mm);
+/* mm_make_private_range(copy_old=0) WITHOUT zeroing the fresh frames: for ELF
+ * exec, every allocated page is immediately overwritten by elf_copy_into_mm /
+ * elf_zero_into_mm, so the per-page memset was pure double work. Caller must
+ * supply content for the whole range (incl. unaligned head/tail gaps). */
+int mm_make_private_range_nozero(mm_t *mm, uint64_t va_begin, uint64_t va_end,
+                                 mm_t *share_cmp_mm);
 /* Zero-backed private mapping optimized for ELF exec: allocate backing in
  * bounded contiguous blocks while still installing ordinary 4 KiB PTEs.
  * force_replace: tip setup must never skip "already private" leaves — a shallow
@@ -111,6 +117,31 @@ int mm_cow_mark_user_readonly_pair_l4(mm_t *child, mm_t *parent, uint64_t *paren
                                       uint64_t va_begin, uint64_t va_end);
 /* After linuxrc exclusive privatize: drop SOFT_COW and restore PG_RW on parent. */
 int mm_cow_restore_user_writable(mm_t *mm, uint64_t va_begin, uint64_t va_end);
+
+/* Exec image cache (Linux page-cache semantics): the first load of an ELF
+ * file registers its pristine post-relocation frames (one retain per page);
+ * later execve of the same file maps them read-only Soft_COW so writes
+ * fault-copy lazily instead of re-materializing the whole image. Opaque
+ * entry; only valid between lookup and the end of a single execve. */
+typedef struct exec_img_entry exec_img_entry_t;
+/* Returns the cached entry for path/size/VA-window, or NULL. */
+const exec_img_entry_t *exec_img_lookup(const char *path, uint64_t fsz,
+                                        uint64_t va_lo, uint64_t va_hi);
+/* True if a snapshot exists for this path (any size/window). Lets execve skip
+ * the redundant open-probe when the file is already known good. */
+int exec_img_path_cached(const char *path);
+/* Map every cached page inside [va_begin, va_end) into mm as RO Soft_COW.
+ * Returns 0 on success; -1 (exec must fail) on any map error. */
+int exec_img_map(const exec_img_entry_t *e, mm_t *mm,
+                 uint64_t va_begin, uint64_t va_end);
+/* Snapshot the pristine user-owned frames in [va_lo, va_hi) of mm under the
+ * path/size key. Returns 1 registered, 0 skipped. */
+int exec_img_register(const char *path, uint64_t fsz, mm_t *mm,
+                      uint64_t va_lo, uint64_t va_hi);
+/* Turn the owner's own image PTEs in [va_lo, va_hi) into Soft_COW so the
+ * first runner (and any fork descendant) writes a private copy like every
+ * cache hit — registered template frames stay pristine forever. */
+void exec_img_demote_owner(mm_t *mm, uint64_t va_lo, uint64_t va_hi);
 /* Fork setup for the complete user address space. This is the correctness
  * baseline; range-specific calls are optional optimizations only. */
 int mm_cow_mark_all_user_writable_pair_l4(mm_t *child, mm_t *parent,

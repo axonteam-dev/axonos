@@ -219,10 +219,16 @@ void enter_user_mode(uint64_t user_entry, uint64_t user_stack_top) {
 }
 
 // Set the user FS base MSR for the CPU. Used when switching a thread into user mode.
+static uint64_t g_fs_base_last[SMP_MAX_CPUS];
 void set_user_fs_base(uint64_t base) {
+        int c = smp_sched_cpu_id();
+        if (c < 0 || c >= SMP_MAX_CPUS) c = 0;
+        if (g_fs_base_last[c] == base)
+                return;
         uint32_t lo = (uint32_t)(base & 0xFFFFFFFFu);
         uint32_t hi = (uint32_t)(base >> 32);
         asm volatile("wrmsr" :: "c"(0xC0000100u), "a"(lo), "d"(hi));
+        g_fs_base_last[c] = base;
 }
 
 /* Called from assembly trampoline right before iret frame is pushed.

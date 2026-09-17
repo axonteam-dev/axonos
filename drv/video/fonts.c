@@ -117,7 +117,7 @@ static inline void put_pix(uint8_t *line, uint32_t bpp, uint32_t x, uint32_t pix
 }
 
 static void font_blit_glyph_generic(void *fb, uint32_t pitch, uint32_t bpp_bytes,
-				    uint32_t px, uint32_t py, uint8_t ch,
+				    uint32_t px, uint32_t py, uint16_t ch,
 				    uint32_t fg, uint32_t bg) {
 	const struct font *f = font_current();
 	const uint8_t *rows = glyph_rows(ch);
@@ -174,7 +174,7 @@ static void font_fill_cell_32(void *fb, uint32_t pitch, uint32_t px, uint32_t py
 }
 
 void font_blit_glyph_32(void *fb, uint32_t pitch, uint32_t px, uint32_t py,
-			uint8_t ch, uint32_t fg, uint32_t bg) {
+			uint16_t ch, uint32_t fg, uint32_t bg) {
 	const struct font *f = font_current();
 	const uint8_t *rows = glyph_rows(ch);
 	uint32_t w = f->cwidth;
@@ -229,7 +229,7 @@ void font_blit_glyph_32(void *fb, uint32_t pitch, uint32_t px, uint32_t py,
 }
 
 void font_blit_glyph(void *fb, uint32_t pitch, uint32_t bpp_bytes,
-		     uint32_t px, uint32_t py, uint8_t ch,
+		     uint32_t px, uint32_t py, uint16_t ch,
 		     uint32_t fg, uint32_t bg) {
 	if (!fb || bpp_bytes == 0)
 		return;

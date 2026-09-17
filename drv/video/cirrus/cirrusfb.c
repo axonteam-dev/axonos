@@ -52,7 +52,7 @@ static uint32_t g_rows = 0;
 static inline uint32_t FONT_W(void) { return font_cell_width(); }
 static inline uint32_t FONT_H(void) { return font_cell_height(); }
 
-typedef struct { uint8_t ch; uint8_t attr; } cell_t;
+typedef struct { uint16_t ch; uint8_t attr; } cell_t;
 static cell_t *g_textbuf = NULL;
 static uint32_t g_cursor_x = 0;
 static uint32_t g_cursor_y = 0;
@@ -300,7 +300,7 @@ static inline uint32_t rgb_to_pixel(uint32_t rgb) {
 	return pack_pixel(r, g, b);
 }
 
-static void draw_glyph_noflush(uint32_t cx, uint32_t cy, uint8_t ch, uint8_t attr) {
+static void draw_glyph_noflush(uint32_t cx, uint32_t cy, uint16_t ch, uint8_t attr) {
 	if (!g_fb) return;
 	/* Boot logo pixels are not owned by the text console. */
 	if (g_logo_visible && g_margin_rows > 0 && cy < g_margin_rows)
@@ -647,7 +647,7 @@ int cirrusfb_is_ready(void) { return g_ready; }
 uint32_t cirrusfb_cols(void) { return g_cols; }
 uint32_t cirrusfb_rows(void) { return g_rows; }
 
-void cirrusfb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
+void cirrusfb_putch_xy(uint32_t x, uint32_t y, uint16_t ch, uint8_t attr) {
 	if (!g_ready || !g_textbuf || x >= g_cols || y >= g_rows) return;
 	/*
 	 * Unbatched echo/klog: freeze the SW cursor around the paint so a timer
@@ -671,7 +671,7 @@ void cirrusfb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	cirrusfb_flush_dirty();
 }
 
-void cirrusfb_putch_run(uint32_t x, uint32_t y, const uint8_t *chars, uint32_t n, uint8_t attr) {
+void cirrusfb_putch_run(uint32_t x, uint32_t y, const uint16_t *chars, uint32_t n, uint8_t attr) {
 	if (!g_ready || !g_textbuf || !chars || n == 0 || y >= g_rows || x >= g_cols)
 		return;
 	if (x + n > g_cols)
@@ -682,7 +682,7 @@ void cirrusfb_putch_run(uint32_t x, uint32_t y, const uint8_t *chars, uint32_t n
 	uint32_t fg_pix = rgb_to_pixel(attr_to_rgb(attr, 1));
 	uint32_t bg_pix = rgb_to_pixel(attr_to_rgb(attr, 0));
 	for (uint32_t i = 0; i < n; i++) {
-		uint8_t ch = chars[i];
+		uint16_t ch = chars[i];
 		g_textbuf[y * g_cols + x + i].ch = ch;
 		g_textbuf[y * g_cols + x + i].attr = attr;
 		if (g_logo_visible && g_margin_rows > 0 && y < g_margin_rows)
@@ -743,7 +743,7 @@ int cirrusfb_recompute_geometry(void) {
 	return 0;
 }
 
-static void cirrusfb_putchar_inner(uint8_t ch, uint8_t attr) {
+static void cirrusfb_putchar_inner(uint16_t ch, uint8_t attr) {
 	if (!g_ready || !g_textbuf) return;
 	g_current_attr = attr;
 
@@ -804,7 +804,7 @@ static void cirrusfb_putchar_inner(uint8_t ch, uint8_t attr) {
 	cirrusfb_flush_dirty_if_small();
 }
 
-void cirrusfb_putchar_literal(uint8_t ch, uint8_t attr) {
+void cirrusfb_putchar_literal(uint16_t ch, uint8_t attr) {
 	if (!g_ready || !g_textbuf) return;
 	cirrusfb_putchar_inner(ch, attr);
 }
@@ -858,7 +858,7 @@ uint8_t cirrusfb_get_cell_attr(uint32_t x, uint32_t y) {
 
 void cirrusfb_snapshot_screen(uint8_t *out, size_t max_bytes) {
 	if (!g_ready || !g_textbuf || !out) return;
-	size_t need = (size_t)g_cols * (size_t)g_rows * 2u;
+	size_t need = (size_t)g_cols * (size_t)g_rows * sizeof(cell_t);
 	if (need > max_bytes) return;
 	memcpy(out, g_textbuf, need);
 }
@@ -868,9 +868,9 @@ void cirrusfb_restore_screen(const uint8_t *src, uint32_t cols, uint32_t rows) {
 	if (cols != g_cols || rows != g_rows) return;
 	for (uint32_t y = 0; y < rows; y++) {
 		for (uint32_t x = 0; x < cols; x++) {
-			size_t off = ((size_t)y * cols + x) * 2u;
-			uint8_t ch = src[off];
-			uint8_t attr = src[off + 1];
+			const uint8_t *s = src + ((size_t)y * cols + x) * sizeof(cell_t);
+			uint16_t ch = (uint16_t)s[0] | ((uint16_t)s[1] << 8);
+			uint8_t attr = s[2];
 			g_textbuf[y * g_cols + x].ch = ch;
 			g_textbuf[y * g_cols + x].attr = attr;
 			draw_glyph_noflush(x, y, ch, attr);
@@ -1170,7 +1170,7 @@ static void cirrusfb_csi_dispatch(uint8_t fb) {
 	}
 }
 
-void cirrusfb_putchar(uint8_t ch, uint8_t attr) {
+void cirrusfb_putchar(uint16_t ch, uint8_t attr) {
 	if (!g_ready || !g_textbuf) return;
 
 	if (g_esc_state == CIR_ESC_NONE) {

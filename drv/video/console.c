@@ -6,13 +6,13 @@
 #include <devfs.h>
 #include <font.h>
 
-void console_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
+void console_putch_xy(uint32_t x, uint32_t y, uint16_t ch, uint8_t attr) {
 	if (cirrusfb_is_ready()) {
 		cirrusfb_putch_xy(x, y, ch, attr);
 	} else if (vbe_is_available()) {
 		vbefb_putch_xy(x, y, ch, attr);
 	} else {
-		vga_putch_xy(x, y, ch, attr);
+		vga_putch_xy(x, y, (uint8_t)ch, attr);
 	}
 }
 
@@ -42,15 +42,16 @@ int console_max_cols() {
 	return MAX_COLS;
 }
 
-void console_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t ch, uint8_t attr) {
+void console_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint16_t ch, uint8_t attr) {
 	if (cirrusfb_is_ready()) {
-		uint8_t run[256];
+		uint16_t run[256];
 		cirrusfb_begin_batch();
 		for (uint32_t ry = 0; ry < h; ry++) {
 			uint32_t left = w;
 			uint32_t cx = x;
 			while (left) {
-				uint32_t n = left > (uint32_t)sizeof(run) ? (uint32_t)sizeof(run) : left;
+				uint32_t n = left > (uint32_t)(sizeof(run) / sizeof(run[0])) ?
+					(uint32_t)(sizeof(run) / sizeof(run[0])) : left;
 				for (uint32_t i = 0; i < n; i++)
 					run[i] = ch;
 				cirrusfb_putch_run(cx, y + ry, run, n, attr);
@@ -71,7 +72,7 @@ void console_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t c
 	} else {
 		for (uint32_t ry = 0; ry < h; ry++) {
 			for (uint32_t rx = 0; rx < w; rx++) {
-				vga_putch_xy(x + rx, y + ry, ch, attr);
+				vga_putch_xy(x + rx, y + ry, (uint8_t)ch, attr);
 			}
 		}
 	}
@@ -101,11 +102,18 @@ void console_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
 			       cx + (uint32_t)(j - i) < maxc)
 				j++;
 			if (j > i) {
-				cirrusfb_putch_run(cx, cy, (const uint8_t *)s + i,
-						   (uint32_t)(j - i), attr);
-				cx += (uint32_t)(j - i);
-				i = j;
-				if (cx >= maxc) { cx = 0; cy++; }
+				uint16_t run[128];
+				while (j > i) {
+					uint32_t n = (uint32_t)(j - i);
+					if (n > (uint32_t)(sizeof(run) / sizeof(run[0])))
+						n = (uint32_t)(sizeof(run) / sizeof(run[0]));
+					for (uint32_t k = 0; k < n; k++)
+						run[k] = (uint8_t)s[i + k];
+					cirrusfb_putch_run(cx, cy, run, n, attr);
+					cx += n;
+					i += n;
+					if (cx >= maxc) { cx = 0; cy++; }
+				}
 				continue;
 			}
 			cirrusfb_putch_xy(cx, cy, (uint8_t)s[i], attr);
@@ -275,7 +283,7 @@ uint8_t console_get_cell_attr(uint32_t x, uint32_t y) {
 	return vga_get_cell_attr(x, y);
 }
 
-void console_putc_tty_literal(uint8_t ch, uint8_t attr) {
+void console_putc_tty_literal(uint16_t ch, uint8_t attr) {
 	if (cirrusfb_is_ready()) {
 		cirrusfb_putchar_literal(ch, attr);
 		return;
@@ -285,5 +293,5 @@ void console_putc_tty_literal(uint8_t ch, uint8_t attr) {
 		return;
 	}
 	/* Bypass VGA ANSI FSM — '[' from klog timestamps must not complete a stale ESC. */
-	vga_putchar_literal(ch, attr);
+	vga_putchar_literal((uint8_t)ch, attr);
 }

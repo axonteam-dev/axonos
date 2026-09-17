@@ -104,7 +104,19 @@ static inline uint32_t devfs_tty_rows(void) {
 }
 
 static inline size_t devfs_tty_screen_bytes(void) {
-    return (size_t)devfs_tty_rows() * (size_t)devfs_tty_cols() * 2u;
+    return (size_t)devfs_tty_rows() * (size_t)devfs_tty_cols() * 4u;
+}
+
+/* Console backing cell layout: 4 bytes per cell — glyph16LE + attr + pad. */
+static inline uint16_t tty_cell_glyph(const uint8_t *screen, uint32_t i) {
+    return (uint16_t)screen[(size_t)i * 4u] | ((uint16_t)screen[(size_t)i * 4u + 1u] << 8);
+}
+
+static inline void tty_cell_store(uint8_t *screen, uint32_t i, uint16_t glyph, uint8_t attr) {
+    screen[(size_t)i * 4u] = (uint8_t)(glyph & 0xFFu);
+    screen[(size_t)i * 4u + 1u] = (uint8_t)(glyph >> 8);
+    screen[(size_t)i * 4u + 2u] = attr;
+    screen[(size_t)i * 4u + 3u] = 0;
 }
 
 static void devfs_tty_snapshot_visible(struct devfs_tty *tty) {
@@ -120,13 +132,31 @@ static void devfs_tty_snapshot_visible(struct devfs_tty *tty) {
         vbefb_get_cursor(&tty->cursor_x, &tty->cursor_y);
         return;
     }
-    const size_t vga_scr_sz = (size_t)MAX_COLS * (size_t)MAX_ROWS * 2u;
-    size_t copy_sz = scr_sz < vga_scr_sz ? scr_sz : vga_scr_sz;
-    memcpy(tty->screen, (uint8_t *)VIDEO_ADDRESS, copy_sz);
+    const uint32_t vga_rows = devfs_tty_rows();
+    uint32_t n = vga_rows * (uint32_t)MAX_COLS;
+    if (n > (uint32_t)MAX_ROWS * (uint32_t)MAX_COLS)
+        n = (uint32_t)MAX_ROWS * (uint32_t)MAX_COLS;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *w = (const uint8_t *)VIDEO_ADDRESS + (size_t)i * 2u;
+        tty_cell_store(tty->screen, i, (uint16_t)w[0], w[1]);
+    }
     uint16_t pos = get_cursor();
     uint32_t tty_cols = MAX_COLS;
     tty->cursor_x = (pos % (tty_cols * 2)) / 2;
     tty->cursor_y = pos / (tty_cols * 2);
+}
+
+/* Full-screen VGA text pack (legacy: 8-bit glyph, no second font page). */
+static void tty_cells_pack_vga(const uint8_t *screen, uint32_t rows, uint32_t cols,
+                               uint8_t *packed) {
+    for (uint32_t y = 0; y < rows && y < (uint32_t)MAX_ROWS; y++) {
+        for (uint32_t x = 0; x < cols && x < (uint32_t)MAX_COLS; x++) {
+            uint32_t i = y * cols + x;
+            size_t off = ((size_t)y * (uint32_t)MAX_COLS + x) * 2u;
+            packed[off] = (uint8_t)(tty_cell_glyph(screen, i) & 0xFFu);
+            packed[off + 1] = screen[(size_t)i * 4u + 2u];
+        }
+    }
 }
 
 /* Push tty backing store to the visible console (active VC only). */
@@ -142,10 +172,16 @@ static void devfs_tty_blit_to_console(struct devfs_tty *tty) {
         vbefb_set_cursor(tty->cursor_x, tty->cursor_y);
         return;
     }
-    size_t scr_sz = devfs_tty_screen_bytes();
+    static uint8_t packed[MAX_ROWS * MAX_COLS * 2];
+    uint32_t rows = devfs_tty_rows();
+    uint32_t cols = devfs_tty_cols();
+    tty_cells_pack_vga(tty->screen, rows, cols, packed);
     const size_t vga_scr_sz = (size_t)MAX_COLS * (size_t)MAX_ROWS * 2u;
-    size_t copy_sz = scr_sz < vga_scr_sz ? scr_sz : vga_scr_sz;
-    memcpy((uint8_t *)VIDEO_ADDRESS, tty->screen, copy_sz);
+    size_t rows_n = rows < (uint32_t)MAX_ROWS ? rows : (uint32_t)MAX_ROWS;
+    size_t cols_n = cols < (uint32_t)MAX_COLS ? cols : (uint32_t)MAX_COLS;
+    size_t copy_sz = rows_n * cols_n * 2u;
+    if (copy_sz > vga_scr_sz) copy_sz = vga_scr_sz;
+    memcpy((uint8_t *)VIDEO_ADDRESS, packed, copy_sz);
     console_set_cursor(tty->cursor_x, tty->cursor_y);
 }
 
@@ -327,10 +363,10 @@ static int tty_pending_locked(struct devfs_tty *t) {
     return v;
 }
 
-void devfs_tty_leave_alt_screen(int tty_idx) {
-    if (tty_idx < 0 || tty_idx >= DEVFS_TTY_COUNT) return;
+int devfs_tty_leave_alt_screen(int tty_idx) {
+    if (tty_idx < 0 || tty_idx >= DEVFS_TTY_COUNT) return 0;
     struct devfs_tty *tty = &dev_ttys[tty_idx];
-    if (!tty->alt_active) return;
+    if (!tty->alt_active) return 0;
     size_t scr_sz = devfs_tty_screen_bytes();
     if (tty->alt_screen && tty->screen)
         memcpy(tty->screen, tty->alt_screen, scr_sz);
@@ -348,17 +384,15 @@ void devfs_tty_leave_alt_screen(int tty_idx) {
     tty->ansi_escape_state = 0;
     if (tty_idx == devfs_get_active())
         devfs_tty_blit_to_console(tty);
+    return 1;
 }
 
-/* Fast clear for tty backing buffer: fill cells as packed VGA words. */
+/* Fast clear for tty backing buffer. */
 static inline void devfs_tty_clear_backing_fast(struct devfs_tty *tty, uint8_t attr) {
     if (!tty || !tty->screen) return;
     uint32_t cells = devfs_tty_rows() * devfs_tty_cols();
-    uint16_t cell = (uint16_t)' ' | ((uint16_t)attr << 8);
-    uint16_t *dst = (uint16_t*)tty->screen;
-    for (uint32_t i = 0; i < cells; i++) {
-        dst[i] = cell;
-    }
+    for (uint32_t i = 0; i < cells; i++)
+        tty_cell_store(tty->screen, i, (uint16_t)' ', attr);
 }
 
 static void devfs_tty_init_scroll(struct devfs_tty *tty) {
@@ -374,14 +408,12 @@ static void devfs_tty_scroll_backing(struct devfs_tty *tty, uint32_t top, uint32
     if (!tty || !tty->screen || cols == 0 || rows == 0 || top >= bottom)
         return;
     if (bottom >= rows) bottom = rows - 1;
-    size_t row_bytes = (size_t)cols * 2u;
+    size_t row_bytes = (size_t)cols * 4u;
     memmove(tty->screen + (size_t)top * row_bytes,
             tty->screen + (size_t)(top + 1u) * row_bytes,
             (size_t)(bottom - top) * row_bytes);
-    uint16_t blank = (uint16_t)' ' | ((uint16_t)tty->current_attr << 8);
-    uint16_t *last = (uint16_t *)(tty->screen + (size_t)bottom * row_bytes);
     for (uint32_t x = 0; x < cols; x++)
-        last[x] = blank;
+        tty_cell_store(tty->screen, bottom * cols + x, (uint16_t)' ', tty->current_attr);
 }
 
 static void devfs_tty_scroll_backing_down(struct devfs_tty *tty, uint32_t top,
@@ -393,16 +425,13 @@ static void devfs_tty_scroll_backing_down(struct devfs_tty *tty, uint32_t top,
     if (bottom >= rows)
         bottom = rows - 1;
 
-    size_t row_bytes = (size_t)cols * 2;
+    size_t row_bytes = (size_t)cols * 4;
     for (uint32_t y = bottom; y > top; y--) {
         memcpy(tty->screen + (size_t)y * row_bytes,
                tty->screen + (size_t)(y - 1) * row_bytes, row_bytes);
     }
-    for (uint32_t x = 0; x < cols; x++) {
-        size_t off = ((size_t)top * cols + x) * 2;
-        tty->screen[off] = ' ';
-        tty->screen[off + 1] = tty->current_attr;
-    }
+    for (uint32_t x = 0; x < cols; x++)
+        tty_cell_store(tty->screen, top * cols + x, (uint16_t)' ', tty->current_attr);
 }
 
 static void devfs_tty_scroll_region_up(struct devfs_tty *tty, int tty_on_vga) {
@@ -415,10 +444,15 @@ static void devfs_tty_scroll_region_up(struct devfs_tty *tty, int tty_on_vga) {
          * The backing buffer already contains the scrolled result, so publish
          * it using wide write-only stores instead of VRAM read-modify-copy.
          */
-        if (!cirrusfb_is_ready() && !vbe_is_available())
-            vga_blit_cells(tty->screen, top, bot);
-        else
+        if (!cirrusfb_is_ready() && !vbe_is_available()) {
+            static uint8_t packed[MAX_ROWS * MAX_COLS * 2];
+            uint32_t rows = devfs_tty_rows();
+            uint32_t cols = devfs_tty_cols();
+            tty_cells_pack_vga(tty->screen, rows, cols, packed);
+            vga_blit_cells(packed, top, bot);
+        } else {
             console_scroll_region_up(top, bot, tty->current_attr);
+        }
     }
 }
 
@@ -442,28 +476,24 @@ static void devfs_tty_newline(struct devfs_tty *tty, int tty_on_vga) {
         console_set_cursor(tty->cursor_x, tty->cursor_y);
 }
 
-static void devfs_tty_store_xy(struct devfs_tty *tty, uint32_t x, uint32_t y, uint8_t ch) {
+static void devfs_tty_store_xy(struct devfs_tty *tty, uint32_t x, uint32_t y, uint16_t ch) {
     uint32_t cols = devfs_tty_cols();
     uint32_t rows = devfs_tty_rows();
     if (!tty || !tty->screen || cols == 0 || rows == 0)
         return;
     if (y >= rows) y = rows - 1;
     if (x >= cols) x = cols - 1;
-    size_t off = ((size_t)y * cols + x) * 2;
-    tty->screen[off] = ch;
-    tty->screen[off + 1] = tty->current_attr;
+    tty_cell_store(tty->screen, y * cols + x, ch, tty->current_attr);
 }
 
-static void devfs_tty_store_at_cursor(struct devfs_tty *tty, uint8_t ch) {
+static void devfs_tty_store_at_cursor(struct devfs_tty *tty, uint16_t ch) {
     uint32_t cols = devfs_tty_cols();
     uint32_t rows = devfs_tty_rows();
     if (!tty || !tty->screen || cols == 0 || rows == 0)
         return;
     if (tty->cursor_y >= rows) tty->cursor_y = rows - 1;
     if (tty->cursor_x >= cols) tty->cursor_x = cols - 1;
-    size_t off = ((size_t)tty->cursor_y * cols + tty->cursor_x) * 2;
-    tty->screen[off] = ch;
-    tty->screen[off + 1] = tty->current_attr;
+    tty_cell_store(tty->screen, tty->cursor_y * cols + tty->cursor_x, ch, tty->current_attr);
 }
 
 static void devfs_tty_advance_cursor(struct devfs_tty *tty) {
@@ -485,9 +515,7 @@ static void devfs_tty_buf_erase_eol(struct devfs_tty *tty, uint32_t from_x, uint
     uint32_t rows = devfs_tty_rows();
     if (!tty || !tty->screen || cols == 0 || rows == 0 || y >= rows || from_x >= cols) return;
     for (uint32_t rx = from_x; rx < cols; rx++) {
-        size_t off = ((size_t)y * cols + rx) * 2;
-        tty->screen[off] = ' ';
-        tty->screen[off + 1] = attr;
+        tty_cell_store(tty->screen, y * cols + rx, (uint16_t)' ', attr);
     }
 }
 
@@ -507,9 +535,8 @@ static void devfs_tty_blit_cells(struct devfs_tty *tty, uint32_t x0, uint32_t x1
     if (x0 > x1)
         return;
     for (uint32_t x = x0; x <= x1; x++) {
-        size_t off = ((size_t)y * cols + x) * 2;
-        uint8_t ch = tty->screen[off];
-        uint8_t attr = tty->screen[off + 1];
+        uint16_t ch = tty_cell_glyph(tty->screen, y * cols + x);
+        uint8_t attr = tty->screen[((size_t)y * cols + x) * 4u + 2u];
         if (cirrusfb_is_ready())
             cirrusfb_putch_xy(x, y, ch, attr);
         else
@@ -530,14 +557,11 @@ static void devfs_tty_insert_cells(struct devfs_tty *tty, int tty_on_vga, uint32
         n = (int)(cols - x0);
     for (int k = 0; k < n; k++) {
         for (uint32_t x = cols - 1; x > x0; x--) {
-            size_t dst = ((size_t)y * cols + x) * 2;
-            size_t src = ((size_t)y * cols + (x - 1)) * 2;
-            tty->screen[dst] = tty->screen[src];
-            tty->screen[dst + 1] = tty->screen[src + 1];
+            size_t base = ((size_t)y * cols) * 4u;
+            memcpy(tty->screen + base + (size_t)x * 4u,
+                   tty->screen + base + (size_t)(x - 1) * 4u, 4u);
         }
-        size_t off = ((size_t)y * cols + x0) * 2;
-        tty->screen[off] = ' ';
-        tty->screen[off + 1] = tty->current_attr;
+        tty_cell_store(tty->screen, y * cols + x0, (uint16_t)' ', tty->current_attr);
     }
     if (tty_on_vga)
         devfs_tty_blit_cells(tty, x0, cols - 1, y);
@@ -555,15 +579,12 @@ static void devfs_tty_delete_cells(struct devfs_tty *tty, int tty_on_vga, uint32
     if ((uint32_t)n > cols - x0)
         n = (int)(cols - x0);
     for (uint32_t x = x0; x + (uint32_t)n < cols; x++) {
-        size_t dst = ((size_t)y * cols + x) * 2;
-        size_t src = ((size_t)y * cols + x + (uint32_t)n) * 2;
-        tty->screen[dst] = tty->screen[src];
-        tty->screen[dst + 1] = tty->screen[src + 1];
+        size_t base = ((size_t)y * cols) * 4u;
+        memcpy(tty->screen + base + (size_t)x * 4u,
+               tty->screen + base + (size_t)(x + (uint32_t)n) * 4u, 4u);
     }
     for (uint32_t x = cols - (uint32_t)n; x < cols; x++) {
-        size_t off = ((size_t)y * cols + x) * 2;
-        tty->screen[off] = ' ';
-        tty->screen[off + 1] = tty->current_attr;
+        tty_cell_store(tty->screen, y * cols + x, (uint16_t)' ', tty->current_attr);
     }
     if (tty_on_vga)
         devfs_tty_blit_cells(tty, x0, cols - 1, y);
@@ -582,9 +603,7 @@ static void devfs_tty_erase_cells(struct devfs_tty *tty, int tty_on_vga, uint32_
         n = (int)(cols - x0);
     uint32_t x1 = x0 + (uint32_t)n - 1u;
     for (uint32_t x = x0; x <= x1; x++) {
-        size_t off = ((size_t)y * cols + x) * 2;
-        tty->screen[off] = ' ';
-        tty->screen[off + 1] = tty->current_attr;
+        tty_cell_store(tty->screen, y * cols + x, (uint16_t)' ', tty->current_attr);
     }
     if (tty_on_vga)
         console_clear_line_segment(x0, x1, y, tty->current_attr);
@@ -624,9 +643,7 @@ static void devfs_tty_virtual_putc(struct devfs_tty *tty, uint8_t c) {
         if (tty->cursor_y + 1 < rows) tty->cursor_y++;
         else tty->cursor_y = rows - 1;
     }
-    size_t off = ((size_t)tty->cursor_y * cols + tty->cursor_x) * 2;
-    tty->screen[off] = c;
-    tty->screen[off + 1] = tty->current_attr;
+    tty_cell_store(tty->screen, tty->cursor_y * cols + tty->cursor_x, (uint16_t)c, tty->current_attr);
     tty->cursor_x++;
     if (tty->cursor_x >= cols) {
         tty->cursor_x = 0;
@@ -752,8 +769,8 @@ void devfs_tty_console_write(const char *s, size_t n) {
     devfs_tty_console_leave();
 }
 
-static void devfs_tty_emit_byte_impl(struct devfs_tty *tty, int tty_on_vga, uint8_t ch);
-static void devfs_tty_put_glyph(struct devfs_tty *tty, int tty_on_vga, uint8_t glyph);
+static void devfs_tty_emit_byte_impl(struct devfs_tty *tty, int tty_on_vga, uint8_t raw);
+static void devfs_tty_put_glyph(struct devfs_tty *tty, int tty_on_vga, uint16_t glyph);
 
 /*
  * UTF-8 output folding for the console.  Ground-state bytes >=0x80 are assembled
@@ -766,7 +783,7 @@ static void devfs_tty_put_glyph(struct devfs_tty *tty, int tty_on_vga, uint8_t g
  *   On an invalid lead followed by a non-continuation, the broken sequence renders
  *   '?' and 0xFF is returned so the caller emits the fresh byte afterwards.
  */
-static int devfs_tty_utf8_fold(struct devfs_tty *tty, uint8_t raw, uint8_t *out) {
+static int devfs_tty_utf8_fold(struct devfs_tty *tty, uint8_t raw, uint16_t *out) {
     if (raw < 0x80) {
         if (tty->utf8_n) { /* truncation of an unfinished sequence */
             tty->utf8_n = 0;
@@ -798,12 +815,12 @@ static int devfs_tty_utf8_fold(struct devfs_tty *tty, uint8_t raw, uint8_t *out)
     uint32_t cp = tty->utf8_cp;
     tty->utf8_cp = 0;
     int g = con_unimap_lookup(cp);
-    *out = (g >= 0 && g < 256) ? (uint8_t)g : (uint8_t)'?';
+    *out = (g >= 0 && g < FONT_GLYPH_CACHE) ? (uint16_t)g : (uint16_t)'?';
     return 0;
 }
 
 /* Store/advance a printable glyph (after UTF-8 decode + ACS). */
-static void devfs_tty_put_glyph(struct devfs_tty *tty, int tty_on_vga, uint8_t glyph) {
+static void devfs_tty_put_glyph(struct devfs_tty *tty, int tty_on_vga, uint16_t glyph) {
     if (tty->need_wrap) {
         tty->cursor_x = 0;
         devfs_tty_newline(tty, tty_on_vga);
@@ -826,7 +843,7 @@ static void devfs_tty_put_glyph(struct devfs_tty *tty, int tty_on_vga, uint8_t g
 }
 
 static void devfs_tty_emit_byte_impl(struct devfs_tty *tty, int tty_on_vga, uint8_t raw) {
-    uint8_t ch;
+    uint16_t ch;
     /* Fold UTF-8 first; 0xFF flags "render '?' then reprocess the same byte". */
     for (;;) {
         int r = devfs_tty_utf8_fold(tty, raw, &ch);
@@ -838,7 +855,8 @@ static void devfs_tty_emit_byte_impl(struct devfs_tty *tty, int tty_on_vga, uint
         }
         break;
     }
-    ch = devfs_tty_acs_translate(ch, tty->acs_mode);
+    if (ch < 0x100u)
+        ch = devfs_tty_acs_translate((uint8_t)ch, tty->acs_mode);
     /*
      * Linux VT C0 handling: controls act on the terminal and are never
      * rendered as glyphs.  In particular readline writes BEL when completion
@@ -2227,11 +2245,8 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
                                 uint32_t x0 = (ry == cy) ? tty->cursor_x : 0;
                                 uint32_t x1 = tty_cols - 1;
                                 for (uint32_t rx = x0; rx <= x1; rx++) {
-                                    size_t off = ((size_t)ry * tty_cols + rx) * 2;
-                                    if (tty->screen) {
-                                        tty->screen[off] = ' ';
-                                        tty->screen[off + 1] = tty->current_attr;
-                                    }
+                                    if (tty->screen)
+                                        tty_cell_store(tty->screen, ry * tty_cols + rx, (uint16_t)' ', tty->current_attr);
                                 }
                                 if (tty_on_vga) console_clear_line_segment((uint32_t)x0, x1, ry, tty->current_attr);
                             }
@@ -2244,11 +2259,8 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
                                 uint32_t x0 = 0;
                                 uint32_t x1 = (ry == cy) ? tty->cursor_x : tty_cols - 1;
                                 for (uint32_t rx = x0; rx <= x1; rx++) {
-                                    size_t off = ((size_t)ry * tty_cols + rx) * 2;
-                                    if (tty->screen) {
-                                        tty->screen[off] = ' ';
-                                        tty->screen[off + 1] = tty->current_attr;
-                                    }
+                                    if (tty->screen)
+                                        tty_cell_store(tty->screen, ry * tty_cols + rx, (uint16_t)' ', tty->current_attr);
                                 }
                                 if (tty_on_vga) console_clear_line_segment(x0, x1, ry, tty->current_attr);
                             }
@@ -2275,9 +2287,7 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
                                 x1 = tty_cols - 1;
                             if (tty->screen) {
                                 for (uint32_t rx = x0; rx <= x1; rx++) {
-                                    size_t off = ((size_t)cy * tty_cols + rx) * 2;
-                                    tty->screen[off] = ' ';
-                                    tty->screen[off + 1] = tty->current_attr;
+                                    tty_cell_store(tty->screen, cy * tty_cols + rx, (uint16_t)' ', tty->current_attr);
                                 }
                             }
                             if (tty_on_vga)
@@ -2356,19 +2366,16 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
                             if (tty->cursor_y >= rows) break;
                             for (uint32_t y = tty->cursor_y; y < bot && y + 1 < rows; y++) {
                                 for (uint32_t x = 0; x < cols; x++) {
-                                    size_t dst = ((size_t)y * cols + x) * 2;
-                                    size_t src = ((size_t)(y + 1) * cols + x) * 2;
+                                    size_t base = ((size_t)y) * cols * 4u;
                                     if (tty->screen) {
-                                        tty->screen[dst] = tty->screen[src];
-                                        tty->screen[dst + 1] = tty->screen[src + 1];
+                                        memcpy(tty->screen + base + (size_t)x * 4u,
+                                               tty->screen + base + (size_t)cols * 4u + (size_t)x * 4u, 4u);
                                     }
                                 }
                             }
                             if (tty->screen && cols > 0) {
                                 for (uint32_t x = 0; x < cols; x++) {
-                                    size_t off = ((size_t)bot * cols + x) * 2;
-                                    tty->screen[off] = ' ';
-                                    tty->screen[off + 1] = tty->current_attr;
+                                    tty_cell_store(tty->screen, bot * cols + x, (uint16_t)' ', tty->current_attr);
                                 }
                             }
                             if (tty_on_vga) {
@@ -2690,7 +2697,9 @@ int devfs_register(void) {
         size_t scr_sz = devfs_tty_screen_bytes();
         dev_ttys[i].screen = (uint8_t*)kmalloc(scr_sz);
         if (dev_ttys[i].screen) {
-            for (size_t j = 0; j + 1 < scr_sz; j += 2) { dev_ttys[i].screen[j] = ' '; dev_ttys[i].screen[j + 1] = GRAY_ON_BLACK; }
+            uint32_t n = devfs_tty_rows() * devfs_tty_cols();
+            for (uint32_t j = 0; j < n; j++)
+                tty_cell_store(dev_ttys[i].screen, j, (uint16_t)' ', GRAY_ON_BLACK);
         }
         /* initialize ANSI/escape parsing state and current attribute */
         dev_ttys[i].current_attr = GRAY_ON_BLACK;
@@ -2768,10 +2777,9 @@ void devfs_tty_realloc_for_console(void) {
         }
         kfree(dev_ttys[i].screen);
         dev_ttys[i].screen = new_screens[i];
-        for (size_t j = 0; j + 1 < scr_sz; j += 2) {
-            dev_ttys[i].screen[j] = ' ';
-            dev_ttys[i].screen[j + 1] = GRAY_ON_BLACK;
-        }
+        uint32_t n = devfs_tty_rows() * devfs_tty_cols();
+        for (uint32_t j = 0; j < n; j++)
+            tty_cell_store(dev_ttys[i].screen, j, (uint16_t)' ', GRAY_ON_BLACK);
         dev_ttys[i].cursor_x = 0;
         dev_ttys[i].cursor_y = 0;
         devfs_tty_init_scroll(&dev_ttys[i]);
@@ -2895,7 +2903,8 @@ ssize_t devfs_tty_debug_dump(char *buf, size_t size) {
         size_t pi = 0;
         if (t->screen) {
             for (size_t c = 0; c < cells; c++) {
-                uint8_t ch = t->screen[c * 2];
+                uint16_t g = tty_cell_glyph(t->screen, (uint32_t)c);
+                uint8_t ch = (g < 256u) ? (uint8_t)g : (uint8_t)'?';
                 if (ch != ' ' && ch != '\0') {
                     nonspace++;
                     if (pi + 1 < sizeof(preview)) {

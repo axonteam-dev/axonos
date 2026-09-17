@@ -280,6 +280,11 @@ int thread_wait_parent_alive(const thread_t *t);
 /* Remove TERMINATED zombies with no wait4 waiter (returns count reaped). */
 int thread_reap_unwaited_zombies(void);
 int thread_reap(int pid);
+/* NULL out ->process/linux_tgid on every thread before its process_t is freed
+   (process_reap / process_reap_zombie / process_discard). CLONE_THREAD peers and
+   lingering TERMINATED slots would otherwise deref a freed process_t from
+   scheduler autoreap / thread_wait_parent_alive (UAF). */
+void thread_detach_process(process_t *p);
 /* Non-idle threads in READY or RUNNING (scheduler load sample). */
 int thread_runnable_nonidle_count(void);
 void thread_sleep(uint32_t ms);

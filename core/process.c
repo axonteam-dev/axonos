@@ -415,6 +415,7 @@ int process_reap(process_t *parent, process_t *child) {
         }
     }
     release_irqrestore(&process_lock, flags);
+    thread_detach_process(child);
     kfree(child);
     return 0;
 }
@@ -440,6 +441,7 @@ int process_reap_zombie(process_t *child) {
         }
     }
     release_irqrestore(&process_lock, flags);
+    thread_detach_process(child);
     kfree(child);
     return 0;
 }
@@ -468,6 +470,7 @@ int process_discard(process_t *parent, process_t *child) {
         }
     }
     release_irqrestore(&process_lock, flags);
+    thread_detach_process(child);
     kfree(child);
     return 0;
 }

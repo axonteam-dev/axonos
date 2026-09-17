@@ -17,7 +17,7 @@ typedef struct thread thread_t;
 #endif
 struct devfs_tty {
     int id;
-    uint8_t *screen; /* saved VGA buffer (raw bytes 2 per cell) */
+    uint8_t *screen; /* console backing buffer (4 bytes per cell: glyph16LE, attr) */
     uint32_t cursor_x;
     uint32_t cursor_y;
     /* foreground process group for this tty (-1 if none) */
@@ -155,7 +155,7 @@ void devfs_tty_remove_waiter(int tty, int tid);
 /* Remove tid from every tty waiter list (fixes slot exhaustion after exit_group). */
 void devfs_tty_remove_waiter_from_all_ttys(int tid);
 /* Restore main TTY buffer after smcup/rmcup or fatal exit (htop/nano). */
-void devfs_tty_leave_alt_screen(int tty);
+int devfs_tty_leave_alt_screen(int tty);
 /* Force the active tty's backing store back onto the visible console. */
 void devfs_tty_force_reblit(int tty);
 /* ICANON|ECHO|ISIG after apt/dpkg raw-mode (StartPtyMagic) or a crash. */

@@ -1444,6 +1444,37 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
     uint64_t brk_end = 0;
     uint64_t loaded_lo = UINT64_MAX;
     uint64_t loaded_hi = 0;
+    /*
+     * Linux page-cache fast path: a static ELF whose pristine image is already
+     * registered maps read-only Soft_COW over the cached frames instead of
+     * re-reading and re-copying the file.  Both ET_EXEC and static-PIE ET_DYN
+     * have a deterministic VA window (elf_et_dyn_base is build-fixed); the
+     * snapshot is taken post-reload so skipping RELA on a cache hit replays the
+     * same relocated bytes.  PT_INTERP is excluded: the loader needs its own
+     * interp load and per-run relocation.
+     */
+    int image_from_cache = 0;
+    const exec_img_entry_t *cached_e = NULL;
+    if (!has_interp && fsz) {
+        uint64_t ilo = UINT64_MAX, ihi = 0;
+        for (int ci = 0; ci < (int)eh.e_phnum; ci++) {
+            Elf64_Phdr *cph = &phdrs[ci];
+            if (cph->p_type != 1) continue;
+            uint64_t cvs = cph->p_vaddr + load_base;
+            uint64_t cve = cvs + cph->p_memsz;
+            if (cvs < ilo) ilo = cvs;
+            if (cve > ihi) ihi = cve;
+        }
+        if (ilo != UINT64_MAX && ilo < ihi) {
+            thread_t *ctc = elf_bprm_thread();
+            if (ctc && elf_needs_private_user_pages(ctc)) {
+                cached_e = exec_img_lookup(path, (uint64_t)fsz,
+                                           ilo & ~0xFFFULL,
+                                           (ihi + 0xFFFULL) & ~0xFFFULL);
+                image_from_cache = (cached_e != NULL);
+            }
+        }
+    }
     const uint64_t image_entry = (uint64_t)eh.e_entry + load_base;
     uint64_t aux_phdr = 0;
     uint64_t phsz64 = (uint64_t)eh.e_phnum * (uint64_t)eh.e_phentsize;
@@ -1522,10 +1553,31 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
             uint64_t map_hi = (vend + 0xFFFULL) & ~0xFFFULL;
             thread_t *tc = elf_bprm_thread();
             if (tc && elf_needs_private_user_pages(tc)) {
+                if (image_from_cache) {
+                    /*
+                     * Shared page-cache image: map the segment's VAs read-only
+                     * Soft_COW over the pristine cached frames.  No frames are
+                     * allocated and no file bytes are copied; the head gap and
+                     * BSS pages are part of the snapshot.  A write faults and
+                     * copies (mm_cow_fault_page), so template frames stay
+                     * pristine.  A map failure aborts exec (no partial image).
+                     */
+                    if (exec_img_map(cached_e, tc->mm, map_lo, map_hi) != 0) {
+                            kprintf("elf: exec-img cache map failed %s [0x%llx..0x%llx)\n",
+                                    path ? path : "(null)",
+                                    (unsigned long long)map_lo, (unsigned long long)map_hi);
+                            kfree(phdrs);
+                            fs_file_free(f);
+                            return -1;
+                        }
+                    } else {
                 /* Linux load_elf: map into current->mm only; never walk oldmm PTs. */
                 mm_t *share = mm_kernel();
-                /* copy_old=0 + has_private skip: never wipe a prior PT_LOAD. */
-                if (mm_make_private_range(tc->mm, map_lo, map_hi, 0, share) != 0) {
+                /* copy_old=0 + has_private skip: never wipe a prior PT_LOAD.
+                 * Frames are deliberately NOT zeroed here: elf_copy_into_mm and
+                 * the BSS elf_zero_into_mm below overwrite every page.  The
+                 * unaligned head gap is zeroed right after. */
+                if (mm_make_private_range_nozero(tc->mm, map_lo, map_hi, share) != 0) {
                     kprintf("elf: OOM private PT_LOAD %s [0x%llx..0x%llx)\n",
                             path ? path : "(null)",
                             (unsigned long long)map_lo, (unsigned long long)map_hi);
@@ -1533,8 +1585,19 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
                     fs_file_free(f);
                     return -12; /* ENOMEM */
                 }
+                /* Head gap of an unaligned p_vaddr is not file-backed and is
+                 * never reached by copy/BSS zeroing — zero it now (used to be
+                 * covered by the per-page zeroing inside private-range). */
+                uint64_t seg_va = (uint64_t)(uintptr_t)dst;
+                if (seg_va > map_lo &&
+                    elf_zero_into_mm(tc->mm, map_lo, (size_t)(seg_va - map_lo)) != 0) {
+                    kfree(phdrs);
+                    fs_file_free(f);
+                    return -1;
+                }
                 /* Do NOT mark_user_identity here: holes become pa==va and the
                  * following elf_copy_into_mm smashes the vfork parent's image. */
+                }
             } else {
                 uint64_t lo2 = map_lo & ~((uint64_t)PAGE_SIZE_2M - 1);
                 uint64_t hi2 = (map_hi + PAGE_SIZE_2M - 1) & ~((uint64_t)PAGE_SIZE_2M - 1);
@@ -1548,7 +1611,7 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
                 (void)mark_user_identity_range_2m(map_lo, map_hi);
             }
         }
-        if (ph->p_filesz > 0) {
+        if (ph->p_filesz > 0 && !image_from_cache) {
             thread_t *tc = elf_bprm_thread();
             if (tc && elf_needs_private_user_pages(tc) && tc->mm) {
                 /*
@@ -1599,7 +1662,7 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
                 }
             }
         }
-        if (ph->p_memsz > ph->p_filesz) {
+        if (ph->p_memsz > ph->p_filesz && !image_from_cache) {
             thread_t *tc = elf_bprm_thread();
             size_t zlen = (size_t)(ph->p_memsz - ph->p_filesz);
             uint64_t zva = (uint64_t)(uintptr_t)dst + (uint64_t)ph->p_filesz;
@@ -1611,6 +1674,19 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
                 }
             } else {
                 memset((char *)dst + ph->p_filesz, 0, zlen);
+            }
+        } else if ((ph->p_filesz & 0xFFFULL) && !image_from_cache) {
+            /* memsz==filesz with a partial last file page: zero the tail beyond
+             * EOF. Frames were not zeroed by mm_make_private_range_nozero. */
+            thread_t *tc = elf_bprm_thread();
+            if (tc && elf_needs_private_user_pages(tc) && tc->mm) {
+                uint64_t zv = (uint64_t)(uintptr_t)dst + (uint64_t)ph->p_filesz;
+                size_t tz = (size_t)(0x1000ULL - (zv & 0xFFFULL));
+                if (tz && elf_zero_into_mm(tc->mm, zv, tz) != 0) {
+                    kfree(phdrs);
+                    fs_file_free(f);
+                    return -1;
+                }
             }
         }
         if (vstart < loaded_lo) loaded_lo = vstart;
@@ -1635,7 +1711,8 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
      * before IFUNC resolvers run (they fetch .text through the process CR3). */
     {
         thread_t *tc = elf_bprm_thread();
-        if (tc && elf_needs_private_user_pages(tc) && tc->mm &&
+        if (!image_from_cache &&
+            tc && elf_needs_private_user_pages(tc) && tc->mm &&
             loaded_lo < loaded_hi) {
             elf_publish_private_image(tc->mm, loaded_lo, loaded_hi);
             /*
@@ -1688,8 +1765,11 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
         }
     }
 
-    /* RELATIVE / IRELATIVE after Soft_OWNED is visible via user VA. */
-    if (elf_apply_rela_relative(f, load_base, &eh, phdrs, (int)eh.e_phnum) != 0) {
+    /* RELATIVE / IRELATIVE after Soft_OWNED is visible via user VA.  A cached
+     * snapshot was registered post-relocation, so re-applying would rewrite the
+     * shared template frames through the leaf PA (they are Soft_COW RO here). */
+    if (!image_from_cache &&
+        elf_apply_rela_relative(f, load_base, &eh, phdrs, (int)eh.e_phnum) != 0) {
         kprintf("elf: RELA/IRELATIVE apply failed %s\n", path ? path : "(null)");
         kfree(phdrs);
         fs_file_free(f);
@@ -1700,6 +1780,25 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
         thread_t *tc = thread_current();
         user_as_set_brk_after_load(tc, (uintptr_t)brk_end,
             loaded_hi != UINT64_MAX ? (uintptr_t)loaded_hi : 0);
+    }
+
+    /*
+     * Cold load: snapshot the now-complete (post-relocation) pristine image so
+     * the next execve of this file is a page-cache hit, then demote this runner
+     * to Soft_COW so its data/BSS writes copy like any later runner's — the
+     * registered frames stay pristine.  PT_INTERP images are excluded (see the
+     * cache-decision note above).
+     */
+    if (!image_from_cache) {
+        thread_t *tc = elf_bprm_thread();
+        if (tc && elf_needs_private_user_pages(tc) && tc->mm &&
+            loaded_lo != UINT64_MAX && loaded_lo < loaded_hi &&
+            !has_interp && fsz) {
+            uint64_t clo = loaded_lo & ~0xFFFULL;
+            uint64_t chi = (loaded_hi + 0xFFFULL) & ~0xFFFULL;
+            if (exec_img_register(path, (uint64_t)fsz, tc->mm, clo, chi))
+                exec_img_demote_owner(tc->mm, clo, chi);
+        }
     }
     if (out_info) {
         out_info->entry = image_entry;
@@ -2174,7 +2273,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
      * holding Soft_COW dockerd image through a multi-MiB PT_LOAD OOMed frames
      * and surfaced as ENOENT from fork/exec of docker-containerd.
      */
-    if (elf_probe_exec_open(curpath) != 0)
+    if (!exec_img_path_cached(curpath) && elf_probe_exec_open(curpath) != 0)
         return -1;
     {
         thread_t *tc = elf_bprm_thread();
@@ -2433,7 +2532,6 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         memcpy((void *)(uintptr_t)final_stack, tip_kimg, tip_bytes);
     }
     kfree(tip_kimg);
-
     /*
      * Legacy shared-CR3 only. Private mm (including vfork-exec load under oldmm):
      * tip/TLS already PG_US from bulk_zero — mark_user_identity would mutate

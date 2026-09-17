@@ -269,7 +269,7 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg archive
 QEMU_MEMORY ?= 3072M
 
 run: archive iso
-	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m $(QEMU_MEMORY) -serial stdio -boot d -hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0,hostfwd=tcp::2222-:22 -vga vmware -enable-kvm -cpu host -smp 4
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m $(QEMU_MEMORY) -serial stdio -boot d -hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0,hostfwd=tcp::2222-:22 -vga vmware
 
 # UEFI (OVMF). Same machine as `run`. Needs ovmf; hybrid ISO needs grub-efi-amd64-bin.
 OVMF_CODE ?= $(firstword $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd))
@@ -289,12 +289,12 @@ run-uefi: archive iso
 			-drive if=pflash,format=raw,file="$(OVMF_VARS)" \
 			-cdrom $(ISO_IMAGE) -m $(QEMU_MEMORY) -smp 4 -serial stdio -boot d \
 			-hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0 \
-			-enable-kvm -cpu host; \
+			-enable-kvm -cpu host -vga vmware; \
 	else \
 		qemu-system-x86_64 -bios "$(OVMF_CODE)" \
 			-cdrom $(ISO_IMAGE) -m $(QEMU_MEMORY) -smp 4 -serial stdio -boot d \
 			-hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0 \
-			-enable-kvm -cpu host; \
+			-enable-kvm -cpu host -vga vmware; \
 	fi
 
 test-boot:

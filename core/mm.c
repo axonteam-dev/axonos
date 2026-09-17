@@ -3173,7 +3173,7 @@ int mm_copy_from_user(mm_t *mm, void *dst, uint64_t src, size_t len) {
 }
 
 static int mm_make_private_range_impl(mm_t *mm, uint64_t va_begin, uint64_t va_end, int copy_old,
-                          mm_t *share_cmp_mm, int no_yield) {
+                          mm_t *share_cmp_mm, int no_yield, int no_zero) {
     if (!mm || !mm->pml4) return -1;
     mm_dbg_ash_touch(copy_old ? "make-private-copy" : "make-private-zero",
                      mm, va_begin, va_end);
@@ -3269,7 +3269,7 @@ static int mm_make_private_range_impl(mm_t *mm, uint64_t va_begin, uint64_t va_e
         int had_replaced = (mm_va_leaf_pa(mm, va, &replaced_pa) == 0);
         if (had_replaced)
             (void)mm_va_leaf_entry(mm, va, &replaced_pte);
-        void *newp = mm_user_frame_alloc_avoid_va(va, !copy_old);
+        void *newp = mm_user_frame_alloc_avoid_va(va, (!copy_old) && !no_zero);
         if (!newp) goto out;
         if (copy_old) {
             uint64_t spa = 0;
@@ -3329,12 +3329,17 @@ out:
 
 int mm_make_private_range(mm_t *mm, uint64_t va_begin, uint64_t va_end, int copy_old,
                           mm_t *share_cmp_mm) {
-    return mm_make_private_range_impl(mm, va_begin, va_end, copy_old, share_cmp_mm, 0);
+    return mm_make_private_range_impl(mm, va_begin, va_end, copy_old, share_cmp_mm, 0, 0);
 }
 
 int mm_make_private_range_noyield(mm_t *mm, uint64_t va_begin, uint64_t va_end, int copy_old,
                                   mm_t *share_cmp_mm) {
-    return mm_make_private_range_impl(mm, va_begin, va_end, copy_old, share_cmp_mm, 1);
+    return mm_make_private_range_impl(mm, va_begin, va_end, copy_old, share_cmp_mm, 1, 0);
+}
+
+int mm_make_private_range_nozero(mm_t *mm, uint64_t va_begin, uint64_t va_end,
+                                 mm_t *share_cmp_mm) {
+    return mm_make_private_range_impl(mm, va_begin, va_end, 0, share_cmp_mm, 0, 1);
 }
 
 static int mm_make_private_range_bulk_zero_ex(mm_t *mm, uint64_t va_begin, uint64_t va_end,
@@ -3603,4 +3608,310 @@ void mm_dbg_ash_touch(const char *tag, mm_t *mm, uint64_t lo, uint64_t hi) {
     g_ash_last_touch_lo = lo;
     g_ash_last_touch_hi = hi;
 #endif
+}
+
+/*============================================================================
+ * Exec image cache (Linux page-cache semantics)
+ *
+ * The first execve of an ELF file materializes its PT_LOAD windows the usual
+ * eager way (mm_make_private_range_nozero + copies + BSS zero + RELA).  Once
+ * materialization and RELA relocation are complete and the image is still
+ * pristine, exec_img_register() snapshots every user-owned frame in the image
+ * window (path + size + user window as key) and retains one reference per page
+ * so the snapshot outlives every process that maps it.  The registering
+ * process is then demoted to Soft_COW (exec_img_demote_owner), making it a
+ * COW user of the same shared frames like any later runner.
+ *
+ * A later execve of the same file is a cache hit: exec_img_map() installs
+ * RO|PG_SOFT_COW|PG_SOFT_OWNED PTEs over the retained frames, so the body and
+ * BSS are never re-read or re-copied (Linux file-backed VMAs).  A user write
+ * takes the normal COW fault path (mm_cow_fault_page), which copies from the
+ * shared page; the template reference keeps every frame at refcount >= 2 while
+ * any runner maps it, so the "exclusive reuse" shortcut never corrupts it.
+ *
+ * Constraints: ET_EXEC static images only (ET_DYN/PT_DYNAMIC/PT_INTERP swap
+ * the VA window and need RELA every run); a bounded page/byte budget; only
+ * present user-owned 4K leaves qualify (identity leaves disqualify the file);
+ * cache-hit map failures abort exec rather than mixing a partial image.
+ *==========================================================================*/
+#define EXEC_IMG_CACHE_MAX   8
+#define EXEC_IMG_MAX_PAGES   (16u * 1024u)          /* 64 MiB at 4K/page */
+#define EXEC_IMG_MAX_TOTAL   (64u * 1024u * 1024u)  /* aggregate snapshot budget */
+
+struct exec_img_entry {
+    uint64_t key;      /* fnv64(path) ^ fsz ^ lo ^ hi */
+    uint64_t phash;    /* path-only hash, for probe-skip on cache hit */
+    uint64_t lo, hi;   /* page-aligned user VA window */
+    uint64_t *va;      /* n pages, stable order */
+    uint64_t *pa;
+    int n;
+    int gen;           /* registration generation for LRU eviction */
+    uint64_t bytes;
+};
+
+static struct exec_img_entry g_exec_img[EXEC_IMG_CACHE_MAX];
+static int g_exec_img_gen = 0;
+static uint64_t g_exec_img_bytes = 0;
+
+/*
+ * Registration only starts on the second cold load of a file.  A process
+ * loaded once (and never re-exec'd) is therefore never demoted to COW — the
+ * common boot case — which keeps the first-run path byte-for-byte the old
+ * eager behaviour and avoids touching long-lived init images.  From the second
+ * load on, the image is snapshotted and every later exec is a cache hit.
+ */
+#define EXEC_IMG_SEEN_MAX 16
+static struct {
+    uint64_t key;
+    int count;
+} g_exec_img_seen[EXEC_IMG_SEEN_MAX];
+
+static int exec_img_seen_bump(uint64_t key) {
+    int free_i = -1;
+    for (int i = 0; i < EXEC_IMG_SEEN_MAX; i++) {
+        if (g_exec_img_seen[i].count && g_exec_img_seen[i].key == key) {
+            if (g_exec_img_seen[i].count < (1 << 30))
+                g_exec_img_seen[i].count++;
+            return g_exec_img_seen[i].count;
+        }
+        if (!g_exec_img_seen[i].count && free_i < 0)
+            free_i = i;
+    }
+    if (free_i >= 0) {
+        g_exec_img_seen[free_i].key = key;
+        g_exec_img_seen[free_i].count = 1;
+        return 1;
+    }
+    return 2; /* seen table full: treat as eligible rather than stalling */
+}
+
+static uint64_t exec_img_key(const char *path, uint64_t fsz,
+                             uint64_t lo, uint64_t hi) {
+    uint64_t h = 14695981039346656037ULL; /* FNV-1a 64 */
+    if (path) {
+        for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+            h ^= (uint64_t)*p;
+            h *= 1099511628211ULL;
+        }
+    }
+    h ^= fsz; h *= 1099511628211ULL;
+    h ^= lo;  h *= 1099511628211ULL;
+    h ^= hi;  h *= 1099511628211ULL;
+    return h;
+}
+
+static uint64_t exec_img_path_hash(const char *path) {
+    uint64_t h = 14695981039346656037ULL; /* FNV-1a 64 */
+    if (path) {
+        for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+            h ^= (uint64_t)*p;
+            h *= 1099511628211ULL;
+        }
+    }
+    return h;
+}
+
+/* True if any snapshot exists for this path; lets exec skip the redundant
+ * open-probe (the file was already opened and validated when snapshotted). */
+int exec_img_path_cached(const char *path) {
+    uint64_t ph = exec_img_path_hash(path);
+    for (int i = 0; i < EXEC_IMG_CACHE_MAX; i++) {
+        if (g_exec_img[i].va && g_exec_img[i].phash == ph)
+            return 1;
+    }
+    return 0;
+}
+
+/* Exact-key slot, else first free slot, else lowest-generation slot. */
+static struct exec_img_entry *exec_img_evict_slot(uint64_t key) {
+    struct exec_img_entry *lru = NULL;
+    for (int i = 0; i < EXEC_IMG_CACHE_MAX; i++) {
+        struct exec_img_entry *e = &g_exec_img[i];
+        if (!e->va)
+            return e;
+        if (e->key == key)
+            return e;
+        if (!lru || e->gen < lru->gen)
+            lru = e;
+    }
+    return lru;
+}
+
+static void exec_img_clear(struct exec_img_entry *e) {
+    if (!e || !e->va)
+        return;
+    for (int i = 0; i < e->n; i++)
+        frame_release(e->pa[i]);
+    kfree(e->va);
+    kfree(e->pa);
+    g_exec_img_bytes -= e->bytes;
+    e->va = NULL;
+    e->pa = NULL;
+    e->n = 0;
+    e->bytes = 0;
+    e->gen = 0;
+}
+
+const exec_img_entry_t *exec_img_lookup(const char *path, uint64_t fsz,
+                                        uint64_t va_lo, uint64_t va_hi) {
+    uint64_t key = exec_img_key(path, fsz, va_lo, va_hi);
+    for (int i = 0; i < EXEC_IMG_CACHE_MAX; i++) {
+        struct exec_img_entry *e = &g_exec_img[i];
+        if (e->va && e->key == key && e->lo == va_lo && e->hi == va_hi)
+            return (const exec_img_entry_t *)e;
+    }
+    return NULL;
+}
+
+int exec_img_map(const exec_img_entry_t *entry, mm_t *mm,
+                 uint64_t va_begin, uint64_t va_end) {
+    const struct exec_img_entry *e = entry;
+    if (!e || !e->va || !mm || !mm->pml4)
+        return -1;
+    uint64_t *share = mm_kernel() ? mm_kernel()->pml4 : NULL;
+    if (!share)
+        return -1;
+    uint64_t begin = va_begin & ~0xFFFULL;
+    uint64_t end = (va_end + 0xFFFULL) & ~0xFFFULL;
+    if (end > (uint64_t)MMIO_IDENTITY_LIMIT)
+        end = (uint64_t)MMIO_IDENTITY_LIMIT;
+    if (begin >= end)
+        return -1;
+    mm_dm_ctx_t dm = mm_enter_direct_map();
+    int rc = -1;
+    for (int i = 0; i < e->n; i++) {
+        uint64_t va = e->va[i];
+        if (va < begin || va >= end)
+            continue;
+        uint64_t p = e->pa[i];
+        /* Template frames are already in the frame table, so retain cannot
+         * normally fail; keep the guard and abort exec rather than mix. */
+        if (frame_retain(p) != 0)
+            goto out;
+        if (mm_map_4k_sharedaware_body(mm, share, va, p,
+                PG_PRESENT | PG_US | PG_SOFT_COW | PG_SOFT_OWNED) != 0) {
+            frame_release(p);
+            goto out;
+        }
+        uint64_t got = 0;
+        if (mm_va_leaf_entry(mm, va, &got) != 0 ||
+            (got & ~0xFFFULL) != p ||
+            (got & (PG_PRESENT | PG_US | PG_SOFT_COW | PG_SOFT_OWNED)) !=
+                (PG_PRESENT | PG_US | PG_SOFT_COW | PG_SOFT_OWNED)) {
+            goto out;
+        }
+    }
+    rc = 0;
+out:
+    mm_leave_direct_map(dm);
+    return rc;
+}
+
+int exec_img_register(const char *path, uint64_t fsz, mm_t *mm,
+                      uint64_t va_lo, uint64_t va_hi) {
+    if (!mm || !mm->pml4 || va_hi <= va_lo)
+        return 0;
+    uint64_t lo = va_lo & ~0xFFFULL;
+    uint64_t hi = (va_hi + 0xFFFULL) & ~0xFFFULL;
+    if (hi > (uint64_t)MMIO_IDENTITY_LIMIT)
+        hi = (uint64_t)MMIO_IDENTITY_LIMIT;
+    if (lo >= hi)
+        return 0;
+    uint64_t tot = (hi - lo) >> 12;
+    if (tot == 0 || tot > (uint64_t)EXEC_IMG_MAX_PAGES)
+        return 0;
+
+    uint64_t key = exec_img_key(path, fsz, lo, hi);
+    if (exec_img_seen_bump(key) < 2)
+        return 0; /* first cold load of this file: keep the old eager image */
+
+    /* Count present user leaves, disqualifying only identity (pa==va) or huge
+     * leaves.  NOTE: mm_va_leaf_pa() masks the PTE flags (returns only the
+     * address), so raw-flag checks MUST use mm_va_leaf_entry().  A Soft_COW
+     * leaf is a legitimate shared frame; a plain present|US non-identity leaf
+     * is an ordinary refcounted frame — frame_retain below validates both. */
+    uint64_t n = 0;
+    for (uint64_t va = lo; va < hi; va += 0x1000ULL) {
+        uint64_t leaf = 0;
+        if (mm_va_leaf_entry(mm, va, &leaf) != 0)
+            continue; /* unallocated hole between/around segments */
+        if ((leaf & PG_PS_2M) || !(leaf & PG_PRESENT) || !(leaf & PG_US))
+            return 0;
+        if ((leaf & PG_ADDR_MASK) == (va & ~0xFFFULL))
+            return 0;
+        n++;
+    }
+    if (n == 0 || n > (uint64_t)EXEC_IMG_MAX_PAGES)
+        return 0;
+
+    uint64_t bytes = n * (uint64_t)PAGE_SIZE_4K;
+    if (g_exec_img_bytes + bytes > (uint64_t)EXEC_IMG_MAX_TOTAL)
+        return 0;
+
+    uint64_t *va = (uint64_t *)kmalloc(n * sizeof(uint64_t));
+    uint64_t *pa = (uint64_t *)kmalloc(n * sizeof(uint64_t));
+    if (!va || !pa) {
+        kfree(va);
+        kfree(pa);
+        return 0;
+    }
+    uint64_t j = 0;
+    for (uint64_t vv = lo; vv < hi; vv += 0x1000ULL) {
+        uint64_t leaf = 0;
+        if (mm_va_leaf_pa(mm, vv, &leaf) != 0)
+            continue;
+        va[j] = vv;
+        pa[j] = leaf & ~0xFFFULL;
+        if (frame_retain(pa[j]) != 0) {
+            while (j) {
+                j--;
+                frame_release(pa[j]);
+            }
+            kfree(va);
+            kfree(pa);
+            return 0;
+        }
+        j++;
+    }
+
+    struct exec_img_entry *e = exec_img_evict_slot(key);
+    if (!e) {
+        while (j) {
+            j--;
+            frame_release(pa[j]);
+        }
+        kfree(va);
+        kfree(pa);
+        return 0;
+    }
+    exec_img_clear(e);
+    e->key = key;
+    e->phash = exec_img_path_hash(path);
+    e->lo = lo;
+    e->hi = hi;
+    e->va = va;
+    e->pa = pa;
+    e->n = (int)n;
+    e->bytes = bytes;
+    e->gen = ++g_exec_img_gen;
+    g_exec_img_bytes += bytes;
+    return 1;
+}
+
+void exec_img_demote_owner(mm_t *mm, uint64_t va_lo, uint64_t va_hi) {
+    if (!mm || !mm->pml4 || va_hi <= va_lo)
+        return;
+    uint64_t lo = va_lo & ~0xFFFULL;
+    uint64_t hi = (va_hi + 0xFFFULL) & ~0xFFFULL;
+    if (hi > (uint64_t)MMIO_IDENTITY_LIMIT)
+        hi = (uint64_t)MMIO_IDENTITY_LIMIT;
+    if (lo >= hi)
+        return;
+    mm_dm_ctx_t dm = mm_enter_direct_map();
+    for (uint64_t va = lo; va < hi; va += 0x1000ULL) {
+        /* mm_mark_share_user_readonly_page() no-ops non-owned leaves and only
+         * -1 on a huge-leaf split (never present for image windows). */
+        (void)mm_mark_share_user_readonly_page(mm, mm->pml4, va);
+    }
+    mm_leave_direct_map(dm);
 }

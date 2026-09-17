@@ -77,15 +77,27 @@ static int kd_mode = 0;             /* KD_TEXT */
  * KD_GRAPHICS back to KD_TEXT, K_OFF back to K_XLATE, and force the active
  * tty's backing store onto the screen so the shell text reappears. */
 static void console_kd_reset_for_dead_owner(int tty_idx) {
+    int changed = 0;
     if (video_kd_graphics()) {
         video_set_kd_mode(0); /* KD_GRAPHICS -> KD_TEXT */
+        changed = 1;
     }
-    kd_mode = 0;             /* KD_TEXT */
-    console_kbd_mode = 0x01; /* K_XLATE */
+    if (kd_mode) {
+        kd_mode = 0;
+        changed = 1;
+    }
+    if (console_kbd_mode != 0x01) { /* K_XLATE */
+        console_kbd_mode = 0x01;
+        changed = 1;
+    }
     if (tty_idx >= 0 && tty_idx < DEVFS_TTY_COUNT) {
         devfs_tty_restore_sane(tty_idx);
-        devfs_tty_leave_alt_screen(tty_idx);
-        devfs_tty_force_reblit(tty_idx);
+        /* Full-screen blit only when a mode/alt-screen transition actually
+         * happened; a plain child exit (foreground /bin/true) left the
+         * console untouched, so a forced reblit is pure 2-3ms waste. */
+        int alt_was = devfs_tty_leave_alt_screen(tty_idx);
+        if (changed && !alt_was)
+            devfs_tty_force_reblit(tty_idx);
     }
 }
 
@@ -119,13 +131,25 @@ uint64_t syscall_user_rsp_saved = 0;
 uint64_t syscall_kernel_rsp0 = 0;
 /* Per-APIC-id syscall stack tops. syscall_entry64 picks stack from this table. */
 uint64_t syscall_kernel_rsp0_by_apic[256] = { 0 };
+static uint64_t g_bind_cached_tid[256];
+static uint64_t g_bind_cached_rsp0[256];
 
 static inline int syscall_lapic_id(void) {
     return (int)((*(volatile uint32_t *)(uintptr_t)0xFEE00020ULL) >> 24) & 0xFF;
 }
 
 void syscall_bind_kstack_for_thread(thread_t *t) {
+    int fast_tid = 0;
+    uint64_t sc_tid = 0;
+    if (t && t->syscall_kstack_top) {
+        fast_tid = 1;
+        sc_tid = t->tid ? t->tid : 1;
+        if (g_bind_cached_tid[0] == sc_tid &&
+            g_bind_cached_rsp0[0] == t->syscall_kstack_top)
+            return;
+    }
     int apic = syscall_lapic_id();
+    if (apic < 0 || apic >= 256) apic = 0;
     uint64_t sp = 0;
     if (t && t->syscall_kstack_top)
         sp = t->syscall_kstack_top;
@@ -134,8 +158,15 @@ void syscall_bind_kstack_for_thread(thread_t *t) {
     else
         sp = syscall_kernel_rsp0_by_apic[apic];
     if (!sp) return;
+    if (fast_tid && g_bind_cached_tid[apic] == sc_tid &&
+        g_bind_cached_rsp0[apic] == sp)
+        return;
     syscall_kernel_rsp0_by_apic[apic] = sp;
     syscall_kernel_rsp0 = sp;
+    if (fast_tid) {
+        g_bind_cached_tid[apic] = sc_tid;
+        g_bind_cached_rsp0[apic] = sp;
+    }
 }
 
 /* Saved user RIP for SYSCALL path (RCX at syscall entry). Used by fork/vfork helpers. */
@@ -1245,6 +1276,7 @@ uint64_t syscall_maybe_vfork_wait(uint64_t parent_ret) {
                 (unsigned long long)parent_ret,
                 (unsigned long long)cur->saved_user_rdi);
 
+    uint64_t vfork_block_us0 = time_monotonic_us();
     if (cur->state != THREAD_BLOCKED && !thread_block_current_atomic())
         thread_block(parent_tid);
     /* Safety net: child should already be runnable from wake_up_new_task. */
@@ -1282,6 +1314,13 @@ uint64_t syscall_maybe_vfork_wait(uint64_t parent_ret) {
                 (unsigned long long)parent_ret,
                 (unsigned long long)cur->saved_user_rdi,
                 (unsigned long long)cur->saved_user_rcx);
+    {
+        static int vfork_block_left = 40;
+        uint64_t vbd = time_monotonic_us() - vfork_block_us0;
+        if (vbd >= 100 && vfork_block_left-- > 0)
+            kprintf("vfork-block-parent: tid=%d dur=%lluus\n",
+                parent_tid, (unsigned long long)vbd);
+    }
     return parent_ret;
 }
 
@@ -21676,29 +21715,29 @@ xorg_trace_done:;
                 if (ignore_sigchld && cur->waiter_tid < 0 &&
                     !thread_wait_parent_alive(cur))
                     wait_drop_ignored_child(cur);
-                if (is_watch_proc(cur)) {
-                    qemu_debug_printf("exit_group: tid=%llu name=%s exit_status=0x%x waiter_tid=%d parent_tid=%d\n",
-                        (unsigned long long)(cur->tid ? cur->tid : 1),
-                        (cur->name[0] ? cur->name : "(noname)"),
-                        (unsigned)cur->exit_status,
-                        cur->waiter_tid,
-                        cur->parent_tid);
-                }
-                if (cur->mm_ptemplate) {
+if (is_watch_proc(cur)) {
+                     qemu_debug_printf("exit_group: tid=%llu name=%s exit_status=0x%x waiter_tid=%d parent_tid=%d\n",
+                         (unsigned long long)(cur->tid ? cur->tid : 1),
+                         (cur->name[0] ? cur->name : "(noname)"),
+                         (unsigned)cur->exit_status,
+                         cur->waiter_tid,
+                         cur->parent_tid);
+                 }
+                 if (cur->mm_ptemplate) {
                     mm_release(cur->mm_ptemplate);
                     cur->mm_ptemplate = NULL;
                 }
-                if (cur->attached_tty >= 0)
+                 if (cur->attached_tty >= 0)
                     console_kd_reset_for_dead_owner(cur->attached_tty);
-                if (cur->mm && cur->mm != mm_kernel()) {
-                    mm_t *dead_mm = cur->mm;
-                    cur->mm = NULL;
-                    (void)mm_switch_away_from(dead_mm);
-                    mm_release(dead_mm);
-                }
-                if (thread_get_current_user() == cur)
-                    thread_set_current_user(NULL);
-                /* After full teardown — see SYS_exit comment. */
+                 if (cur->mm && cur->mm != mm_kernel()) {
+                     mm_t *dead_mm = cur->mm;
+                     cur->mm = NULL;
+                     (void)mm_switch_away_from(dead_mm);
+                     mm_release(dead_mm);
+                 }
+                 if (thread_get_current_user() == cur)
+                     thread_set_current_user(NULL);
+                 /* After full teardown — see SYS_exit comment. */
                 process_release_vfork_parent(exiting_proc, PROCESS_VFORK_EXIT);
                 if (!ignore_sigchld || cur->waiter_tid >= 0)
                     wait_wake_parent(cur, !ignore_sigchld);
@@ -21975,7 +22014,6 @@ xorg_trace_done:;
 }
 
 uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
-    uint64_t syscall_prof_begin = time_monotonic_us();
     thread_t *trace_t = syscall_resolve_thread();
     if (!trace_t)
         trace_t = thread_get_current_user();

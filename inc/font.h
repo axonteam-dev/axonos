@@ -62,11 +62,11 @@ void font_try_load_console_pf2(void);
  * Fills the full cell with bg, then stamps the glyph in fg.
  */
 void font_blit_glyph_32(void *fb, uint32_t pitch, uint32_t px, uint32_t py,
-			uint8_t ch, uint32_t fg, uint32_t bg);
+			uint16_t ch, uint32_t fg, uint32_t bg);
 
 /* Generic bpp path (2/3/4 bytes per pixel). */
 void font_blit_glyph(void *fb, uint32_t pitch, uint32_t bpp_bytes,
-		     uint32_t px, uint32_t py, uint8_t ch,
+		     uint32_t px, uint32_t py, uint16_t ch,
 		     uint32_t fg, uint32_t bg);
 
 /* Notify fbcon backends that metrics changed (recompute cols/rows). */

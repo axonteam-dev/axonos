@@ -11,10 +11,10 @@ int vbe_is_available(void);
 int vbe_attach_framebuffer(void *frontbuf, uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp);
 
 /* Simple framebuffer console primitives used by kprintf delegation */
-void vbefb_putchar(uint8_t ch, uint8_t attr);
-void vbefb_putchar_literal(uint8_t ch, uint8_t attr);
+void vbefb_putchar(uint16_t ch, uint8_t attr);
+void vbefb_putchar_literal(uint16_t ch, uint8_t attr);
 /* Write character at (x,y) without moving cursor (for clearing line segments). */
-void vbefb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr);
+void vbefb_putch_xy(uint32_t x, uint32_t y, uint16_t ch, uint8_t attr);
 /* Defer SVGA/region flush across one userspace tty write. */
 void vbefb_begin_batch(void);
 void vbefb_end_batch(void);
@@ -47,7 +47,7 @@ void vbe_scroll_band_pixels(uint32_t y, uint32_t band_h, uint32_t pixels,
 void vbe_clear_region(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t packed_pixel);
 /* Update blinking cursor (call from timer interrupt). */
 void vbefb_update_cursor(void);
-/* Virtual-console switch: save/restore text buffer (VGA cell layout: char, attr). */
+/* Virtual-console switch: save/restore text buffer (4-byte cells: glyph16, attr). */
 void vbefb_snapshot_screen(uint8_t *out, size_t max_bytes);
 void vbefb_restore_screen(const uint8_t *src, uint32_t cols, uint32_t rows);
 

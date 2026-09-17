@@ -29,7 +29,7 @@ static uint32_t rows = 0;
 uint32_t font_w = 8;
 uint32_t font_h = 16;
 
-typedef struct { uint8_t ch; uint8_t attr; } cell_t;
+typedef struct { uint16_t ch; uint8_t attr; } cell_t;
 static cell_t *textbuf = NULL;
 static uint32_t cursor_x = 0;
 static uint32_t cursor_y = 0;
@@ -150,7 +150,7 @@ static inline uint32_t vga_attr_bg_to_pixel(uint8_t attr) {
 
 static void draw_cell_to_framebuffer(uint32_t cx, uint32_t cy) {
 	if (!textbuf) return;
-	uint8_t ch = textbuf[cy * cols + cx].ch;
+	uint16_t ch = textbuf[cy * cols + cx].ch;
 	uint8_t attr = textbuf[cy * cols + cx].attr;
 
 	uint32_t fg_rgb = vga_attr_to_rgb(attr, 1);
@@ -179,7 +179,7 @@ static void draw_text_row(uint32_t row) {
 		draw_cell_to_framebuffer(x, row);
 }
 
-void vbefb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
+void vbefb_putch_xy(uint32_t x, uint32_t y, uint16_t ch, uint8_t attr) {
 	if (!vbe_is_available() || !textbuf) return;
 	if (x >= cols || y >= rows) return;
 	textbuf[y * cols + x].ch = ch;
@@ -206,7 +206,7 @@ static void vbefb_erase_cells(uint32_t x0, uint32_t x1, uint32_t y) {
 	vbefb_flush_dirty();
 }
 
-static void vbefb_emit_tty_char(uint8_t ch) {
+static void vbefb_emit_tty_char(uint16_t ch) {
 	/* Swallow C0 junk (BEL etc.) — never map to CP437 glyphs. */
 	if (ch < 0x20u && ch != '\n' && ch != '\r' && ch != '\t' && ch != '\b')
 		return;
@@ -269,7 +269,7 @@ static void vbefb_emit_tty_char(uint8_t ch) {
 	}
 }
 
-void vbefb_putchar(uint8_t ch, uint8_t attr) {
+void vbefb_putchar(uint16_t ch, uint8_t attr) {
 	if (!vbe_is_available()) { return; }
 	/* Honor caller-selected color when printing raw chars (devfs/tty path). */
 	if (!esc_mode && ch != 0x1B) current_attr = attr;
@@ -372,7 +372,7 @@ void vbefb_putchar(uint8_t ch, uint8_t attr) {
 	vbefb_emit_tty_char(ch);
 }
 
-void vbefb_putchar_literal(uint8_t ch, uint8_t attr) {
+void vbefb_putchar_literal(uint16_t ch, uint8_t attr) {
 	if (!vbe_is_available()) return;
 	esc_mode = 0;
 	esc_len = 0;
@@ -522,7 +522,7 @@ void vbefb_scroll_region(uint32_t top, uint32_t bottom, uint8_t attr)
 
 void vbefb_snapshot_screen(uint8_t *out, size_t max_bytes) {
 	if (!vbe_is_available() || !textbuf || !out) return;
-	size_t need = (size_t)cols * (size_t)rows * 2u;
+	size_t need = (size_t)cols * (size_t)rows * sizeof(cell_t);
 	if (need > max_bytes) return;
 	memcpy(out, textbuf, need);
 }
@@ -533,9 +533,9 @@ void vbefb_restore_screen(const uint8_t *src, uint32_t src_cols, uint32_t src_ro
 	vbefb_begin_batch();
 	for (uint32_t y = 0; y < rows; y++) {
 		for (uint32_t x = 0; x < cols; x++) {
-			size_t off = ((size_t)y * cols + x) * 2u;
-			uint8_t ch = src[off];
-			uint8_t attr = src[off + 1];
+			const uint8_t *s = src + ((size_t)y * cols + x) * sizeof(cell_t);
+			uint16_t ch = (uint16_t)s[0] | ((uint16_t)s[1] << 8);
+			uint8_t attr = s[2];
 			textbuf[y * cols + x].ch = ch;
 			textbuf[y * cols + x].attr = attr;
 			draw_cell_to_framebuffer(x, y);

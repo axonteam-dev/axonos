@@ -1,54 +1,19 @@
-<div align="center">
+axonOS - это операционная система, созданная в России с загрузчиком GRUB и ядром, 
+построенным на linux семантиках. Эта операционная система расчитана быть более 
+безопасной альтернативой ядру linux (по крайней мере какого-либо дистрибутива), 
+но **пока** проект находится в разработке, система **не может** стать полноценной заменой линуксу.
 
-<img src="https://capsule-render.vercel.app/api?type=waving&color=6C63FF&height=180&section=header&text=AXON%20OS&fontSize=48&fontColor=ffffff&animation=fadeIn"/>
+Целевые платформы, на которых рассчитана рабоать axonOS - сервера, или же 
+виртуальные машины (такие как: QEMU, VMware, ESXi, Xen, и другие), на реальном 
+железе система может работать гораздо медленнее.
 
-### The operating system built for speed, simplicity and full control.
+Каждый день axonOS становится всё лучше, у неё появляются новые функции и возможности,
+и каждый из вас сможет внести свой значимый вклад в систему. Но прежде тем, как 
+контрибьютить, вам **следует** прочитать сведения о стилях, правилах и особенностях
+в docs/CODING_STYLE.md. Главное - это не абсолютное умение и знания в osdev'е,
+а желание и энтузиазм (хотя знания не помешали бы :D).
 
-<p align="center">
-<img src="https://img.shields.io/github/stars/fcexx/AxonOS?style=for-the-badge&color=6C63FF">
-<img src="https://img.shields.io/github/issues-pr/fcexx/AxonOS?style=for-the-badge&color=C77DFF">
-<img src="https://img.shields.io/github/license/fcexx/AxonOS?style=for-the-badge&color=5D3FD3">
-<img src="https://img.shields.io/github/last-commit/fcexx/AxonOS?style=for-the-badge&color=836FFF">
-<img src="https://img.shields.io/badge/Platform-x86__64-7B68EE?style=for-the-badge">
-<img src="https://img.shields.io/badge/Made%20with-C%20%2F%20ASM-9D4EDD?style=for-the-badge">
-</p>
+**Если вы нашли баг**, то обязательно выложите его в issues, разработчики увидят
+и исправят его как можно скорее. Если вы являетесь разработчиком, то напишите об
+этом в чате Axon Team.
 
-<a href="https://axont.ru">
-<img src="https://readme-typing-svg.herokuapp.com?font=Orbitron&size=28&duration=3000&color=6C63FF&center=true&vCenter=true&width=700&lines=Visit+AXON+OS+Official+Website;axont.ru">
-</a>
-
-</div>
-
----
-
-## What is AxonOS?
-
-AxonOS is not just a repository.
-It is a real operating system project focused on performance, stability and modern design.
-
-Built from the ground up with a clean architecture and a vision for the future, AxonOS is designed for people who want more than a standard environment. Lightweight core, flexible development and full customization — everything is made to feel smooth and powerful.
-
-Whether you are exploring low-level systems, building your own environment or simply following the development of a modern OS project, AxonOS represents the idea of freedom and control.
-
----
-
-## Vision
-
-* Minimal and clean system architecture
-* High performance and lightweight behavior
-* Modern interface and ecosystem
-* Full developer control
-* Open development philosophy
-* Built to evolve
-
----
-
-## Technologies
-
-```txt
-• Kernel Development
-• Low-Level Programming
-• System Architecture
-• Hardware Interaction
-• Open Source Infrastructure
-```

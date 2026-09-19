@@ -1,19 +1,7 @@
-axonOS - это операционная система, созданная в России с загрузчиком GRUB и ядром, 
-построенным на linux семантиках. Эта операционная система расчитана быть более 
-безопасной альтернативой ядру linux (по крайней мере какого-либо дистрибутива), 
-но **пока** проект находится в разработке, система **не может** стать полноценной заменой линуксу.
+axonOS is an operating system created in Russia with the GNU GRUB bootloader and a kernel built on Linux semantics. This operating system is intended to be a more secure alternative to the Linux kernel (or at least to the kernel of any given distribution), but **for now** the project is under development, and the system **cannot** yet be a full replacement for GNU/Linux.
 
-Целевые платформы, на которых рассчитана рабоать axonOS - сервера, или же 
-виртуальные машины (такие как: QEMU, VMware, ESXi, Xen, и другие), на реальном 
-железе система может работать гораздо медленнее.
+The target platforms for which axonOS is intended are servers, or virtual machines (such as QEMU, VMware, ESXi, Xen, and others); on real hardware, the system may run considerably slower.
 
-Каждый день axonOS становится всё лучше, у неё появляются новые функции и возможности,
-и каждый из вас сможет внести свой значимый вклад в систему. Но прежде тем, как 
-контрибьютить, вам **следует** прочитать сведения о стилях, правилах и особенностях
-в docs/CODING_STYLE.md. Главное - это не абсолютное умение и знания в osdev'е,
-а желание и энтузиазм (хотя знания не помешали бы :D).
+Every day axonOS gets better, with new features and capabilities appearing, and each of you can make a meaningful contribution to the system. But before you contribute, you **should** read the information about styles, rules, and specifics in docs/CODING_STYLE.md. The main thing is not absolute skill and knowledge in OSDev, but desire and enthusiasm (though knowledge wouldn't hurt :D).
 
-**Если вы нашли баг**, то обязательно выложите его в issues, разработчики увидят
-и исправят его как можно скорее. Если вы являетесь разработчиком, то напишите об
-этом в чате Axon Team.
-
+**If you found a bug**, be sure to post it in the issues; the developers will see it and fix it as soon as possible. If you are a developer, write about it in the Axon Team chat.

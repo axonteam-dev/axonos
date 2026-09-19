@@ -10,7 +10,7 @@ make run       # QEMU, needs ../disk.img — run make disk once if missing
 
 If `make` left files owned by root:
 
-```bash
+```bash 
 sudo ./docs/fix_permissions.sh
 ```
 

@@ -12,6 +12,9 @@ extern uint64_t syscall_kernel_rsp0;
 extern uint64_t syscall_user_rsp_saved;
 extern uint64_t syscall_user_return_rip;
 extern uint64_t syscall_user_return_rax;
+/* Per-CPU int0x80 snapshot slots (SMP_MAX_CPUS entries each). */
+extern uint64_t syscall_user_return_rip_pc[];
+extern uint64_t syscall_user_rsp_saved_pc[];
 void syscall_set_user_brk(uintptr_t base);
 
 int fault_try_grow_user_heap(uint64_t cr2);

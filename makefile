@@ -279,7 +279,7 @@ OVMF_VARS := $(BUILD_DIR)/OVMF_VARS.fd
 run-uefi: archive iso
 	@test -n "$(OVMF_CODE)" || { echo "run-uefi: OVMF not found (apt install ovmf)" >&2; exit 1; }
 	@if [ ! -d /usr/lib/grub/x86_64-efi ]; then \
-		echo "run-uefi: ISO is BIOS-only. apt install grub-efi-amd64-bin && make iso" >&2; \
+		echo "run-uefi: apt install grub-efi-amd64-bin && make iso" >&2; \
 	fi
 	@mkdir -p $(BUILD_DIR)
 	@if [ -n "$(OVMF_VARS_SRC)" ]; then \

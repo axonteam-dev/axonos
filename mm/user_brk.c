@@ -10,6 +10,7 @@
 #include <paging.h>
 #include <string.h>
 #include <thread.h>
+#include <smp.h>
 #include <axonos.h>
 #include <klog.h>
 #include <syscall.h>
@@ -142,9 +143,12 @@ uint64_t user_syscall_brk(uint64_t req) {
             top_limit = mmap_lo;
     }
     {
+        int brk_cpu = smp_sched_cpu_id();
+        if (brk_cpu < 0 || brk_cpu >= SMP_MAX_CPUS)
+            brk_cpu = 0;
         uintptr_t rsp = tcur && tcur->active_syscall_frame ?
             (uintptr_t)tcur->active_syscall_frame->rsp :
-            (uintptr_t)syscall_user_rsp_saved;
+            (uintptr_t)syscall_user_rsp_saved_pc[brk_cpu];
         if (rsp >= 0x200000u && rsp < top_limit) {
             uintptr_t rsp_cap = (rsp > 0x40000u) ? (rsp - 0x40000u) : 0x200000u;
             if (rsp_cap < top_limit)

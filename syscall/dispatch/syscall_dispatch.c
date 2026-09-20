@@ -127,6 +127,13 @@ extern uint64_t virt_to_phys(uint64_t va);
 
 /* Saved user RSP for syscall_entry64 (legacy/debug helper). */
 uint64_t syscall_user_rsp_saved = 0;
+/* Per-CPU saved user RIP/RSP for the int0x80 (isr_syscall) path.  The SYSCALL
+ * prologue keeps its own single global snapshot (serialized by
+ * syscall_entry_lock in syscall.S), while these per-CPU slots carry the values
+ * written from the shared isr_syscall ISR so a concurrent SYSCALL on another
+ * CPU cannot swap in a foreign RIP/RSP for fork/vfork return-site lookup. */
+uint64_t syscall_user_return_rip_pc[SMP_MAX_CPUS] = { 0 };
+uint64_t syscall_user_rsp_saved_pc[SMP_MAX_CPUS] = { 0 };
 /* Legacy global syscall stack top (kept for fallback/debug paths). */
 uint64_t syscall_kernel_rsp0 = 0;
 /* Per-APIC-id syscall stack tops. syscall_entry64 picks stack from this table. */
@@ -136,6 +143,14 @@ static uint64_t g_bind_cached_rsp0[256];
 
 static inline int syscall_lapic_id(void) {
     return (int)((*(volatile uint32_t *)(uintptr_t)0xFEE00020ULL) >> 24) & 0xFF;
+}
+
+/* Logical (sched) CPU index for per-CPU slots; 16-bit TSC_AUX logical id. */
+static inline unsigned syscall_cpu_idx(void) {
+    int c = smp_sched_cpu_id();
+    if (c < 0 || c >= SMP_MAX_CPUS)
+        c = 0;
+    return (unsigned)c;
 }
 
 void syscall_bind_kstack_for_thread(thread_t *t) {
@@ -983,7 +998,7 @@ static int apply_exec_trampoline(thread_t *t) {
 
     /* syscall_entry64 returns through the saved frame, not the legacy global. */
     *(uint64_t*)(uintptr_t)rsp_slot = (uint64_t)t->exec_trampoline_rsp;
-    syscall_user_rsp_saved = t->exec_trampoline_rsp;
+    syscall_user_rsp_saved_pc[syscall_cpu_idx()] = t->exec_trampoline_rsp;
 
     /* Also set saved rax so final popped rax becomes our chosen value */
     *(uint64_t*)(uintptr_t)rax_slot = (uint64_t)t->exec_trampoline_rax;
@@ -1498,7 +1513,7 @@ static uint64_t fork_child_ret_rip(thread_t *cur) {
     uint64_t entry_rip = cur->syscall_entry_rip;
     uint64_t kbuf_rip = cur->syscall_frame_kbuf ? cur->syscall_frame_kbuf[13] : 0;
     uint64_t live_rip = cur->saved_syscall_frame ? cur->saved_syscall_frame[13] : 0;
-    uint64_t int80_rip = syscall_user_return_rip;
+    uint64_t int80_rip = syscall_user_return_rip_pc[syscall_cpu_idx()];
     uint64_t cands[5] = { locked_rip, live_rip, kbuf_rip, entry_rip, int80_rip };
 
     for (int i = 0; i < 5; i++) {
@@ -9228,7 +9243,7 @@ int maybe_deliver_pending_signal(uint64_t syscall_ret) {
         }
         frame[13] = handler;
         frame[15] = (uint64_t)frame_start;
-        syscall_user_rsp_saved = (uint64_t)frame_start;
+        syscall_user_rsp_saved_pc[syscall_cpu_idx()] = (uint64_t)frame_start;
         signal_commit_delivery(cur, sig, &sa);
         cur->restore_sigmask = 0;
         asm volatile("mfence" ::: "memory");
@@ -16570,7 +16585,7 @@ xorg_trace_done:;
                             cur->syscall_frame_kbuf[15] = cur->user_stack;
                         }
                         syscall_exec_trampoline_active = 1;
-                        syscall_user_rsp_saved = cur->user_stack;
+                        syscall_user_rsp_saved_pc[syscall_cpu_idx()] = cur->user_stack;
                     }
                     devel_printf("execve: iret path=%s rip=0x%llx rsp=0x%llx\n",
                         resolved_path, (unsigned long long)cur->user_rip,
@@ -21778,7 +21793,7 @@ if (is_watch_proc(cur)) {
             cur->saved_user_rsp = sc->rsp;
             cur->saved_sig_mask = uc.uc_sigmask[0];
             rebuild_syscall_frame(cur);
-            syscall_user_rsp_saved = sc->rsp;
+            syscall_user_rsp_saved_pc[syscall_cpu_idx()] = sc->rsp;
             return sc->rax;
         }
         case SYS_resolve: { /* resolve(hostname, out_ip_be) - full resolver: hosts then DNS; hostname user ptr, out_ip_be user ptr to uint32_t */
@@ -22347,8 +22362,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
 void isr_syscall(cpu_registers_t* regs) {
     if (!regs) return;
     /* Record user rip/rsp for int0x80 path so fork/vfork can find return site. */
-    syscall_user_return_rip = regs->rip;
-    syscall_user_rsp_saved = regs->rsp;
+    syscall_user_return_rip_pc[syscall_cpu_idx()] = regs->rip;
+    syscall_user_rsp_saved_pc[syscall_cpu_idx()] = regs->rsp;
     {
         thread_t *cur = thread_current();
         if (!cur || cur->ring != 3)
@@ -22361,7 +22376,7 @@ void isr_syscall(cpu_registers_t* regs) {
             cur->saved_user_rsp = regs->rsp;
         }
     }
-    if (syscall_user_return_rip == 0) {
+    if (syscall_user_return_rip_pc[syscall_cpu_idx()] == 0) {
         debug_dump_kernel_syscall_stack();
     }
     /* Match Linux x86_64 syscall ABI: args 4–6 are r10, r8, r9 (same as SYSCALL path in syscall.S). */

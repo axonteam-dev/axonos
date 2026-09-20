@@ -44,8 +44,31 @@
 //
 // We preserve all GPRs and only change rax (return value), rcx/r11 are restored and used for iret frame
 //
+
+// Spinlock serializing the SYSCALL entry prologue.  The prologue records the
+// user RSP and RFLAGS into the global slots syscall_user_rsp_saved and
+// syscall_user_saved_r11 and re-reads them a few instructions later to build
+// the iret frame; without serialization a second CPU entering SYSCALL at the
+// same time would clobber those slots in between.  At entry every GPR is
+// live (SYSCALL only clobbers rcx/r11, and both still hold user values we
+// must preserve), so the lock is taken with a register-free lock bts that
+// only touches the EFLAGS flags register.  MSR_FMASK clears IF/DF on entry,
+// so the window cannot be interrupted; kernel-mode IRQ handlers never
+// schedule, so the holder always completes.  Released once the prologue has
+// consumed both global slots.
+.section .data
+.align 8
+.globl syscall_entry_lock
+syscall_entry_lock:
+        .quad 0
+.text
+
 syscall_entry64:
     cld
+    // Acquire entry prologue lock (no GPR used; only flags clobbered).
+.on_entry_lock_retry:
+    lock    btsq $0, syscall_entry_lock(%rip)
+    jc      .on_entry_lock_retry
     // Save user RFLAGS image from r11 before using it as scratch.
     movq    %r11, syscall_user_saved_r11(%rip)
     // Save user RSP and switch to kernel syscall stack (only if set).
@@ -117,6 +140,9 @@ syscall_entry64:
     movq    %rax, syscall_user_saved_rcx(%rip)
     movq    32(%rsp), %rax      // r11 (saved RFLAGS from SYSCALL)
     movq    %rax, syscall_user_saved_r11(%rip)
+
+    // Both global snapshot slots consumed by the prologue; other CPUs may enter now.
+    lock    btrq $0, syscall_entry_lock(%rip)
 
     // Snapshot saved user regs into current thread (per-thread, avoids globals).
     // Pass pointer to saved frame (rsp points to r15).

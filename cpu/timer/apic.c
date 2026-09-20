@@ -2,10 +2,15 @@
 #include <vga.h>
 #include <klog.h>
 #include <mmio.h>
+#include <smp.h>
 #include <stdint.h>
 
 /* Volatile: AP may call apic_local_enable later; avoid C11 data races / stale loads of the pointer. */
 static volatile uintptr_t lapic_base_va;
+/* Per-logical-CPU MMIO mappings: each CPU's LAPIC is a different physical
+ * window, and the APIC_BASE MSR (0x1B) is per-CPU.  In xAPIC mode every CPU
+ * must reach its own LAPIC through its own VA. */
+static volatile uintptr_t lapic_base_va_pc[SMP_MAX_CPUS];
 static volatile bool lapic_x2apic;
 static bool apic_initialized = false;
 
@@ -36,6 +41,12 @@ static uint32_t apic_local_enable(void) {
     msr_write(0x1B, apic_base_msr);
     apic_base_msr = msr_read(0x1B);
 
+    /* The LAPIC is per-CPU; keep the mapping in this CPU's slot too so the
+     * BSP/APs never write through a neighbor's MMIO window in xAPIC mode. */
+    int mycpu = smp_sched_cpu_id();
+    if (mycpu < 0 || mycpu >= SMP_MAX_CPUS)
+        mycpu = 0;
+
     uintptr_t base_addr = (uintptr_t)(apic_base_msr & 0xFFFFF000ULL);
     lapic_x2apic = (apic_base_msr & APIC_BASE_EXTD) != 0;
     if (lapic_x2apic) {
@@ -44,6 +55,7 @@ static uint32_t apic_local_enable(void) {
         void *mapped = mmio_map_phys((uint64_t)base_addr, 0x1000u);
         lapic_base_va = mapped ? (uintptr_t)mapped : base_addr;
     }
+    lapic_base_va_pc[mycpu] = lapic_base_va;
 
     uint32_t svr = apic_read(LAPIC_SVR_REG);
     apic_write(LAPIC_SVR_REG, svr | LAPIC_SVR_ENABLE | APIC_SPURIOUS_VECTOR);
@@ -65,10 +77,18 @@ void apic_ap_enable_local(void) {
     (void)apic_local_enable();
 }
 
+static uintptr_t lapic_base_for_cpu(void) {
+    int cpu = smp_sched_cpu_id();
+    if (cpu < 0 || cpu >= SMP_MAX_CPUS)
+        cpu = 0;
+    uintptr_t pc = lapic_base_va_pc[cpu];
+    return pc ? pc : lapic_base_va;
+}
+
 uint32_t apic_read(uint32_t reg) {
     if (lapic_x2apic)
         return (uint32_t)msr_read(MSR_X2APIC_REG_BASE + (reg >> 4));
-    uintptr_t b = lapic_base_va;
+    uintptr_t b = lapic_base_for_cpu();
     if (!b)
         return 0;
     return *(volatile uint32_t *)((uint8_t *)b + reg);
@@ -79,7 +99,7 @@ void apic_write(uint32_t reg, uint32_t value) {
         msr_write(MSR_X2APIC_REG_BASE + (reg >> 4), value);
         return;
     }
-    uintptr_t b = lapic_base_va;
+    uintptr_t b = lapic_base_for_cpu();
     if (!b)
         return;
     *(volatile uint32_t *)((uint8_t *)b + reg) = value;
@@ -94,7 +114,7 @@ void apic_eoi(void) {
         msr_write(MSR_X2APIC_EOI, 0);
         return;
     }
-    if (lapic_base_va)
+    if (lapic_base_for_cpu())
         apic_write(LAPIC_EOI_REG, 0);
 }
 
@@ -112,7 +132,7 @@ uint32_t apic_local_apic_id(void) {
     uint64_t ab = msr_read(MSR_IA32_APIC_BASE);
     if (ab & APIC_BASE_EXTD)
         return (uint32_t)msr_read(MSR_IA32_X2APIC_ID);
-    if (!lapic_base_va)
+    if (!lapic_base_for_cpu())
         return 0;
     return apic_read(LAPIC_ID_REG) >> 24;
 }
@@ -141,7 +161,7 @@ static void lapic_icr_send_phy(uint8_t apic_id, uint32_t icr_low) {
                 lapic_icr_wait_x2();
                 return;
         }
-        if (!lapic_base_va)
+        if (!lapic_base_for_cpu())
                 return;
         apic_write(LAPIC_ICR_HIGH, (uint32_t)apic_id << 24);
         asm volatile("" ::: "memory");
@@ -160,7 +180,7 @@ void lapic_send_init_deassert(uint8_t apic_id) {
 
 void lapic_send_init_deassert_broadcast(void) {
         /* Level-triggered INIT de-assert; destination field ignored when shorthand != 0. */
-        if (!lapic_base_va)
+        if (!lapic_base_for_cpu())
                 return;
         lapic_icr_send_phy(0, LAPIC_ICR_DM_INIT | (1u << 14) | LAPIC_ICR_DEST_EXCLUDE_SELF);
 }

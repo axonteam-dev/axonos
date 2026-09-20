@@ -23,6 +23,10 @@ extern volatile uint32_t timer_frequency;
 extern int syscall_pipe_watch_active;
 
 volatile uint64_t apic_timer_ticks = 0;
+/* Per-CPU tick counters: once APs run their own LAPIC timer the ISR can fire
+ * on any CPU, and the shared apic_timer_ticks must stay BSP-owned (it doubles
+ * as the uptime/calibration source).  APs count into their own slot. */
+volatile uint64_t apic_timer_ticks_pc[SMP_MAX_CPUS] = { 0 };
 apic_timer_state_t apic_timer_state = {0};
 
 // Timer divider values (encoded for APIC timer divider register)
@@ -36,6 +40,10 @@ static uint32_t g_timer_init_count = 0;
 static int g_tsc_deadline_mode;
 static uint64_t g_tsc_deadline_interval;
 static uint64_t g_tsc_deadline_next;
+/* Per-CPU next TSC deadline: MSR_IA32_TSC_DEADLINE is per-CPU, and each AP
+ * rearmed its own deadline from the ISR, so the rearm state must not share a
+ * single global that two CPUs would race on. */
+static uint64_t g_tsc_deadline_next_pc[SMP_MAX_CPUS];
 
 #define MSR_IA32_TSC_DEADLINE 0x6E0u
 
@@ -84,11 +92,16 @@ static uint64_t apic_tsc_frequency_hz(void) {
 static void apic_tsc_deadline_rearm(void) {
     if (!g_tsc_deadline_mode || !g_tsc_deadline_interval)
         return;
+    int cpu = smp_sched_cpu_id();
+    if (cpu < 0 || cpu >= SMP_MAX_CPUS)
+        cpu = 0;
     uint64_t now = apic_rdtsc();
-    uint64_t next = g_tsc_deadline_next + g_tsc_deadline_interval;
+    uint64_t next = g_tsc_deadline_next_pc[cpu] + g_tsc_deadline_interval;
     if (next <= now)
         next = now + g_tsc_deadline_interval;
-    g_tsc_deadline_next = next;
+    g_tsc_deadline_next_pc[cpu] = next;
+    if (cpu == 0)
+        g_tsc_deadline_next = next;
     apic_wrmsr(MSR_IA32_TSC_DEADLINE, next);
 }
 
@@ -331,11 +344,18 @@ uint64_t apic_timer_get_uptime_seconds(void) {
 }
 
 void apic_timer_handler(cpu_registers_t* regs) {
+    int mycpu = smp_sched_cpu_id();
+    if (mycpu < 0 || mycpu >= SMP_MAX_CPUS)
+        mycpu = 0;
     apic_tsc_deadline_rearm();
-    apic_timer_ticks++;
-    apic_timer_state.ticks = apic_timer_ticks;
-    if (!pit_is_enabled())
-        timer_ticks++;
+    apic_timer_ticks_pc[mycpu]++;
+    /* BSP keeps the global counters: they are the uptime/calibration source. */
+    if (mycpu == 0) {
+        apic_timer_ticks++;
+        apic_timer_state.ticks = apic_timer_ticks;
+        if (!pit_is_enabled())
+            timer_ticks++;
+    }
     /*
      * Early clockevent mode: calibration starts before thread_init(). Linux
      * likewise keeps the early timer handler to accounting + EOI; scheduler,
@@ -348,34 +368,36 @@ void apic_timer_handler(cpu_registers_t* regs) {
 
     /* Charge CPU time before any schedule/publish side effects. */
     thread_account_timer_tick(regs && ((regs->cs & 3) == 3));
-    process_itimer_tick(pit_get_time_ms());
-    if (smp_sched_cpu_id() == 0)
+    /* Wall-clock, process timers, timeout scan, NIC poll and power requests are
+     * BSP-only: their shared state is not per-CPU, and one global clock owner is
+     * all the subsystems need.  AP ticks handle only accounting + scheduling. */
+    if (mycpu == 0) {
+        process_itimer_tick(pit_get_time_ms());
         syscall_net_l2_irq_poll();
+        /* Wall-second loadavg update (modulo ticks skips seconds when IRQs coalesce). */
+        {
+            static uint64_t loadavg_last_ms;
+            uint64_t now_ms = pit_get_time_ms();
+            if (now_ms - loadavg_last_ms >= 1000ull) {
+                loadavg_last_ms = now_ms;
+                loadavg_second_tick();
+            }
+        }
+        /* Ensure ACPI/power requests progress even when system is otherwise idle at a prompt. */
+        if (power_is_pending() && (!regs || ((regs->cs & 3) == 0))) {
+            power_poll();
+        }
+        thread_wake_expired_timeouts();
+    }
     /* Safety net for rare deferred CLONE_THREAD wakes; normal fork wakes earlier. */
     int published_fork_child = 0;
-    if (regs && ((regs->cs & 3) == 3))
+    if (mycpu == 0 && regs && ((regs->cs & 3) == 3))
         published_fork_child = syscall_publish_deferred_fork_child();
-    /* Wall-second loadavg update (modulo ticks skips seconds when IRQs coalesce). */
-    if (init && smp_sched_cpu_id() == 0) {
-        static uint64_t loadavg_last_ms;
-        uint64_t now_ms = pit_get_time_ms();
-        if (now_ms - loadavg_last_ms >= 1000ull) {
-            loadavg_last_ms = now_ms;
-            loadavg_second_tick();
-        }
-    }
-
-    /* Ensure ACPI/power requests progress even when system is otherwise idle at a prompt. */
-    if (power_is_pending() && (!regs || ((regs->cs & 3) == 0))) {
-        power_poll();
-    }
-
-    thread_wake_expired_timeouts();
     if (apic_timer_state.frequency > 0) {
         uint32_t resched_quantum = apic_timer_state.frequency / 100u;
         if (resched_quantum < 1u)
             resched_quantum = 1u;
-        if ((apic_timer_ticks % resched_quantum) == 0)
+        if ((apic_timer_ticks_pc[mycpu] % resched_quantum) == 0)
             thread_request_resched();
     }
 
@@ -407,21 +429,16 @@ void apic_timer_handler(cpu_registers_t* regs) {
     }
 
     /*
-     * UP needs timer preemption for a ring-3 CPU spinner.  PIT already uses
-     * this path; omitting it after PIT is disabled lets a post-fork child
-     * starve its parent forever (the shell cannot regain the tty or handle
-     * Ctrl-C).  Acknowledge the local APIC before a possible context switch,
-     * because this handler may resume only when this task is scheduled again.
-     * SMP remains cooperative until syscall entry/scheduler state is per-CPU.
-     */
-    /*
-     * All ring-3 tasks are intentionally pinned to the BSP until syscall
-     * entry is per-CPU.  A VM may still expose several vCPUs; using the total
-     * CPU count here disabled preemption on cpu0 and let one shell freeze all
-     * user terminals.  Preempt the BSP's ring-3 task regardless of AP count.
+     * Timer preemption: an IDLE/ring-3 CPU spinner must be preempted or the
+     * shell can starve forever.  PIT already uses this path; omitting it after
+     * PIT is disabled lets a post-fork child outrun its parent (the shell
+     * cannot regain the tty or handle Ctrl-C).  Acknowledge the local APIC
+     * before a possible context switch, because this handler may resume only
+     * when this task is scheduled again.  With per-CPU syscall entry and per-CPU
+     * LAPIC timers live, this runs on any CPU for its own ring-3 task / work pull.
      */
     /* Cursor and deferred framebuffer damage must progress while ring 3 runs. */
-    if (smp_sched_cpu_id() == 0) {
+    if (mycpu == 0) {
         if (cirrusfb_is_ready()) {
             cirrusfb_update_cursor();
         } else if (vbe_is_available()) {
@@ -431,12 +448,14 @@ void apic_timer_handler(cpu_registers_t* regs) {
         }
     }
 
-    if (regs && ((regs->cs & 3) == 3) && smp_sched_cpu_id() == 0) {
+    if (regs && ((regs->cs & 3) == 3)) {
         apic_eoi();
         /*
          * After wake_up_new_task from this IRQ, run the child on this tick.
          * Skipping preempt here used to leave the child READY until the next
          * quantum — with slow console SYNC that looked like a 1s post-fork stall.
+         * This is BSP-only: the deferred-fork publish list is not per-CPU, and
+         * any CPU's syscall return drains its own deferred children anyway.
          */
         if (published_fork_child) {
             thread_ring3_preempt_if_waiters();
@@ -456,12 +475,29 @@ void apic_timer_handler(cpu_registers_t* regs) {
         uint32_t quantum = apic_timer_state.frequency / 100u;
         if (quantum < 1u)
             quantum = 1u;
-        if ((apic_timer_ticks % quantum) == 0)
+        if ((apic_timer_ticks_pc[mycpu] % quantum) == 0)
             thread_ring3_preempt_if_waiters();
         return;
     }
 
-    /* Kernel-mode/AP timer ticks do not schedule from IRQ context. */
+    /*
+     * Kernel-mode tick on an AP idle: pull runnable work.  With the BSP-only
+     * schedule source gone, an idle AP must take READY tasks itself or it would
+     * sleep in hlt forever (smp_ipi_reschedule is intentionally a no-op).
+     */
+    if (mycpu != 0) {
+        thread_t *cur = thread_current();
+        if ((!cur || cur == thread_idle_for_cpu(mycpu) || cur->state == THREAD_TERMINATED ||
+             cur->state == THREAD_BLOCKED || cur->state == THREAD_SLEEPING) &&
+            thread_runnable_nonidle_count() > 0) {
+            apic_eoi();
+            thread_request_resched();
+            thread_schedule();
+            return;
+        }
+    }
+
+    /* Kernel-mode BSP/AP ticks do not schedule from IRQ context. */
     apic_eoi();
 }
 
@@ -508,6 +544,7 @@ void apic_timer_start(uint32_t freq_hz) {
             g_tsc_deadline_mode = 1;
             g_tsc_deadline_interval = interval;
             g_tsc_deadline_next = apic_rdtsc() + interval;
+            g_tsc_deadline_next_pc[0] = g_tsc_deadline_next;
             g_timer_init_count = 1;
             apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_TSC_DEADLINE, false);
             apic_wrmsr(MSR_IA32_TSC_DEADLINE, g_tsc_deadline_next);

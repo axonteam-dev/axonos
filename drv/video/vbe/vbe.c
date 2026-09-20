@@ -9,6 +9,7 @@
 
 static void *g_frontbuf = NULL;
 static void *g_backbuf = NULL;
+static uint64_t g_front_pa = 0;
 static uint32_t g_width = 0;
 static uint32_t g_height = 0;
 static uint32_t g_pitch = 0;
@@ -49,6 +50,7 @@ int vbe_attach_framebuffer(void *frontbuf, uint32_t width, uint32_t height, uint
 
 	g_frontbuf = frontbuf;
 	g_backbuf = NULL;
+	g_front_pa = 0;
 	g_width = width;
 	g_height = height;
 	g_pitch = pitch;
@@ -58,6 +60,12 @@ int vbe_attach_framebuffer(void *frontbuf, uint32_t width, uint32_t height, uint
 	klogprintf("vbe: attached external framebuffer %ux%u bpp=%u pitch=%u front=%p\n",
 	           (unsigned)g_width, (unsigned)g_height, (unsigned)g_bpp, (unsigned)g_pitch, g_frontbuf);
 	return 0;
+}
+
+void vbe_detach_framebuffer(void) {
+	g_enabled = 0;
+	g_frontbuf = NULL;
+	g_backbuf = NULL;
 }
 
 static void vbe_flush_region_internal(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
@@ -93,6 +101,8 @@ void vbe_flush_region(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 void *vbe_get_backbuffer(void) { return g_backbuf; }
 void *vbe_get_drawbuffer(void) { return vbe_drawbuffer(); }
 void *vbe_get_frontbuffer(void) { return g_frontbuf; }
+uint64_t vbe_get_frontbuffer_pa(void) { return g_front_pa; }
+void vbe_adopt_frontbuffer(void *kva) { g_frontbuf = kva; }
 uint32_t vbe_get_pitch(void) { return g_pitch; }
 uint32_t vbe_get_bpp(void) { return g_bpp; }
 uint32_t vbe_get_width(void) { return g_width; }
@@ -305,6 +315,7 @@ int vbe_init_from_multiboot(uint32_t multiboot_magic, uint64_t multiboot_info) {
 			}
 
 			g_frontbuf = fb_va;
+			g_front_pa = fb_addr;
 			g_backbuf = kcalloc(1, fb_size);
 			g_width = width;
 			g_height = height;

@@ -18,7 +18,7 @@ extern "C" {
 int pagecache_get(struct fs_file *file, uint64_t file_off, uint64_t *pa_out);
 
 /* Drop every cached frame for this inode (all generations). */
-void pagecache_invalidate(uint64_t backing_id);
+void pagecache_invalidate(uint64_t backing_id, uint64_t new_generation);
 
 #ifdef __cplusplus
 }

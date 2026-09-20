@@ -108,17 +108,6 @@ static inline int pt_page_pa_ok(uint64_t ent) {
     return (ent & PG_ADDR_MASK) < (uint64_t)MMIO_IDENTITY_LIMIT;
 }
 
-/*
- * Linux services page-table walks through the direct map (__va / page_address),
- * which userspace munmap / PROT_NONE cannot punch. AxonOS uses identity VA==PA
- * for the same role: software casts of PTE PAs must run under swapper CR3 so
- * a process hole at e.g. 0x8119000 (Go arena reserve) cannot Oops the kernel
- * while reading share_l3 in mm_fork_private_pt_path / mm_map_4k_sharedaware.
- *
- * Critical: hold IF=0 for the whole window. thread_schedule → mm_switch would
- * otherwise reload the process CR3 mid-walk and either Oops or corrupt user
- * memory (seen as Go poison regs after docker pthread + PROT_NONE).
- */
 static uint64_t mm_direct_map_cr3(void) {
     if (g_mm_ready && g_kernel_mm.cr3)
         return g_kernel_mm.cr3;
@@ -1755,7 +1744,272 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
     int parent_wr = ((parent_pte & PG_RW) || (parent_pte & PG_SOFT_COW)) ? 1 : 0;
 
     if (shared) {
+        static int frks_left = 1000;
         flags &= ~PG_SOFT_COW;
+        if (frks_left > 0 && frame_refcount(parent_pa & PG_ADDR_MASK) >= 2u &&
+            va >= 0x10000000u) {
+            frks_left--;
+            {
+                thread_t *ft = thread_current();
+                klogprintf_logonly("pc[FRKS] pid=%lu tid=%lu name=%s va=0x%llx "
+                        "ppa=0x%llx cpa=0x%llx pte=0x%llx refs=%u owned=%d\n",
+                        (unsigned long)(ft ? (unsigned long)ft->linux_tgid : 0),
+                        (unsigned long)owner_tid,
+                        (ft && ft->name[0]) ? ft->name : "?",
+                        (unsigned long long)va,
+                        (unsigned long long)(parent_pa & PG_ADDR_MASK),
+                        (unsigned long long)child_pa,
+                        (unsigned long long)parent_pte,
+                        frame_refcount(parent_pa & PG_ADDR_MASK), owned);
+            }
+            {
+                uint64_t fpa = parent_pa & PG_ADDR_MASK;
+                if (fpa < (uint64_t)MMIO_IDENTITY_LIMIT && parent) {
+                    thread_t *ht = thread_current();
+                    uint64_t vq[10] = {0};
+                    uint64_t pq[10];
+                    mm_dm_ctx_t hdm = mm_enter_direct_map();
+                    const uint64_t *w = (const uint64_t *)(uintptr_t)fpa;
+                    for (int vi = 0; vi < 10; vi++)
+                        pq[vi] = w[vi];
+                    uint64_t pcr3 = parent->cr3 ? parent->cr3
+                        : (uint64_t)(uintptr_t)parent_l4;
+                    unsigned long hpid = (unsigned long)(ht ? (unsigned long)ht->linux_tgid : 0);
+                    paging_write_cr3(pcr3);
+                    {
+                        volatile const uint64_t *g =
+                            (volatile const uint64_t *)(uintptr_t)va;
+                        for (int vi = 0; vi < 10; vi++)
+                            vq[vi] = g[vi];
+                    }
+                    paging_write_cr3(hdm.cr3);
+                    {
+                        const uint64_t *d = (const uint64_t *)(uintptr_t)fpa;
+                        klogprintf_logonly("pc[HNDLD] pid=%lu tid=%lu va=0x%llx pa=0x%llx "
+                                "a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx\n",
+                                hpid,
+                                (unsigned long)owner_tid,
+                                (unsigned long long)va,
+                                (unsigned long long)fpa,
+                                (unsigned long long)d[0], (unsigned long long)d[1],
+                                (unsigned long long)d[2], (unsigned long long)d[3]);
+                        klogprintf_logonly("pc[HNDLE] pid=%lu tid=%lu va=0x%llx "
+                                "b0=0x%llx b1=0x%llx b2=0x%llx b3=0x%llx\n",
+                                hpid,
+                                (unsigned long)owner_tid,
+                                (unsigned long long)va,
+                                (unsigned long long)d[8], (unsigned long long)d[9],
+                                (unsigned long long)d[10], (unsigned long long)d[11]);
+                        klogprintf_logonly("pc[HNDLI] pid=%lu tid=%lu va=0x%llx "
+                                "c0=0x%llx c1=0x%llx c2=0x%llx c3=0x%llx\n",
+                                hpid,
+                                (unsigned long)owner_tid,
+                                (unsigned long long)va,
+                                (unsigned long long)d[16], (unsigned long long)d[17],
+                                (unsigned long long)d[18], (unsigned long long)d[19]);
+                        klogprintf_logonly("pc[HNDLO] pid=%lu tid=%lu va=0x%llx "
+                                "o0=0x%llx o1=0x%llx o2=0x%llx o3=0x%llx\n",
+                                hpid,
+                                (unsigned long)owner_tid,
+                                (unsigned long long)va,
+                                (unsigned long long)d[24], (unsigned long long)d[25],
+                                (unsigned long long)d[26], (unsigned long long)d[27]);
+                        klogprintf_logonly("pc[HNDLZ] pid=%lu tid=%lu va=0x%llx "
+                                "z0=0x%llx z1=0x%llx z2=0x%llx z3=0x%llx\n",
+                                hpid,
+                                (unsigned long)owner_tid,
+                                (unsigned long long)va,
+                                (unsigned long long)d[32], (unsigned long long)d[33],
+                                (unsigned long long)d[34], (unsigned long long)d[35]);
+                        klogprintf_logonly("pc[HNDLY] pid=%lu tid=%lu va=0x%llx "
+                                "y0=0x%llx y1=0x%llx y2=0x%llx y3=0x%llx\n",
+                                hpid,
+                                (unsigned long)owner_tid,
+                                (unsigned long long)va,
+                                (unsigned long long)d[40], (unsigned long long)d[41],
+                                (unsigned long long)d[42], (unsigned long long)d[43]);
+                        klogprintf_logonly("pc[HNDLX] pid=%lu tid=%lu va=0x%llx "
+                                "x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx\n",
+                                hpid,
+                                (unsigned long)owner_tid,
+                                (unsigned long long)va,
+                                (unsigned long long)d[48], (unsigned long long)d[49],
+                                (unsigned long long)d[50], (unsigned long long)d[51]);
+                        klogprintf_logonly("pc[HNDLW] pid=%lu tid=%lu va=0x%llx "
+                                "w0=0x%llx w1=0x%llx w2=0x%llx w3=0x%llx\n",
+                                hpid,
+                                (unsigned long)owner_tid,
+                                (unsigned long long)va,
+                                (unsigned long long)d[56], (unsigned long long)d[57],
+                                (unsigned long long)d[58], (unsigned long long)d[59]);
+                        klogprintf_logonly("pc[HNDLV] pid=%lu tid=%lu va=0x%llx "
+                                "v0=0x%llx v1=0x%llx v2=0x%llx v3=0x%llx\n",
+                                hpid,
+                                (unsigned long)owner_tid,
+                                (unsigned long long)va,
+                                (unsigned long long)d[64], (unsigned long long)d[65],
+                                (unsigned long long)d[66], (unsigned long long)d[67]);
+                    }
+                    klogprintf_logonly("pc[HNDL] pid=%lu tid=%lu va=0x%llx pa=0x%llx "
+                            "q0=0x%llx q1=0x%llx q2=0x%llx q3=0x%llx "
+                            "q4=0x%llx q5=0x%llx q6=0x%llx q7=0x%llx "
+                            "q8=0x%llx q9=0x%llx g0=0x%llx g1=0x%llx\n",
+                            (unsigned long)(ht ? (unsigned long)ht->linux_tgid : 0),
+                            (unsigned long)owner_tid,
+                            (unsigned long long)va,
+                            (unsigned long long)fpa,
+                            (unsigned long long)pq[0], (unsigned long long)pq[1],
+                            (unsigned long long)pq[2], (unsigned long long)pq[3],
+                            (unsigned long long)pq[4], (unsigned long long)pq[5],
+                            (unsigned long long)pq[6], (unsigned long long)pq[7],
+                            (unsigned long long)pq[8], (unsigned long long)pq[9],
+                            (unsigned long long)vq[0], (unsigned long long)vq[1]);
+                    mm_leave_direct_map(hdm);
+                }
+                static int main_probe_left = 400;
+                if (main_probe_left > 0 && parent) {
+                    thread_t *mp = thread_current();
+                    if (mp && mp->name[0] && strstr(mp->name, "postgres")) {
+                        main_probe_left--;
+                        static int scanned_pids[16];
+                        static int scanned_n = 0;
+                        pid_t spid = mp->linux_tgid;
+                        int do_scan = 1;
+                        for (int si = 0; si < scanned_n; si++)
+                            if (scanned_pids[si] == (int)spid) { do_scan = 0; break; }
+                        mm_dm_ctx_t mdm = mm_enter_direct_map();
+                        user_vma_t *mvs = parent->vma_storage ?
+                            (user_vma_t *)parent->vma_storage : NULL;
+                        int vcount = mvs ? USER_VMA_MAX : 0;
+                        int found_main_vma = 0;
+                        if (do_scan && scanned_n < 16)
+                            scanned_pids[scanned_n++] = (int)spid;
+                        for (int vi = 0; vi < vcount; vi++) {
+                            if (!mvs[vi].used || mvs[vi].file ||
+                                mvs[vi].kind != USER_VMA_KIND_SHM)
+                                continue;
+                            if (mvs[vi].len < 0x100000ULL)
+                                continue;
+                            uint64_t MSB = mvs[vi].addr;
+                            uint64_t ppa = 0;
+                            if (mm_va_leaf_pa(parent, MSB, &ppa) != 0)
+                                continue;
+                            const uint64_t *gp =
+                                (const uint64_t *)(uintptr_t)ppa;
+                            klogprintf_logonly("pc[VMA] pid=%d base=0x%llx "
+                                    "len=0x%llx leaf=0x%llx g0=0x%llx "
+                                    "g1=0x%llx g2=0x%llx g3=0x%llx scan=%d\n",
+                                    (int)spid,
+                                    (unsigned long long)MSB,
+                                    (unsigned long long)mvs[vi].len,
+                                    (unsigned long long)ppa,
+                                    (unsigned long long)gp[0],
+                                    (unsigned long long)gp[1],
+                                    (unsigned long long)gp[2],
+                                    (unsigned long long)gp[3],
+                                    do_scan);
+                            if (!do_scan)
+                                continue;
+                            uint64_t cap = mvs[vi].len > 0x4000000ULL ?
+                                (uint64_t)0x4000000ULL : mvs[vi].len;
+                            int mag = -1, hdl = -1;
+                            for (uint64_t pg = MSB + 0x1000ULL;
+                                 pg < MSB + cap; pg += 0x1000ULL) {
+                                uint64_t pa = 0;
+                                if (mm_va_leaf_pa(parent, pg, &pa) != 0)
+                                    continue;
+                                const uint32_t *pw =
+                                    (const uint32_t *)(uintptr_t)pa;
+                                for (int wo = 0; wo < 0x400; wo++) {
+                                    if (pw[wo] == 0x0CE26608u) {
+                                        mag = (int)(pg - MSB + wo * 4);
+                                        break;
+                                    }
+                                }
+                                if (mag >= 0)
+                                    break;
+                            }
+                            if (mag < 0)
+                                continue;
+                            found_main_vma = 1;
+                            for (uint64_t pg = MSB + 0x1000ULL;
+                                 pg < MSB + cap; pg += 0x1000ULL) {
+                                uint64_t pa = 0;
+                                if (mm_va_leaf_pa(parent, pg, &pa) != 0)
+                                    continue;
+                                const uint32_t *pw =
+                                    (const uint32_t *)(uintptr_t)pa;
+                                for (int wo = 0; wo < 0x400; wo++) {
+                                    if (pw[wo] == 0x8D966356u) {
+                                        hdl = (int)(pg - MSB + wo * 4);
+                                        break;
+                                    }
+                                }
+                                if (hdl >= 0)
+                                    break;
+                            }
+                            klogprintf_logonly("pc[VMA] pid=%d base=0x%llx "
+                                    "scan magic_off=%d handle_off=%d\n",
+                                    (int)spid,
+                                    (unsigned long long)MSB, mag, hdl);
+                            {
+                                uint64_t cva = MSB + (uint64_t)mag;
+                                uint64_t ppac = 0, cpac = 0;
+                                int pprc = mm_va_leaf_pa(parent, cva, &ppac);
+                                int cprc = mm_va_leaf_pa(child, cva, &cpac);
+                                uint64_t poff = (uint64_t)mag & 0xFFFULL;
+                                const uint64_t *dp =
+                                    (const uint64_t *)(uintptr_t)((ppac & ~0xFFFULL) + poff);
+                                const uint64_t *dc =
+                                    (const uint64_t *)(uintptr_t)((cpac & ~0xFFFULL) + poff);
+                                klogprintf_logonly("pc[MAIN] pid=%d cva=0x%llx "
+                                        "pprc=%d ppac=0x%llx cprc=%d "
+                                        "cpac=0x%llx pshared=%d\n",
+                                        (int)spid,
+                                        (unsigned long long)cva, pprc,
+                                        (unsigned long long)ppac, cprc,
+                                        (unsigned long long)cpac,
+                                        ((pprc == 0 && cprc == 0 &&
+                                          ppac == cpac) ? 1 : 0));
+                                klogprintf_logonly("pc[DSAC] pid=%d off=0x%x "
+                                        "ph=0x%x pup=0x%llx psz=0x%llx "
+                                        "ps0=0x%x ps1=0x%x ps2=0x%x ps3=0x%x "
+                                        "ch=0x%x cup=0x%llx csz=0x%llx "
+                                        "cs0=0x%x cs1=0x%x cs2=0x%x cs3=0x%x\n",
+                                        (int)spid, mag,
+                                        *(const uint32_t *)
+                                            ((const unsigned char *)dp + 0x38),
+                                        (unsigned long long)dp[1],
+                                        (unsigned long long)dp[2],
+                                        *(const uint32_t *)
+                                            ((const unsigned char *)dp + 0x40+0*4),
+                                        *(const uint32_t *)
+                                            ((const unsigned char *)dp + 0x40+1*4),
+                                        *(const uint32_t *)
+                                            ((const unsigned char *)dp + 0x40+2*4),
+                                        *(const uint32_t *)
+                                            ((const unsigned char *)dp + 0x40+3*4),
+                                        *(const uint32_t *)
+                                            ((const unsigned char *)dc + 0x38),
+                                        (unsigned long long)dc[1],
+                                        (unsigned long long)dc[2],
+                                        *(const uint32_t *)
+                                            ((const unsigned char *)dc + 0x40+0*4),
+                                        *(const uint32_t *)
+                                            ((const unsigned char *)dc + 0x40+1*4),
+                                        *(const uint32_t *)
+                                            ((const unsigned char *)dc + 0x40+2*4),
+                                        *(const uint32_t *)
+                                            ((const unsigned char *)dc + 0x40+3*4));
+                            }
+                            break;
+                        }
+                        (void)found_main_vma;
+                        mm_leave_direct_map(mdm);
+                    }
+                }
+            }
+        }
         if (owned) {
             if (frame_retain(child_pa) != 0) {
                 devel_printf("fork-cow: retain failed va=0x%llx pa=0x%llx "
@@ -1767,13 +2021,40 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
                 return -1;
             }
             retained = 1;
+        } else if (frame_retain(child_pa) == 0) {
+            /*
+             * Frame-backed page whose PTE lost PG_SOFT_OWNED (e.g. a second
+             * mapper replaced the flag): child must hold its own ref or the
+             * frame can be freed while this map is still live — a stale
+             * page cache / glibc locale page later reads as garbage TLS.
+             * frame_retain() == -1 for identity (VA==PA) pages: share bare,
+             * as before.  Claim SOFT_OWNED so the child's unmap releases the
+             * ref it now owns.
+             */
+            flags |= PG_SOFT_OWNED;
+            retained = 1;
         }
     } else {
+        static int frkp_left = 1000;
         uint64_t src_pa = parent_pa & PG_ADDR_MASK;
         int eager;
 
         if (src_pa >= (uint64_t)MMIO_IDENTITY_LIMIT)
             return -1;
+        if (frkp_left > 0 && frame_refcount(src_pa) >= 2u && va >= 0x10000000u) {
+            thread_t *ft = thread_current();
+            frkp_left--;
+            klogprintf_logonly("pc[FRKP] pid=%lu tid=%lu name=%s va=0x%llx "
+                    "ppa=0x%llx pte=0x%llx refs=%u owned=%d wr=%d c0=0x%x\n",
+                    (unsigned long)(ft ? (unsigned long)ft->linux_tgid : 0),
+                    (unsigned long)owner_tid,
+                    (ft && ft->name[0]) ? ft->name : "?",
+                    (unsigned long long)va,
+                    (unsigned long long)src_pa,
+                    (unsigned long long)parent_pte,
+                    frame_refcount(src_pa), owned, parent_wr,
+                    (unsigned)(*(volatile uint32_t *)(uintptr_t)src_pa));
+        }
         /*
          * Eager-copy only:
          *  - the live primary stack/TLS (parent must stay RW through iret)
@@ -1945,6 +2226,33 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
         snap_g = snap_cnt - mm_only;
         if (snap_cnt >= MV_SNAP_CAP || snap_g < 0 || snap_g > snap_cnt)
             snap_full = 1;
+    }
+
+    /* TEMP diagnostic: dump the exact snapshot the fork COW walk uses, once
+     * per PostgreSQL process, to expose kind/file of the DSA arena pages
+     * (0x112ed000 control + 0x112f4000.. data) and whether they are SHM. */
+    {
+        static int pg_vma_dumps = 0;
+        thread_t *ft = thread_current();
+        if (ft && ft->name[0] && strstr(ft->name, "postgres") &&
+            pg_vma_dumps < 40) {
+            pg_vma_dumps++;
+            klogprintf_logonly("pc[VMAS] pid=%lu tid=%lu name=%s cnt=%d g=%d\n",
+                    (unsigned long)ft->linux_tgid, (unsigned long)owner_tid,
+                    ft->name, snap_cnt, snap_g);
+            for (int i = 0; i < snap_cnt; i++) {
+                const user_vma_t *v = &snap[i];
+                if (!v->used)
+                    continue;
+                const char *nm = (v->file && v->file->path) ? v->file->path : "-";
+                klogprintf_logonly("pc[VMAS]   va=0x%llx end=0x%llx prot=%d "
+                        "kind=%d tid=%lu %s\n",
+                        (unsigned long long)v->addr,
+                        (unsigned long long)(v->addr + v->len),
+                        v->prot, v->kind, (unsigned long)v->tid,
+                        nm ? nm : "-");
+            }
+        }
     }
 
     /*
@@ -2571,6 +2879,33 @@ int mm_cow_fault_page(mm_t *mm, uint64_t va, mm_t *share_cmp_mm) {
             goto out;
         }
     }
+    uint64_t old_pa = old_pte & PG_ADDR_MASK;
+    int old_owned = (old_pte & PG_SOFT_OWNED) != 0;
+
+    /*
+     * MAP_SHARED anon identity (PostgreSQL's in-place dsa_area control inside
+     * main shm, VA==PA): a write must stay on the shared frame — Linux never
+     * copy-privatizes MAP_SHARED pages.  Re-establish the shared leaf as
+     * writable (same PA) here, even when it is RO without Soft_COW; the strict
+     * do_wp_page requirement below would otherwise reject it (rc=-2) and the
+     * caller's mm_wp_fault_writable() fallback would then
+     * mm_privatize_identity_range() — a private DSA control copy splits
+     * make_new_segment()'s segment_handles write from get_segment_by_index()'s
+     * read across postmaster children ("dsa_area could not attach to a segment
+     * that has been freed").
+     */
+    if (user_vma_is_shared_page_mm(mm, (uintptr_t)pg)) {
+        uint64_t nfl = (old_pte &
+            (PG_PRESENT | PG_US | PG_PWT | PG_PCD | PG_GLOBAL |
+             PG_SOFT_OWNED | PG_NX)) | PG_RW;
+        if (mm_map_user_page(mm, pg, old_pa, nfl) != 0) {
+            rc = -1;
+            goto out;
+        }
+        rc = 0;
+        goto out;
+    }
+
     /*
      * Linux do_wp_page: Soft_COW write-protect faults get a private copy.
      * Soft_OWNED is optional — fork also Soft_COW-marks identity leaves that
@@ -2582,8 +2917,6 @@ int mm_cow_fault_page(mm_t *mm, uint64_t va, mm_t *share_cmp_mm) {
         rc = -2;
         goto out;
     }
-    uint64_t old_pa = old_pte & PG_ADDR_MASK;
-    int old_owned = (old_pte & PG_SOFT_OWNED) != 0;
 
     /* Exclusive owned Soft_COW: reuse the frame (Linux reuse_swap_page path). */
     if (old_owned && frame_refcount(old_pa) == 1) {
@@ -2971,6 +3304,10 @@ static int mm_ensure_soft_owned_writable(mm_t *mm, mm_t *share_cmp_mm,
     mm_t *share = share_cmp_mm ? share_cmp_mm : mm_kernel();
     uint64_t existing = 0;
     if (mm_user_leaf_pa(mm, page, 0, &existing) == 0) {
+        if (user_vma_is_shared_page_mm(mm, (uintptr_t)page)) {
+            if (mm_cow_fault_page(mm, page, share) == 0)
+                return 0;
+        }
         if ((existing & ~0xFFFULL) == page) {
             if (mm_privatize_identity_range(mm, page, page + 0x1000ULL) != 0)
                 return -1;
@@ -3633,6 +3970,8 @@ void mm_dbg_ash_touch(const char *tag, mm_t *mm, uint64_t lo, uint64_t hi) {
  * the VA window and need RELA every run); a bounded page/byte budget; only
  * present user-owned 4K leaves qualify (identity leaves disqualify the file);
  * cache-hit map failures abort exec rather than mixing a partial image.
+ * Eviction never drops a snapshot whose frames a live mm still maps (idle =
+ * every retained frame at refcount 1), so clearing cannot UAF a reader.
  *==========================================================================*/
 #define EXEC_IMG_CACHE_MAX   8
 #define EXEC_IMG_MAX_PAGES   (16u * 1024u)          /* 64 MiB at 4K/page */
@@ -3722,19 +4061,43 @@ int exec_img_path_cached(const char *path) {
     return 0;
 }
 
-/* Exact-key slot, else first free slot, else lowest-generation slot. */
+/* True when no live mm still maps this snapshot: every retained template
+ * frame is at refcount 1 (only the cache's own retention ref).  A snapshot
+ * whose frames are still mapped RO Soft_COW by a running process must never
+ * be cleared — frame_release would hand the frames to the allocator while
+ * the reader keeps fetching them (use-after-free). */
+static int exec_img_entry_idle(const struct exec_img_entry *e) {
+    if (!e || e->n <= 0)
+        return 1;
+    for (int i = 0; i < e->n; i++) {
+        if (frame_refcount(e->pa[i]) != 1)
+            return 0;
+    }
+    return 1;
+}
+
+/* Exact-key slot, else first free slot, else lowest-generation IDLE slot.
+ * Returns NULL when nothing is safe to reuse: registration then skips the
+ * cache rather than dropping frames a live mm still maps. */
 static struct exec_img_entry *exec_img_evict_slot(uint64_t key) {
     struct exec_img_entry *lru = NULL;
+    struct exec_img_entry *freeslot = NULL;
     for (int i = 0; i < EXEC_IMG_CACHE_MAX; i++) {
         struct exec_img_entry *e = &g_exec_img[i];
-        if (!e->va)
-            return e;
-        if (e->key == key)
-            return e;
-        if (!lru || e->gen < lru->gen)
+        if (!e->va) {
+            if (!freeslot)
+                freeslot = e;
+            continue;
+        }
+        if (e->key == key) {
+            /* Re-registering the same image replaces the old snapshot; that
+             * must not drop frames a live mm still maps (see idle). */
+            return exec_img_entry_idle(e) ? e : NULL;
+        }
+        if (exec_img_entry_idle(e) && (!lru || e->gen < lru->gen))
             lru = e;
     }
-    return lru;
+    return freeslot ? freeslot : lru;
 }
 
 static void exec_img_clear(struct exec_img_entry *e) {

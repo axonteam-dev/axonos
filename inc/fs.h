@@ -48,6 +48,11 @@ struct fs_driver_ops {
 
     /* Optional cleanup for fs_file allocated by driver */
     void (*release)(struct fs_file *file);
+    /* Optional: report the file's current page-cache generation.  Handles for
+     * mutable inodes (ramfs/tmpfs) may have captured a stale backing_gen at
+     * open(); pagecache_get() consults this so a generation bump (write(2),
+     * ftruncate, unlink) never makes live MAP_SHARED frames unreachable. */
+    uint64_t (*current_generation)(struct fs_file *file);
     /* Optional chmod operation: set mode for path */
     int (*chmod)(const char *path, mode_t mode);
     /* Optional hard link: link(oldpath, newpath). Return 0 on success. */
@@ -97,6 +102,8 @@ struct fs_file *fs_open(const char *path);
 struct fs_file *fs_open_nofollow(const char *path);
 ssize_t fs_read(struct fs_file *file, void *buf, size_t size, size_t offset);
 ssize_t fs_write(struct fs_file *file, const void *buf, size_t size, size_t offset);
+/* Live page-cache generation for a handle; defaults to backing_gen. */
+uint64_t fs_current_generation(struct fs_file *file);
 void fs_file_free(struct fs_file *file);
 /* Bump refcount (mmap VMA / dup). Pair with fs_file_free. */
 void fs_file_get(struct fs_file *file);

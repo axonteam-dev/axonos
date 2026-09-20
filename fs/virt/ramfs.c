@@ -90,6 +90,15 @@ static struct fs_driver ramfs_driver;
 static struct fs_driver_ops ramfs_ops;
 static struct ramfs_node *ramfs_root = NULL;
 static uint32_t ramfs_next_inode = 10;
+static int ramfs_diag_left = 400;
+static int ramfs_diag_pg(const char *path, const char *name)
+{
+    if (name && strstr(name, "PostgreSQL."))
+        return 1;
+    if (path && strstr(path, "PostgreSQL."))
+        return 1;
+    return 0;
+}
 /* Serialize ramfs namespace operations (children lists, rename/remove/create).
    Git performs parallel file operations; without a global lock the singly-linked
    children lists can corrupt and make lookups/stat/rename hang. */
@@ -382,12 +391,42 @@ static void ramfs_file_set_backing(struct fs_file *f, struct ramfs_node *n)
     f->backing_gen = n->generation;
 }
 
+/*
+ * Live generation for page-cache lookups.  backing_gen is snapshotted at
+ * open(); after a write(2)/ftruncate bumps the inode generation the cache
+ * entries are re-stamped, and a stale-handle lookup would MISS and re-read
+ * the file (zeros for a posix_fallocate'd MAP_SHARED file) instead of the
+ * live frame.  Report the node's current generation so MAP_SHARED faults
+ * always resolve to the coherent cached frame.
+ */
+static uint64_t ramfs_current_generation(struct fs_file *file)
+{
+    if (!file || !file->driver_private)
+        return file ? file->backing_gen : 0;
+    struct ramfs_file_handle *fh = (struct ramfs_file_handle *)file->driver_private;
+    struct ramfs_node *n = fh->node;
+    if (!n)
+        return file->backing_gen;
+    unsigned long irqf;
+    unsigned long long g;
+    acquire_irqsave(&n->io_lock, &irqf);
+    g = (unsigned long long)n->generation;
+    release_irqrestore(&n->io_lock, irqf);
+    return (uint64_t)g;
+}
+
 static void ramfs_inode_changed(struct ramfs_node *n)
 {
     if (!n)
         return;
     n->generation++;
-    pagecache_invalidate(PAGECACHE_ID_RAMFS(n->ino));
+    if (ramfs_diag_left > 0 && ramfs_diag_pg(NULL, n->name)) {
+        ramfs_diag_left--;
+        klogprintf_logonly("pc[FSCHG] ino=%lu name=%s gen=%llu\n",
+                (unsigned long)n->ino, n->name ? n->name : "?",
+                (unsigned long long)n->generation);
+    }
+    pagecache_invalidate(PAGECACHE_ID_RAMFS(n->ino), n->generation);
 }
 
 static void ramfs_free_data_owned(struct ramfs_node *n) {
@@ -423,11 +462,18 @@ static void ramfs_maybe_free_inode(struct ramfs_node *n) {
         return;
     if (n->parent)
         ramfs_unlink_from_parent(n);
+    if (ramfs_diag_left > 0 && ramfs_diag_pg(NULL, n->name)) {
+        ramfs_diag_left--;
+        klogprintf_logonly("uvm[FREE] pid=%lu ino=%lu name=%s gen=%llu nlink=%d open=%d\n",
+                thread_current() ? (unsigned long)thread_current()->linux_tgid : 0UL,
+                (unsigned long)n->ino, n->name ? n->name : "?",
+                (unsigned long long)n->generation, (int)n->nlink, (int)n->open_count);
+    }
     if (n->name) {
         kfree(n->name);
         n->name = NULL;
     }
-    pagecache_invalidate(PAGECACHE_ID_RAMFS(n->ino));
+    pagecache_invalidate(PAGECACHE_ID_RAMFS(n->ino), 0);
     ramfs_free_data_owned(n);
     ramfs_free_xattrs(n);
     kfree(n);
@@ -882,6 +928,13 @@ static int ramfs_open(const char *path, struct fs_file **out_file) {
     n->open_count++;
     f->driver_private = fh;
     ramfs_file_set_backing(f, n);
+    if (ramfs_diag_left > 0 && ramfs_diag_pg(path, n->name)) {
+        ramfs_diag_left--;
+        klogprintf_logonly("uvm[OPEN] pid=%lu ino=%lu size=%llu gen=%llu path=%s\n",
+                thread_current() ? (unsigned long)thread_current()->linux_tgid : 0UL,
+                (unsigned long)n->ino, (unsigned long long)n->size,
+                (unsigned long long)n->generation, path);
+    }
     if (out_file) *out_file = f;
     return 0;
 }
@@ -1068,11 +1121,16 @@ int ramfs_ftruncate(struct fs_file *file, off_t length) {
     if (ct && ct->euid != 0 && (unsigned)ct->euid != n->uid) return -22;
     size_t newsize = (size_t)length;
     if ((off_t)newsize != length) return -22; /* overflow */
-    /*
-     * Same as ramfs_write: do not cli across kmalloc/memset. posix_fallocate of
-     * a PostgreSQL DSM used to freeze the machine (IF=0 + memset of tens of MiB)
-     * and parked the payload in the user mmap identity window.
-     */
+
+    if (ramfs_diag_left > 0 && ramfs_diag_pg(file->path, n->name)) {
+        ramfs_diag_left--;
+        klogprintf_logonly("uvm[TRUNC] pid=%lu ino=%lu old=%llu new=%llu gen=%llu path=%s\n",
+                thread_current() ? (unsigned long)thread_current()->linux_tgid : 0UL,
+                (unsigned long)n->ino, (unsigned long long)n->size,
+                (unsigned long long)newsize, (unsigned long long)n->generation,
+                file->path ? file->path : "?");
+    }
+
     acquire(&n->io_lock);
     if (newsize == n->size) {
         release(&n->io_lock);
@@ -1405,7 +1463,7 @@ int ramfs_remove(const char *path) {
         }
         if (cur->name) kfree(cur->name);
         if (!cur->is_dir && !cur->link_target)
-            pagecache_invalidate(PAGECACHE_ID_RAMFS(cur->ino));
+            pagecache_invalidate(PAGECACHE_ID_RAMFS(cur->ino), 0);
         ramfs_free_data_owned(cur);
         ramfs_free_xattrs(cur);
         kfree(cur);
@@ -1710,6 +1768,7 @@ int ramfs_register(void) {
     ramfs_ops.rename = ramfs_rename;
     ramfs_ops.unlink = ramfs_remove;
     ramfs_ops.release = ramfs_release;
+    ramfs_ops.current_generation = ramfs_current_generation;
 
     return fs_register_driver(&ramfs_driver) == 0
         ? fs_mount("/", &ramfs_driver)

@@ -1444,6 +1444,8 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
     uint64_t brk_end = 0;
     uint64_t loaded_lo = UINT64_MAX;
     uint64_t loaded_hi = 0;
+    uint64_t loaded_map_hi = 0;
+    uint64_t identity_widest_hi = 0;
     /*
      * Linux page-cache fast path: a static ELF whose pristine image is already
      * registered maps read-only Soft_COW over the cached frames instead of
@@ -1455,7 +1457,12 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
      */
     int image_from_cache = 0;
     const exec_img_entry_t *cached_e = NULL;
-    if (!has_interp && fsz) {
+    /* load_base_override != 0 means this is the PT_INTERP interpreter load
+     * (kernel_execve_into_mm passes interp_base only for the interpreter).
+     * The loader must never be served from the image cache: it performs its
+     * own per-run relocation and runtime bootstrap and would read stale
+     * shared frames otherwise. */
+    if (!has_interp && fsz && load_base_override == 0) {
         uint64_t ilo = UINT64_MAX, ihi = 0;
         for (int ci = 0; ci < (int)eh.e_phnum; ci++) {
             Elf64_Phdr *cph = &phdrs[ci];
@@ -1608,20 +1615,13 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
                         return -1;
                     }
                 }
+                if (hi2 > identity_widest_hi) identity_widest_hi = hi2;
                 (void)mark_user_identity_range_2m(map_lo, map_hi);
             }
         }
         if (ph->p_filesz > 0 && !image_from_cache) {
             thread_t *tc = elf_bprm_thread();
             if (tc && elf_needs_private_user_pages(tc) && tc->mm) {
-                /*
-                 * Stream PT_LOAD into private pages. A single kmalloc(p_filesz)
-                 * for static Go binaries (docker-containerd ~7MiB, dockerd ~30MiB)
-                 * OOMs the kernel heap after the parent has already run — exec
-                 * then returns -1 which syscall maps to ENOENT ("no such file").
-                 * Linux load_elf reads into the destination VMA; we chunk via a
-                 * small bounce buffer into leaf PAs.
-                 */
                 const size_t chunk_cap = 256u * 1024u;
                 void *kbuf = kmalloc(chunk_cap);
                 if (!kbuf) {
@@ -1690,9 +1690,43 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
             }
         }
         if (vstart < loaded_lo) loaded_lo = vstart;
-        if (vend > loaded_hi) loaded_hi = vend;
+        if (vend > loaded_hi) {
+            loaded_hi = vend;
+            loaded_map_hi = (vend + 0xFFFULL) & ~0xFFFULL;
+        }
         /* Linux: brk follows real ELF mem end, not a 2MiB-rounded window. */
         if (vend > brk_end) brk_end = vend;
+    }
+
+    /*
+     * Zero the mapped-but-unwritten tail beyond the last PT_LOAD, in both
+     * the private-mm and the identity path.  Linux backs everything outside
+     * p_filesz/p_memsz with fresh anon pages that read as zeros; our private
+     * frames (mm_make_private_range_nozero) and identity 2MiB windows instead
+     * hold stale RAM.  ld.so places its bootstrap heap / first link_map right
+     * past BSS end (end of RW memsz), so l_info slots for absent DT tags such
+     * as DT_FLAGS_1 must read NULL there — initdb crashes when they hold a
+     * leftover string ("libppop..." / "shadow-n...") deref'd as a pointer:
+     * user-#GP @ ld.so+0x30c3 (insn `mov rax,[rax+8]`).
+     */
+    if (loaded_hi > 0 && loaded_map_hi > loaded_hi &&
+        loaded_map_hi < (uint64_t)MMIO_IDENTITY_LIMIT) {
+        thread_t *tc = elf_bprm_thread();
+        if (tc && elf_needs_private_user_pages(tc) && tc->mm) {
+            if (elf_zero_into_mm(tc->mm, loaded_hi,
+                                 (size_t)(loaded_map_hi - loaded_hi)) != 0) {
+                kfree(phdrs);
+                fs_file_free(f);
+                return -1;
+            }
+        } else {
+            memset((void *)(uintptr_t)loaded_hi, 0,
+                   (size_t)(loaded_map_hi - loaded_hi));
+        }
+    }
+    if (!image_from_cache && identity_widest_hi > loaded_hi) {
+        memset((void *)(uintptr_t)loaded_hi, 0,
+               (size_t)(identity_widest_hi - loaded_hi));
     }
 
     /* Pass 2: mark user-accessible after all segments are copied (avoid RO before memset). */
@@ -1793,7 +1827,7 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
         thread_t *tc = elf_bprm_thread();
         if (tc && elf_needs_private_user_pages(tc) && tc->mm &&
             loaded_lo != UINT64_MAX && loaded_lo < loaded_hi &&
-            !has_interp && fsz) {
+            !has_interp && fsz && load_base_override == 0) {
             uint64_t clo = loaded_lo & ~0xFFFULL;
             uint64_t chi = (loaded_hi + 0xFFFULL) & ~0xFFFULL;
             if (exec_img_register(path, (uint64_t)fsz, tc->mm, clo, chi))
@@ -2267,12 +2301,6 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
                 curpath ? curpath : "?");
     }
 
-    /*
-     * Linux open_exec before exec_mmap: fail missing paths (binary + PT_INTERP)
-     * while oldmm can still be restored. Then mmput(old) before load_elf —
-     * holding Soft_COW dockerd image through a multi-MiB PT_LOAD OOMed frames
-     * and surfaced as ENOENT from fork/exec of docker-containerd.
-     */
     if (!exec_img_path_cached(curpath) && elf_probe_exec_open(curpath) != 0)
         return -1;
     {

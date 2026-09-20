@@ -270,7 +270,7 @@ static void vbefb_emit_tty_char(uint16_t ch) {
 }
 
 void vbefb_putchar(uint16_t ch, uint8_t attr) {
-	if (!vbe_is_available()) { return; }
+	if (!vbe_is_available() || !textbuf || cols == 0 || rows == 0) { return; }
 	/* Honor caller-selected color when printing raw chars (devfs/tty path). */
 	if (!esc_mode && ch != 0x1B) current_attr = attr;
 	/* CSI: ESC [ ... final (@ to ~). Was SGR-only; other finals were swallowed and broke the console. */
@@ -373,7 +373,7 @@ void vbefb_putchar(uint16_t ch, uint8_t attr) {
 }
 
 void vbefb_putchar_literal(uint16_t ch, uint8_t attr) {
-	if (!vbe_is_available()) return;
+	if (!vbe_is_available() || !textbuf || cols == 0 || rows == 0) return;
 	esc_mode = 0;
 	esc_len = 0;
 	current_attr = attr;

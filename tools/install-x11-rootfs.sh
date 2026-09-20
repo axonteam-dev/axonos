@@ -30,7 +30,7 @@ SEEDS=(
     libfontconfig1
     libxft2
     libudev1
-    libmtdev1
+    libmtdev1t64
     libevdev2
     xauth
     openbox
@@ -73,11 +73,13 @@ skip_copy_pfx = (
 )
 
 def query_s(pkg):
-    try:
-        return subprocess.check_output(["dpkg-query", "-s", pkg], text=True,
-                                       stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
-        return None
+    for q in (pkg, pkg + ":amd64"):
+        try:
+            return subprocess.check_output(["dpkg-query", "-s", q], text=True,
+                                           stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            continue
+    return None
 
 def depends(st):
     names = []
@@ -114,10 +116,15 @@ print("MISSING", " ".join(missing), flush=True)
 skip_copy_exact = {"/.", "/"}
 
 def copy_pkg(pkg):
-    try:
-        files = subprocess.check_output(["dpkg-query", "-L", pkg], text=True,
-                                        stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
+    files = None
+    for q in (pkg, pkg + ":amd64"):
+        try:
+            files = subprocess.check_output(["dpkg-query", "-L", q], text=True,
+                                            stderr=subprocess.DEVNULL)
+            break
+        except subprocess.CalledProcessError:
+            continue
+    if files is None:
         return 0
     n = 0
     for line in files.splitlines():
@@ -194,15 +201,27 @@ print(f"MISSING_FILE {missing_path}", flush=True)
 PY
 
 MISSING_FILE="$DEST/var/tmp/x11-missing-pkgs.txt"
-if [[ -s "$MISSING_FILE" ]]; then
+
+# Download closure: downloaded packages bring their own Depends which the
+# host dpkg-query cannot see (they were never installed).  Keep downloading
+# the newly-discovered dependencies until the set stops growing (fixpoint),
+# so runtime libs like libxcb1 do not silently stay out of the overlay.
+seen=""
+shopt -s nullglob
+for _iter in 1 2 3 4 5 6 7 8 9; do
+    [[ -s "$MISSING_FILE" ]] || break
     log "downloading missing packages"
-    # shellcheck disable=SC2024
+    # shellcheck disable=SC2024,SC2046
     ( cd "$ARCHIVES" && apt-get download $(tr '\n' ' ' < "$MISSING_FILE") )
-    shopt -s nullglob
+    new_missing=""
     for deb in "$ARCHIVES"/*.deb; do
+        pkg="$(dpkg-deb -f "$deb" Package)"
+        if [[ " $seen " == *" $pkg "* ]]; then
+            continue
+        fi
+        seen="$seen $pkg"
         log "unpack $(basename "$deb")"
         dpkg-deb -x "$deb" "$DEST"
-        pkg="$(dpkg-deb -f "$deb" Package)"
         {
             echo "Package: $pkg"
             echo "Status: install ok installed"
@@ -212,8 +231,36 @@ if [[ -s "$MISSING_FILE" ]]; then
             echo "Depends: $(dpkg-deb -f "$deb" Depends || true)"
             echo
         } >> "$DEST/var/lib/dpkg/status"
+        # Walk this package's Depends for the next iteration.  deb-format
+        # folds long fields onto whitespace-indented continuation lines, so
+        # join them first, then drop alternatives/version constraints and
+        # reject version-like or virtual ABI tokens (e.g. xorg-input-abi-24).
+        # shellcheck disable=SC2016
+        deps_txt="$(dpkg-deb -f "$deb" Depends 2>/dev/null)"
+        deps_txt="$(printf '%s\n' "$deps_txt" | awk 'NR==1{sub(/^Depends:[[:space:]]*/,"")} /^[[:space:]]+[^[:space:]]/{sub(/^[[:space:]]+/," ")} {printf "%s", $0} END{print ""}')"
+        for part in $(printf '%s' "$deps_txt" | tr ',' '\n'); do
+            d="$(printf '%s' "$part" | sed -E 's/[|].*//; s/[[:space:]]*\([^)]*\)[[:space:]]*//g; s/^[[:space:]]*//' | grep -oE '^[a-zA-Z][a-zA-Z0-9.+-]*' || true)"
+            [[ -z "$d" ]] && continue
+            [[ "$d" == xorg-*-abi-* ]] && continue
+            # Virtual/absent providers (gsettings-backend, mime-support, ...)
+            # have no version table in apt-cache policy; apt-get download
+            # would fail on them, so never let them into the download list.
+            if ! apt-cache policy "$d" 2>/dev/null | grep -qE '^[[:space:]]+([0-9]|\*)'; then
+                continue
+            fi
+            [[ " $seen " == *" $d "* ]] && continue
+            if grep -q "^Package: $d\$" "$DEST/var/lib/dpkg/status" 2>/dev/null; then
+                continue
+            fi
+            new_missing="$new_missing $d"
+        done
     done
-fi
+    if [[ -z "${new_missing// }" ]]; then
+        : > "$MISSING_FILE"
+    else
+        printf '%s\n' $new_missing | sort -u > "$MISSING_FILE"
+    fi
+done
 
 # xorg.conf: fbdev + evdev only. AutoAdd* off so libinput/udev/modesetting stay out.
 mkdir -p "$DEST/etc/X11"

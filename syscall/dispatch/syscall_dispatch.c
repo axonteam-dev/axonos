@@ -9707,6 +9707,11 @@ static uint64_t do_linux_fork(thread_t *cur,
                     fork_stop_child(child);
                     return ret_err(ENOMEM);
                 }
+                klogprintf_logonly("pc[FORK] parent_pid=%lu parent_name=%s "
+                        "child_tid=%d\n",
+                        (unsigned long)cur->linux_tgid,
+                        (cur->name[0]) ? cur->name : "?",
+                        (int)child->tid);
 
                 child->user_fs_base = cur->user_fs_base;
                 child->user_brk_base = cur->user_brk_base;
@@ -19220,10 +19225,6 @@ xorg_trace_done:;
                     has_net_socket = 1;
             }
             if (timeout == 0) {
-                /* Non-blocking poll: must return immediately (POSIX). Sleeping
-                 * here made ncurses/htop feel laggy — every idle poll cost 10ms.
-                 * Linux still copies revents (including zeros). doomgeneric_linuxvt
-                 * checkKeys() loops on stale POLLIN if we skip the copy. */
                 if (has_net_socket)
                     net_pump_all_tcp(poll_thr);
                 fbdev_sync_user_frontbuffer();

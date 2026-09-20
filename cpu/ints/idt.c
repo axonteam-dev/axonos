@@ -25,6 +25,7 @@
 #include <keyboard.h>
 #include <serial.h>
 #include <string.h>
+#include <boot_brk.h>
 // Avoid including <cstdint> because cross-toolchain headers may not provide it; use uint64_t instead
 
 // Forward declare C-linkage helpers from other compilation units
@@ -57,19 +58,39 @@ static inline void read_crs(uint64_t* cr0, uint64_t* cr2, uint64_t* cr3, uint64_
         if (cr0) *cr0 = t0; if (cr2) *cr2 = t2; if (cr3) *cr3 = t3; if (cr4) *cr4 = t4;
 }
 
+/* Raw VGA-text trace written straight to 0xB8000. This bypasses the framebuffer
+ * console entirely, so a fault in the fbcon path cannot hide the fault itself.
+ * Visible as long as the legacy VGA plane is still enabled. */
+static void vga_raw_line(const char *s)
+{
+        static unsigned row = 20;
+        volatile uint16_t *vga = (volatile uint16_t *)0xB8000u;
+        if (row > 24) row = 24;
+        unsigned col = 0;
+        for (; s[col] && col < 80; col++)
+                vga[row * 80u + col] = (uint16_t)(0x4F00u | (uint8_t)s[col]);
+        for (; col < 80; col++)
+                vga[row * 80u + col] = (uint16_t)0x4F20u;
+        row++;
+}
+
+static void vga_raw_hex(const char *tag, uint64_t v)
+{
+        static const char hx[] = "0123456789abcdef";
+        char buf[48];
+        unsigned i = 0;
+        for (const char *p = tag; *p && i < 20; p++) buf[i++] = *p;
+        buf[i++] = '0'; buf[i++] = 'x';
+        for (int sh = 60; sh >= 0; sh -= 4) buf[i++] = hx[(v >> sh) & 0xFu];
+        buf[i] = '\0';
+        vga_raw_line(buf);
+}
+
 static void dump(const char* what, const char* who, cpu_registers_t* regs, uint64_t cr2, uint64_t err, bool user_mode){
         void (*logfn)(const char *fmt, ...) = user_mode ? klogprintf_logonly : klogprintf;
-        logfn("Oops! %s in %s at RIP=0x%llx err=0x%llx\n", what, who, (unsigned long long)regs->rip, (unsigned long long)regs->error_code);
-        logfn("RIP: 0x%llx\n", (unsigned long long)regs->rip);
-        logfn("RSP: 0x%llx\n", (unsigned long long)regs->rsp);
-        logfn("RBP: 0x%llx\n", (unsigned long long)regs->rbp);
-        logfn("RDI: 0x%llx\n", (unsigned long long)regs->rdi);
-        logfn("RSI: 0x%llx\n", (unsigned long long)regs->rsi);
-        logfn("RDX: 0x%llx\n", (unsigned long long)regs->rdx);
-        logfn("RCX: 0x%llx\n", (unsigned long long)regs->rcx);
 
-        /* Mirror the most important fault info to serial (qemu -serial stdio),
-           otherwise user-mode faults printed to VGA are not visible in terminal logs. */
+        /* Serial first: the console may itself fault (e.g. broken fbcon), which
+           would otherwise prevent any diagnostic from being emitted. */
         qemu_debug_printf("Oops! %s in %s RIP=0x%llx err=0x%llx user=%d cr2=0x%llx\n",
                           what, who,
                           (unsigned long long)regs->rip,
@@ -84,6 +105,15 @@ static void dump(const char* what, const char* who, cpu_registers_t* regs, uint6
                           (unsigned long long)regs->rdx,
                           (unsigned long long)regs->rcx,
                           (unsigned long long)regs->rax);
+
+        logfn("Oops! %s in %s at RIP=0x%llx err=0x%llx\n", what, who, (unsigned long long)regs->rip, (unsigned long long)regs->error_code);
+        logfn("RIP: 0x%llx\n", (unsigned long long)regs->rip);
+        logfn("RSP: 0x%llx\n", (unsigned long long)regs->rsp);
+        logfn("RBP: 0x%llx\n", (unsigned long long)regs->rbp);
+        logfn("RDI: 0x%llx\n", (unsigned long long)regs->rdi);
+        logfn("RSI: 0x%llx\n", (unsigned long long)regs->rsi);
+        logfn("RDX: 0x%llx\n", (unsigned long long)regs->rdx);
+        logfn("RCX: 0x%llx\n", (unsigned long long)regs->rcx);
 }
 
 static inline uint64_t rdmsr_u64(uint32_t msr) {
@@ -481,10 +511,31 @@ static int fault_try_fix_ldso_kernel_phdr(cpu_registers_t *regs, uint64_t cr2) {
         return 1;
 }
 
+static void pfdbg(const char *tag, uint64_t cr2, uint64_t err) {
+         static int pfdbg_left = 200;
+         if (pfdbg_left <= 0)
+                 return;
+         if (cr2 < 0x10000000ULL || cr2 >= 0x12000000ULL)
+                 return;
+         pfdbg_left--;
+         thread_t *pt = thread_current();
+         klogprintf_logonly("pfdbg[%s] cr2=0x%llx err=0x%llx tid=%lu name=%s\n",
+                 tag, (unsigned long long)cr2, (unsigned long long)err,
+                 (unsigned long)thread_current()->linux_tgid,
+                 (pt && pt->name[0]) ? pt->name : "?");
+}
+
 static void page_fault_handler(cpu_registers_t* regs) {
-        uint64_t cr2;
-        asm volatile("mov %%cr2, %0" : "=r"(cr2));
-        int user = (regs->cs & 3) == 3;
+         uint64_t cr2;
+         asm volatile("mov %%cr2, %0" : "=r"(cr2));
+         int user = (regs->cs & 3) == 3;
+         boot_brk_fault(user ? 0xE2 : 0xE1);
+         if (user) pfdbg("enter", cr2, regs->error_code);
+         if (!user) {
+                vga_raw_hex("KPF cr2=", cr2);
+                vga_raw_hex("KPF rip=", regs->rip);
+                vga_raw_hex("KPF err=", regs->error_code);
+        }
         if (user) {
                 extern thread_t *thread_current(void);
                 extern thread_t *thread_get_current_user(void);
@@ -602,11 +653,22 @@ static void page_fault_handler(cpu_registers_t* regs) {
                                         brk_wr = 1;
                                 /* MAP_SHARED file: leftover identity is not the
                                  * page-cache frame. Install it instead of skipping
-                                 * do_wp_page and livelocking postgres --boot. */
-                                if (user_vma_is_shared_page(tid, (uintptr_t)cr2) &&
-                                    fault_try_mmap_lazy_anon(cr2))
-                                        return;
+                                 * do_wp_page and livelocking postgres --boot.
+                                 * mm-scoped SHM is authoritative for children: a
+                                 * postmaster child inherits main-shm as an mm-only
+                                 * VMA entry, so g_user_vmas[tid] alone misses it. */
+                                {
+                                        int shm_hit =
+                                                user_vma_is_shared_page(tid, (uintptr_t)cr2) ||
+                                                (ut->mm &&
+                                                 user_vma_is_shared_page_mm(ut->mm, (uintptr_t)cr2));
+                                        if (shm_hit && fault_try_mmap_lazy_anon(cr2))
+                                                return;
+                                }
+                                pfdbg("cow-wp", cr2, regs->error_code);
                                 if (!user_vma_is_shared_page(tid, (uintptr_t)cr2) &&
+                                    !(ut->mm &&
+                                      user_vma_is_shared_page_mm(ut->mm, (uintptr_t)cr2)) &&
                                     (brk_wr || user_vma_allows_write(ut, (uintptr_t)cr2)) &&
                                     mm_wp_fault_writable(ut->mm, cr2, share) == 0)
                                         return;
@@ -616,8 +678,10 @@ static void page_fault_handler(cpu_registers_t* regs) {
         /* Demand-fill only for !present (after do_wp_page above). */
         if (user && (regs->error_code & 1u) == 0u && fault_try_mmap_lazy_anon(cr2))
                 return;
+        pfdbg("demand", cr2, regs->error_code);
         if (user && fault_try_user_vma_nonpresent(cr2, regs->error_code))
                 return;
+        pfdbg("fallback", cr2, regs->error_code);
         if (user && fault_try_grow_user_heap(cr2)) return;
         if (user && cr2 >= 0x10000ULL && cr2 < 0x200000ULL) {
                 if (map_page_2m(0, 0, PG_PRESENT | PG_RW | PG_US) == 0)
@@ -909,6 +973,11 @@ pte_dump_done:
 }
 
 static void gp_fault_handler(cpu_registers_t* regs){
+    boot_brk_fault((regs->cs & 3) == 3 ? 0xE4 : 0xE3);
+    if ((regs->cs & 3) != 3) {
+        vga_raw_hex("KGP rip=", regs->rip);
+        vga_raw_hex("KGP err=", regs->error_code);
+    }
     if ((regs->cs & 3) == 3) {
         // ash GPF @ 0x801738 ("ls"): dump leaf state for the watch VA.
         if (regs->rip >= MM_ASH_WATCH_LO && regs->rip < MM_ASH_WATCH_HI) {
@@ -923,7 +992,7 @@ static void gp_fault_handler(cpu_registers_t* regs){
             thread_t *gt = thread_current();
             if (!gt || gt->ring != 3)
                 gt = thread_get_current_user();
-            klogprintf_logonly("user-gpf-fatal: tid=%llu name=%s rip=0x%llx err=0x%llx rsp=0x%llx fs=0x%llx rax=0x%llx rbx=0x%llx\n",
+            klogprintf_logonly("user-gpf-fatal: tid=%llu name=%s rip=0x%llx err=0x%llx rsp=0x%llx fs=0x%llx rax=0x%llx rbx=0x%llx rdx=0x%llx rcx=0x%llx r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx\n",
                     (unsigned long long)(gt && gt->tid ? gt->tid : 0),
                     (gt && gt->name[0]) ? gt->name : "?",
                     (unsigned long long)regs->rip,
@@ -931,7 +1000,13 @@ static void gp_fault_handler(cpu_registers_t* regs){
                     (unsigned long long)regs->rsp,
                     (unsigned long long)(gt ? gt->user_fs_base : 0),
                     (unsigned long long)regs->rax,
-                    (unsigned long long)regs->rbx);
+                    (unsigned long long)regs->rbx,
+                    (unsigned long long)regs->rdx,
+                    (unsigned long long)regs->rcx,
+                    (unsigned long long)regs->r12,
+                    (unsigned long long)regs->r13,
+                    (unsigned long long)regs->r14,
+                    (unsigned long long)regs->r15);
             if (gt && gt->mm && gt->mm != mm_kernel() &&
                 regs->rip >= 0x200000ULL && regs->rip + 16ULL < (uint64_t)MMIO_IDENTITY_LIMIT) {
                 uint8_t insn[16];
@@ -951,6 +1026,97 @@ static void gp_fault_handler(cpu_registers_t* regs){
                 if (mm_copy_from_user(gt->mm, &ra, regs->rsp, sizeof(ra)) == 0)
                     klogprintf_logonly("user-gpf-ret: [rsp]=0x%llx\n",
                             (unsigned long long)ra);
+                /* Walk the frame-pointer chain so the call site of the garbage
+                 * deref is identifiable in initdb/ld.so from the next run. */
+                {
+                    uint64_t fp = regs->rbp;
+                    for (int f = 0; f < 14; f++) {
+                        if (fp < 0x200000ULL ||
+                            fp + 16ULL >= (uint64_t)MMIO_IDENTITY_LIMIT)
+                            break;
+                        uint64_t saved_fp = 0, saved_rip = 0;
+                        if (mm_copy_from_user(gt->mm, &saved_fp, fp, sizeof(saved_fp)) != 0)
+                            break;
+                        if (mm_copy_from_user(gt->mm, &saved_rip, fp + 8, sizeof(saved_rip)) != 0)
+                            break;
+                        klogprintf_logonly("user-gpf-bt[%d]: rbp=0x%llx ret=0x%llx\n",
+                                f, (unsigned long long)fp,
+                                (unsigned long long)saved_rip);
+                        if (saved_fp == 0 || saved_fp <= fp)
+                            break;
+                        fp = saved_fp;
+                    }
+                }
+                /* Show the process memory layout so rip/r15/ret addresses can be
+                 * attributed to initdb vs ld.so vs a shared library. */
+                if (gt && gt->tid)
+                    user_vma_dump_for_tid(gt->tid, regs->rip);
+                /* A #GP data access (e.g. add %rax,0x8(%rdx) after a slot was
+                 * loaded from the ld.so l_info table) reports no CR2.  r13 is
+                 * the struct base; dump l_addr and the l_info slots so a
+                 * garbage entry is visible with its neighbours. */
+                {
+                    uint64_t tgt = regs->r13 + 0x58ULL;
+                    uint64_t leaf = 0;
+                    int mapped = (tgt < (uint64_t)MMIO_IDENTITY_LIMIT &&
+                                  mm_va_leaf_pa(gt->mm, tgt, &leaf) == 0);
+                    klogprintf_logonly("user-gpf-target: tgt=0x%llx mapped=%d leaf=0x%llx\n",
+                            (unsigned long long)tgt, mapped,
+                            (unsigned long long)((leaf & PG_ADDR_MASK)));
+                    if (mapped && regs->r13 < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                        for (int q = 0; q < 0x18; q += 2) {
+                            uint64_t v0 = 0, v1 = 0;
+                            int ok0 = mm_copy_from_user(gt->mm, &v0,
+                                    (uint64_t)(regs->r13 + (uint64_t)q * 8ULL),
+                                    8) == 0;
+                            int ok1 = mm_copy_from_user(gt->mm, &v1,
+                                    (uint64_t)(regs->r13 + (uint64_t)(q + 1) * 8ULL),
+                                    8) == 0;
+                            if (!ok0 || !ok1) {
+                                klogprintf_logonly("user-gpf-linfo[0x%x]: U\n", q * 8);
+                                continue;
+                            }
+                            klogprintf_logonly("user-gpf-linfo[0x%x]: 0x%llx  [0x%x]: 0x%llx\n",
+                                    q * 8, (unsigned long long)v0,
+                                    (q + 1) * 8, (unsigned long long)v1);
+                        }
+                    }
+                }
+                /* initdb/ld.so: the link_map base is in r15 (interp_base + RW
+                 * memsz end, e.g. 0x2027170 for ld.so @ 0x2000000).  Dump the
+                 * map region so a stale identity-backed (non-zeroed) l_info slot
+                 * vs a correctly written one is visible directly. */
+                {
+                    uint64_t base = regs->r15;
+                    if (base >= 0x200000ULL &&
+                        base + 0x300ULL < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                        uint64_t sleaf = 0;
+                        int bmapped = mm_va_leaf_pa(gt->mm, base, &sleaf) == 0;
+                        klogprintf_logonly("user-gpf-r15map: base=0x%llx mapped=%d leaf=0x%llx\n",
+                                (unsigned long long)base, bmapped,
+                                (unsigned long long)(bmapped ? (sleaf & PG_ADDR_MASK) : 0));
+                        for (int q = 0; q < 6; q++) {
+                            uint64_t v[8];
+                            int any = 0;
+                            for (int j = 0; j < 8; j++) {
+                                v[j] = 0;
+                                if (mm_copy_from_user(gt->mm, &v[j],
+                                        base + (uint64_t)(q * 8 + j) * 8ULL, 8) == 0)
+                                    any = 1;
+                            }
+                            if (!any) {
+                                klogprintf_logonly("user-gpf-r15[+0x%02x]: U\n", q * 64);
+                                continue;
+                            }
+                            klogprintf_logonly("user-gpf-r15[+0x%02x]: %016llx %016llx %016llx %016llx  %016llx %016llx %016llx %016llx\n",
+                                    q * 64,
+                                    (unsigned long long)v[0], (unsigned long long)v[1],
+                                    (unsigned long long)v[2], (unsigned long long)v[3],
+                                    (unsigned long long)v[4], (unsigned long long)v[5],
+                                    (unsigned long long)v[6], (unsigned long long)v[7]);
+                        }
+                    }
+                }
             }
         }
         syscall_user_fatal_exit(11); /* SIGSEGV */
@@ -968,6 +1134,9 @@ static void apic_ipi_resched_handler(cpu_registers_t *regs) {
 
 static void df_fault_handler(cpu_registers_t* regs){
         // Double Fault (#DF) — используем отдельный IST стек, чтобы избежать triple fault
+        boot_brk_fault(0xE5);
+        vga_raw_line("DOUBLE FAULT");
+        vga_raw_hex("KDF rip=", regs->rip);
         klogprintf("DOUBLE FAULT\n");
         dump("double fault", "kernel", regs, 0, regs->error_code, false);
         // Застываем в безопасной петле с включёнными прерываниями
@@ -996,6 +1165,8 @@ void isr_dispatch(cpu_registers_t* regs) {
                 isr_handlers[vec](regs);
         } else if (vec < 32) {
                 // Exceptions 0..31 without specific handler: print and halt
+                vga_raw_hex("EXC vec=", vec);
+                vga_raw_hex("EXC rip=", regs->rip);
                 for (;;);
         } else {
                 // Unknown vector

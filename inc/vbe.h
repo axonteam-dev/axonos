@@ -9,6 +9,8 @@
 int vbe_init_from_multiboot(uint32_t multiboot_magic, uint64_t multiboot_info);
 int vbe_is_available(void);
 int vbe_attach_framebuffer(void *frontbuf, uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp);
+/* Undo vbe_attach_framebuffer (e.g. when the text console fails to come up). */
+void vbe_detach_framebuffer(void);
 
 /* Simple framebuffer console primitives used by kprintf delegation */
 void vbefb_putchar(uint16_t ch, uint8_t attr);
@@ -38,6 +40,9 @@ int vbefb_init(uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp);
 uint32_t vbe_pack_pixel(uint8_t r, uint8_t g, uint8_t b);
 /* Hardware framebuffer access. */
 void *vbe_get_frontbuffer(void);
+uint64_t vbe_get_frontbuffer_pa(void);
+/* Redirect the console front buffer to a new scanout surface (driver take-over). */
+void vbe_adopt_frontbuffer(void *kva);
 /* Scroll framebuffer up by given pixel rows (fast memmove). */
 void vbe_scroll_up_pixels(uint32_t pixels);
 /* Scroll one vertical pixel band and clear its newly exposed bottom rows. */

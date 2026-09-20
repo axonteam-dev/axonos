@@ -19,6 +19,24 @@
 static user_vma_t g_user_vmas[USER_VMA_MAX];
 static spinlock_t g_user_vma_lock;
 
+static int g_uv_trace;
+#define UV_TRACE_MAX 260
+static void uv_trace_one(const char *tag, unsigned long pid, uint64_t va,
+                         uint64_t kind, uint64_t extra1, uint64_t extra2)
+{
+    if (g_uv_trace < UV_TRACE_MAX)
+        klogprintf_logonly("uv[%s] pid=%lu va=0x%llx kind=0x%llx a=0x%llx b=0x%llx\n",
+                tag, pid, (unsigned long long)va, (unsigned long long)kind,
+                (unsigned long long)extra1, (unsigned long long)extra2);
+    g_uv_trace++;
+}
+
+static int uv_is_pg_file(const user_vma_t *hit)
+{
+    return hit && hit->file && hit->file->path &&
+           strstr(hit->file->path, "/PostgreSQL.") != NULL;
+}
+
 static void user_vma_drop_file_nolock(user_vma_t *v) {
     if (!v || !v->file)
         return;
@@ -1206,12 +1224,23 @@ static int user_vma_map_shared_file_page(thread_t *t, const user_vma_t *hit, uin
 
     if (!t || !t->mm || !hit || !hit->file)
         return 0;
+    {
+        static int mapsh_dbg_left = 80;
+        if (mapsh_dbg_left-- > 0)
+            klogprintf_logonly("mapsh[entry] pid=%lu lo=0x%llx path=%s\n",
+                (unsigned long)thread_current()->linux_tgid,
+                (unsigned long long)lo,
+                (hit->file->path) ? hit->file->path : "?");
+    }
     k = mm_kernel();
     if (!k || !t->mm->pml4 || t->mm->pml4 == k->pml4)
         return 0;
     if (lo < (uint64_t)hit->addr)
         return 0;
     foff = hit->file_off + (lo - (uint64_t)hit->addr);
+    if (uv_is_pg_file(hit))
+        uv_trace_one("MAPSH", thread_current()->linux_tgid, lo,
+                     (uint64_t)USER_VMA_KIND_SHM, foff, (uint64_t)lo);
     if (pagecache_get(hit->file, foff, &pa) != 0)
         return 0;
     flags = PG_PRESENT | PG_US | PG_SOFT_OWNED;
@@ -1246,6 +1275,9 @@ static int user_vma_fill_file_page(thread_t *t, const user_vma_t *hit, uint64_t 
     if (lo < (uint64_t)hit->addr)
         return 0;
     foff = hit->file_off + (lo - (uint64_t)hit->addr);
+    if (uv_is_pg_file(hit))
+        uv_trace_one("FILL", thread_current()->linux_tgid, lo,
+                     (uint64_t)hit->kind, foff, (uint64_t)hit->file->size);
     memset(kbuf, 0, sizeof(kbuf));
     n = 0x1000u;
     if (foff < (uint64_t)hit->file->size) {

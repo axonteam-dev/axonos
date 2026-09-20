@@ -38,6 +38,7 @@
 #include <initfs.h>
 #include <squashfs.h>
 #include <overlayfs.h>
+#include <boot_brk.h>
 #include <bootparam.h>
 #include <mb2_linux_shim.h>
 #include <ramfs.h>
@@ -61,6 +62,7 @@
 #include <cirrus.h>
 #include <vmwgfx.h>
 #include <vboxsvga.h>
+#include <intel.h>
 #include <cirrusfb.h>
 #include <acpi_powerbtn.h>
 #include <nvme.h>
@@ -900,14 +902,20 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                                 (void*)(uintptr_t)_end,
                                 (void*)(uintptr_t)rd_st,
                                 (void*)(uintptr_t)mods_end);
+                boot_brk(0x3E);
                 /* Default 8x16 until VFS/console.pf2 (or explicit pf2 load). */
                 font_init_default();
+                boot_brk(0x4C);
                 /* Built-in box-drawing/identity map so UTF-8 never smears trash. */
                 con_unimap_default_only();
+                boot_brk(0x4D);
         }
 
         gdt_init();
+        boot_brk(0x4E);
         smp_init(multiboot_magic, multiboot_info);
+        boot_brk(0x4F);
+        boot_brk(0x50);
 
         /* Per-CPU IST1 stacks for Double Fault (avoids triple-fault when SMP is enabled). */
         {
@@ -930,6 +938,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         }
                 }
         }
+        boot_brk(0x51);
         int vbe_init = 0;
         /* Initialize VBE framebuffer console after heap is available */
         if (multiboot_info != 0) {
@@ -956,6 +965,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         idt_init();
         pic_init();
         pit_init();
+        boot_brk(0x62);
 
         mmio_init();
         ramfs_register();
@@ -965,10 +975,12 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 #endif
         squashfs_register();
         overlayfs_register();
+        boot_brk(0x63);
 
         /* sysfs, procfs, devfs mount — only via SYS_mount from userspace (e.g. init) */
 
         klog_init(); // for logging into /var/log/kernel file
+        boot_brk(0x64);
         klogprintf(OS_NAME " v" OS_VERSION ".\n");
         sysinfo_print_platform();
         sysinfo_print_dmi();
@@ -984,11 +996,14 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         idt_set_handler(APIC_TIMER_VECTOR, apic_timer_handler);
 
         syscall_init();/* syscall (int 0x80) initialization */
+        boot_brk(0x65);
         
         paging_init();
+        boot_brk(0x66);
 
         // Enabling interrupts
         asm volatile("sti");
+        boot_brk(0x67);
         /* Recalibrate after STI when PIT ticks are guaranteed to progress. */
         apic_timer_calibrate();
         /* TSC vs PIT while IRQ0 still drives timer_ticks (before APIC-only timekeeping). */
@@ -1177,6 +1192,20 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 klogprintf("video: cirrus fbcon enabled early\n");
         }
 #endif
+#ifdef DRIVER_INTEL
+	/* Intel HD Graphics (Gen6/7): adopt the firmware pipe + own the plane.
+	 * Runs later than VBE console so the boot text is already painted.
+	 * Off by default (config.cfg DRIVER_INTEL=n): on real SNB hardware a
+	 * misread BSM/GTT geometry can hang the display engine and reset the
+	 * machine — enable deliberately only after the board is verified. */
+	boot_brk(0x41);
+	int icr = intel_kernel_init();
+	boot_brk(0x45);
+	if (icr == 0) {
+		klogprintf("video: Intel i915-class fbdev enabled\n");
+	}
+#endif
+
         /* Linux device_initcall: i8042/input before userspace /etc synthesis. */
         ps2_keyboard_init();
         ps2_mouse_init();
@@ -1440,30 +1469,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 };
                 for (unsigned i = 0; i < sizeof(apt_dirs) / sizeof(apt_dirs[0]); i++)
                         (void)ramfs_mkdir(apt_dirs[i]);
-        }
-        /* Debian trixie Packages overflow the 24MiB apt default; no mremap
-         * used to mean Grow() died with "Dynamic MMap ran out of room". */
-        {
-                static const char apt_cache[] =
-                        "APT::Install-Recommends \"false\";\n"
-                        "APT::Install-Suggests \"false\";\n"
-                        "APT::Cache-Start \"33554432\";\n"
-                        "APT::Cache-Grow \"16777216\";\n"
-                        "APT::Cache-Limit \"134217728\";\n"
-                        "Dpkg::Use-Pty \"false\";\n"
-                        "DPkg::Inhibit-Shutdown \"false\";\n"
-                        "DPkg::FlushSTDIN \"false\";\n"
-                        "DPkg::Path \"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\";\n"
-                        "Acquire::http::Pipeline-Depth \"0\";\n"
-                        "Acquire::Retries \"5\";\n";
-                struct fs_file *cf = fs_create_file("/etc/apt/apt.conf.d/01axonos-cache");
-                if (!cf)
-                        cf = fs_open("/etc/apt/apt.conf.d/01axonos-cache");
-                if (cf) {
-                        (void)vfs_ftruncate(cf, 0);
-                        fs_write(cf, apt_cache, sizeof(apt_cache) - 1, 0);
-                        fs_file_free(cf);
-                }
         }
         /* dpkg looks up ldconfig on PATH (/usr/sbin, /sbin). Binary comes from
          * initfs; here we only write ld.so.conf and usr-merge the name. */

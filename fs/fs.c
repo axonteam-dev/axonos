@@ -736,6 +736,18 @@ ssize_t fs_write(struct fs_file *file, const void *buf, size_t size, size_t offs
         return -1;
 }
 
+uint64_t fs_current_generation(struct fs_file *file) {
+        if (!file) return 0;
+        for (int i = 0; i < g_drivers_count; i++) {
+                struct fs_driver *drv = g_drivers[i];
+                if (!drv || !drv->ops || !fs_file_matches_driver(drv, file)) continue;
+                if (drv->ops->current_generation)
+                        return drv->ops->current_generation(file);
+                break;
+        }
+        return file->backing_gen;
+}
+
 void fs_file_get(struct fs_file *file) {
         if (!file) return;
         if (file->refcount < 1) file->refcount = 1;

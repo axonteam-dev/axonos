@@ -553,11 +553,6 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
             if (!f) f = cur->fds[fd];
             if (f && f->type == FS_TYPE_REG && !fbdev_is_fb0_file(f)) {
                 if (shared_mapping) {
-                    /*
-                     * Linux filemap: MAP_SHARED must demand-fill from the page
-                     * cache so fork/mmap-attach share frames (PostgreSQL DSM).
-                     * Eager copy-in gave each process a private snapshot.
-                     */
                     file_lazy = 1;
                     file_lazy_f = f;
                     file_lazy_off = (uint64_t)file_off;
@@ -567,11 +562,7 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
                     int locale = (f->path &&
                         (strncmp(f->path, "/usr/lib/locale/", 16) == 0 ||
                          strstr(f->path, "locale-archive") != NULL));
-                    /*
-                     * Locale files (LC_COLLATE is ~1.4KiB; LC_CTYPE ~367KiB) are
-                     * interned immediately. Eager copy-in matches Linux filemap
-                     * populate for the pages glibc touches first.
-                     */
+
                     if (!small && !locale) {
                         file_lazy = 1;
                         file_lazy_f = f;
@@ -611,9 +602,6 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     }
 
     if (flags & MAP_ANONYMOUS) {
-        /* pthread stack uses MAP_STACK|MAP_ANONYMOUS|MAP_PRIVATE (0x20022).
-         * Stripping only the core bits left MAP_STACK set → spurious ENOSYS
-         * and docker's pthread_create never reached clone. */
         flags &= ~(MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED | MAP_FIXED |
                    MAP_FIXED_NOREPLACE | MAP_IGNORABLE);
         if (flags != 0) return user_mm_ret_err(USER_MM_ENOSYS);
@@ -698,6 +686,28 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     }
 
     /* Non-FIXED: address was chosen free via user_vma_find_unmapped. */
+    {
+        const char *tpath = NULL;
+        if (file_lazy_f && file_lazy_f->path)
+            tpath = file_lazy_f->path;
+        else if (eager_file && eager_file->path)
+            tpath = eager_file->path;
+        else if (!file_lazy && !eager_file && !(flags & MAP_ANONYMOUS) &&
+                 (int)(int64_t)a5 >= 0 && (int)(int64_t)a5 < THREAD_MAX_FD &&
+                 tcur && tcur->fds[(int)(int64_t)a5] &&
+                 tcur->fds[(int)(int64_t)a5]->path)
+            tpath = tcur->fds[(int)(int64_t)a5]->path;
+        if (tpath && (strstr(tpath, "/dev/shm/") != NULL ||
+                      strstr(tpath, "PostgreSQL.") != NULL ||
+                      strstr(tpath, "dynshmem") != NULL)) {
+            static int usv_mmap_trace;
+            if (usv_mmap_trace++ < 1000)
+                klogprintf_logonly("uvm[MMAP] pid=%lu addr=0x%llx len=0x%zx lazy=%d eager=%d kind=%d path=%s\n",
+                        (unsigned long)thread_current()->linux_tgid,
+                        (unsigned long long)addr, len, file_lazy ? 1 : 0,
+                        eager_file ? 1 : 0, mmap_vma_kind, tpath);
+        }
+    }
     if (file_lazy) {
         if (user_vma_add_file(vtid, addr, len, prot & 7, mmap_vma_kind,
                               file_lazy_f, file_lazy_off) != 0)

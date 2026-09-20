@@ -95,6 +95,7 @@ static volatile bool alt_pressed = false;
 static volatile bool ctrlc_pending = false;
 static bool keyboard_sysfs_registered = false;
 static volatile bool kbd_extended_prefix = false;
+static volatile bool caps_lock_on = false;
 
 static ssize_t keyboard_sysfs_show_text(char *buf, size_t size, void *priv) {
         if (!buf || size == 0) return 0;
@@ -139,10 +140,13 @@ static void kbd_push_char(int tty, char c) {
 }
 
 // Обработчик прерывания клавиатуры
-void keyboard_handler(cpu_registers_t* regs) {
-        (void)regs;
-        /* Drain all pending controller bytes so stale AUX data can't block keyboard. */
-        for (int i = 0; i < 32; i++) {
+/* Serializes 8042 output drains across SMP: the ISR and a synchronous
+   paint-time poll can run on different CPUs. */
+static spinlock_t g_kbd_drain_lock = {0};
+static uint32_t g_kbd_left_makes = 0;
+
+static void keyboard_drain_output(int limit) {
+        for (int i = 0; i < limit; i++) {
                 uint8_t st = inb(0x64);
                 if ((st & 0x01u) == 0) break;
                 uint8_t data = inb(0x60);
@@ -157,7 +161,29 @@ void keyboard_handler(cpu_registers_t* regs) {
                 }
                 keyboard_process_scancode(data);
         }
+}
+
+void keyboard_handler(cpu_registers_t* regs) {
+        (void)regs;
+        /* Drain all pending controller bytes so stale AUX data can't block keyboard. */
+        acquire(&g_kbd_drain_lock);
+        keyboard_drain_output(32);
+        release(&g_kbd_drain_lock);
         // EOI отправляется центральным диспетчером прерываний в isr_dispatch
+}
+
+/*
+ * Synchronous 8042 drain for console paints that mask IRQs: while IF=0 the IRQ1
+ * path can't run, and if the console writer is slow a key burst overflows the
+ * controller FIFO and drops arrow/Home presses.  Called every N glyphs of a
+ * paint so long wrapped-line redraws never eat typed keys.
+ * Bounded and non-blocking: if the ISR owns the drain, skip this round.
+ */
+void keyboard_poll_drain(void) {
+        if (!try_acquire(&g_kbd_drain_lock))
+                return;
+        keyboard_drain_output(64);
+        release(&g_kbd_drain_lock);
 }
 
 // Обработка одного байта сканкода (вынесена для возможности polling из PIT)
@@ -179,6 +205,13 @@ static void kbd_emit_ascii(int tty, uint8_t scancode) {
                                : scancode_to_ascii[scancode];
         if (c == 0)
                 return;
+        /* Caps Lock latches and only flips letters, never symbols. */
+        if (caps_lock_on) {
+                if (c >= 'a' && c <= 'z')
+                        c = (char)(c - 'a' + 'A');
+                else if (c >= 'A' && c <= 'Z')
+                        c = (char)(c - 'A' + 'a');
+        }
         if (ctrl_pressed) {
                 unsigned char uc = (unsigned char)c;
                 if (uc >= 'a' && uc <= 'z') uc = (unsigned char)(uc - 'a' + 'A');
@@ -266,7 +299,7 @@ void keyboard_process_scancode(uint8_t scancode) {
                         case 0x38: /* Right Alt (AltGr) */ alt_pressed = true; break;
                         case 0x48: /* Up */    kbd_push_sequence(target_tty_for_user, "\x1B[A"); break;
                         case 0x50: /* Down */  kbd_push_sequence(target_tty_for_user, "\x1B[B"); break;
-                        case 0x4B: /* Left */  kbd_push_sequence(target_tty_for_user, "\x1B[D"); break;
+                        case 0x4B: /* Left */  g_kbd_left_makes++; kbd_push_sequence(target_tty_for_user, "\x1B[D"); break;
                         case 0x4D: /* Right */ kbd_push_sequence(target_tty_for_user, "\x1B[C"); break;
                         case 0x47: /* Home */  kbd_push_sequence(target_tty_for_user, "\x1B[H"); break;
                         case 0x4F: /* End */   kbd_push_sequence(target_tty_for_user, "\x1B[F"); break;
@@ -304,6 +337,9 @@ void keyboard_process_scancode(uint8_t scancode) {
                 case 0x0E: // Backspace
                         kbd_push_char(target_tty_for_user, '\b');
                         break;
+                case 0x3A: // Caps Lock — latch, no char emitted
+                        caps_lock_on = !caps_lock_on;
+                        break;
                 case 0x48: // Up arrow
                 case 0x50: // Down arrow
                 case 0x4B: // Left arrow
@@ -317,7 +353,7 @@ void keyboard_process_scancode(uint8_t scancode) {
                         /* Always send ANSI sequences to TTY (thread_get_current_user() is NULL in ISR) */
                         if (scancode == 0x48) kbd_push_sequence(target_tty_for_user, "\x1B[A");
                         else if (scancode == 0x50) kbd_push_sequence(target_tty_for_user, "\x1B[B");
-                        else if (scancode == 0x4B) kbd_push_sequence(target_tty_for_user, "\x1B[D");
+                        else if (scancode == 0x4B) { g_kbd_left_makes++; kbd_push_sequence(target_tty_for_user, "\x1B[D"); }
                         else if (scancode == 0x4D) kbd_push_sequence(target_tty_for_user, "\x1B[C");
                         else if (scancode == 0x47) kbd_push_sequence(target_tty_for_user, "\x1B[H");
                         else if (scancode == 0x4F) kbd_push_sequence(target_tty_for_user, "\x1B[F");
@@ -364,10 +400,19 @@ void keyboard_process_scancode(uint8_t scancode) {
                 case 0x57: // F11
                 case 0x58: // F12
                         switch (scancode) {
+                                /* F10 doubles as a diagnostics key: dumps input-path
+                                 * counters to the debugcon so we can tell whether
+                                 * arrow/Home presses reach the tty queue at all. */
+                                case 0x44:
+                                        qemu_debug_printf("KBDDIAG left_makes=%u pushed=%llu dropped=%llu consumed=%llu\n",
+                                                          (unsigned)g_kbd_left_makes,
+                                                          (unsigned long long)g_diag_pushed,
+                                                          (unsigned long long)g_diag_dropped,
+                                                          (unsigned long long)g_diag_consumed);
+                                        break;
                                 case 0x41: kbd_push_sequence(target_tty_for_user, "\x1B[18~"); break; /* F7 */
                                 case 0x42: kbd_push_sequence(target_tty_for_user, "\x1B[19~"); break; /* F8 */
                                 case 0x43: kbd_push_sequence(target_tty_for_user, "\x1B[20~"); break; /* F9 */
-                                case 0x44: kbd_push_sequence(target_tty_for_user, "\x1B[21~"); break; /* F10 */
                                 case 0x57: kbd_push_sequence(target_tty_for_user, "\x1B[23~"); break; /* F11 */
                                 case 0x58: kbd_push_sequence(target_tty_for_user, "\x1B[24~"); break; /* F12 */
                         }
@@ -384,6 +429,7 @@ void ps2_keyboard_init() {
         shift_pressed = false;
         ctrl_pressed = false;
         alt_pressed = false;
+        caps_lock_on = false;
         ctrlc_pending = false;
         kbd_extended_prefix = false;
 

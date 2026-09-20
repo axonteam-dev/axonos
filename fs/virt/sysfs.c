@@ -225,9 +225,11 @@ int sysfs_create_file(const char *path, const struct sysfs_attr *attr) {
         if (!node->attr) { release(&sysfs_lock); return -1; }
     }
     memcpy(node->attr, attr, sizeof(struct sysfs_attr));
-    /* compute size for sysfs file content if possible */
-    sysfs_update_node_size(node);
     release(&sysfs_lock);
+    /* compute size AFTER releasing the lock: show() callbacks may re-enter
+     * the VFS / sysfs (e.g. diagnostic readbacks that open() other sysfs
+     * nodes). Calling show() while sysfs_lock is held deadlocks. */
+    sysfs_update_node_size(node);
     return 0;
 }
 

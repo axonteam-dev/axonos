@@ -13,7 +13,7 @@ typedef struct thread thread_t;
 #define DEVFS_TTY_COUNT 6
 #endif
 #ifndef DEVFS_TTY_IRQ_OVF
-#define DEVFS_TTY_IRQ_OVF 64
+#define DEVFS_TTY_IRQ_OVF 512
 #endif
 struct devfs_tty {
     int id;
@@ -39,7 +39,7 @@ struct devfs_tty {
     uint32_t scroll_top;    /* DECSTBM inclusive, 0-based */
     uint32_t scroll_bottom; /* DECSTBM inclusive, 0-based */
     /* input buffer (chars) */
-    char inbuf[256];
+    char inbuf[1024];
     int in_head;
     int in_tail;
     int in_count;
@@ -94,9 +94,9 @@ struct devfs_tty {
      * not drop scancodes. Drain into inbuf whenever in_lock is taken.
      */
     char irq_ovf[DEVFS_TTY_IRQ_OVF];
-    uint8_t irq_ovf_head;
-    uint8_t irq_ovf_tail;
-    uint8_t irq_ovf_count;
+    uint16_t irq_ovf_head;
+    uint16_t irq_ovf_tail;
+    uint16_t irq_ovf_count;
     spinlock_t irq_ovf_lock;
 };
 
@@ -140,6 +140,8 @@ void devfs_tty_push_input(int tty, char c);
 void devfs_tty_push_input_noblock(int tty, char c);
 /* Atomically enqueue one key's complete escape sequence from keyboard IRQ. */
 void devfs_tty_push_input_sequence(int tty, const char *seq, size_t len);
+/* Input-path diagnostics (dumped to the debugcon on F10). */
+extern volatile uint64_t g_diag_pushed, g_diag_dropped, g_diag_consumed;
 /* Non-blocking pop: returns -1 if none, or char (0-255) */
 int devfs_tty_pop_nb(int tty);
 /* Push one byte back; will be returned by next pop. Returns 0 on success, -1 if already pushed. */

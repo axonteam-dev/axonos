@@ -431,49 +431,6 @@ void apic_timer_handler(cpu_registers_t* regs) {
         }
     }
 
-    /* TEMP: sample user-space Xorg progress from the timer (remove after fix). */
-    if (regs && ((regs->cs & 3) == 3) && smp_sched_cpu_id() == 0) {
-        static uint64_t x3_last_ms = 0;
-        static uint64_t x3_repeat_rip = 0;
-        static int x3_repeat = 0;
-        static int x3_dumped = 0;
-        uint64_t x3_now = pit_get_time_ms();
-        if (x3_now - x3_last_ms >= 250) {
-            x3_last_ms = x3_now;
-            thread_t *x3t = thread_current();
-            if (!x3t || x3t->ring != 3)
-                x3t = thread_get_current_user();
-            int x3x = 0;
-            if (x3t && x3t->name && x3t->name[0]) {
-                const char *z = x3t->name;
-                for (; *z; z++) {
-                    if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { x3x = 1; break; }
-                }
-            }
-            if (x3x) {
-                static int x3_left = 60;
-                if (regs->rip == x3_repeat_rip)
-                    x3_repeat++;
-                else {
-                    x3_repeat_rip = regs->rip;
-                    x3_repeat = 1;
-                }
-                if (x3_left-- > 0)
-                    kprintf("xorg3: ms=%llu rip=0x%llx rsp=0x%llx rep=%d\n",
-                            (unsigned long long)x3_now,
-                            (unsigned long long)regs->rip,
-                            (unsigned long long)regs->rsp,
-                            x3_repeat);
-                if (x3_repeat >= 3 && !x3_dumped) {
-                    x3_dumped = 1;
-                    kprintf("xorg-vma-dump:\n");
-                    if (x3t)
-                        user_vma_dump_for_tid(x3t->tid, regs->rip);
-                }
-            }
-        }
-    }
-
     if (regs && ((regs->cs & 3) == 3) && smp_sched_cpu_id() == 0) {
         apic_eoi();
         /*

@@ -1,6 +1,10 @@
 #include <paging.h>
 #include <mm.h>
 #include <debug.h>
+#include <klog.h>
+
+/* Set by paging_pat_init(); upgrades early (pre-PAT) framebuffer maps to WC. */
+void mmio_pat_apply_wc(void);
 
 // Simple page-table allocator for creating new PDPT/PD tables for 2MiB mappings
 static uint64_t* next_free_table(void) {
@@ -42,6 +46,100 @@ static inline void wrmsr_u64(uint32_t msr, uint64_t v) {
 #define MSR_EFER 0xC0000080u
 #define EFER_NXE (1ULL << 11)
 
+/* IA32_PAT (MSR 0x277): selects the memory type of each mapping via the
+ * PAT:PCD:PWT field in the PTE. Kernel never programmed it, so large 2MiB
+ * framebuffer mappings (`PG_PAT`, bit 12) evaluated against the firmware
+ * default PAT4 = WB — stores sat in the CPU cache, invisible to the scanout
+ * engine, making UEFI/GOP rendering crawl on bare metal while emulators
+ * (coherent guest RAM) stayed fast.
+ *
+ * Safety: probing is CPUID-only (never faults), and the MSR is only written
+ * from paging_init(), which runs after the IDT is installed. A WRMSR before
+ * the IDT exists would #GP straight into a triple fault on a machine that
+ * rejects the write. */
+#define MSR_IA32_PAT 0x277u
+#define PAT_ENTRY(idx, memtype) ((uint64_t)(memtype) << ((idx) * 8u))
+#define PAT_UC          0x00u
+#define PAT_WC          0x01u
+#define PAT_UC_MINUS    0x02u
+#define PAT_WB          0x06u
+
+static int g_pat_probed;
+static int g_pat_cpu_supported;
+static int g_pat_configured;
+
+/* CPUID.01H:EDX bit16 = PAT. No side effects, safe before the IDT is up. */
+int paging_pat_probe(void)
+{
+	uint32_t eax, ebx, ecx, edx;
+
+	if (g_pat_probed)
+		return g_pat_cpu_supported;
+	__asm__ volatile("cpuid"
+	                 : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+	                 : "a"(1u), "c"(0u));
+	g_pat_cpu_supported = (int)((edx >> 16) & 1u);
+	g_pat_probed = 1;
+	return g_pat_cpu_supported;
+}
+
+/* Program PAT4 = WC. Must run with the IDT installed (any WRMSR #GP must be
+ * catchable). Returns 1 when WC is active, 0 when the CPU lacks PAT.
+ * No full CR3 reload here: the only PG_PAT mappings exist after this runs
+ * (created by the upgrade below or by later WC maps), and both paths invalidate
+ * their own pages. A page-grained memory type change needs only invlpg on the
+ * affected 2MiB page.
+ * The MSR write is verified by readback: if the platform refuses to honor it
+ * (or grants a different decode), we bail to WB instead of assuming WC.
+ *
+ * DISABLED BY DEFAULT: some real boards hang executing WRMSR 0x277 itself
+ * (observed on bare metal). When disabled, framebuffers stay WB and rely on
+ * explicit cache-line flushes after rendering (see vbe_fb_clflush_range). */
+#ifndef AXON_PAT_WC_ENABLE
+#define AXON_PAT_WC_ENABLE 0
+#endif
+
+int paging_pat_init(void)
+{
+	uint64_t pat, got;
+
+	if (g_pat_configured)
+		return 1;
+	if (!paging_pat_probe())
+		return 0;
+#if !AXON_PAT_WC_ENABLE
+	return 0;
+#else
+	klogprintf("PAT: programming IA32_PAT (idx4=WC)\n");
+	pat  = PAT_ENTRY(0, PAT_WB);          /* idx0: plain WB mappings unchanged */
+	pat |= PAT_ENTRY(1, PAT_WC);
+	pat |= PAT_ENTRY(2, PAT_UC_MINUS);
+	pat |= PAT_ENTRY(3, PAT_UC);          /* idx3: existing PG_PCD|PG_PWT -> UC */
+	pat |= PAT_ENTRY(4, PAT_WC);          /* idx4: large page PG_PAT -> WC */
+	pat |= PAT_ENTRY(5, PAT_UC_MINUS);
+	pat |= PAT_ENTRY(6, PAT_UC);
+	pat |= PAT_ENTRY(7, PAT_WB);
+	wrmsr_u64(MSR_IA32_PAT, pat);
+	got = rdmsr_u64(MSR_IA32_PAT);
+	if (got != pat) {
+		klogprintf("PAT: MSR write not honored (got 0x%llx != 0x%llx), using WB\n",
+		           (unsigned long long)got, (unsigned long long)pat);
+		return 0;
+	}
+	g_pat_configured = 1;
+	klogprintf("PAT: WC active, upgrading early framebuffer mappings\n");
+	mmio_pat_apply_wc();
+	klogprintf("PAT: early framebuffer upgrade done\n");
+	return 1;
+#endif
+}
+
+/* Whether IA32_PAT has been programmed (and is therefore WC-capable). */
+int paging_pat_configured(void)
+{
+	return g_pat_configured;
+}
+
 void paging_init(void) {
     // Ensure CR3 is loaded with our L4 base (it already is after bootstrap)
     (void)paging_read_cr3();
@@ -49,6 +147,8 @@ void paging_init(void) {
     uint64_t efer = rdmsr_u64(MSR_EFER);
     efer |= EFER_NXE;
     wrmsr_u64(MSR_EFER, efer);
+    // Make PAT4 = WC so large-page framebuffer mappings are write-combining.
+    paging_pat_init();
 }
 
 /*
@@ -125,7 +225,7 @@ static int map_page_2m_on_l4(uint64_t *l4, uint64_t va, uint64_t pa, uint64_t fl
     }
     // Set 2MiB page entry. Explicitly clear PG_NX: when EFER.NXE=0, NX bit is reserved
     // and causes page fault with RSVD (err bit 3).
-    l2[l2i] = ((pa & ~(PAGE_SIZE_2M - 1)) | PG_PRESENT | PG_RW | PG_PS_2M | (flags & (PG_US|PG_PWT|PG_PCD|PG_GLOBAL))) & ~PG_NX;
+    l2[l2i] = ((pa & ~(PAGE_SIZE_2M - 1)) | PG_PRESENT | PG_RW | PG_PS_2M | (flags & (PG_US|PG_PWT|PG_PCD|PG_GLOBAL|PG_PAT))) & ~PG_NX;
 
     invlpg((void*)va);
     return 0;

@@ -261,6 +261,20 @@ static void intel_flip_plane(intel_drv_t *d, uint32_t surf)
 	(void)mmio_read32(mm, pbase + (INTEL_DSPASURF - INTEL_DSPACNTR));
 }
 
+/* WB framebuffer stores are invisible to the plane until they reach DRAM;
+ * CLFLUSH the touched range (64-bit mode guarantees CLFLUSH), then fence so
+ * the scanout engine samples coherent data. */
+static void intel_fb_cache_flush(void *addr, size_t len)
+{
+	uintptr_t a = (uintptr_t)addr & ~(uintptr_t)63;
+	uintptr_t end = (uintptr_t)addr + len;
+	while (a < end) {
+		__asm__ volatile("clflush (%0)" :: "r"(a) : "memory");
+		a += 64;
+	}
+	__asm__ volatile("sfence" ::: "memory");
+}
+
 static void intel_copy_fw_fb(intel_drv_t *d)
 {
 	if (!d->fb.fb_va)
@@ -278,11 +292,13 @@ static void intel_copy_fw_fb(intel_drv_t *d)
 				const uint8_t *src = (const uint8_t *)fw + (size_t)y * fw_pitch;
 				memcpy(dst + (size_t)y * d->fb.pitch, src, row_probe);
 			}
+			intel_fb_cache_flush(d->fb.fb_va, (size_t)d->fb.height * d->fb.pitch);
 			return;
 		}
 	}
 	/* No firmware copy available: start from a black frame. */
 	memset(d->fb.fb_va, 0, d->fb.len);
+	intel_fb_cache_flush(d->fb.fb_va, d->fb.len);
 }
 
 int intel_display_takeover(intel_drv_t *d)
@@ -355,7 +371,7 @@ int intel_display_takeover(intel_drv_t *d)
 	d->fb.height = h;
 	d->fb.pitch = pitch;
 	d->fb.bpp = bpp;
-	d->fb.fb_va = mmio_map_framebuffer((uint64_t)fb_pa, (size_t)len);
+	d->fb.fb_va = mmio_map_framebuffer_wc((uint64_t)fb_pa, (size_t)len);
 	if (!d->fb.fb_va) {
 		klogprintf("intel: WM map failed for fb pa=0x%x len=0x%x\n",
 		           (unsigned)fb_pa, (unsigned)len);

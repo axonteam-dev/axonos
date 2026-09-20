@@ -23,6 +23,16 @@ void *mmio_map_phys(uint64_t pa, size_t len);
 /* Linear framebuffer / VRAM: cached (WB) PTEs. Use for PCI video RAM scanout; keep mmio_map_phys for device regs. */
 void *mmio_map_framebuffer(uint64_t pa, size_t len);
 
+/* Linear framebuffer as write-combining (WC) via PAT. For real UEFI/GOP
+ * framebuffers in system RAM and discrete VRAM, where WB stores stay in cache
+ * lines the scanout engine cannot see (rendering crawls on bare metal).
+ * Never WRMSRs at call time; if IA32_PAT is not programmed yet (early boot,
+ * before the IDT), the mapping is made WB and upgraded by mmio_pat_apply_wc(). */
+void *mmio_map_framebuffer_wc(uint64_t pa, size_t len);
+
+/* Upgrade early pre-PAT framebuffer mappings to WC. Called from paging_pat_init(). */
+void mmio_pat_apply_wc(void);
+
 /* Освободить отображение, если оно было создано (noop для identity-mapped). */
 void mmio_unmap(void *va, size_t len);
 

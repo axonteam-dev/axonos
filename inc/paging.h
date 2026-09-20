@@ -18,6 +18,7 @@
 #define PG_DIRTY                 (1ULL << 6)
 #define PG_PS_2M                 (1ULL << 7)   // set in PD entry for 2MiB page
 #define PG_GLOBAL                (1ULL << 8)
+#define PG_PAT                   (1ULL << 12)  // PAT bit in 2MiB/1GiB leaf (PD/PDPTE); bit 7 for 4KiB PTEs
 #define PG_SOFT_RESERVED         (1ULL << 9)   // software-only marker for non-present reserved PTEs
 #define PG_SOFT_COW              (1ULL << 10)  // present user PTE write-protected for fork COW
 #define PG_SOFT_OWNED            (1ULL << 11)  // this PTE owns one frame allocator reference
@@ -30,6 +31,18 @@
 
 // Initialize paging helpers (assumes bootstrap tables are already active)
 void paging_init(void);
+
+// CPUID-only check whether PAT is supported. Safe to call before the IDT is up
+// and before paging_init() (no MSR access). Returns 1 if supported.
+int paging_pat_probe(void);
+
+// Program IA32_PAT so a large-page PTE with PG_PAT and clear PCD/PWT selects
+// write-combining (index 4). Must only run once the IDT is installed; safe to
+// call from paging_init(). Returns 1 when WC is active, 0 on PAT-less CPUs.
+int paging_pat_init(void);
+
+// Whether IA32_PAT has been programmed (and WC mappings are effective).
+int paging_pat_configured(void);
 
 // Map one 2MiB page at 'va' to physical 'pa' with flags (PG_PRESENT|PG_RW|...)
 // Returns 0 on success, <0 on error.

@@ -407,8 +407,12 @@ static int fault_try_user_identity_us(uint64_t cr2, uint64_t err) {
                 thread_t *t = thread_current();
                 if (!t || t->ring != 3)
                         t = thread_get_current_user();
-                if (!t || !user_vma_covers_page(t->tid ? t->tid : 1, a))
+                if (!t)
                         return 0;
+                if (!user_vma_covers_page(t->tid ? t->tid : 1, a) &&
+                    !(t->mm && user_vma_covers_page_mm(t->mm, a))) {
+                        return 0;
+                }
         }
         /* Soft-fix U=0 for any user data access in the low identity window.
          * Previous fixed ceilings (TOP, TOP+2MiB, TOP+128MiB) were exactly hit
@@ -535,28 +539,6 @@ static void page_fault_handler(cpu_registers_t* regs) {
                 vga_raw_hex("KPF cr2=", cr2);
                 vga_raw_hex("KPF rip=", regs->rip);
                 vga_raw_hex("KPF err=", regs->error_code);
-        }
-        if (user) {
-                extern thread_t *thread_current(void);
-                extern thread_t *thread_get_current_user(void);
-                thread_t *pft = thread_current();
-                if (!pft || pft->ring != 3) pft = thread_get_current_user();
-                if (pft && pft->name && pft->name[0]) {
-                        const char *z = pft->name;
-                        int xpf = 0;
-                        for (; *z; z++) {
-                                if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { xpf = 1; break; }
-                        }
-                        if (xpf) {
-                                static int xorg_pf_left = 200;
-                                if (xorg_pf_left-- > 0)
-                                        kprintf("xorg-pf: tid=%llu va=0x%llx rip=0x%llx err=0x%llx\n",
-                                                (unsigned long long)(pft->tid ? pft->tid : 1),
-                                                (unsigned long long)cr2,
-                                                (unsigned long long)regs->rip,
-                                                (unsigned long long)regs->error_code);
-                        }
-                }
         }
         if (user && syscall_pipe_watch_active) {
                 static int pf_all_left = 24;
@@ -985,139 +967,6 @@ static void gp_fault_handler(cpu_registers_t* regs){
             if (!gt || gt->ring != 3)
                 gt = thread_get_current_user();
             mm_dbg_ash_watch_thread("GPF-ash-rip", gt);
-        }
-        {
-            extern thread_t *thread_current(void);
-            extern thread_t *thread_get_current_user(void);
-            thread_t *gt = thread_current();
-            if (!gt || gt->ring != 3)
-                gt = thread_get_current_user();
-            klogprintf_logonly("user-gpf-fatal: tid=%llu name=%s rip=0x%llx err=0x%llx rsp=0x%llx fs=0x%llx rax=0x%llx rbx=0x%llx rdx=0x%llx rcx=0x%llx r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx\n",
-                    (unsigned long long)(gt && gt->tid ? gt->tid : 0),
-                    (gt && gt->name[0]) ? gt->name : "?",
-                    (unsigned long long)regs->rip,
-                    (unsigned long long)regs->error_code,
-                    (unsigned long long)regs->rsp,
-                    (unsigned long long)(gt ? gt->user_fs_base : 0),
-                    (unsigned long long)regs->rax,
-                    (unsigned long long)regs->rbx,
-                    (unsigned long long)regs->rdx,
-                    (unsigned long long)regs->rcx,
-                    (unsigned long long)regs->r12,
-                    (unsigned long long)regs->r13,
-                    (unsigned long long)regs->r14,
-                    (unsigned long long)regs->r15);
-            if (gt && gt->mm && gt->mm != mm_kernel() &&
-                regs->rip >= 0x200000ULL && regs->rip + 16ULL < (uint64_t)MMIO_IDENTITY_LIMIT) {
-                uint8_t insn[16];
-                memset(insn, 0, sizeof(insn));
-                if (mm_copy_from_user(gt->mm, insn, regs->rip, sizeof(insn)) == 0)
-                    klogprintf_logonly("user-gpf-insn: %02x %02x %02x %02x %02x %02x %02x %02x "
-                            "%02x %02x %02x %02x rdi=0x%llx rsi=0x%llx rdx=0x%llx rcx=0x%llx rbp=0x%llx\n",
-                            insn[0], insn[1], insn[2], insn[3],
-                            insn[4], insn[5], insn[6], insn[7],
-                            insn[8], insn[9], insn[10], insn[11],
-                            (unsigned long long)regs->rdi,
-                            (unsigned long long)regs->rsi,
-                            (unsigned long long)regs->rdx,
-                            (unsigned long long)regs->rcx,
-                            (unsigned long long)regs->rbp);
-                uint64_t ra = 0;
-                if (mm_copy_from_user(gt->mm, &ra, regs->rsp, sizeof(ra)) == 0)
-                    klogprintf_logonly("user-gpf-ret: [rsp]=0x%llx\n",
-                            (unsigned long long)ra);
-                /* Walk the frame-pointer chain so the call site of the garbage
-                 * deref is identifiable in initdb/ld.so from the next run. */
-                {
-                    uint64_t fp = regs->rbp;
-                    for (int f = 0; f < 14; f++) {
-                        if (fp < 0x200000ULL ||
-                            fp + 16ULL >= (uint64_t)MMIO_IDENTITY_LIMIT)
-                            break;
-                        uint64_t saved_fp = 0, saved_rip = 0;
-                        if (mm_copy_from_user(gt->mm, &saved_fp, fp, sizeof(saved_fp)) != 0)
-                            break;
-                        if (mm_copy_from_user(gt->mm, &saved_rip, fp + 8, sizeof(saved_rip)) != 0)
-                            break;
-                        klogprintf_logonly("user-gpf-bt[%d]: rbp=0x%llx ret=0x%llx\n",
-                                f, (unsigned long long)fp,
-                                (unsigned long long)saved_rip);
-                        if (saved_fp == 0 || saved_fp <= fp)
-                            break;
-                        fp = saved_fp;
-                    }
-                }
-                /* Show the process memory layout so rip/r15/ret addresses can be
-                 * attributed to initdb vs ld.so vs a shared library. */
-                if (gt && gt->tid)
-                    user_vma_dump_for_tid(gt->tid, regs->rip);
-                /* A #GP data access (e.g. add %rax,0x8(%rdx) after a slot was
-                 * loaded from the ld.so l_info table) reports no CR2.  r13 is
-                 * the struct base; dump l_addr and the l_info slots so a
-                 * garbage entry is visible with its neighbours. */
-                {
-                    uint64_t tgt = regs->r13 + 0x58ULL;
-                    uint64_t leaf = 0;
-                    int mapped = (tgt < (uint64_t)MMIO_IDENTITY_LIMIT &&
-                                  mm_va_leaf_pa(gt->mm, tgt, &leaf) == 0);
-                    klogprintf_logonly("user-gpf-target: tgt=0x%llx mapped=%d leaf=0x%llx\n",
-                            (unsigned long long)tgt, mapped,
-                            (unsigned long long)((leaf & PG_ADDR_MASK)));
-                    if (mapped && regs->r13 < (uint64_t)MMIO_IDENTITY_LIMIT) {
-                        for (int q = 0; q < 0x18; q += 2) {
-                            uint64_t v0 = 0, v1 = 0;
-                            int ok0 = mm_copy_from_user(gt->mm, &v0,
-                                    (uint64_t)(regs->r13 + (uint64_t)q * 8ULL),
-                                    8) == 0;
-                            int ok1 = mm_copy_from_user(gt->mm, &v1,
-                                    (uint64_t)(regs->r13 + (uint64_t)(q + 1) * 8ULL),
-                                    8) == 0;
-                            if (!ok0 || !ok1) {
-                                klogprintf_logonly("user-gpf-linfo[0x%x]: U\n", q * 8);
-                                continue;
-                            }
-                            klogprintf_logonly("user-gpf-linfo[0x%x]: 0x%llx  [0x%x]: 0x%llx\n",
-                                    q * 8, (unsigned long long)v0,
-                                    (q + 1) * 8, (unsigned long long)v1);
-                        }
-                    }
-                }
-                /* initdb/ld.so: the link_map base is in r15 (interp_base + RW
-                 * memsz end, e.g. 0x2027170 for ld.so @ 0x2000000).  Dump the
-                 * map region so a stale identity-backed (non-zeroed) l_info slot
-                 * vs a correctly written one is visible directly. */
-                {
-                    uint64_t base = regs->r15;
-                    if (base >= 0x200000ULL &&
-                        base + 0x300ULL < (uint64_t)MMIO_IDENTITY_LIMIT) {
-                        uint64_t sleaf = 0;
-                        int bmapped = mm_va_leaf_pa(gt->mm, base, &sleaf) == 0;
-                        klogprintf_logonly("user-gpf-r15map: base=0x%llx mapped=%d leaf=0x%llx\n",
-                                (unsigned long long)base, bmapped,
-                                (unsigned long long)(bmapped ? (sleaf & PG_ADDR_MASK) : 0));
-                        for (int q = 0; q < 6; q++) {
-                            uint64_t v[8];
-                            int any = 0;
-                            for (int j = 0; j < 8; j++) {
-                                v[j] = 0;
-                                if (mm_copy_from_user(gt->mm, &v[j],
-                                        base + (uint64_t)(q * 8 + j) * 8ULL, 8) == 0)
-                                    any = 1;
-                            }
-                            if (!any) {
-                                klogprintf_logonly("user-gpf-r15[+0x%02x]: U\n", q * 64);
-                                continue;
-                            }
-                            klogprintf_logonly("user-gpf-r15[+0x%02x]: %016llx %016llx %016llx %016llx  %016llx %016llx %016llx %016llx\n",
-                                    q * 64,
-                                    (unsigned long long)v[0], (unsigned long long)v[1],
-                                    (unsigned long long)v[2], (unsigned long long)v[3],
-                                    (unsigned long long)v[4], (unsigned long long)v[5],
-                                    (unsigned long long)v[6], (unsigned long long)v[7]);
-                        }
-                    }
-                }
-            }
         }
         syscall_user_fatal_exit(11); /* SIGSEGV */
     }

@@ -271,15 +271,18 @@ static void tty_echo_input_byte(struct devfs_tty *t, unsigned char uc) {
         devfs_tty_echo_bytes(t, &uc, 1);
 }
 
-static void tty_irq_ovf_push(struct devfs_tty *t, unsigned char c) {
+static int tty_irq_ovf_push(struct devfs_tty *t, unsigned char c) {
     unsigned long flags = 0;
     acquire_irqsave(&t->irq_ovf_lock, &flags);
+    int ok = 0;
     if (t->irq_ovf_count < DEVFS_TTY_IRQ_OVF) {
         t->irq_ovf[t->irq_ovf_tail] = (char)c;
-        t->irq_ovf_tail = (uint8_t)((t->irq_ovf_tail + 1u) % (unsigned)DEVFS_TTY_IRQ_OVF);
+        t->irq_ovf_tail = (uint16_t)((t->irq_ovf_tail + 1u) % (unsigned)DEVFS_TTY_IRQ_OVF);
         t->irq_ovf_count++;
+        ok = 1;
     }
     release_irqrestore(&t->irq_ovf_lock, flags);
+    return ok;
 }
 
 static void tty_irq_ovf_flush(struct devfs_tty *t) {
@@ -296,7 +299,7 @@ static void tty_drain_irq_ovf_locked(struct devfs_tty *t) {
     acquire_irqsave(&t->irq_ovf_lock, &flags);
     while (t->irq_ovf_count > 0 && t->in_count < (int)sizeof(t->inbuf)) {
         unsigned char c = (unsigned char)t->irq_ovf[t->irq_ovf_head];
-        t->irq_ovf_head = (uint8_t)((t->irq_ovf_head + 1u) % (unsigned)DEVFS_TTY_IRQ_OVF);
+        t->irq_ovf_head = (uint16_t)((t->irq_ovf_head + 1u) % (unsigned)DEVFS_TTY_IRQ_OVF);
         t->irq_ovf_count--;
         t->inbuf[t->in_tail] = (char)c;
         t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
@@ -312,9 +315,14 @@ static int tty_enqueue_byte_locked(struct devfs_tty *t, unsigned char c) {
         t->inbuf[t->in_tail] = (char)c;
         t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
         t->in_count++;
+        g_diag_pushed++;
         return 1;
     }
-    tty_irq_ovf_push(t, c);
+    if (tty_irq_ovf_push(t, c)) {
+        g_diag_pushed++;
+        return 0;
+    }
+    g_diag_dropped++;
     return 0;
 }
 
@@ -718,6 +726,9 @@ void devfs_tty_console_write_locked(const char *s, size_t n) {
     tty->insert_mode = 0;
     console_begin_tty_batch();
     for (size_t i = 0; i < n; i++) {
+        /* Long printk bursts mask IRQs too — keep the 8042 drained. */
+        if ((i & 0x0Fu) == 0)
+            keyboard_poll_drain();
         uint8_t ch = (uint8_t)s[i];
         if (ch == '\n')
             devfs_tty_emit_byte(tty, 1, '\r');
@@ -1653,6 +1664,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
              * on input so a leftover CSI state cannot hide the next letter. */
             release_irqrestore(&t->in_lock, flags);
             out[got++] = (char)c;
+            g_diag_consumed++;
             if (is_canonical) {
                 if ((unsigned char)c == '\n') break;
                 continue;
@@ -1925,6 +1937,11 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
     if (tty_on_vga_batch)
         console_begin_tty_batch();
     for (size_t i = 0; i < size; i++) {
+        /* IRQs stay masked for this whole paint; drain the PS/2 controller
+         * periodically so a key burst during a long redraw isn't lost to FIFO
+         * overflow (arrows/Home on wrapped lines). */
+        if ((i & 0x0Fu) == 0)
+            keyboard_poll_drain();
         char ch = s[i];
         {
             const int tty_on_vga = tty_on_vga_batch;
@@ -2929,11 +2946,15 @@ ssize_t devfs_tty_debug_dump(char *buf, size_t size) {
     return (ssize_t)w;
 }
 
+volatile uint64_t g_diag_pushed = 0;
+volatile uint64_t g_diag_dropped = 0;
+volatile uint64_t g_diag_consumed = 0;
+
 void devfs_tty_push_input_sequence(int tty, const char *seq, size_t len) {
     if (tty < 0 || tty >= DEVFS_TTY_COUNT || !seq || len == 0)
         return;
     struct devfs_tty *t = &dev_ttys[tty];
-    if (len > sizeof(t->inbuf))
+    if (len == 0)
         return;
 
     /*
@@ -2942,20 +2963,42 @@ void devfs_tty_push_input_sequence(int tty, const char *seq, size_t len) {
      * and enqueue the complete string while holding the tty input lock.
      */
     unsigned long flags = 0;
-    acquire_irqsave(&t->in_lock, &flags);
-    tty_drain_irq_ovf_locked(t);
-    if ((size_t)t->in_count + len > sizeof(t->inbuf)) {
-        release_irqrestore(&t->in_lock, flags);
+    if (!try_acquire(&t->in_lock)) {
+        /*
+         * The reader holds in_lock (it may even be blocked holding it).  An
+         * ISR must NEVER spin on that lock — the reader can sleep waiting for
+         * input, so the push would deadlock that CPU and stall the keyboard.
+         * Park the whole sequence in irq_ovf instead; it is drained in order
+         * before the next read.  Bytes are pushed under irq_ovf_lock so a
+         * multi-byte key stays contiguous.
+         */
+        for (size_t i = 0; i < len; i++) {
+            unsigned char uc = (unsigned char)seq[i];
+            if (!tty_map_iflag(t, &uc))
+                continue;
+            if (tty_irq_ovf_push(t, uc))
+                g_diag_pushed++;
+            else
+                g_diag_dropped++;
+        }
+        tty_wake_waiters_unlocked(t);
+        thread_request_resched();
         return;
     }
+    tty_drain_irq_ovf_locked(t);
+    /*
+     * Never drop a key event on a full inbuf: overflow spills into irq_ovf
+     * below and is drained back into inbuf before the next read (in order),
+     * so line editors keep a coherent ESC/key sequence instead of silently
+     * losing arrow/Home presses while a wrapped line is being edited.
+     */
     for (size_t i = 0; i < len; i++) {
         unsigned char uc = (unsigned char)seq[i];
         if (!tty_map_iflag(t, &uc))
             continue;
-        t->inbuf[t->in_tail] = (char)uc;
-        t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
-        t->in_count++;
+        tty_enqueue_byte_locked(t, uc);
     }
+    tty_drain_irq_ovf_locked(t);
     tty_wake_waiters_locked(t);
     release_irqrestore(&t->in_lock, flags);
     thread_request_resched();
@@ -2978,7 +3021,10 @@ void devfs_tty_push_input_noblock(int tty, char c) {
             return;
         }
         if (tty_map_iflag(t, &uc)) {
-            tty_irq_ovf_push(t, uc);
+            if (tty_irq_ovf_push(t, uc))
+                g_diag_pushed++;
+            else
+                g_diag_dropped++;
             tty_echo_input_byte(t, uc);
         }
         tty_wake_waiters_unlocked(t);

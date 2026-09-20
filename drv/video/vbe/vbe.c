@@ -27,6 +27,55 @@ static void *vbe_drawbuffer(void)
 	return g_backbuf ? g_backbuf : g_frontbuf;
 }
 
+/* WC stores drain asynchronously; order them before any dependent MMIO/notify. */
+static inline void vbe_fb_store_barrier(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+	__asm__ volatile("sfence" ::: "memory");
+#else
+	__sync_synchronize();
+#endif
+}
+
+/* Write-back framebuffers are invisible to the display engine until the dirty
+ * lines reach DRAM. WB + explicit writeback is the no-WRMSR fallback when the
+ * board cannot program IA32_PAT (observed: WRMSR 0x277 hangs real hardware).
+ * Prefer CLWB (writeback, keeps the line resident for the next blit); fall back
+ * to CLFLUSH (mandatory in 64-bit mode). */
+static int g_vbe_clwb_ok = -1;
+
+static void vbe_fb_cache_flush_init(void)
+{
+	uint32_t eax, ebx = 0, ecx = 0, edx = 0;
+	__asm__ volatile("cpuid"
+	                 : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+	                 : "a"(7u), "c"(0u));
+	g_vbe_clwb_ok = (int)((ebx >> 24) & 1u);
+}
+
+static inline void vbe_fb_cache_flush_line(uintptr_t a, int clwb_ok)
+{
+	if (clwb_ok)
+		__asm__ volatile("clwb (%0)" :: "r"(a) : "memory");
+	else
+		__asm__ volatile("clflush (%0)" :: "r"(a) : "memory");
+}
+
+static void vbe_fb_cache_flush_range(void *addr, size_t len)
+{
+	uintptr_t a, end;
+	if (!addr || len == 0)
+		return;
+	if (g_vbe_clwb_ok < 0)
+		vbe_fb_cache_flush_init();
+	a = (uintptr_t)addr & ~(uintptr_t)63;
+	end = (uintptr_t)addr + len;
+	while (a < end) {
+		vbe_fb_cache_flush_line(a, g_vbe_clwb_ok > 0);
+		a += 64;
+	}
+}
+
 int vbe_attach_framebuffer(void *frontbuf, uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp) {
 	if (!frontbuf || width == 0 || height == 0 || pitch == 0 || bpp == 0) {
 		return -1;
@@ -79,13 +128,18 @@ static void vbe_flush_region_internal(uint32_t x, uint32_t y, uint32_t w, uint32
 		memcpy((uint8_t *)g_frontbuf + (size_t)y * g_pitch,
 		       (const uint8_t *)g_backbuf + (size_t)y * g_pitch,
 		       (size_t)h * g_pitch);
-		return;
+	} else {
+		for (uint32_t row = 0; row < h; row++) {
+			uint8_t *src = (uint8_t*)g_backbuf + (size_t)( (y + row) * g_pitch + x * bytes_per_pixel );
+			uint8_t *dst = (uint8_t*)g_frontbuf + (size_t)( (y + row) * g_pitch + x * bytes_per_pixel );
+			memcpy(dst, src, (size_t)w * bytes_per_pixel);
+		}
 	}
-	for (uint32_t row = 0; row < h; row++) {
-		uint8_t *src = (uint8_t*)g_backbuf + (size_t)( (y + row) * g_pitch + x * bytes_per_pixel );
-		uint8_t *dst = (uint8_t*)g_frontbuf + (size_t)( (y + row) * g_pitch + x * bytes_per_pixel );
-		memcpy(dst, src, (size_t)w * bytes_per_pixel);
-	}
+	/* Write-back stores must reach DRAM before the scanout engine samples the
+	 * framebuffer; CLWB/CLFLUSH the dirty rectangle, then fence store ordering. */
+	vbe_fb_cache_flush_range((uint8_t *)g_frontbuf + (size_t)y * g_pitch + (size_t)x * bytes_per_pixel,
+	                         (size_t)h * g_pitch);
+	vbe_fb_store_barrier();
 }
 
 /* Public: flush entire backbuffer to front */
@@ -169,6 +223,9 @@ void vbe_scroll_band_pixels(uint32_t y, uint32_t band_h, uint32_t pixels,
 		vbe_fill_rows(vbe_drawbuffer(), y, band_h, packed_clear);
 		if (g_backbuf && g_frontbuf != g_backbuf)
 			vbe_fill_rows(g_frontbuf, y, band_h, packed_clear);
+		vbe_fb_cache_flush_range((uint8_t *)g_frontbuf + (size_t)y * g_pitch,
+		                         (size_t)band_h * g_pitch);
+		vbe_fb_store_barrier();
 		return;
 	}
 
@@ -186,6 +243,11 @@ void vbe_scroll_band_pixels(uint32_t y, uint32_t band_h, uint32_t pixels,
 	vbe_fill_rows(draw, clear_y, pixels, packed_clear);
 	if (g_backbuf && g_frontbuf != g_backbuf)
 		vbe_fill_rows(g_frontbuf, clear_y, pixels, packed_clear);
+	/* Write-back: flush only the cleared band (the memmove above re-serves
+	 * already-coherent visible rows) and fence the store ordering. */
+	vbe_fb_cache_flush_range((uint8_t *)g_frontbuf + (size_t)clear_y * g_pitch,
+	                         (size_t)pixels * g_pitch);
+	vbe_fb_store_barrier();
 }
 
 /* Scroll whole framebuffer up by given pixel rows. */
@@ -290,7 +352,7 @@ int vbe_init_from_multiboot(uint32_t multiboot_magic, uint64_t multiboot_info) {
 			}
 
 			size_t fb_size = (size_t)pitch * (size_t)height;
-			void *fb_va = mmio_map_framebuffer(fb_addr, fb_size);
+			void *fb_va = mmio_map_framebuffer_wc(fb_addr, fb_size);
 			if (!fb_va) {
 				klogprintf("vbe: framebuffer map failed for addr=0x%016llx size=%u\n",
 					(unsigned long long)fb_addr, (unsigned)fb_size);

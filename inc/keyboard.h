@@ -37,6 +37,7 @@ char* kgets(char* buffer, int max_length);
 
 /* Internal helper used by PS/2 routing code. */
 void keyboard_process_scancode(uint8_t scancode);
+void keyboard_poll_drain(void);
 
 // ctrl+C handling helpers
 int keyboard_ctrlc_pending(void);

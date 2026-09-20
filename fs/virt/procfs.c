@@ -140,7 +140,7 @@ static int procfs_build_root_dir(struct procfs_handle *h) {
     static const char *top[] = {
         "meminfo", "cpuinfo", "uptime", "loadavg", "mounts", "filesystems",
         "stat", "partitions", "cmdline", "sys", "bus", "tty", "ttydebug", "net", "scsi",
-        "keys"
+        "keys", "mountinfo", "modules"
     };
     for (size_t ti = 0; ti < sizeof(top) / sizeof(top[0]); ti++) {
         const char *name = top[ti];
@@ -207,6 +207,12 @@ static int procfs_build_root_dir(struct procfs_handle *h) {
                 kfree(buf);
             return -1;
         }
+    }
+    /* Linux exposes /proc/self as a symlink to the current process. */
+    if (procfs_append_dirent(&buf, &len, &cap, "self", 0x6E31, EXT2_FT_SYMLINK) != 0) {
+        if (buf)
+            kfree(buf);
+        return -1;
     }
     h->cache = buf;
     h->cache_len = len;
@@ -850,7 +856,50 @@ static ssize_t procfs_show_mounts(char *buf, size_t size, void *priv) {
     return (ssize_t)w;
 }
 
-/* Linux /proc/filesystems — OpenRC sysfs init greps for "sysfs" here. */
+/* Linux /proc/mountinfo backed by the same VFS mount table.  Static mount ids,
+ * major:minor 0:0 for pseudo filesystems so lsblk does not chase block devices. */
+static ssize_t procfs_show_mountinfo(char *buf, size_t size, void *priv) {
+    (void)priv;
+    if (!buf || size == 0) return 0;
+    size_t w = 0;
+    int n = fs_mount_count();
+    int have_root = 0;
+    for (int i = 0; i < n; i++) {
+        char mpath[64];
+        char drv[32];
+        if (fs_mount_get(i, mpath, sizeof(mpath), drv, sizeof(drv)) != 0) continue;
+        int is_root = (mpath[0] == '/' && mpath[1] == '\0');
+        if (is_root)
+            have_root = 1;
+        const char *fstype = procfs_mount_fstype(drv, is_root);
+        int id = i + 1;
+        int parent_id = 1;
+        int wr = snprintf(buf + w, (w < size) ? (size - w) : 0,
+                          "%d %d 0:0 / %s rw,relatime shared:1 - %s %s rw,relatime\n",
+                          id, parent_id, mpath, fstype, fstype);
+        if (wr < 0) break;
+        w += (size_t)wr;
+        if (w >= size) { w = size; break; }
+    }
+    if (!have_root && w < size) {
+        int wr = snprintf(buf + w, size - w,
+                          "%d 1 0:0 / / rw,relatime shared:1 - overlay overlay rw,relatime\n",
+                          n + 1);
+        if (wr > 0)
+            w += (size_t)wr;
+    }
+    if (w > size)
+        w = size;
+    return (ssize_t)w;
+}
+
+/* Linux /proc/modules — monolithic kernel: present and empty so lsmod works. */
+static ssize_t procfs_show_modules(char *buf, size_t size, void *priv) {
+    (void)priv;
+    (void)buf;
+    (void)size;
+    return 0;
+}
 static ssize_t procfs_show_filesystems(char *buf, size_t size, void *priv) {
     (void)priv;
     if (!buf || size == 0) return 0;
@@ -1044,6 +1093,7 @@ static ssize_t procfs_generate_plain(int file_id, char *buf, size_t cap) {
 	if (file_id == 15) return procfs_show_kernel_stat(buf, cap, NULL);
 	if (file_id == 16) return procfs_show_mounts(buf, cap, NULL);
 	if (file_id == 17) return procfs_show_filesystems(buf, cap, NULL);
+	if (file_id == 19) return procfs_show_mountinfo(buf, cap, NULL);
 	if (file_id == 18) {
 		/* Linux /proc/cmdline — trailing newline required. */
 		const char *s = "BOOT_IMAGE=axonos init=/sbin/openrc-init\n";
@@ -1068,6 +1118,7 @@ static ssize_t procfs_generate_plain(int file_id, char *buf, size_t cap) {
 	if (file_id == 59) return procfs_net_snap_route(buf, cap);
 	if (file_id == 60) return procfs_net_snap_dhcp(buf, cap);
 	if (file_id == 61) return procfs_show_keys(buf, cap);
+	if (file_id == 62) return procfs_show_modules(buf, cap, NULL);
 	return 0;
 }
 
@@ -1307,6 +1358,24 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
                 f->size = 0;
                 f->driver_private = h;
                 h->file_id = 16; /* mounts */
+                procfs_fill_kind7_cache(h, f);
+                *out_file = f;
+                return 0;
+            }
+            if (first_len == 9 && strncmp(p, "mountinfo", 9) == 0) {
+                h->kind = 7; f->type = FS_TYPE_REG;
+                f->size = 0;
+                f->driver_private = h;
+                h->file_id = 19; /* mountinfo */
+                procfs_fill_kind7_cache(h, f);
+                *out_file = f;
+                return 0;
+            }
+            if (first_len == 7 && strncmp(p, "modules", 7) == 0) {
+                h->kind = 7; f->type = FS_TYPE_REG;
+                f->size = 0;
+                f->driver_private = h;
+                h->file_id = 62; /* modules */
                 procfs_fill_kind7_cache(h, f);
                 *out_file = f;
                 return 0;
@@ -1596,6 +1665,13 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					procfs_fill_kind7_cache(h, f);
 					*out_file = f;
 					return 0;
+				} else if (strncmp(rest, "mountinfo", 9) == 0 && rest[9] == '\0') {
+					/* /proc/self/mountinfo == /proc/mountinfo (lsblk needs it) */
+					h->kind = 7; h->file_id = 19; f->type = FS_TYPE_REG; f->size = 0;
+					f->driver_private = h;
+					procfs_fill_kind7_cache(h, f);
+					*out_file = f;
+					return 0;
 				} else {
 					kfree(h); kfree(pp); kfree(f); return -1;
 				}
@@ -1651,10 +1727,11 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
     }
 
     if (h->kind == 2) {
-        /* /proc/<pid> dir: entries cmdline/stat/status/statm/environ */
-        const char *names[6] = { "task", "cmdline", "stat", "status", "statm", "environ" };
-        const uint8_t types[6] = { EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
-                                   EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE };
+        /* /proc/<pid> dir: entries task/cmdline/stat/status/statm/environ/mounts/mountinfo */
+        const char *names[8] = { "task", "cmdline", "stat", "status", "statm", "environ", "mounts", "mountinfo" };
+        const uint8_t types[8] = { EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
+                                   EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
+                                   EXT2_FT_REG_FILE, EXT2_FT_REG_FILE };
         size_t pos = 0;
         size_t written = 0;
         uint8_t *out = (uint8_t*)buf;
@@ -1693,7 +1770,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
             }
             pos += rec_len;
         }
-        for (int idx = 0; idx < 6; idx++) {
+        for (int idx = 0; idx < 8; idx++) {
             size_t namelen = strlen(names[idx]);
             size_t rec_len = 8 + namelen;
             rec_len = (rec_len + 3) & ~3u;

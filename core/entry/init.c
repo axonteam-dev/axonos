@@ -449,6 +449,14 @@ void kernel_sysfs_populate_default(void) {
         sysfs_mkdir("/sys/kernel");
         sysfs_mkdir("/sys/class");
         sysfs_mkdir("/sys/bus");
+        sysfs_mkdir("/sys/bus/scsi");
+        sysfs_mkdir("/sys/bus/scsi/devices");
+        sysfs_mkdir("/sys/bus/ata");
+        sysfs_mkdir("/sys/bus/ata/devices");
+        sysfs_mkdir("/sys/bus/ide");
+        sysfs_mkdir("/sys/bus/ide/devices");
+        sysfs_mkdir("/sys/bus/platform");
+        sysfs_mkdir("/sys/bus/platform/devices");
         sysfs_mkdir("/sys/devices/system/cpu");
         static const struct sysfs_attr attr_cpu = { sysfs_show_cpu_name_attr, NULL, NULL };
         static const struct sysfs_attr attr_ram = { sysfs_show_ram_mb_attr, NULL, NULL };

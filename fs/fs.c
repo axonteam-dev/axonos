@@ -750,24 +750,26 @@ uint64_t fs_current_generation(struct fs_file *file) {
 
 void fs_file_get(struct fs_file *file) {
         if (!file) return;
-        if (file->refcount < 1) file->refcount = 1;
-        else file->refcount++;
+        /* atomic: the same fs_file may be shared (dup / dev/fd/N) across CPUs */
+        __atomic_add_fetch(&file->refcount, 1, __ATOMIC_ACQ_REL);
 }
 
 void fs_file_free(struct fs_file *file) {
         if (!file) return;
         /* reference-counted: decrement and only free when zero */
-        if (file->refcount > 1) { file->refcount--; return; }
-        if (file->refcount < 1) {
+        int prev = __atomic_fetch_sub(&file->refcount, 1, __ATOMIC_ACQ_REL);
+        if (prev > 1) return;
+        if (prev < 1) {
 #if !AXON_PRODUCTION
                 static int warn_left = 8;
                 if (warn_left-- > 0)
                         kprintf("fs_file_free: refcount=%d path=%s (skip)\n",
-                                file->refcount, file->path ? file->path : "(null)");
+                                prev, file->path ? file->path : "(null)");
 #endif
                 return;
         }
-        file->refcount = 0;
+        /* prev == 1: last reference — we own the object from here on. */
+        __atomic_store_n(&file->refcount, 0, __ATOMIC_RELAXED);
         if (file->type == FS_TYPE_PIPE) {
                 pipe_release_end(file);
                 if (file->path)

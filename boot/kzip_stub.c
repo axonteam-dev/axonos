@@ -601,7 +601,16 @@ static void load_elf_image(const uint8_t *img, size_t img_len, uint64_t *entry_o
         *entry_out = eh->e_entry;
 }
 
-void kernel_main(uint64_t multiboot_magic, uint64_t multiboot_info) {
+/*
+ * decompress_kernel() — the AxonOS analog of Linux's compressed kernel stage
+ * (arch/x86/boot/compressed/head_64.S + misc.c):
+ *   - preserve+relocate the boot info (Linux copy_bootdata),
+ *   - park the initramfs under top-of-RAM before the ELF load can clobber it,
+ *   - decompress the payload LZ4 image (decompress_kernel / in-place),
+ *   - load the ET_EXEC segments and zero BSS (Linux __startup_64 clear_bss),
+ *   - jump to the real kernel entry (start_kernel) with boot info in RDI/RSI.
+ */
+void decompress_kernel(uint64_t multiboot_magic, uint64_t multiboot_info) {
         const uint8_t *payload_lz4 = _binary_build_payload_lz4_start;
         size_t payload_lz4_len = (size_t)(_binary_build_payload_lz4_end - _binary_build_payload_lz4_start);
 

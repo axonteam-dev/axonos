@@ -840,10 +840,8 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                 /* copy fd table and bump refcount so close in parent doesn't free shared files (e.g. pipe) */
                 for (int i = 0; i < THREAD_MAX_FD; i++) {
                     t->fds[i] = tc->fds[i];
-                    if (t->fds[i]) {
-                        if (t->fds[i]->refcount <= 0) t->fds[i]->refcount = 1;
-                        else t->fds[i]->refcount++;
-                    }
+                    if (t->fds[i])
+                        fs_file_get(t->fds[i]);
                 }
                 t->attached_tty = tc->attached_tty;
                 t->attached_pty = tc->attached_pty;
@@ -915,8 +913,25 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                 if (tc && tc->mm) t->mm = mm_retain(tc->mm);
                 else t->mm = mm_retain(mm_kernel());
         }
-        threads[thread_count++] = t;
-        t->sched_fifo_seq = ++sched_fifo_counter;
+        /* Publish under sched_lock: two CPUs registering concurrently must not
+         * pick the same slot / overwrite each other (T26). tid is re-assigned
+         * here (== slot) so pgid/sid below match the final, unique id. */
+        {
+                unsigned long irqf;
+                acquire_irqsave(&sched_lock, &irqf);
+                int slot = thread_count;
+                if (slot >= MAX_THREADS) {
+                        release_irqrestore(&sched_lock, irqf);
+                        thread_free_resources(t);
+                        return NULL;
+                }
+                t->tid = slot;
+                t->pgid = slot;
+                t->sid = slot;
+                threads[thread_count++] = t;
+                t->sched_fifo_seq = ++sched_fifo_counter;
+                release_irqrestore(&sched_lock, irqf);
+        }
         return t;
 }
 

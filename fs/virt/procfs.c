@@ -29,7 +29,7 @@
 #include <keyring.h>
 
 struct procfs_handle {
-	int kind; /* 1=root, 2=pid_dir, 3=pid_file, 4=symlink, 5=pid_fd_dir, 6=pid_fd_link, 7=plain, 8=proc_sys_dir, 9=proc_sys_file */
+	int kind; /* 1=root, 2=pid_dir, 3=pid_file, 4=symlink, 5=pid_fd_dir, 6=pid_fd_link, 7=plain, 8=proc_sys_dir, 9=proc_sys_file, 10=bus_root, 11=bus_usb_dir, 12=tty_dir, 13=scsi_dir, 14=net_dir, 15=task_dir, 16=bus_pci_dir, 17=task_tid_dir */
 	int pid;
 	int file_id; /* pid_file: 0=cmdline,1=stat,2=status,3=statm; sys/plain: ids; pid_fd_link: fd number */
 	size_t pos;
@@ -393,7 +393,9 @@ static void procfs_calc_proc_mem(thread_t *t, struct procfs_proc_mem *m) {
 }
 
 static uint64_t procfs_sum_unique_user_rss_kb(void) {
-    void *seen_mm[128];
+    /* Covers the whole thread table (MAX_THREADS=512); beyond that the
+     * remaining mms are counted per-thread (best-effort overcount). */
+    void *seen_mm[512];
     int seen_count = 0;
     uint64_t rss_kb = 0;
     int n = thread_get_count();
@@ -1052,14 +1054,16 @@ static ssize_t procfs_write(struct fs_file *file, const void *buf, size_t size, 
 	return -1;
 }
 
-/* /proc/keys — Linux-style listing of keyring keys. */
+/* /proc/keys — Linux-style listing of keyring keys. Reentrant: the buffer is
+ * per-call (arg), not a shared global, so two CPUs reading /proc/keys cannot
+ * tear each other's output (and keyring_walk serializes against key mutations). */
 struct keys_buf { char *buf; size_t cap; size_t used; };
-static struct keys_buf g_keys_buf;
 
-static void keys_walk_cb(uint32_t serial, int type, uint32_t uid, uint32_t gid,
-                         uint32_t perms, const char *desc, size_t desc_len) {
-    struct keys_buf *kb = &g_keys_buf;
-    if (!kb->buf) return;
+static void keys_walk_cb(void *arg, uint32_t serial, int type, uint32_t uid,
+                         uint32_t gid, uint32_t perms,
+                         const char *desc, size_t desc_len) {
+    struct keys_buf *kb = (struct keys_buf *)arg;
+    if (!kb || !kb->buf) return;
     const char *tn = (type == KEY_TYPE_KEYRING) ? "keyring" :
                      (type == KEY_TYPE_ASYMMETRIC) ? "asymmetric" : "user";
     /* format similar to /proc/keys */
@@ -1070,16 +1074,15 @@ static void keys_walk_cb(uint32_t serial, int type, uint32_t uid, uint32_t gid,
     if (n > 0) kb->used += (size_t)n;
     if (kb->used > kb->cap) kb->used = kb->cap;
 }
-static struct keys_buf g_keys_buf;
 
 ssize_t procfs_show_keys(char *buf, size_t size) {
     if (!buf || size == 0) return 0;
-    g_keys_buf.buf = buf;
-    g_keys_buf.cap = size;
-    g_keys_buf.used = 0;
-    keyring_walk(keys_walk_cb);
-    g_keys_buf.buf = NULL;
-    return (ssize_t)g_keys_buf.used;
+    struct keys_buf kb;
+    kb.buf = buf;
+    kb.cap = size;
+    kb.used = 0;
+    keyring_walk(keys_walk_cb, &kb);
+    return (ssize_t)kb.used;
 }
 
 /* Generate /proc plain-file body for file_id (meminfo/stat/mounts/...). */
@@ -1122,7 +1125,9 @@ static ssize_t procfs_generate_plain(int file_id, char *buf, size_t cap) {
 	return 0;
 }
 
-/* Snapshot plain /proc file at open (or lazily on first read). */
+/* Snapshot plain /proc file at open (or lazily on first read).  Cache build is
+ * serialized by procfs_lock: the same fs_file may be shared (dup) across CPUs,
+ * and a concurrent first-read could otherwise double-allocate/torn-fill (T22). */
 static void procfs_fill_kind7_cache(struct procfs_handle *h, struct fs_file *f) {
 	if (!h || !f || h->kind != 7 || h->cache)
 		return;
@@ -1131,18 +1136,24 @@ static void procfs_fill_kind7_cache(struct procfs_handle *h, struct fs_file *f) 
 		cap = 65536;
 	else if (h->file_id == 15)
 		cap = 8192; /* cpu + cpu0..N + btime trailer */
-	h->cache = (char *)kmalloc(cap);
-	if (!h->cache)
-		return;
-	ssize_t full = procfs_generate_plain(h->file_id, h->cache, cap);
-	if (full > 0) {
-		f->size = (size_t)full;
-		h->cache_len = f->size;
-	} else {
-		/* Keep empty snapshot (len 0) so read returns EOF, not "missing". */
-		h->cache_len = 0;
-		f->size = 0;
+	unsigned long irqf;
+	acquire_irqsave(&procfs_lock, &irqf);
+	/* Re-check under the lock: another CPU may have just filled it. */
+	if (!h->cache) {
+		h->cache = (char *)kmalloc(cap);
+		if (h->cache) {
+			ssize_t full = procfs_generate_plain(h->file_id, h->cache, cap);
+			if (full > 0) {
+				f->size = (size_t)full;
+				h->cache_len = f->size;
+			} else {
+				/* Keep empty snapshot (len 0) so read returns EOF, not "missing". */
+				h->cache_len = 0;
+				f->size = 0;
+			}
+		}
 	}
+	release_irqrestore(&procfs_lock, irqf);
 }
 
 static int procfs_create(const char *path, struct fs_file **out_file) {
@@ -1212,6 +1223,10 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 			memcpy(tmp, p, first_len); tmp[first_len] = '\0';
 			int ok = 1;
 			for (size_t i = 0; i < first_len; i++) if (tmp[i] < '0' || tmp[i] > '9') { ok = 0; break; }
+			/* pid space is <= PROC_PID_MAX (512); anything longer is attacker
+			 * garbage that atoi() would wrap into a valid-looking small pid. */
+			if (ok && first_len > 6)
+				ok = 0;
 			if (ok) pid = atoi(tmp);
 		}
 		/* special subtree: /proc/sys/... */
@@ -1417,8 +1432,9 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				return 0;
 			}
 			if (first_len == 3 && strncmp(p, "sys", 3) == 0) {
-				/* /proc/sys root directory */
+				/* /proc/sys root directory (fallback; primary path is above) */
 				h->kind = 8; h->file_id = 0; f->type = FS_TYPE_DIR; f->size = 0;
+				f->driver_private = h;
 				*out_file = f;
 				return 0;
 			}
@@ -1438,6 +1454,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
             if (first_len == 3 && strncmp(p, "bus", 3) == 0) {
                 /* /proc/bus root directory */
                 h->kind = 10; f->type = FS_TYPE_DIR; f->size = 0;
+                f->driver_private = h;
                 *out_file = f;
                 return 0;
             }
@@ -1556,10 +1573,13 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					int ok = 1;
 					for (size_t i = 0; tmp[i]; i++)
 						if (tmp[i] < '0' || tmp[i] > '9') { ok = 0; break; }
+					/* tid space is <= MAX_THREADS (512); longer strings wrap in atoi. */
+					if (strlen(tmp) > 4)
+						ok = 0;
 					if (!ok) { kfree(h); kfree(pp); kfree(f); return -1; }
 					tid = atoi(tmp);
 					if (!slash3) {
-						h->kind = 16;
+						h->kind = 17;
 						h->pid = tid;
 						f->type = FS_TYPE_DIR;
 						f->size = 0;
@@ -1618,6 +1638,9 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					memcpy(tmp, rest2, l); tmp[l] = '\0';
 					int ok = 1;
 					for (size_t i = 0; i < l; i++) if (tmp[i] < '0' || tmp[i] > '9') { ok = 0; break; }
+					/* fd table is 1024 entries; a longer string wraps in atoi. */
+					if (ok && l > 4)
+						ok = 0;
 					if (!ok) { kfree(h); kfree(pp); kfree(f); return -1; }
 					int fdnum = atoi(tmp);
 					h->kind = 6; h->pid = pid; h->file_id = fdnum;
@@ -1713,8 +1736,13 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 
     /* /proc root and /proc/<pid>/fd — snapshots built at open. */
     if (h->kind == 1 || h->kind == 5) {
-        if (h->kind == 5 && !h->cache)
-            (void)procfs_build_fd_dir(h);
+        if (h->kind == 5 && !h->cache) {
+            unsigned long irqf;
+            acquire_irqsave(&procfs_lock, &irqf);
+            if (!h->cache)
+                (void)procfs_build_fd_dir(h);
+            release_irqrestore(&procfs_lock, irqf);
+        }
         if (!h->cache)
             return 0;
         if ((size_t)offset >= h->cache_len)
@@ -1745,8 +1773,9 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
             size_t namelen = strlen(fname);
             size_t rec_len = 8 + namelen;
             rec_len = (rec_len + 3) & ~3u;
-            if (pos + rec_len <= offset) { pos += rec_len; }
-            else {
+            if (pos + rec_len <= offset) {
+                pos += rec_len;
+            } else {
                 if (written < size) {
                     size_t entry_off = 0;
                     if ((size_t)offset > pos) entry_off = (size_t)offset - pos;
@@ -1767,8 +1796,8 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
                         written += tocopy;
                     }
                 }
+                pos += rec_len;
             }
-            pos += rec_len;
         }
         for (int idx = 0; idx < 8; idx++) {
             size_t namelen = strlen(names[idx]);
@@ -2092,7 +2121,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         return (ssize_t)written;
 	}
 	/* /proc/<pid>/task/<tid> — same files as pid dir */
-	if (h->kind == 16) {
+	if (h->kind == 17) {
 		const char *tnames[4] = { "cmdline", "stat", "status", "statm" };
 		size_t pos = 0;
 		size_t written = 0;
@@ -2186,7 +2215,7 @@ int procfs_fill_stat(struct fs_file *file, struct stat *st) {
     if (!h) return -1;
     if (h->kind == 1 || h->kind == 2 || h->kind == 5 || h->kind == 8 || h->kind == 10 ||
         h->kind == 11 || h->kind == 12 || h->kind == 13 || h->kind == 14 || h->kind == 15 ||
-        h->kind == 16) {
+        h->kind == 16 || h->kind == 17) {
         st->st_ino = (h->kind == 2 && h->pid > 0) ? (ino_t)((unsigned)h->pid + 100u)
                    : (h->kind == 5 && h->pid > 0) ? (ino_t)((unsigned)h->pid + 200u)
                    : 1;

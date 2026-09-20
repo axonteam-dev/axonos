@@ -70,11 +70,12 @@ long keyctl_do(int cmd, long a2, long a3, long a4, long a5);
 /* Number of keys currently present (for /proc/keys). */
 int keyring_count(void);
 
-/* Walk keys for /proc/keys: calls cb(serial, type, uid, gid, perms, desc, len).
- * Returns 0 on success. cb receives kernel pointers valid during the call. */
-typedef void (*keyring_walk_fn)(uint32_t serial, int type, uint32_t uid,
+/* Walk keys for /proc/keys: calls cb(arg, serial, type, uid, gid, perms, desc, len).
+ * The whole walk runs under the keyring lock; desc pointers are valid during the
+ * call. `arg` is opaque per-call data (reentrancy — two CPUs may walk at once). */
+typedef void (*keyring_walk_fn)(void *arg, uint32_t serial, int type, uint32_t uid,
                                 uint32_t gid, uint32_t perms,
                                 const char *desc, size_t desc_len);
-void keyring_walk(keyring_walk_fn cb);
+void keyring_walk(keyring_walk_fn cb, void *arg);
 
 #endif /* KEYRING_H */

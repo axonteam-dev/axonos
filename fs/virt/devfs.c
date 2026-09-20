@@ -371,9 +371,8 @@ static int tty_pending_locked(struct devfs_tty *t) {
     return v;
 }
 
-int devfs_tty_leave_alt_screen(int tty_idx) {
-    if (tty_idx < 0 || tty_idx >= DEVFS_TTY_COUNT) return 0;
-    struct devfs_tty *tty = &dev_ttys[tty_idx];
+/* Caller must hold tty->out_lock (locked variant, see wrapper below). */
+static int devfs_tty_leave_alt_screen_locked(struct devfs_tty *tty) {
     if (!tty->alt_active) return 0;
     size_t scr_sz = devfs_tty_screen_bytes();
     if (tty->alt_screen && tty->screen)
@@ -390,9 +389,19 @@ int devfs_tty_leave_alt_screen(int tty_idx) {
     tty->insert_mode = 0;
     tty->need_wrap = 0;
     tty->ansi_escape_state = 0;
-    if (tty_idx == devfs_get_active())
+    if (tty->id == devfs_get_active())
         devfs_tty_blit_to_console(tty);
     return 1;
+}
+
+int devfs_tty_leave_alt_screen(int tty_idx) {
+    if (tty_idx < 0 || tty_idx >= DEVFS_TTY_COUNT) return 0;
+    struct devfs_tty *tty = &dev_ttys[tty_idx];
+    unsigned long flags;
+    acquire_irqsave(&tty->out_lock, &flags);
+    int r = devfs_tty_leave_alt_screen_locked(tty);
+    release_irqrestore(&tty->out_lock, flags);
+    return r;
 }
 
 /* Fast clear for tty backing buffer. */
@@ -1125,8 +1134,7 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
         struct fs_file *src = (cur->process && n < PROCESS_MAX_FD)
             ? cur->process->fds[n] : cur->fds[n];
         if (!src) return -1;
-        if (src->refcount <= 0) src->refcount = 1;
-        else src->refcount++;
+        fs_file_get(src);
         *out_file = src;
         return 0;
     }
@@ -2456,7 +2464,7 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
                                             console_set_cursor(0, 0);
                                         }
                                     } else {
-                                        devfs_tty_leave_alt_screen(tty->id);
+                                        devfs_tty_leave_alt_screen_locked(tty);
                                     }
                                 }
                             }
@@ -2820,19 +2828,32 @@ void devfs_switch_tty(int index) {
     if (index < 0 || index >= DEVFS_TTY_COUNT) return;
     if (index == devfs_active) return;
 
+    /* Serialize against the painter for the destination tty (write_stream /
+     * echo hold out_lock). ISR-callable: never spin here, defer the switch
+     * if the destination is being painted right now (T6). */
+    struct devfs_tty *dst = &dev_ttys[index];
+    if (!try_acquire(&dst->out_lock))
+        return;
+    if (index == devfs_active) {
+        release(&dst->out_lock);
+        return;
+    }
+
     /* When cirrusfb is active, tty backing store matches its internal textbuf.
        Never memcpy fbcon-sized buffers into legacy VGA text memory; that corrupts memory. */
     if (cirrusfb_is_ready()) {
         devfs_tty_snapshot_visible(&dev_ttys[devfs_active]);
         devfs_active = index;
-        devfs_tty_blit_to_console(&dev_ttys[devfs_active]);
+        devfs_tty_blit_to_console(dst);
+        release(&dst->out_lock);
         return;
     }
 
     if (vbe_is_available()) {
         devfs_tty_snapshot_visible(&dev_ttys[devfs_active]);
         devfs_active = index;
-        devfs_tty_blit_to_console(&dev_ttys[devfs_active]);
+        devfs_tty_blit_to_console(dst);
+        release(&dst->out_lock);
         return;
     }
 
@@ -2840,7 +2861,8 @@ void devfs_switch_tty(int index) {
        Clamp copy size so we never write beyond the actual VGA text buffer. */
     devfs_tty_snapshot_visible(&dev_ttys[devfs_active]);
     devfs_active = index;
-    devfs_tty_blit_to_console(&dev_ttys[devfs_active]);
+    devfs_tty_blit_to_console(dst);
+    release(&dst->out_lock);
     /* set current user/process to first process attached to this tty, if any */
     /* NOTE:
        Do NOT call thread_set_current_user() here.
@@ -2871,15 +2893,20 @@ static int devfs_tty_try_erase(struct devfs_tty *t, int tty) {
     /* Remove last buffered character. */
     t->in_tail = last_idx;
     t->in_count--;
-    /* Echo erase: use TTY's cursor (kept in sync on each echo) so visual matches buffer. */
+    /* Echo erase: use TTY's cursor (kept in sync on each echo) so visual matches buffer.
+     * The console/cursor/VRAM are owned by out_lock; take it best-effort like
+     * devfs_tty_echo_bytes (drop the visual if another painter holds it). */
     if ((t->term_lflag & TTY_ECHO) /* ECHO */ && tty == devfs_get_active()) {
         if (t->cursor_x > 0) {
-            uint32_t cx = (uint32_t)t->cursor_x;
-            uint32_t cy = (uint32_t)t->cursor_y;
-            uint8_t attr = console_get_cell_attr(cx - 1, cy);
-            console_putch_xy(cx - 1, cy, ' ', attr);
-            t->cursor_x = cx - 1;
-            console_set_cursor(t->cursor_x, t->cursor_y);
+            if (try_acquire(&t->out_lock)) {
+                uint32_t cx = (uint32_t)t->cursor_x;
+                uint32_t cy = (uint32_t)t->cursor_y;
+                uint8_t attr = console_get_cell_attr(cx - 1, cy);
+                console_putch_xy(cx - 1, cy, ' ', attr);
+                t->cursor_x = cx - 1;
+                console_set_cursor(t->cursor_x, t->cursor_y);
+                release(&t->out_lock);
+            }
         }
     }
     return 1;

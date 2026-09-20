@@ -593,11 +593,13 @@ int keyring_count(void) {
     return c;
 }
 
-void keyring_walk(keyring_walk_fn cb) {
+void keyring_walk(keyring_walk_fn cb, void *arg) {
+    acquire(&g_kr_lock);
     for (int i = 0; i < KEYRING_MAX; i++) {
         if (!g_keys[i].used) continue;
-        cb(g_keys[i].serial, g_keys[i].type, g_keys[i].uid, g_keys[i].gid,
+        cb(arg, g_keys[i].serial, g_keys[i].type, g_keys[i].uid, g_keys[i].gid,
            g_keys[i].perms, g_keys[i].description,
            strlen(g_keys[i].description));
     }
+    release(&g_kr_lock);
 }

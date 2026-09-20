@@ -59,7 +59,7 @@ page_table_pd3:
 
 section .text
 global _start
-extern kernel_main
+extern decompress_kernel
 bits 32
 _start:
         ; Set up our own stack first. Relying on loader's stack is fragile.
@@ -72,6 +72,10 @@ _start:
         mov dword [multiboot_info_saved], ebx
         mov dword [multiboot_info_saved + 4], 0
 
+        ; Note (Linux head_64.S clear_bss analog): the stub has no BSS data of
+        ; its own that requires clearing — the multiboot vault above is written
+        ; explicitly and setup_page_tables() zeroes every page-table level by
+        ; hand, so a wholesale clear_bss would only wipe the live stack.
         mov edi, initmsg
         call print_vga
 
@@ -386,7 +390,7 @@ long_mode_start:
 	cli
         mov rdi, qword [rel multiboot_magic_saved]
         mov rsi, qword [rel multiboot_info_saved]
-        call kernel_main
+        call decompress_kernel
 
         cli
 .hang:

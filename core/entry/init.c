@@ -583,7 +583,13 @@ static int boot_try_run_init(void) {
         return -1;
 }
 
-void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
+/*
+ * start_kernel() — the AxonOS analog of Linux init/main.c start_kernel().
+ * The decompressor (boot/kzip_stub.c decompress_kernel) has already imaged
+ * this ELF at its link-time address with BSS cleared and jumps here with
+ * (multiboot_magic, multiboot_info) in RDI/RSI — Linux's rsi=boot_params.
+ */
+void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
         enable_cursor();
         sysinfo_init(multiboot_magic, multiboot_info);
 

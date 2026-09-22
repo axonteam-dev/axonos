@@ -7500,15 +7500,13 @@ static void resolve_kernel_path(thread_t *cur, const char *path,
     }
     if (path[0] == '/') {
         resolve_kernel_path(cur, path, out, out_cap);
-        if (trace_apk_abs)
-            kprintf("abs-resolve path=%s -> %s\n", path, out);
+        kprintf("abs-resolve path=%s -> %s\n", path, out);
         return 0;
     }
     enum { AT_FDCWD = -100 };
     if (dirfd == AT_FDCWD) {
         resolve_kernel_path(cur, path, out, out_cap);
-        if (trace_apk_abs)
-            kprintf("atfdcwd-resolve path=%s -> %s\n", path, out);
+        kprintf("atfdcwd-resolve path=%s -> %s\n", path, out);
         return 0;
     }
     /* dirfd: resolve relative to that directory */

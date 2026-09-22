@@ -7490,161 +7490,25 @@ static void resolve_kernel_path(thread_t *cur, const char *path,
     }
     const char *root = task_fs_root(cur);
     const char *cwd = (cur && cur->cwd[0]) ? cur->cwd : root;
-    if (path[0] == '/') {
-        char virt[512];
-        strncpy(virt, path, sizeof(virt) - 1);
-        virt[sizeof(virt) - 1] = '\0';
-        if (path_needs_normalize(virt)) normalize_path(virt, sizeof(virt));
-        if (strcmp(root, "/") == 0)
-            snprintf(out, out_cap, "%s", virt);
-        else if (strcmp(virt, "/") == 0)
-            snprintf(out, out_cap, "%s", root);
-        else
-            snprintf(out, out_cap, "%s%s", root, virt);
-        if (strcmp(root, "/") == 0)
-            map_tty_alias_path(out, out_cap);
-        return;
+    static int init_abs_trace_left = 80;
+    int trace_apk_abs = 0;
+    if (is_init_user(cur) && init_abs_trace_left > 0 &&
+        (strncmp(path, "/lib/", 5) == 0 || strncmp(path, "/etc/", 5) == 0 ||
+         strncmp(path, "/var/", 5) == 0)) {
+        trace_apk_abs = 1;
+        init_abs_trace_left--;
     }
-    /* "." means current directory. */
-    if (strcmp(path, ".") == 0) {
-        strncpy(out, cwd, out_cap);
-        out[out_cap - 1] = '\0';
-        return;
-    }
-    /* ".." means parent directory. */
-    if (strcmp(path, "..") == 0) {
-        if (strcmp(cwd, root) == 0) {
-            strncpy(out, root, out_cap);
-            out[out_cap - 1] = '\0';
-        } else {
-            const char *slash = strrchr(cwd, '/');
-            if (slash && slash > cwd) {
-                size_t len = (size_t)(slash - cwd);
-                if (len >= out_cap) len = out_cap - 1;
-                memcpy(out, cwd, len);
-                out[len] = '\0';
-            } else {
-                strncpy(out, root, out_cap);
-                out[out_cap - 1] = '\0';
-            }
-        }
-        return;
-    }
-    /* Build full path and normalize (handles ./run, a/./b, a/../b, trailing /). */
-    if (strcmp(cwd, "/") == 0) {
-        snprintf(out, out_cap, "/%s", path);
-    } else {
-        snprintf(out, out_cap, "%s/%s", cwd, path);
-    }
-    if (path_needs_normalize(out)) normalize_path(out, out_cap);
-    else {
-        size_t ol = strlen(out);
-        while (ol > 1 && out[ol - 1] == '/') out[--ol] = '\0';
-    }
-    if (!path_is_beneath_root(out, root)) {
-        strncpy(out, root, out_cap - 1);
-        out[out_cap - 1] = '\0';
-    }
-    if (strcmp(root, "/") == 0)
-        map_tty_alias_path(out, out_cap);
-}
-
-static void resolve_user_path(thread_t *cur, const char *path_u,
-                              char *out, size_t out_cap) {
-    if (!out || out_cap == 0) return;
-    out[0] = '\0';
-    if (!path_u || !user_range_ok(path_u, 1))
-        return;
-    char path_local[4096];
-    size_t len = user_strnlen_bounded(path_u, sizeof(path_local) - 1);
-    if (len >= sizeof(path_local) - 1 ||
-        !user_range_ok(path_u, len + 1) ||
-        copy_from_user_raw(path_local, path_u, len + 1) != 0)
-        return;
-    path_local[len] = '\0';
-    resolve_kernel_path(cur, path_local, out, out_cap);
-}
-
-/* Resolve path for openat: dirfd base or cwd. Returns 0 on success, negative errno on error. */
-static int resolve_user_path_at(thread_t *cur, int dirfd, const char *path_u, char *out, size_t out_cap);
-
-/*
- * Linux mknod(2)/mknodat(2). OpenRC seed_dev uses BusyBox mknod (SYS_mknodat)
- * for /dev/kmsg etc. when the node is missing.
- */
-static uint64_t syscall_do_mknod(thread_t *cur, const char *path, mode_t mode,
-                                 uint64_t rdev) {
-    (void)cur;
-    (void)rdev;
-    if (!path || path[0] == '\0')
-        return ret_err(EINVAL);
-    mode_t type = mode & (mode_t)0170000;
-    if (type == 0)
-        type = S_IFREG;
-
-    struct stat st;
-    if (vfs_stat(path, &st) == 0)
-        return ret_err(EEXIST);
-
-    if (type == S_IFCHR && strncmp(path, "/dev/", 5) == 0) {
-        /* Known specials (null, kmsg, …) already exist after boot mount. */
-        if (vfs_stat(path, &st) == 0 && (st.st_mode & S_IFCHR) == S_IFCHR)
-            return ret_err(EEXIST);
-        if (devfs_create_char_node(path, NULL) == 0)
-            return 0;
-        /* Node may already be a built-in special — treat as success if present. */
-        if (vfs_stat(path, &st) == 0 && (st.st_mode & S_IFCHR) == S_IFCHR)
-            return 0;
-        return ret_err(EPERM);
-    }
-
-    if (type == S_IFREG || type == (mode_t)0010000 /* S_IFIFO */) {
-        struct fs_file *f = fs_create_file(path);
-        if (!f)
-            return ret_err(EEXIST);
-        fs_file_free(f);
-        (void)fs_chmod(path, (mode & 07777u) | type);
-        return 0;
-    }
-
-    if (type == S_IFDIR)
-        return ret_err(EPERM);
-
-    /* Char/block outside /dev: create a regular node with the requested mode. */
-    {
-        struct fs_file *f = fs_create_file(path);
-        if (!f)
-            return ret_err(EIO);
-        fs_file_free(f);
-        if (fs_chmod(path, (mode & 07777u) | type) != 0)
-            return ret_err(EPERM);
-        return 0;
-    }
-}
-
-static int resolve_user_path_at(thread_t *cur, int dirfd, const char *path_u, char *out, size_t out_cap) {
-    if (!out || out_cap == 0) return -EFAULT;
-    out[0] = '\0';
-    const char *path = path_u;
-    /* The syscall stack is 64 KiB, so PATH_MAX-sized scratch storage is safe. */
-    char path_local[4096];
-    if (path_u && user_range_ok(path_u, 1)) {
-        size_t L = user_strnlen_bounded(path_u, sizeof(path_local) - 1);
-        if (L >= sizeof(path_local) - 1) return -ENAMETOOLONG;
-        if (!user_range_ok(path_u, L + 1) || copy_from_user_raw(path_local, path_u, L + 1) != 0) return -EFAULT;
-        path_local[L] = '\0';
-        path = path_local;
-    }
-    if (!path || !path[0]) return -ENOENT;
-    /* Absolute path: dirfd ignored, use standard resolve */
     if (path[0] == '/') {
         resolve_kernel_path(cur, path, out, out_cap);
+        if (trace_apk_abs)
+            kprintf("abs-resolve path=%s -> %s\n", path, out);
         return 0;
     }
-    /* AT_FDCWD = -100: use current working directory */
     enum { AT_FDCWD = -100 };
     if (dirfd == AT_FDCWD) {
         resolve_kernel_path(cur, path, out, out_cap);
+        if (trace_apk_abs)
+            kprintf("atfdcwd-resolve path=%s -> %s\n", path, out);
         return 0;
     }
     /* dirfd: resolve relative to that directory */
@@ -7652,10 +7516,25 @@ static int resolve_user_path_at(thread_t *cur, int dirfd, const char *path_u, ch
     struct fs_file *f = cur->fds[dirfd];
     if (!f) return -EBADF;
     if (f->type != FS_TYPE_DIR) return -ENOTDIR;
+    /* The base of a dirfd must be an absolute kernel path. If the directory
+     * was itself opened through a dirfd-relative chain, its stored path can be
+     * relative or empty (CWD-less). resolve_user_path_at() must ALWAYS emit an
+     * absolute pathname — otherwise the next openat() in a multi-level cascade
+     * (apk's db->root_fd -> layer dir -> file inside layer) resolves against
+     * CWD and fails with ENOENT ("Unable to read database"). Anchor + normalize
+     * so the composed path is absolute regardless of how the base was stored. */
     const char *base = f->path ? f->path : "/";
+    if (base[0] != '/') {
+        /* Stored relatively: reinterpret as rooted at "/". */
+        char rooted[4096];
+        snprintf(rooted, sizeof(rooted), "/%s", base);
+        base = rooted;
+    }
     size_t bl = strlen(base);
     int has_trailing = (bl > 1 && base[bl - 1] == '/');
     size_t pl = strlen(path);
+    kprintf("dirfd-resolve dirfd=%d base=%s has_trailing=%d rel=%s\n",
+            dirfd, base[0] ? base : "(empty)", has_trailing, path ? path : "(null)");
     if (has_trailing) {
         snprintf(out, out_cap, "%s%s", base, path);
     } else {

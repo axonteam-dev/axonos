@@ -11,6 +11,7 @@
 #include <vga.h>
 #include <spinlock.h>
 #include <klog.h>
+#include <timekeeping.h>
 #include <xattr.h>
 
 #ifndef ENODATA
@@ -90,6 +91,11 @@ static struct fs_driver ramfs_driver;
 static struct fs_driver_ops ramfs_ops;
 static struct ramfs_node *ramfs_root = NULL;
 static uint32_t ramfs_next_inode = 10;
+static time_t ramfs_now(void) {
+    int64_t sec;
+    ktime_get_real_ts64(&sec, NULL);
+    return (time_t)sec;
+}
 static int ramfs_diag_left = 400;
 static int ramfs_diag_pg(const char *path, const char *name)
 {
@@ -206,7 +212,7 @@ static struct ramfs_node *ramfs_alloc_node(const char *name, int is_dir) {
     n->open_count = 0;
     n->size = 0;
     n->generation = 1;
-    n->atime = n->mtime = n->ctime = 0;
+    n->atime = n->mtime = n->ctime = ramfs_now();
     return n;
 }
 
@@ -419,6 +425,7 @@ static void ramfs_inode_changed(struct ramfs_node *n)
 {
     if (!n)
         return;
+    n->mtime = n->ctime = ramfs_now();
     n->generation++;
     if (ramfs_diag_left > 0 && ramfs_diag_pg(NULL, n->name)) {
         ramfs_diag_left--;
@@ -633,6 +640,12 @@ static struct ramfs_node *ramfs_lookup_nofollow(const char *path) {
         char comp[256];
         int restarted = 0;
         while (ramfs_next_component(&p, comp, sizeof(comp)) && cur) {
+            if (!cur->is_dir) { kfree(curpath); return NULL; }
+            if (strcmp(comp, ".") == 0) continue;
+            if (strcmp(comp, "..") == 0) {
+                cur = cur->parent ? cur->parent : ramfs_root;
+                continue;
+            }
             struct ramfs_node *child = ramfs_find_child_sync(cur, comp);
             if (!child) {
                 kfree(curpath);
@@ -649,7 +662,18 @@ static struct ramfs_node *ramfs_lookup_nofollow(const char *path) {
                 }
                 while (*p == '/') p++;
                 const char *rest = (*p) ? p : NULL;
-                size_t newlen = strlen(child->data) + 1 + (rest ? strlen(rest) : 0) + 2;
+                /* Include the symlink's parent for relative targets. Otherwise
+                 * /usr/bin/sh -> busybox is truncated to /usr/bin/b, and
+                 * appending a remaining component can overrun the allocation. */
+                char parentbuf[2048] = "";
+                if (child->data[0] != '/' &&
+                    ramfs_build_path(child->parent ? child->parent : ramfs_root,
+                                     parentbuf, sizeof(parentbuf)) != 0) {
+                    kfree(curpath);
+                    return NULL;
+                }
+                size_t newlen = strlen(parentbuf) + strlen(child->data) +
+                                (rest ? strlen(rest) : 0) + 3;
                 char *newpath = (char *)kmalloc(newlen);
                 if (!newpath) {
                     kfree(curpath);
@@ -658,11 +682,6 @@ static struct ramfs_node *ramfs_lookup_nofollow(const char *path) {
                 if (child->data[0] == '/') {
                     strcpy(newpath, child->data);
                 } else {
-                    char parentbuf[2048];
-                    parentbuf[0] = '\0';
-                    if (ramfs_build_path(child->parent ? child->parent : ramfs_root,
-                                         parentbuf, sizeof(parentbuf)) != 0)
-                        strcpy(parentbuf, "/");
                     size_t plen = strlen(parentbuf);
                     if (plen > 1 && parentbuf[plen - 1] == '/')
                         parentbuf[plen - 1] = '\0';
@@ -711,13 +730,27 @@ static struct ramfs_node *ramfs_lookup(const char *path) {
         char comp[256];
         int restarted = 0;
         while (ramfs_next_component(&p, comp, sizeof(comp)) && cur) {
+            if (!cur->is_dir) { kfree(curpath); return NULL; }
+            if (strcmp(comp, ".") == 0) continue;
+            if (strcmp(comp, "..") == 0) {
+                cur = cur->parent ? cur->parent : ramfs_root;
+                continue;
+            }
             struct ramfs_node *child = ramfs_find_child_sync(cur, comp);
             if (!child) { kfree(curpath); return NULL; }
             if ((child->mode & S_IFLNK) == S_IFLNK) {
                 /* remaining path (skip slashes) */
                 while (*p == '/') p++;
                 const char *rest = (*p) ? p : NULL;
-                size_t newlen = strlen(child->data) + 1 + (rest ? strlen(rest) : 0) + 2;
+                char parentbuf[2048] = "";
+                if (child->data[0] != '/' &&
+                    ramfs_build_path(child->parent ? child->parent : ramfs_root,
+                                     parentbuf, sizeof(parentbuf)) != 0) {
+                    kfree(curpath);
+                    return NULL;
+                }
+                size_t newlen = strlen(parentbuf) + strlen(child->data) +
+                                (rest ? strlen(rest) : 0) + 3;
                 char *newpath = (char*)kmalloc(newlen);
                 if (!newpath) { kfree(curpath); return NULL; }
                 if (child->data[0] == '/') {
@@ -725,11 +758,6 @@ static struct ramfs_node *ramfs_lookup(const char *path) {
                     strcpy(newpath, child->data);
                 } else {
                     /* relative to parent directory of symlink */
-                    char parentbuf[2048];
-                    parentbuf[0] = '\0';
-                    if (ramfs_build_path(child->parent ? child->parent : ramfs_root, parentbuf, sizeof(parentbuf)) != 0) {
-                        strcpy(parentbuf, "/");
-                    }
                     /* join parent path + relative target */
                     size_t plen = strlen(parentbuf);
                     if (plen > 1 && parentbuf[plen - 1] == '/') parentbuf[plen - 1] = '\0';
@@ -1168,6 +1196,7 @@ int ramfs_ftruncate(struct fs_file *file, off_t length) {
      * zeros on fault; MAP_SHARED attaches stay coherent (no generation bump). */
     n->size = newsize;
     file->size = (off_t)n->size;
+    n->mtime = n->ctime = ramfs_now();
     release(&n->io_lock);
     return 0;
 }

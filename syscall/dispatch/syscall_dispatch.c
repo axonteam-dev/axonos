@@ -7012,13 +7012,13 @@ static inline uint64_t ret_err(int e) {
                     (unsigned long long)(uint64_t)t->user_brk_cur,
                     (unsigned long long)(uint64_t)t->user_mmap_next);
                 if (e == EPERM) {
-                    kprintf("dl-trace EPERM syscall=%llu tid=%llu name=%s\n",
+                    devel_printf("dl-trace EPERM syscall=%llu tid=%llu name=%s\n",
                         (unsigned long long)last_syscall_debug,
                         (unsigned long long)(t->tid ? t->tid : 1), nm);
                 }
             } else if (e == EPERM && (is_init_user(t) || strstr(nm, "openrc") ||
                        strstr(nm, "ld-linux") || strstr(nm, "ld.so"))) {
-                kprintf("dl-trace EPERM syscall=%llu tid=%llu name=%s (suppressed=%d)\n",
+                devel_printf("dl-trace EPERM syscall=%llu tid=%llu name=%s (suppressed=%d)\n",
                     (unsigned long long)last_syscall_debug,
                     (unsigned long long)(t->tid ? t->tid : 1), nm, err_repeat);
             }
@@ -7148,7 +7148,7 @@ static int is_init_user(thread_t *t) {
 }
 
 static int pid1_dl_trace_thread(thread_t *t) {
-    if (AXON_PRODUCTION)
+    if (!DEVEL_DEBUG || AXON_PRODUCTION)
         return 0;
     if (is_init_user(t))
         return 1;
@@ -7318,6 +7318,8 @@ static void pid1_dl_log_fd(thread_t *cur, const char *tag, int fd) {
 
 /* glibc _dl_get_file_id compares fstat(fd) vs stat(readlink path) dev/ino. */
 static void pid1_dl_verify_file_id(thread_t *cur, int fd) {
+    if (!DEVEL_DEBUG)
+        return;
     if (!cur || fd < 0 || fd >= THREAD_MAX_FD)
         return;
     struct fs_file *f = cur->fds[fd];

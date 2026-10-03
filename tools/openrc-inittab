@@ -1,0 +1,12 @@
+# BusyBox init is PID 1; OpenRC brings up runlevels before login.
+# The kernel has already mounted /dev, /proc, /sys and /run.
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+
+tty1::respawn:/sbin/getty 38400 -L tty1
+tty2::respawn:/sbin/getty 38400 -L tty2
+tty3::respawn:/sbin/getty 38400 -L tty3
+
+::ctrlaltdel:/sbin/reboot
+::shutdown:/sbin/openrc shutdown

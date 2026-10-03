@@ -76,6 +76,9 @@ static spinlock_t g_ns_lock;
 static uint32_t g_ns_next_inum = NS_INO_BASE;
 static struct nsproxy g_init_nsproxy;
 static struct uts_namespace g_init_uts;
+/* PID 1 can set the hostname before a process installs its namespace. */
+static char g_boot_nodename[UTS_NODENAME_MAX] = "axoniso";
+static char g_boot_domainname[UTS_NODENAME_MAX] = "local";
 static struct ipc_namespace g_init_ipc;
 static struct mnt_namespace g_init_mnt;
 static struct pid_namespace g_init_pid;
@@ -333,8 +336,8 @@ void ns_init(void)
 	ns_common_init(&g_init_user.ns, NS_TYPE_USER);
 	ns_common_init(&g_init_cgroup.ns, NS_TYPE_CGROUP);
 	ns_common_init(&g_init_time.ns, NS_TYPE_TIME);
-	memcpy(g_init_uts.nodename, "axoniso", 8);
-	memcpy(g_init_uts.domainname, "local", 6);
+	memcpy(g_init_uts.nodename, g_boot_nodename, sizeof(g_boot_nodename));
+	memcpy(g_init_uts.domainname, g_boot_domainname, sizeof(g_boot_domainname));
 	g_init_pid.last_pid = 1;
 	g_init_user.uid_map_count = 1;
 	g_init_user.uid_map[0].first = 0;
@@ -867,7 +870,7 @@ const char *ns_uts_nodename(void)
 	struct nsproxy *ns = ns_of(ns_current_proc());
 
 	if (!ns || !ns->uts_ns)
-		return "axoniso";
+		return g_boot_nodename;
 	return ns->uts_ns->nodename;
 }
 
@@ -876,7 +879,7 @@ const char *ns_uts_domainname(void)
 	struct nsproxy *ns = ns_of(ns_current_proc());
 
 	if (!ns || !ns->uts_ns)
-		return "local";
+		return g_boot_domainname;
 	return ns->uts_ns->domainname;
 }
 
@@ -885,7 +888,7 @@ int ns_uts_set_nodename(const char *buf, size_t len)
 	struct nsproxy *ns = ns_of(ns_current_proc());
 
 	if (!ns || !ns->uts_ns)
-		return -1;
+		return uts_set_name(g_boot_nodename, sizeof(g_boot_nodename), buf, len);
 	return uts_set_name(ns->uts_ns->nodename, sizeof(ns->uts_ns->nodename), buf, len);
 }
 
@@ -894,7 +897,7 @@ int ns_uts_set_domainname(const char *buf, size_t len)
 	struct nsproxy *ns = ns_of(ns_current_proc());
 
 	if (!ns || !ns->uts_ns)
-		return -1;
+		return uts_set_name(g_boot_domainname, sizeof(g_boot_domainname), buf, len);
 	return uts_set_name(ns->uts_ns->domainname, sizeof(ns->uts_ns->domainname), buf, len);
 }
 

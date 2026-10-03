@@ -487,25 +487,17 @@ void kernel_sysfs_populate_default(void) {
 }
 
 static int boot_try_run_init(void) {
-        /* OpenRC PID1 is openrc-init (/sbin/init → openrc-init in initfs).
-         * Prefer it over BusyBox linuxrc. /sbin/openrc is the runlevel helper, not PID1. */
+        /* Alpine boots /sbin/init (BusyBox PID 1), whose inittab runs OpenRC
+         * sysinit, boot and default before starting getty. /linuxrc is a
+         * fallback for older initfs images, not the primary init path. */
         static const char *candidates[] = {
+                "/sbin/init",
                 "/linuxrc",
                 "/sbin/openrc-init",
                 "/usr/sbin/openrc-init",
-                "/sbin/init",
                 "/bin/sh",
                 NULL
         };
-        int have_openrc = 0;
-        {
-                struct stat st;
-                if (vfs_stat("/sbin/openrc-init", &st) == 0 ||
-                        vfs_stat("/usr/sbin/openrc-init", &st) == 0 ||
-                        vfs_stat("/sbin/openrc", &st) == 0 ||
-                        vfs_stat("/usr/sbin/openrc", &st) == 0)
-                        have_openrc = 1;
-        }
         for (int i = 0; candidates[i]; i++) {
                 const char *p = candidates[i];
                 struct stat st;

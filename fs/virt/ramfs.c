@@ -623,7 +623,8 @@ static int ramfs_build_path(struct ramfs_node *node, char *buf, size_t bufsz) {
  * `/var/run/X` failed with ENOENT while getdents on the open(`/var/run`)
  * (followed) directory still listed X — classic ls "cannot access" spam.
  */
-static struct ramfs_node *ramfs_lookup_nofollow(const char *path) {
+/* Callers holding ramfs_tree_lock must not reacquire it for each component. */
+static struct ramfs_node *ramfs_lookup_nofollow_impl(const char *path, int tree_locked) {
     if (!path) return NULL;
     if (strcmp(path, "/") == 0) return ramfs_root;
     if (path[0] != '/') return NULL;
@@ -646,7 +647,8 @@ static struct ramfs_node *ramfs_lookup_nofollow(const char *path) {
                 cur = cur->parent ? cur->parent : ramfs_root;
                 continue;
             }
-            struct ramfs_node *child = ramfs_find_child_sync(cur, comp);
+            struct ramfs_node *child = tree_locked
+                ? ramfs_find_child(cur, comp) : ramfs_find_child_sync(cur, comp);
             if (!child) {
                 kfree(curpath);
                 return NULL;
@@ -712,6 +714,10 @@ static struct ramfs_node *ramfs_lookup_nofollow(const char *path) {
     }
     kfree(curpath);
     return NULL;
+}
+
+static struct ramfs_node *ramfs_lookup_nofollow(const char *path) {
+    return ramfs_lookup_nofollow_impl(path, 0);
 }
 
 static struct ramfs_node *ramfs_lookup(const char *path) {
@@ -1109,6 +1115,21 @@ int ramfs_chmod(const char *path, mode_t mode) {
     if (uid != 0 && uid != n->uid) return -1;
     /* chmod changes permission/special bits, never the inode file type. */
     n->mode = (n->mode & 0170000u) | (mode & 07777u);
+    return 0;
+}
+
+int ramfs_fchmod_file(struct fs_file *file, mode_t mode) {
+    if (!file || file->fs_private != ramfs_driver.driver_data || !file->driver_private)
+        return -1;
+    struct ramfs_file_handle *h = (struct ramfs_file_handle *)file->driver_private;
+    struct ramfs_node *n = h->node;
+    if (!n) return -1;
+    thread_t *ct = ramfs_cred();
+    if (ct && ct->euid != 0 && ct->euid != n->uid) return -1;
+    unsigned long flags;
+    ramfs_tree_lock_acquire(&flags);
+    n->mode = (n->mode & 0170000u) | (mode & 07777u);
+    ramfs_tree_lock_release(flags);
     return 0;
 }
 
@@ -1519,7 +1540,7 @@ ssize_t ramfs_getxattr(const char *path, const char *name, void *value, size_t s
     if (!path || !name)
         return -EINVAL;
     ramfs_tree_lock_acquire(&flags);
-    n = ramfs_lookup_nofollow(path);
+    n = ramfs_lookup_nofollow_impl(path, 1);
     if (!n) {
         ramfs_tree_lock_release(flags);
         return -ENOENT;
@@ -1554,7 +1575,7 @@ ssize_t ramfs_listxattr(const char *path, char *list, size_t size) {
     if (!path)
         return -EINVAL;
     ramfs_tree_lock_acquire(&flags);
-    n = ramfs_lookup_nofollow(path);
+    n = ramfs_lookup_nofollow_impl(path, 1);
     if (!n) {
         ramfs_tree_lock_release(flags);
         return -ENOENT;
@@ -1610,7 +1631,7 @@ int ramfs_setxattr(const char *path, const char *name, const void *value, size_t
         return -EINVAL;
 
     ramfs_tree_lock_acquire(&irqf);
-    n = ramfs_lookup_nofollow(path);
+    n = ramfs_lookup_nofollow_impl(path, 1);
     if (!n) {
         ramfs_tree_lock_release(irqf);
         return -ENOENT;
@@ -1676,7 +1697,7 @@ int ramfs_removexattr(const char *path, const char *name) {
     if (!path || !name)
         return -EINVAL;
     ramfs_tree_lock_acquire(&flags);
-    n = ramfs_lookup_nofollow(path);
+    n = ramfs_lookup_nofollow_impl(path, 1);
     if (!n) {
         ramfs_tree_lock_release(flags);
         return -ENOENT;

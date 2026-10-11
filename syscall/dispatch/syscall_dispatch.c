@@ -53,6 +53,7 @@
 #include <user_as.h>
 #include <keyring.h>
 #include <timekeeping.h>
+#include <cgroup.h>
 
 /* Opt-in TCP connect/RX console traces (VGA paint is expensive under VMware). */
 #ifndef NET_TCP_TRACE
@@ -1388,19 +1389,6 @@ void syscall_epilogue_probe(uint64_t *frame) {
         thread_t *px = thread_current();
         if (!px || px->ring != 3) px = thread_get_current_user();
         if (px && px->name && px->name[0]) {
-            const char *z = px->name;
-            int xr = 0;
-            for (; *z; z++) {
-                if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { xr = 1; break; }
-            }
-            if (xr) {
-                static int xorg_epi_left = 100;
-                if (xorg_epi_left-- > 0)
-                    kprintf("xorg-epi: rip=0x%llx rsp=0x%llx rax=0x%llx\n",
-                            (unsigned long long)frame[13],
-                            (unsigned long long)frame[15],
-                            (unsigned long long)frame[14]);
-            }
         }
     }
     if (!frame || !syscall_pipe_watch_active)
@@ -2251,6 +2239,112 @@ void eventfd_fs_file_destroy(struct fs_file *f) {
     kfree(f);
 }
 
+/* Inotify descriptors own watches independently of their fd number (dup shares
+ * the same open file description). Event delivery can be attached to VFS
+ * mutations; an empty queue reports EAGAIN to nonblocking readers. */
+typedef struct inotify_watch_k {
+    struct inotify_watch_k *next;
+    int wd;
+    uint32_t mask;
+    char path[];
+} inotify_watch_k;
+
+typedef struct inotify_state_k {
+    int next_wd;
+    inotify_watch_k *watches;
+} inotify_state_k;
+
+void inotify_fs_file_destroy(struct fs_file *f) {
+    if (!f || f->type != FS_TYPE_INOTIFY) return;
+    inotify_state_k *state = (inotify_state_k *)f->driver_private;
+    if (state) {
+        inotify_watch_k *w = state->watches;
+        while (w) {
+            inotify_watch_k *next = w->next;
+            kfree(w);
+            w = next;
+        }
+        kfree(state);
+    }
+    if (f->path) kfree((void *)f->path);
+    kfree(f);
+}
+
+/* Linux timerfd(2): expiration state is shared by dup'd descriptors. */
+typedef struct timerfd_state_k {
+    spinlock_t lock;
+    uint64_t interval_ns;
+    uint64_t deadline_ns;
+    uint64_t expirations;
+    int clock_id;
+    int armed;
+    int cancel_on_set;
+} timerfd_state_k;
+
+typedef struct timerfd_timespec_k {
+    int64_t sec;
+    int64_t nsec;
+} timerfd_timespec_k;
+
+typedef struct timerfd_itimerspec_k {
+    timerfd_timespec_k interval;
+    timerfd_timespec_k value;
+} timerfd_itimerspec_k;
+
+static int timerfd_spec_valid(const timerfd_timespec_k *ts) {
+    return ts && ts->sec >= 0 && ts->nsec >= 0 && ts->nsec < 1000000000;
+}
+
+static uint64_t timerfd_timespec_ns(const timerfd_timespec_k *ts) {
+    if ((uint64_t)ts->sec > (UINT64_MAX - (uint64_t)ts->nsec) / 1000000000ULL)
+        return UINT64_MAX;
+    return (uint64_t)ts->sec * 1000000000ULL + (uint64_t)ts->nsec;
+}
+
+static uint64_t timerfd_now_ns(int clock_id) {
+    if (clock_id == 0 || clock_id == 8) {
+        int64_t sec = 0, nsec = 0;
+        ktime_get_real_ts64(&sec, &nsec);
+        return (uint64_t)sec * 1000000000ULL + (uint64_t)nsec;
+    }
+    return time_monotonic_us() * 1000ULL;
+}
+
+static void timerfd_update_at(timerfd_state_k *t, uint64_t now) {
+    if (!t->armed || now < t->deadline_ns) return;
+    uint64_t count = 1;
+    if (t->interval_ns) {
+        count += (now - t->deadline_ns) / t->interval_ns;
+        if (count > (UINT64_MAX - t->deadline_ns) / t->interval_ns)
+            t->deadline_ns = UINT64_MAX;
+        else
+            t->deadline_ns += count * t->interval_ns;
+    } else {
+        t->armed = 0;
+    }
+    if (count > UINT64_MAX - t->expirations)
+        t->expirations = UINT64_MAX;
+    else
+        t->expirations += count;
+}
+
+static void timerfd_get_spec_locked(timerfd_state_k *t, uint64_t now,
+                                     timerfd_itimerspec_k *out) {
+    timerfd_update_at(t, now);
+    uint64_t remaining = t->armed && t->deadline_ns > now ? t->deadline_ns - now : 0;
+    out->interval.sec = (int64_t)(t->interval_ns / 1000000000ULL);
+    out->interval.nsec = (int64_t)(t->interval_ns % 1000000000ULL);
+    out->value.sec = (int64_t)(remaining / 1000000000ULL);
+    out->value.nsec = (int64_t)(remaining % 1000000000ULL);
+}
+
+void timerfd_fs_file_destroy(struct fs_file *f) {
+    if (!f || f->type != FS_TYPE_TIMERFD) return;
+    if (f->driver_private) kfree(f->driver_private);
+    if (f->path) kfree((void *)f->path);
+    kfree(f);
+}
+
 static ssize_t eventfd_read_bytes(eventfd_t *e, void *buf, size_t cnt, thread_t *cur) {
     if (!e || !buf) return -EINVAL;
     if (cnt < 8) return -EINVAL;
@@ -2570,6 +2664,22 @@ typedef struct unix_stream_conn {
     int fdpass_count[2];
 } unix_stream_conn_t;
 
+typedef struct unix_dgram_msg {
+    struct unix_dgram_msg *next;
+    size_t len;
+    uint32_t pid, uid, gid;
+    uint8_t data[];
+} unix_dgram_msg_t;
+
+typedef struct unix_dgram_pair {
+    spinlock_t lock;
+    int refs;
+    int closed[2];
+    unix_dgram_msg_t *head[2], *tail[2]; /* direction 0->1, 1->0 */
+    size_t queued_bytes[2];
+    unsigned queued_messages[2];
+} unix_dgram_pair_t;
+
 typedef struct __attribute__((packed)) {
     uint8_t dst[6];
     uint8_t src[6];
@@ -2636,6 +2746,8 @@ typedef struct {
     char unix_path[108];
     /* AF_UNIX stream endpoint/listener state */
     struct unix_stream_conn *unix_conn;
+    unix_dgram_pair_t *unix_dgram;
+    int unix_passcred;
     int unix_end; /* 0 or 1 endpoint index inside unix_conn */
     struct fs_file *unix_accept_q[16];
     int unix_accept_head;
@@ -2874,6 +2986,106 @@ static ksock_net_t *unix_find_listener_by_path(const char *path, int path_len, i
     return NULL;
 }
 
+/* SOCK_DGRAM socketpairs preserve message boundaries across send/recv and
+ * retain one queue per direction, unlike unix_stream_conn's byte rings. */
+static ssize_t unix_dgram_send(ksock_net_t *s, const void *data, size_t len,
+                               int from_user, thread_t *sender, int nonblock) {
+    if (!s || !s->unix_dgram) return -ENOTCONN;
+    if (len > 65536) return -EMSGSIZE;
+    if (len && (!data || (from_user && !user_range_ok(data, len)))) return -EFAULT;
+    unix_dgram_msg_t *msg = (unix_dgram_msg_t *)kmalloc(sizeof(*msg) + len);
+    if (!msg) return -ENOMEM;
+    msg->next = NULL;
+    msg->len = len;
+    msg->pid = (uint32_t)(sender && sender->process ? sender->process->pid :
+                          sender && sender->tid ? sender->tid : 1);
+    msg->uid = sender ? sender->euid : 0;
+    msg->gid = sender ? sender->egid : 0;
+    if (len) {
+        if (from_user && copy_from_user_raw(msg->data, data, len) != 0) {
+            kfree(msg);
+            return -EFAULT;
+        }
+        if (!from_user) memcpy(msg->data, data, len);
+    }
+    unix_dgram_pair_t *pair = s->unix_dgram;
+    int dir = s->unix_end;
+    for (;;) {
+        unsigned long irqf = 0;
+        acquire_irqsave(&pair->lock, &irqf);
+        if (pair->closed[1 - dir]) {
+            release_irqrestore(&pair->lock, irqf);
+            kfree(msg);
+            return -EPIPE;
+        }
+        if (pair->queued_messages[dir] < 64 &&
+            pair->queued_bytes[dir] <= 65536 - len) {
+            if (pair->tail[dir]) pair->tail[dir]->next = msg;
+            else pair->head[dir] = msg;
+            pair->tail[dir] = msg;
+            pair->queued_bytes[dir] += len;
+            pair->queued_messages[dir]++;
+            release_irqrestore(&pair->lock, irqf);
+            return (ssize_t)len;
+        }
+        release_irqrestore(&pair->lock, irqf);
+        if (nonblock) { kfree(msg); return -EAGAIN; }
+        if (thread_has_interrupt_signal(sender)) { kfree(msg); return -EINTR; }
+        thread_sleep(1);
+    }
+}
+
+static int unix_dgram_recv_kernel(ksock_net_t *s, void *dst, size_t cap, int flags,
+                                  size_t *copied, size_t *full_len, uint32_t creds[3]) {
+    if (!s || !s->unix_dgram || !copied || !full_len) return -EINVAL;
+    unix_dgram_pair_t *pair = s->unix_dgram;
+    int dir = 1 - s->unix_end;
+    for (;;) {
+        unsigned long irqf = 0;
+        acquire_irqsave(&pair->lock, &irqf);
+        unix_dgram_msg_t *msg = pair->head[dir];
+        if (msg) {
+            size_t n = msg->len < cap ? msg->len : cap;
+            if (n && dst) memcpy(dst, msg->data, n);
+            if (creds) {
+                creds[0] = msg->pid;
+                creds[1] = msg->uid;
+                creds[2] = msg->gid;
+            }
+            *copied = n;
+            *full_len = msg->len;
+            if (!(flags & 0x2)) { /* MSG_PEEK */
+                pair->head[dir] = msg->next;
+                if (!pair->head[dir]) pair->tail[dir] = NULL;
+                pair->queued_bytes[dir] -= msg->len;
+                pair->queued_messages[dir]--;
+            }
+            release_irqrestore(&pair->lock, irqf);
+            if (!(flags & 0x2)) kfree(msg);
+            return 0;
+        }
+        int closed = pair->closed[dir];
+        release_irqrestore(&pair->lock, irqf);
+        if (closed) { *copied = *full_len = 0; return 0; }
+        if (s->nonblock || (flags & 0x40)) return -EAGAIN; /* MSG_DONTWAIT */
+        thread_sleep(1);
+    }
+}
+
+static ssize_t unix_dgram_read_to_user(ksock_net_t *s, void *dst, size_t cap, int flags) {
+    if (!cap) return 0;
+    if (!dst || !user_range_ok(dst, cap)) return -EFAULT;
+    size_t limit = cap < 65536 ? cap : 65536;
+    void *tmp = kmalloc(limit);
+    if (!tmp) return -ENOMEM;
+    size_t copied = 0, full_len = 0;
+    int r = unix_dgram_recv_kernel(s, tmp, limit, flags, &copied, &full_len, NULL);
+    if (r == 0 && copied && copy_to_user_safe(dst, tmp, copied) != 0) r = -EFAULT;
+    kfree(tmp);
+    if (r < 0) return r;
+    return (ssize_t)((flags & 0x20) ? full_len : copied); /* MSG_TRUNC */
+}
+
 static size_t unix_stream_avail_to_read(const ksock_net_t *s) {
     if (!s || !s->unix_conn) return 0;
     const unix_stream_conn_t *c = s->unix_conn;
@@ -2997,6 +3209,7 @@ static ssize_t unix_stream_write_from_user(ksock_net_t *s, const void *buf_u, si
 
 #define SOL_SOCKET_LINUX 1
 #define SCM_RIGHTS_LINUX 1
+#define SCM_CREDENTIALS_LINUX 2
 #define MSG_PEEK_LINUX   0x2
 #define MSG_CTRUNC_LINUX 0x8
 #define MSG_CMSG_CLOEXEC_LINUX 0x40000000u
@@ -3226,6 +3439,26 @@ static void unix_socket_cleanup(ksock_net_t *s) {
         release_irqrestore(&c->lock, fl);
         if (refs <= 0) kfree(c);
         s->unix_conn = NULL;
+    }
+    if (s->unix_dgram) {
+        unix_dgram_pair_t *pair = s->unix_dgram;
+        unsigned long irqf = 0;
+        acquire_irqsave(&pair->lock, &irqf);
+        pair->closed[s->unix_end] = 1;
+        int refs = --pair->refs;
+        release_irqrestore(&pair->lock, irqf);
+        if (refs == 0) {
+            for (int dir = 0; dir < 2; dir++) {
+                unix_dgram_msg_t *msg = pair->head[dir];
+                while (msg) {
+                    unix_dgram_msg_t *next = msg->next;
+                    kfree(msg);
+                    msg = next;
+                }
+            }
+            kfree(pair);
+        }
+        s->unix_dgram = NULL;
     }
 }
 
@@ -6542,7 +6775,9 @@ static int netlink_build_route_dump(ksock_net_t *s, uint16_t req_type, uint32_t 
         IFF_RUNNING_LOCAL = 0x40, IFF_NOARP_LOCAL = 0x80, IFF_LOWER_UP_LOCAL = 0x10000,
         IFF_MULTICAST_LOCAL = 0x1000
     };
-    size_t off = 0;
+    size_t off = s->nl_rx_len - s->nl_rx_off;
+    if (off && s->nl_rx_off)
+        memmove(s->nl_rx, s->nl_rx + s->nl_rx_off, off);
     uint16_t msg_type = 0;
     if (req_type == RTM_GETLINK_LOCAL) msg_type = RTM_NEWLINK_LOCAL;
     else if (req_type == RTM_GETADDR_LOCAL) msg_type = RTM_NEWADDR_LOCAL;
@@ -6679,11 +6914,15 @@ static int netlink_build_ack(ksock_net_t *s, const nlmsghdr_k *request,
     reply.header.nlmsg_len = sizeof(reply);
     reply.header.nlmsg_type = 2;
     reply.header.nlmsg_seq = request->nlmsg_seq;
-    reply.header.nlmsg_pid = s->nl_pid;
+    reply.header.nlmsg_pid = s->nl_pid; /* destination netlink port; sender sockaddr is PID 0 */
     reply.error = error > 0 ? -error : error;
     reply.request = *request;
-    memcpy(s->nl_rx, &reply, sizeof(reply));
-    s->nl_rx_len = sizeof(reply);
+    size_t pending = s->nl_rx_len - s->nl_rx_off;
+    if (pending && s->nl_rx_off)
+        memmove(s->nl_rx, s->nl_rx + s->nl_rx_off, pending);
+    if (pending + sizeof(reply) > sizeof(s->nl_rx)) return -1;
+    memcpy(s->nl_rx + pending, &reply, sizeof(reply));
+    s->nl_rx_len = pending + sizeof(reply);
     s->nl_rx_off = 0;
     return 0;
 }
@@ -6710,6 +6949,7 @@ static int netlink_apply_request(ksock_net_t *s, const uint8_t *packet,
                                  size_t len) {
     enum {
         RTM_NEWLINK_LOCAL = 16,
+        RTM_SETLINK_LOCAL = 19,
         RTM_NEWADDR_LOCAL = 20,
         RTM_DELADDR_LOCAL = 21,
         RTM_NEWROUTE_LOCAL = 24,
@@ -6734,13 +6974,16 @@ static int netlink_apply_request(ksock_net_t *s, const uint8_t *packet,
         h->nlmsg_type == RTM_GETROUTE_LOCAL)
         return netlink_build_route_dump(s, h->nlmsg_type, h->nlmsg_seq);
 
-    if (h->nlmsg_type == RTM_NEWLINK_LOCAL) {
+    if (h->nlmsg_type == RTM_NEWLINK_LOCAL || h->nlmsg_type == RTM_SETLINK_LOCAL) {
         if (h->nlmsg_len < sizeof(*h) + sizeof(ifinfomsg_k)) {
             error = EINVAL;
         } else {
             const ifinfomsg_k *ifi =
                 (const ifinfomsg_k *)(packet + sizeof(*h));
-            if (ifi->ifi_index != 2)
+            if (ifi->ifi_index == 1) {
+                /* The loopback interface is already up at boot. */
+                error = 0;
+            } else if (ifi->ifi_index != 2)
                 error = ENODEV;
             else if (net_set_if_up(!!(ifi->ifi_flags & 1u)) != 0)
                 error = EIO;
@@ -6756,7 +6999,10 @@ static int netlink_apply_request(ksock_net_t *s, const uint8_t *packet,
             size_t attrs_len = h->nlmsg_len - sizeof(*h) - sizeof(*ifa);
             uint32_t wire_ip = 0;
 
-            if (ifa->ifa_family != AF_INET_LOCAL || ifa->ifa_index != 2) {
+            if (ifa->ifa_index == 1 &&
+                (ifa->ifa_family == AF_INET_LOCAL || ifa->ifa_family == AF_INET6)) {
+                error = EEXIST; /* ::1 and 127.0.0.1 already assigned */
+            } else if (ifa->ifa_family != AF_INET_LOCAL || ifa->ifa_index != 2) {
                 error = EINVAL;
             } else if (h->nlmsg_type == RTM_DELADDR_LOCAL) {
                 error = net_apply_ipv4(0, 0, 0, 0, 0) == 0 ? 0 : EIO;
@@ -6811,6 +7057,7 @@ static int netlink_apply_request(ksock_net_t *s, const uint8_t *packet,
 }
 
 static uint64_t last_syscall_debug = 0;
+uint64_t g_last_syscall_nr = 0;
 static int is_init_user(thread_t *t);
 static int pid1_dl_trace_thread(thread_t *t);
 static uint64_t g_dl_first_eperm_sc;
@@ -6836,11 +7083,8 @@ static void init_clear_rtld_errno(thread_t *t) {
     (void)copy_from_user_raw(&old, (const void *)(uintptr_t)addr, sizeof(old));
     if (copy_to_user_safe((void *)(uintptr_t)addr, &zero, sizeof(zero)) != 0)
         return;
-    if (old != 0 && is_init_user(t)) {
-        static int rtld_errno_log_left = 12;
-        if (rtld_errno_log_left-- > 0)
-            kprintf("rtld-errno: cleared stale=%d at 0x%llx (base=0x%llx)\n",
-                old, (unsigned long long)addr, (unsigned long long)base);
+if (old != 0 && is_init_user(t)) {
+        /* cleared stale rtld errno (diagnostic value); see RTLD_ERRNO_OFFSET */
     }
 }
 
@@ -6868,11 +7112,6 @@ static uint64_t syscall_sanitize_user_ret(uint64_t ret) {
     if ((e == EPERM || sr == -1) && !keep_eperm) {
         g_dl_eperm_count++;
         if (!g_dl_first_eperm_sc) g_dl_first_eperm_sc = last_syscall_debug;
-        kprintf("user-sanitize EPERM syscall=%llu tid=%llu name=%s ret=0x%llx -> ENOENT\n",
-            (unsigned long long)last_syscall_debug,
-            (unsigned long long)(t->tid ? t->tid : 1),
-            t->name[0] ? t->name : "?",
-            (unsigned long long)ret);
         return (uint64_t)(-(int64_t)ENOENT);
     }
     return ret;
@@ -7022,6 +7261,16 @@ static inline uint64_t ret_err(int e) {
                     (unsigned long long)last_syscall_debug,
                     (unsigned long long)(t->tid ? t->tid : 1), nm, err_repeat);
             }
+        }
+    }
+    if (e == EACCES) {
+        static uint64_t eacces_left = 8;
+        if (eacces_left) {
+            eacces_left--;
+            devel_printf("EACCES: syscall=%llu tid=%llu name=%s\n",
+                (unsigned long long)last_syscall_debug,
+                (unsigned long long)(t ? (t->tid ? t->tid : 1) : 0),
+                (t && t->name[0]) ? t->name : "(null)");
         }
     }
     if (e == ENOMEM) {
@@ -7403,6 +7652,20 @@ static int path_needs_normalize(const char *p) {
     return 0;
 }
 
+/* ld.so compatibility applies to ELF sonames, not names such as ".socket".
+ * Otherwise newfstatat(AT_SYMLINK_NOFOLLOW) hides systemd's unit symlinks. */
+static int path_is_shared_library(const char *path) {
+    if (!path) return 0;
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    const char *so = name;
+    while ((so = strstr(so, ".so")) != NULL) {
+        if (so[3] == '\0' || so[3] == '.') return 1;
+        so += 3;
+    }
+    return 0;
+}
+
 /* Normalize path by resolving . and .. and stripping trailing slashes. */
 static void normalize_path(char *buf, size_t cap) {
     if (!buf || cap == 0) return;
@@ -7459,23 +7722,6 @@ static const char *task_fs_root(thread_t *cur) {
     return "/";
 }
 
-/* TEMP: warn the moment Xorg stats /dev/tty0 so we know the resolve step ran. */
-static void is_in_tty0_stat_xorg_warn(const char *path) {
-    static int xorg_mark2 = 0;
-    thread_t *cur = thread_current();
-    int xorg_nf = 0;
-    if (cur && cur->name && cur->name[0]) {
-        const char *z = cur->name;
-        for (; *z; z++) {
-            if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { xorg_nf = 1; break; }
-        }
-    }
-    if (xorg_nf && xorg_mark2 < 300) {
-        xorg_mark2++;
-        kprintf("nf: MARK2 about-to-stat path=%s\n", path ? path : "<?>");
-    }
-}
-
 static int path_is_beneath_root(const char *path, const char *root) {
     if (!path || !root) return 0;
     if (strcmp(root, "/") == 0) return path[0] == '/';
@@ -7492,23 +7738,161 @@ static void resolve_kernel_path(thread_t *cur, const char *path,
     }
     const char *root = task_fs_root(cur);
     const char *cwd = (cur && cur->cwd[0]) ? cur->cwd : root;
-    static int init_abs_trace_left = 80;
-    int trace_apk_abs = 0;
-    if (is_init_user(cur) && init_abs_trace_left > 0 &&
-        (strncmp(path, "/lib/", 5) == 0 || strncmp(path, "/etc/", 5) == 0 ||
-         strncmp(path, "/var/", 5) == 0)) {
-        trace_apk_abs = 1;
-        init_abs_trace_left--;
-    }
     if (path[0] == '/') {
-        resolve_kernel_path(cur, path, out, out_cap);
-        kprintf("abs-resolve path=%s -> %s\n", path, out);
+        char virt[512];
+        strncpy(virt, path, sizeof(virt) - 1);
+        virt[sizeof(virt) - 1] = '\0';
+        if (path_needs_normalize(virt)) normalize_path(virt, sizeof(virt));
+        if (strcmp(root, "/") == 0)
+            snprintf(out, out_cap, "%s", virt);
+        else if (strcmp(virt, "/") == 0)
+            snprintf(out, out_cap, "%s", root);
+        else
+            snprintf(out, out_cap, "%s%s", root, virt);
+        if (strcmp(root, "/") == 0)
+            map_tty_alias_path(out, out_cap);
+        return;
+    }
+    /* "." means current directory. */
+    if (strcmp(path, ".") == 0) {
+        strncpy(out, cwd, out_cap);
+        out[out_cap - 1] = '\0';
+        return;
+    }
+    /* ".." means parent directory. */
+    if (strcmp(path, "..") == 0) {
+        if (strcmp(cwd, root) == 0) {
+            strncpy(out, root, out_cap);
+            out[out_cap - 1] = '\0';
+        } else {
+            const char *slash = strrchr(cwd, '/');
+            if (slash && slash > cwd) {
+                size_t len = (size_t)(slash - cwd);
+                if (len >= out_cap) len = out_cap - 1;
+                memcpy(out, cwd, len);
+                out[len] = '\0';
+            } else {
+                strncpy(out, root, out_cap);
+                out[out_cap - 1] = '\0';
+            }
+        }
+        return;
+    }
+    /* Build full path and normalize (handles ./run, a/./b, a/../b, trailing /). */
+    if (strcmp(cwd, "/") == 0) {
+        snprintf(out, out_cap, "/%s", path);
+    } else {
+        snprintf(out, out_cap, "%s/%s", cwd, path);
+    }
+    if (path_needs_normalize(out)) normalize_path(out, out_cap);
+    else {
+        size_t ol = strlen(out);
+        while (ol > 1 && out[ol - 1] == '/') out[--ol] = '\0';
+    }
+    if (!path_is_beneath_root(out, root)) {
+        strncpy(out, root, out_cap - 1);
+        out[out_cap - 1] = '\0';
+    }
+    if (strcmp(root, "/") == 0)
+        map_tty_alias_path(out, out_cap);
+}
+
+static void resolve_user_path(thread_t *cur, const char *path_u,
+                              char *out, size_t out_cap) {
+    if (!out || out_cap == 0) return;
+    out[0] = '\0';
+    if (!path_u || !user_range_ok(path_u, 1))
+        return;
+    char path_local[4096];
+    size_t len = user_strnlen_bounded(path_u, sizeof(path_local) - 1);
+    if (len >= sizeof(path_local) - 1 ||
+        !user_range_ok(path_u, len + 1) ||
+        copy_from_user_raw(path_local, path_u, len + 1) != 0)
+        return;
+    path_local[len] = '\0';
+    resolve_kernel_path(cur, path_local, out, out_cap);
+}
+
+/* Resolve path for openat: dirfd base or cwd. Returns 0 on success, negative errno on error. */
+static int resolve_user_path_at(thread_t *cur, int dirfd, const char *path_u, char *out, size_t out_cap);
+
+/*
+ * Linux mknod(2)/mknodat(2). OpenRC seed_dev uses BusyBox mknod (SYS_mknodat)
+ * for /dev/kmsg etc. when the node is missing.
+ */
+static uint64_t syscall_do_mknod(thread_t *cur, const char *path, mode_t mode,
+                                 uint64_t rdev) {
+    (void)cur;
+    (void)rdev;
+    if (!path || path[0] == '\0')
+        return ret_err(EINVAL);
+    mode_t type = mode & (mode_t)0170000;
+    if (type == 0)
+        type = S_IFREG;
+
+    struct stat st;
+    if (vfs_stat(path, &st) == 0)
+        return ret_err(EEXIST);
+
+    if (type == S_IFCHR && strncmp(path, "/dev/", 5) == 0) {
+        /* Known specials (null, kmsg, …) already exist after boot mount. */
+        if (vfs_stat(path, &st) == 0 && (st.st_mode & S_IFCHR) == S_IFCHR)
+            return ret_err(EEXIST);
+        if (devfs_create_char_node(path, NULL) == 0)
+            return 0;
+        /* Node may already be a built-in special — treat as success if present. */
+        if (vfs_stat(path, &st) == 0 && (st.st_mode & S_IFCHR) == S_IFCHR)
+            return 0;
+        return ret_err(EPERM);
+    }
+
+    if (type == S_IFREG || type == (mode_t)0010000 /* S_IFIFO */) {
+        struct fs_file *f = fs_create_file(path);
+        if (!f)
+            return ret_err(EEXIST);
+        fs_file_free(f);
+        (void)fs_chmod(path, (mode & 07777u) | type);
         return 0;
     }
+
+    if (type == S_IFDIR)
+        return ret_err(EPERM);
+
+    /* Char/block outside /dev: create a regular node with the requested mode. */
+    {
+        struct fs_file *f = fs_create_file(path);
+        if (!f)
+            return ret_err(EIO);
+        fs_file_free(f);
+        if (fs_chmod(path, (mode & 07777u) | type) != 0)
+            return ret_err(EPERM);
+        return 0;
+    }
+}
+
+static int resolve_user_path_at(thread_t *cur, int dirfd, const char *path_u, char *out, size_t out_cap) {
+    if (!out || out_cap == 0) return -EFAULT;
+    out[0] = '\0';
+    const char *path = path_u;
+    /* The syscall stack is 64 KiB, so PATH_MAX-sized scratch storage is safe. */
+    char path_local[4096];
+    if (path_u && user_range_ok(path_u, 1)) {
+        size_t L = user_strnlen_bounded(path_u, sizeof(path_local) - 1);
+        if (L >= sizeof(path_local) - 1) return -ENAMETOOLONG;
+        if (!user_range_ok(path_u, L + 1) || copy_from_user_raw(path_local, path_u, L + 1) != 0) return -EFAULT;
+        path_local[L] = '\0';
+        path = path_local;
+    }
+    if (!path || !path[0]) return -ENOENT;
+    /* Absolute path: dirfd ignored, use standard resolve */
+    if (path[0] == '/') {
+        resolve_kernel_path(cur, path, out, out_cap);
+        return 0;
+    }
+    /* AT_FDCWD = -100: use current working directory */
     enum { AT_FDCWD = -100 };
     if (dirfd == AT_FDCWD) {
         resolve_kernel_path(cur, path, out, out_cap);
-        kprintf("atfdcwd-resolve path=%s -> %s\n", path, out);
         return 0;
     }
     /* dirfd: resolve relative to that directory */
@@ -7516,25 +7900,10 @@ static void resolve_kernel_path(thread_t *cur, const char *path,
     struct fs_file *f = cur->fds[dirfd];
     if (!f) return -EBADF;
     if (f->type != FS_TYPE_DIR) return -ENOTDIR;
-    /* The base of a dirfd must be an absolute kernel path. If the directory
-     * was itself opened through a dirfd-relative chain, its stored path can be
-     * relative or empty (CWD-less). resolve_user_path_at() must ALWAYS emit an
-     * absolute pathname — otherwise the next openat() in a multi-level cascade
-     * (apk's db->root_fd -> layer dir -> file inside layer) resolves against
-     * CWD and fails with ENOENT ("Unable to read database"). Anchor + normalize
-     * so the composed path is absolute regardless of how the base was stored. */
     const char *base = f->path ? f->path : "/";
-    if (base[0] != '/') {
-        /* Stored relatively: reinterpret as rooted at "/". */
-        char rooted[4096];
-        snprintf(rooted, sizeof(rooted), "/%s", base);
-        base = rooted;
-    }
     size_t bl = strlen(base);
     int has_trailing = (bl > 1 && base[bl - 1] == '/');
     size_t pl = strlen(path);
-    kprintf("dirfd-resolve dirfd=%d base=%s has_trailing=%d rel=%s\n",
-            dirfd, base[0] ? base : "(empty)", has_trailing, path ? path : "(null)");
     if (has_trailing) {
         snprintf(out, out_cap, "%s%s", base, path);
     } else {
@@ -8114,6 +8483,8 @@ static ssize_t net_sock_write_userspace(thread_t *cur, int fd, ksock_net_t *s, c
         (void)cur;
         (void)fd;
         if (!s->connected) return -ENOTCONN;
+        if (s->unix_dgram)
+            return unix_dgram_send(s, bufp, cnt, 1, cur, s->nonblock);
         if (cnt == 0) return 0;
         return unix_stream_write_from_user(s, bufp, cnt);
     }
@@ -8392,6 +8763,19 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
     }
     if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
         ksock_net_t *s = (ksock_net_t *)f->driver_private;
+        if (s->unix_dgram) {
+            unix_dgram_pair_t *pair = s->unix_dgram;
+            unsigned long irqf = 0;
+            acquire_irqsave(&pair->lock, &irqf);
+            int incoming = 1 - s->unix_end;
+            if ((events & POLLIN_K) && pair->head[incoming]) revents |= POLLIN_K;
+            if ((events & POLLOUT_K) && !pair->closed[incoming] &&
+                pair->queued_messages[s->unix_end] < 64 &&
+                pair->queued_bytes[s->unix_end] < 65536) revents |= POLLOUT_K;
+            if (pair->closed[incoming]) revents |= POLLHUP_K;
+            release_irqrestore(&pair->lock, irqf);
+            return revents;
+        }
         if (events & POLLOUT_K) {
             if (s->unix_domain_stub) {
                 if (!s->unix_listening && s->connected && !unix_stream_peer_closed(s) &&
@@ -8543,6 +8927,19 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
             revents |= POLLIN_K;
         return revents;
     }
+    if (f->type == FS_TYPE_INOTIFY)
+        return 0; /* no queued notifications */
+    if (f->type == FS_TYPE_TIMERFD && f->driver_private) {
+        timerfd_state_k *t = (timerfd_state_k *)f->driver_private;
+        uint64_t now = timerfd_now_ns(t->clock_id);
+        unsigned long irqf = 0;
+        acquire_irqsave(&t->lock, &irqf);
+        timerfd_update_at(t, now);
+        if ((events & POLLIN_K) && t->expirations)
+            revents |= POLLIN_K;
+        release_irqrestore(&t->lock, irqf);
+        return revents;
+    }
     if (events & POLLOUT_K) revents |= POLLOUT_K;
     if (events & POLLIN_K) {
         if (f->type == FS_TYPE_DIR) {
@@ -8604,6 +9001,8 @@ static ssize_t net_sock_read_userspace(thread_t *cur, ksock_net_t *s, void *bufp
     if (!s) return -EINVAL;
     if (s->unix_domain_stub) {
         if (!s->connected) return -ENOTCONN;
+        if (s->unix_dgram)
+            return unix_dgram_read_to_user(s, bufp, cnt, s->nonblock ? 0x40 : 0);
         if (cnt == 0) return 0;
         return unix_stream_read_to_user(s, bufp, cnt, 0);
     }
@@ -9022,19 +9421,6 @@ int maybe_deliver_pending_signal(uint64_t syscall_ret) {
     /* TEMP: only Xorg, only when it actually has a pending signal. */
     for (int si = 1; si <= 64; si++) {
         if (cur->pending_signals & (1ULL << (si - 1))) {
-            int xr = 0;
-            if (cur->name && cur->name[0]) {
-                const char *z = cur->name;
-                for (; *z; z++) {
-                    if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { xr = 1; break; }
-                }
-            }
-            if (xr) {
-                static int xorg_sig_left = 50;
-                if (xorg_sig_left-- > 0)
-                    kprintf("xorg-sigcheck: pending=%d ret-scan-0x%llx\n",
-                            si, (unsigned long long)syscall_ret);
-            }
             break;
         }
     }
@@ -9927,21 +10313,64 @@ static int rlimit_set(thread_t *cur, int resource, uint64_t soft, uint64_t hard)
     }
 }
 
-/* TEMP: TCGETS progress markers for Xorg (remove after hang resolved). */
-static void xorg_tcgets_mark(const char *tag, uint64_t req, uintptr_t arg) {
-    static int tcg_left = 60;
-    thread_t *ct = thread_current();
-    int x = 0;
-    if (ct && ct->name && ct->name[0]) {
-        const char *z = ct->name;
-        for (; *z; z++) {
-            if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { x = 1; break; }
+/* ramfs_remove is an internal recursive primitive. Never expose that
+ * behaviour through unlink/rmdir: apk removes directories with unlinkat. */
+static uint64_t syscall_remove_path(const char *path, int remove_dir) {
+    struct stat st;
+    if (!path || !path[0]) return ret_err(ENOENT);
+    if (strcmp(path, "/") == 0) return ret_err(EBUSY);
+    if (vfs_lstat(path, &st) != 0) return ret_err(ENOENT);
+    int is_dir = (st.st_mode & 0170000u) == S_IFDIR;
+    if (remove_dir && !is_dir) return ret_err(ENOTDIR);
+    if (!remove_dir && is_dir) return ret_err(EISDIR);
+    if (remove_dir) {
+        if (fs_get_mount_driver_exact(path)) return ret_err(EBUSY);
+        struct fs_driver *drv = fs_get_mount_driver(path);
+        if (drv && drv->ops && drv->ops->name &&
+            strcmp(drv->ops->name, "cgroup2") == 0) {
+            /* cgroup control files are virtual: they do not make a cgroup
+             * nonempty for rmdir(2). Let cgroupfs check child groups/tasks. */
+            int r = cgroupfs_rmdir(path);
+            return r == 0 ? 0 : ret_err(-r);
         }
+        struct fs_file *dir = fs_open(path);
+        if (!dir) return ret_err(ENOENT);
+        uint8_t entries[4096];
+        size_t pos = 0;
+        int error = 0;
+        for (;;) {
+            ssize_t nr = fs_read(dir, entries, sizeof(entries), pos);
+            if (nr < 0) { error = EIO; break; }
+            if (nr == 0) break;
+            size_t off = 0;
+            while (off + 8 <= (size_t)nr) {
+                struct ext2_dir_entry *de = (struct ext2_dir_entry *)(entries + off);
+                const char *name = (const char *)(entries + off + 8);
+                if (de->rec_len < 8 || de->name_len > de->rec_len - 8) {
+                    error = EIO;
+                    break;
+                }
+                if (de->rec_len > (size_t)nr - off) break;
+                if (de->inode != 0 &&
+                    !(de->name_len == 1 && name[0] == '.') &&
+                    !(de->name_len == 2 && name[0] == '.' && name[1] == '.')) {
+                    error = ENOTEMPTY;
+                    break;
+                }
+                off += de->rec_len;
+            }
+            if (error) break;
+            if (!off) { error = EIO; break; }
+            pos += off;
+        }
+        fs_file_free(dir);
+        if (error) return ret_err(error);
     }
-    if (x && tcg_left-- > 0)
-        kprintf("xorg-tcgets: %s req=0x%llx arg=0x%llx ms=%llu\n",
-                tag, (unsigned long long)req, (unsigned long long)arg,
-                (unsigned long long)time_monotonic_ms());
+    int r = fs_unlink(path);
+    if (r == 0) return 0;
+    if (r == -3) return ret_err(ENOENT);
+    if (r == -2 || r == -1) return ret_err(EPERM);
+    return ret_err(r < 0 ? -r : EIO);
 }
 
 static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
@@ -9950,7 +10379,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
        Syscalls must be handled for the *currently running* thread. */
     thread_t *cur = syscall_resolve_thread();
     if (!cur) {
-        kprintf("SYSCALL-NOCUR: syscall=%llu (no ring3 task)\n", (unsigned long long)num);
         return ret_err(ESRCH);
     }
     /* Keep global current_user synchronized with the actually running user thread.
@@ -9978,65 +10406,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
     /* record last syscall for debug logging of ENOSYS */
     last_syscall_debug = num;
-
-    /* TEMP: trace Xorg startup to find the probe hang (remove after fix).
-       No budget cap: the LAST line printed equals the syscall that hangs. */
-    {
-        int is_xorg = 0;
-        if (cur->name && cur->name[0]) {
-            const char *n = cur->name;
-            for (; *n && !is_xorg; n++)
-                if (*n == 'X' && n[1] == 'o' && n[2] == 'r' && n[3] == 'g')
-                    is_xorg = 1;
-        }
-        if (is_xorg) {
-            unsigned long ptake = (unsigned long)num;
-            if (ptake == 16) {
-                /* ioctl: fd (a1), request (a2), arg (a3). */
-kprintf("xorg-ioctl: fd=%llu req=0x%llx arg=0x%llx ms=%llu\n",
-                    (unsigned long long)a1, (unsigned long long)a2,
-                    (unsigned long long)a3,
-                    (unsigned long long)time_monotonic_ms());
-                goto xorg_trace_done;
-            }
-            const void *pp_u = NULL;
-            switch (ptake) {
-                case 2:   /* open(path, ...) */
-                case 4:   /* stat(path, ...) */
-                case 6:   /* lstat(path, ...) */
-                case 21:  /* access(path, ...) */
-                case 137: /* statfs(path, ...) */
-                case 257: /* openat(dirfd, path, ...) */
-                case 262: /* newfstatat(dirfd, path, ...) */
-                    pp_u = (ptake == 257 || ptake == 262)
-                               ? (const void*)(uintptr_t)a2
-                               : (const void*)(uintptr_t)a1;
-                    break;
-                default:
-                    break;
-            }
-            char pbuf[96];
-            pbuf[0] = '\0';
-            if (pp_u && cur->ring == 3) {
-                size_t pl = 0;
-                while (pl < sizeof(pbuf) - 2) {
-                    char c;
-                    if (copy_from_user_raw(&c, (const char*)pp_u + pl, 1) != 0)
-                        break;
-                    if (c == '\0')
-                        break;
-                    pbuf[pl++] = c;
-                }
-                pbuf[pl] = '\0';
-            }
-            kprintf("xorg-sys: tid=%llu nr=%llu a1=0x%llx ms=%llu%s%s\n",
-                    (unsigned long long)cur->tid, (unsigned long long)num,
-                    (unsigned long long)a1,
-                    (unsigned long long)time_monotonic_ms(),
-                    pbuf[0] ? " path=" : "", pbuf);
-        }
-xorg_trace_done:;
-    }
+    g_last_syscall_nr = num;
 
     /* Uncomment if there is some syscall issue — floods the console and
      * hides the shell prompt (ash setjobctl alone is getpgrp/kill/ioctl). */
@@ -10310,7 +10680,7 @@ xorg_trace_done:;
                                      strstr(cur->name, "/sh") ||
                                      strstr(cur->name, "fstabinfo") ||
                                      strstr(cur->name, "busybox")))
-                    kprintf("clone-ret: parent=%s child_pid=%u child_tid=%d flags=0x%llx\n",
+                    devel_printf("clone-ret: parent=%s child_pid=%u child_tid=%d flags=0x%llx\n",
                         cur->name, (unsigned)child_user_tid,
                         (int)(child->tid ? child->tid : 1),
                         (unsigned long long)flags);
@@ -11028,28 +11398,9 @@ xorg_trace_done:;
             return (uint64_t)res;
         }
         case SYS_rseq:
-            /* Minimal rseq registration:
-               int rseq(struct rseq *rseq, uint32_t rseq_len, int flags, uint32_t sig)
-               We accept a non-NULL pointer and length (basic validation) and store it
-               per-thread so userspace can use rseq registration checks. This is not a
-               full rseq implementation but enough for libc compatibility. */
-            {
-                const void *rseq_ptr = (const void*)(uintptr_t)a1;
-                uint32_t rseq_len = (uint32_t)a2;
-                int flags = (int)a3;
-                (void)flags;
-                thread_t *tcur = thread_get_current_user();
-                if (!tcur) tcur = thread_current();
-                if (rseq_ptr == NULL) {
-                    /* unregister */
-                    if (tcur) tcur->rseq_ptr = NULL;
-                    return 0;
-                }
-                if ((uintptr_t)rseq_ptr + (uintptr_t)rseq_len > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-                if (rseq_len < 16 || rseq_len > 4096) return ret_err(EINVAL);
-                if (tcur) tcur->rseq_ptr = (void*)rseq_ptr;
-                return 0;
-            }
+            /* No restartable-sequence implementation: advertising registration
+             * without updating cpu_id/abort state lets libc take unsafe paths. */
+            return ret_err(ENOSYS);
         case SYS_prlimit64: {
             /* prlimit64(pid, resource, new_limit, old_limit) — current process only. */
             uint64_t pid = a1;
@@ -11373,7 +11724,11 @@ xorg_trace_done:;
             r = overlayfs_symlink(linkpath, target);
             if (r == 0)
                 return 0;
-            return ret_err(EIO);
+            if (r == -2) return ret_err(ENOENT);
+            if (r == -3) return ret_err(ENOTDIR);
+            if (r == -4) return ret_err(EEXIST);
+            if (r == -5 || r == -6) return ret_err(ENOMEM);
+            return ret_err(EPERM);
         }
         case SYS_symlinkat: {
             const char *target_u = (const char *)(uintptr_t)a1;
@@ -11403,7 +11758,11 @@ xorg_trace_done:;
             r = overlayfs_symlink(linkpath, target);
             if (r == 0)
                 return 0;
-            return ret_err(EIO);
+            if (r == -2) return ret_err(ENOENT);
+            if (r == -3) return ret_err(ENOTDIR);
+            if (r == -4) return ret_err(EEXIST);
+            if (r == -5 || r == -6) return ret_err(ENOMEM);
+            return ret_err(EPERM);
         }
         case 87: { /* unlink(path) */
             const char *path_u = (const char*)(uintptr_t)a1;
@@ -11411,28 +11770,19 @@ xorg_trace_done:;
             if ((uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             char path[256];
             resolve_user_path(cur, path_u, path, sizeof(path));
-            int r = fs_unlink(path);
-            if (r == 0) return 0;
-            if (r == -3) return ret_err(ENOENT);
-            if (r == -2) return ret_err(EPERM);
-            if (r == -1) return ret_err(EPERM);
-            return ret_err(r < 0 ? -r : EIO);
+            return syscall_remove_path(path, 0);
         }
         case 263: { /* unlinkat(dirfd, path, flags) */
             int dirfd = (int)a1;
             const char *path_u = (const char*)(uintptr_t)a2;
             int flags = (int)a3;
-            (void)flags; /* we don't support AT_REMOVEDIR etc yet */
+            enum { AT_REMOVEDIR_LOCAL = 0x200 };
+            if (flags & ~AT_REMOVEDIR_LOCAL) return ret_err(EINVAL);
             if (!path_u || (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             char path[256];
             int rc = resolve_user_path_at(cur, dirfd, path_u, path, sizeof(path));
             if (rc != 0) return ret_err(-rc);
-            int r = fs_unlink(path);
-            if (r == 0) return 0;
-            if (r == -3) return ret_err(ENOENT);
-            if (r == -2) return ret_err(EPERM);
-            if (r == -1) return ret_err(EPERM);
-            return ret_err(r < 0 ? -r : EIO);
+            return syscall_remove_path(path, (flags & AT_REMOVEDIR_LOCAL) != 0);
         }
         case 265: { /* linkat(olddirfd, oldpath, newdirfd, newpath, flags) */
             int olddirfd = (int)a1;
@@ -11451,6 +11801,37 @@ xorg_trace_done:;
             if ((uintptr_t)newpath_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             rc2 = resolve_user_path_at(cur, newdirfd, newpath_u, newpath, sizeof(newpath));
             if (rc2 != 0) return ret_err(-rc2);
+            /* apk3 (HAVE_O_TMPFILE) finalizes cached APKINDEX via
+             * linkat(AT_FDCWD, "/proc/self/fd/N", atfd, name, AT_SYMLINK_FOLLOW).
+             * Resolve the /proc/self/fd/N path to the open descriptor and link
+             * the anonymous inode just like the AT_EMPTY_PATH (O_TMPFILE) case. */
+            {
+                char selfbuf[32];
+                if (oldpath_u && (uintptr_t)oldpath_u < (uintptr_t)MMIO_IDENTITY_LIMIT &&
+                    copy_from_user_raw(selfbuf, oldpath_u, sizeof(selfbuf) - 1) == 0) {
+                    selfbuf[sizeof(selfbuf) - 1] = '\0';
+                    if (strncmp(selfbuf, "/proc/self/fd/", 14) == 0) {
+                        int pfd = 0;
+                        const char *q = selfbuf + 14;
+                        for (; *q >= '0' && *q <= '9'; q++) {
+                            pfd = pfd * 10 + (*q - '0');
+                            if (pfd > THREAD_MAX_FD) break;
+                        }
+                        if (pfd >= 0 && pfd < THREAD_MAX_FD && *q == '\0') {
+                            struct fs_file *of = syscall_fd_get(cur, pfd);
+                            if (!of) return ret_err(ENOENT);
+                            r = ramfs_link_open_file(of, newpath);
+                            if (r == -1)
+                                r = overlayfs_link_open_file(of, newpath);
+                            if (r == 0) return 0;
+                            if (r == -2) return ret_err(ENOENT);
+                            if (r == -17) return ret_err(EEXIST);
+                            return ret_err(ENOENT);
+                        }
+                        return ret_err(ENOENT);
+                    }
+                }
+            }
             if (flags & AT_EMPTY_PATH_LOCAL) {
                 char first = 1;
                 if (copy_from_user_raw(&first, oldpath_u, 1) != 0)
@@ -11571,65 +11952,11 @@ xorg_trace_done:;
         case SYS_rmdir: {
             const char *path_u = (const char *)(uintptr_t)a1;
             char path[256];
-            struct stat st;
-            struct fs_file *dir;
-            uint8_t entries[4096];
-            ssize_t nr;
-            size_t off;
-
             if (!path_u ||
                 (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT)
                 return ret_err(EFAULT);
             resolve_user_path(cur, path_u, path, sizeof(path));
-            if (path[0] == '\0')
-                return ret_err(ENOENT);
-            if (strcmp(path, "/") == 0)
-                return ret_err(EBUSY);
-            if (vfs_lstat(path, &st) != 0)
-                return ret_err(ENOENT);
-            if ((st.st_mode & S_IFDIR) != S_IFDIR)
-                return ret_err(ENOTDIR);
-
-            /*
-             * ramfs_remove() is also the overlay unlink primitive and removes
-             * directories recursively. Keep Linux rmdir(2) semantics here:
-             * inspect the ext2-like directory stream and reject anything
-             * except "." and "..".
-             */
-            dir = fs_open(path);
-            if (!dir)
-                return ret_err(ENOENT);
-            nr = fs_read(dir, entries, sizeof(entries), 0);
-            fs_file_free(dir);
-            if (nr < 0)
-                return ret_err(EIO);
-            off = 0;
-            while (off + sizeof(struct ext2_dir_entry) <= (size_t)nr) {
-                struct ext2_dir_entry *de =
-                    (struct ext2_dir_entry *)(entries + off);
-                const char *name = (const char *)(entries + off + 8);
-                size_t name_room;
-
-                if (de->rec_len < 8 || off + de->rec_len > (size_t)nr)
-                    return ret_err(EIO);
-                name_room = (size_t)de->rec_len - 8;
-                if (de->name_len > name_room)
-                    return ret_err(EIO);
-                if (de->inode != 0 &&
-                    !(de->name_len == 1 && name[0] == '.') &&
-                    !(de->name_len == 2 && name[0] == '.' && name[1] == '.'))
-                    return ret_err(ENOTEMPTY);
-                off += de->rec_len;
-            }
-
-            {
-                int r = fs_unlink(path);
-                if (r == 0)
-                    return 0;
-                if (r == -3)
-                    return ret_err(ENOENT);
-                return ret_err(EIO);
-            }
+            return syscall_remove_path(path, 1);
         }
         case 258: { /* mkdirat(dirfd, pathname, mode) */
             int dirfd = (int)a1;
@@ -11698,8 +12025,12 @@ xorg_trace_done:;
         case 91: { /* fchmod(fd, mode) */
             int fd = (int)a1;
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
-            struct fs_file *f = cur ? cur->fds[fd] : NULL;
+            struct fs_file *f = syscall_fd_get(cur, fd);
             if (!f) return ret_err(EBADF);
+            /* Chmod the open inode, not a stale name (O_TMPFILE and rename). */
+            if (ramfs_fchmod_file(f, (mode_t)a2) == 0) return 0;
+            if (f->flags & 0x400000 /* O_TMPFILE: inode has no pathname */)
+                return ret_err(EPERM);
             if (f->path) {
                 int r = fs_chmod(f->path, (mode_t)a2);
                 if (r == 0) return 0;
@@ -11709,9 +12040,11 @@ xorg_trace_done:;
         case 93: { /* fchown(fd, uid, gid) */
             int fd = (int)a1;
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
-            struct fs_file *f = cur ? cur->fds[fd] : NULL;
+            struct fs_file *f = syscall_fd_get(cur, fd);
             if (!f) return ret_err(EBADF);
             if (!f->path) return ret_err(EINVAL);
+            if (devfs_chown(f->path, (uid_t)a2, (gid_t)a3) == 0)
+                return 0;
             if (overlayfs_chown(f->path, (uid_t)a2, (gid_t)a3) != 0)
                 return ret_err(EPERM);
             return 0;
@@ -13584,15 +13917,6 @@ xorg_trace_done:;
                 if (backlog == 0) backlog = 1;
                 s->unix_backlog = backlog;
                 s->unix_listening = 1;
-                {
-                    static int unix_listen_log = 8;
-                    if (unix_listen_log-- > 0)
-                        kprintf("unix: listen ok path=%s abs=%d backlog=%d tid=%d\n",
-                                s->unix_abstract ? "(abstract)" :
-                                    (s->unix_path[0] ? s->unix_path : "?"),
-                                s->unix_abstract, backlog,
-                                t ? (int)t->tid : -1);
-                }
                 return 0;
             }
             if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
@@ -14129,6 +14453,14 @@ xorg_trace_done:;
                 s->reuseaddr = on ? 1 : 0;
                 return 0;
             }
+            if (level == SOL_SOCKET_LOCAL && optname == 16 /* SO_PASSCRED */ && s->unix_domain_stub) {
+                int enabled;
+                if (!optval_u || optlen < sizeof(enabled) ||
+                    copy_from_user_raw(&enabled, optval_u, sizeof(enabled)) != 0)
+                    return ret_err(EFAULT);
+                s->unix_passcred = !!enabled;
+                return 0;
+            }
             if (level == SOL_IPV6_LOCAL && optname == IPV6_V6ONLY_LOCAL) {
                 int on = 0;
                 if (optval_u && optlen >= sizeof(int) && user_range_ok(optval_u, sizeof(int))) {
@@ -14275,6 +14607,11 @@ xorg_trace_done:;
             }
             if (s->unix_domain_stub) {
                 if (!s->connected) return ret_err(ENOTCONN);
+                if (s->unix_dgram) {
+                    ssize_t wr = unix_dgram_send(s, buf_u, len, 1, t,
+                                                 s->nonblock || ((int)a4 & 0x40));
+                    return wr < 0 ? ret_err((int)-wr) : (uint64_t)wr;
+                }
                 /* SOCK_DGRAM connect to /dev/log succeeds without a peer.
                  * Discard the datagram (vsyslog then falls through cleanly)
                  * instead of sleeping in the stream writer with unix_conn=NULL. */
@@ -14441,6 +14778,10 @@ xorg_trace_done:;
             if (len == 0) return 0;
             if (s->unix_domain_stub) {
                 if (!s->connected) return ret_err(ENOTCONN);
+                if (s->unix_dgram) {
+                    ssize_t rr = unix_dgram_read_to_user(s, buf_u, len, flags);
+                    return rr < 0 ? ret_err((int)-rr) : (uint64_t)rr;
+                }
                 ssize_t rr = unix_stream_read_to_user(s, buf_u, len, (flags & 0x2) ? 1 : 0);
                 if (rr < 0) return ret_err((int)(-rr));
                 if (from_u && fromlen_u && user_range_ok(fromlen_u, 4)) {
@@ -14683,6 +15024,12 @@ xorg_trace_done:;
             }
             if (s->unix_domain_stub) {
                 if (!s->connected) { kfree(flat); return ret_err(ENOTCONN); }
+                if (s->unix_dgram) {
+                    ssize_t wr = unix_dgram_send(s, flat, sum, 0, t,
+                                                 s->nonblock || ((int)a3 & 0x40));
+                    kfree(flat);
+                    return wr < 0 ? ret_err((int)-wr) : (uint64_t)wr;
+                }
                 if (s->type_base != SOCK_STREAM_LOCAL || !s->unix_conn) {
                     kfree(flat);
                     return (uint64_t)sum;
@@ -14856,25 +15203,31 @@ xorg_trace_done:;
             ksock_net_t *s = NULL;
             if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
             if (s->sock_domain == AF_NETLINK_LOCAL) {
-                if (iov[0].len == 0) return 0;
-                if (!iov[0].base || !user_range_ok(iov[0].base, (size_t)iov[0].len)) return ret_err(EFAULT);
                 if (s->nl_rx_off >= s->nl_rx_len) return 0;
                 size_t avail = s->nl_rx_len - s->nl_rx_off;
-                size_t ncopy = (avail > (size_t)iov[0].len) ? (size_t)iov[0].len : avail;
-                if (copy_to_user_safe(iov[0].base, s->nl_rx + s->nl_rx_off, ncopy) != 0) return ret_err(EFAULT);
-                if (!(flags & 0x2)) s->nl_rx_off += ncopy; /* MSG_PEEK */
-                if (m.msg_name && m.msg_namelen >= sizeof(sockaddr_nl_k) && user_range_ok(m.msg_name, sizeof(sockaddr_nl_k))) {
+                if (m.msg_name && m.msg_namelen >= sizeof(sockaddr_nl_k) &&
+                    user_range_ok(m.msg_name, sizeof(sockaddr_nl_k))) {
                     sockaddr_nl_k sa;
                     memset(&sa, 0, sizeof(sa));
                     sa.nl_family = AF_NETLINK_LOCAL;
-                    sa.nl_pid = 0; /* kernel */
+                    sa.nl_pid = 0; /* sender is the kernel */
                     (void)copy_to_user_safe(m.msg_name, &sa, sizeof(sa));
                 }
-                if (m.msg_name && user_range_ok(msg_u, sizeof(m))) {
-                    m.msg_namelen = sizeof(sockaddr_nl_k);
+                m.msg_namelen = m.msg_name ? sizeof(sockaddr_nl_k) : 0;
+                m.msg_controllen = 0; /* no NETLINK_PKTINFO control message */
+                m.msg_flags = 0;
+                if (user_range_ok(msg_u, sizeof(m))) {
                     (void)copy_to_user_safe(msg_u, &m, sizeof(m));
                 }
-                return (uint64_t)ncopy;
+                /* systemd probes datagram length with recvmsg(MSG_PEEK|MSG_TRUNC)
+                 * and a zero-length iovec before allocating its receive buffer. */
+                if (iov[0].len == 0)
+                    return (flags & 0x22) == 0x22 ? (uint64_t)avail : 0;
+                if (!iov[0].base || !user_range_ok(iov[0].base, (size_t)iov[0].len)) return ret_err(EFAULT);
+                size_t ncopy = (avail > (size_t)iov[0].len) ? (size_t)iov[0].len : avail;
+                if (copy_to_user_safe(iov[0].base, s->nl_rx + s->nl_rx_off, ncopy) != 0) return ret_err(EFAULT);
+                if (!(flags & 0x2)) s->nl_rx_off += ncopy; /* MSG_PEEK */
+                return (flags & 0x20) ? (uint64_t)avail : (uint64_t)ncopy;
             }
             if (s->sock_domain == AF_PACKET_LOCAL) {
                 size_t cap = (size_t)iov[0].len;
@@ -14920,6 +15273,44 @@ xorg_trace_done:;
             if (want64 == 0) return 0;
             if (s->unix_domain_stub) {
                 if (!s->connected) return ret_err(ENOTCONN);
+                if (s->unix_dgram) {
+                    size_t cap = want64 > 65536 ? 65536 : (size_t)want64;
+                    uint8_t *tmp = (uint8_t *)kmalloc(cap ? cap : 1);
+                    if (!tmp) return ret_err(ENOMEM);
+                    size_t copied = 0, full_len = 0;
+                    uint32_t creds[3] = {0};
+                    int r = unix_dgram_recv_kernel(s, tmp, cap, flags, &copied, &full_len, creds);
+                    if (r < 0) { kfree(tmp); return ret_err(-r); }
+                    size_t at = 0;
+                    for (uint64_t i = 0; i < m.msg_iovlen && at < copied; i++) {
+                        size_t n = (size_t)iov[i].len;
+                        if (n > copied - at) n = copied - at;
+                        if (n && (!iov[i].base || copy_to_user_safe(iov[i].base, tmp + at, n) != 0)) {
+                            kfree(tmp);
+                            return ret_err(EFAULT);
+                        }
+                        at += n;
+                    }
+                    kfree(tmp);
+                    size_t ctlcap = (size_t)m.msg_controllen;
+                    m.msg_controllen = 0;
+                    m.msg_namelen = 0;
+                    m.msg_flags = copied < full_len ? 0x20 : 0; /* MSG_TRUNC */
+                    if (s->unix_passcred) {
+                        if (m.msg_control && ctlcap >= 32 && user_range_ok(m.msg_control, 32)) {
+                            uint8_t cbuf[32] = {0};
+                            cmsghdr_k hdr = { .cmsg_len = 28, .cmsg_level = SOL_SOCKET_LINUX,
+                                              .cmsg_type = SCM_CREDENTIALS_LINUX };
+                            memcpy(cbuf, &hdr, sizeof(hdr));
+                            memcpy(cbuf + sizeof(hdr), creds, sizeof(creds));
+                            if (copy_to_user_safe(m.msg_control, cbuf, sizeof(cbuf)) != 0)
+                                return ret_err(EFAULT);
+                            m.msg_controllen = sizeof(cbuf);
+                        } else m.msg_flags |= MSG_CTRUNC_LINUX;
+                    }
+                    if (copy_to_user_safe(msg_u, &m, sizeof(m)) != 0) return ret_err(EFAULT);
+                    return (flags & 0x20) ? (uint64_t)full_len : (uint64_t)copied;
+                }
                 for (uint64_t i = 0; i < m.msg_iovlen; i++) {
                     if (iov[i].len == 0) continue;
                     if (!iov[i].base || !user_range_ok(iov[i].base, (size_t)iov[i].len))
@@ -15215,9 +15606,9 @@ xorg_trace_done:;
         case SYS_sysinfo: { /* sysinfo(struct sysinfo *) - syscall 99; glibc allocatestack needs sane freeram */
             void *info_u = (void*)(uintptr_t)a1;
             if (!info_u || (uintptr_t)info_u + 112 > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            /* Linux struct sysinfo x86_64: uptime(0), loads[3](8), totalram(32), freeram(40), sharedram(48),
-               bufferram(56), totalswap(64), freeswap(72), procs(80), pad(82), totalhigh(84), freehigh(92),
-               mem_unit(100). glibc advise_stack_range: freesize from freeram*mem_unit; must be >= stack size. */
+             /* Linux struct sysinfo x86_64: uptime(0), loads[3](8), totalram(32), freeram(40), sharedram(48),
+                bufferram(56), totalswap(64), freeswap(72), procs(80), pad(82), alignment(84..87),
+                totalhigh(88), freehigh(96), mem_unit(104). glibc uses mem_unit for physical_memory(). */
             uint8_t buf[128];
             memset(buf, 0, sizeof(buf));
             int64_t uptime_sec = (int64_t)(pit_get_time_ms() / 1000);
@@ -15253,9 +15644,9 @@ xorg_trace_done:;
             /* totalswap, freeswap at 64,72 = 0 */
             uint16_t procs = (uint16_t)thread_get_count();
             memcpy(buf + 80, &procs, 2);
-            /* totalhigh, freehigh at 84,92 = 0 */
-            uint32_t mem_unit = 1;
-            memcpy(buf + 100, &mem_unit, 4);
+             /* totalhigh, freehigh at 88,96 = 0 */
+             uint32_t mem_unit = 1;
+             memcpy(buf + 104, &mem_unit, 4);
             if (copy_to_user_safe(info_u, buf, 112) != 0) return ret_err(EFAULT);
             return 0;
         }
@@ -15480,40 +15871,56 @@ xorg_trace_done:;
             if (r < 0) return ret_err(EBADF);
             return (uint64_t)r;
         }
-        case 269: /* faccessat(dirfd, pathname, mode, flags) */
-        case 439: /* faccessat2(dirfd, pathname, mode, flags, ...) */
+        case 269: /* faccessat(dirfd, pathname, mode) */
+        case 439: /* faccessat2(dirfd, pathname, mode, flags) */
         {
             int dirfd = (int)a1;
             const char *path_u = (const char*)(uintptr_t)a2;
             int mode = (int)a3;
-            int flags = (int)a4;
-            (void)mode; (void)flags;
-            if (!path_u) return ret_err(EFAULT);
-            if ((uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            /* Same dirfd join as openat: base + "/" + path (do NOT dirname-strip). */
-            {
-                char path[512];
-                int rc = resolve_user_path_at(cur, dirfd, path_u, path, sizeof(path));
-                if (rc < 0) return ret_err(-rc);
-                if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(path)) {
-                    pid1_dl_log_stat("faccessat-req", path);
-                    kprintf("dl-trace faccessat req path=%s mode=0%o dirfd=%d flags=0x%x\n",
-                        path, (unsigned)mode, dirfd, (unsigned)flags);
+            int flags = (num == 439) ? (int)a4 : 0;
+            enum { AT_SYMLINK_NOFOLLOW_LOCAL = 0x100,
+                   AT_EACCESS_LOCAL = 0x200, AT_EMPTY_PATH_LOCAL = 0x1000 };
+            if (mode & ~7) return ret_err(EINVAL);
+            if (flags & ~(AT_SYMLINK_NOFOLLOW_LOCAL | AT_EACCESS_LOCAL | AT_EMPTY_PATH_LOCAL))
+                return ret_err(EINVAL);
+            struct stat st;
+            int empty = 0;
+            if (flags & AT_EMPTY_PATH_LOCAL) {
+                if (!path_u) empty = 1;
+                else {
+                    char first;
+                    if (!user_range_ok(path_u, 1) ||
+                        copy_from_user_raw(&first, path_u, 1) != 0)
+                        return ret_err(EFAULT);
+                    empty = first == '\0';
                 }
-                struct stat st;
-                if (vfs_stat(path, &st) != 0) {
-                    if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(path))
-                        kprintf("dl-trace faccessat ENOENT path=%s mode=0%o dirfd=%d\n",
-                            path, (unsigned)mode, dirfd);
-                    return ret_err(ENOENT);
-                }
-                if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(path)) {
-                    pid1_dl_log_stat("faccessat-ok", path);
-                    kprintf("dl-trace faccessat ok path=%s mode=0%o dirfd=%d flags=0x%x\n",
-                        path, (unsigned)mode, dirfd, (unsigned)flags);
-                }
-                return 0;
             }
+            if (empty && dirfd != -100) {
+                if (dirfd < 0 || dirfd >= THREAD_MAX_FD) return ret_err(EBADF);
+                struct fs_file *f = syscall_fd_get(cur, dirfd);
+                if (!f) return ret_err(EBADF);
+                if (vfs_fstat(f, &st) != 0) return ret_err(EINVAL);
+            } else {
+                if (!path_u && !empty) return ret_err(EFAULT);
+                char path[512];
+                int rc;
+                if (empty) resolve_kernel_path(cur, ".", path, sizeof(path));
+                else {
+                    rc = resolve_user_path_at(cur, dirfd, path_u, path, sizeof(path));
+                    if (rc != 0) return ret_err(-rc);
+                }
+                rc = (flags & AT_SYMLINK_NOFOLLOW_LOCAL) ? vfs_lstat(path, &st) : vfs_stat(path, &st);
+                if (rc != 0) return ret_err(ENOENT);
+            }
+            if (mode == 0) return 0; /* F_OK */
+            uid_t uid = (flags & AT_EACCESS_LOCAL) ? cur->euid : cur->uid;
+            gid_t gid = (flags & AT_EACCESS_LOCAL) ? cur->egid : cur->gid;
+            if (uid == 0)
+                return ((mode & 1) && !(st.st_mode & 0111)) ? ret_err(EACCES) : 0;
+            unsigned bits = uid == st.st_uid ? (st.st_mode >> 6) & 7u :
+                            gid == st.st_gid ? (st.st_mode >> 3) & 7u :
+                                               st.st_mode & 7u;
+            return (bits & (unsigned)mode) == (unsigned)mode ? 0 : ret_err(EACCES);
         }
         case 72: { /* fcntl(fd, cmd, arg) - minimal support */
             int fd = (int)a1;
@@ -15689,6 +16096,9 @@ xorg_trace_done:;
                     } else if (strcmp(md->ops->name, "sysfs") == 0) {
                         ksf.f_type = 0x62656572;
                         ksf.f_blocks = ksf.f_bfree = ksf.f_bavail = 0;
+                    } else if (strcmp(md->ops->name, "cgroup2") == 0) {
+                        ksf.f_type = 0x63677270; /* CGROUP2_SUPER_MAGIC */
+                        ksf.f_blocks = ksf.f_bfree = ksf.f_bavail = 0;
                     } else if (strcmp(md->ops->name, "devfs") == 0 || strcmp(md->ops->name, "devtmpfs") == 0) {
                         /* /dev is devtmpfs; /dev/pts is Unix98 devpts (glibc ptsname). */
                         if (strncmp(path, "/dev/pts", 8) == 0 &&
@@ -15728,6 +16138,9 @@ xorg_trace_done:;
                         ksf.f_blocks = ksf.f_bfree = ksf.f_bavail = 0;
                     } else if (strcmp(md->ops->name, "sysfs") == 0) {
                         ksf.f_type = 0x62656572;
+                        ksf.f_blocks = ksf.f_bfree = ksf.f_bavail = 0;
+                    } else if (strcmp(md->ops->name, "cgroup2") == 0) {
+                        ksf.f_type = 0x63677270; /* CGROUP2_SUPER_MAGIC */
                         ksf.f_blocks = ksf.f_bfree = ksf.f_bavail = 0;
                     } else if (strcmp(md->ops->name, "squashfs") == 0) {
                         ksf.f_type = 0x73717368;
@@ -16273,8 +16686,8 @@ xorg_trace_done:;
             char resolved_path[512];
             resolve_kernel_path(cur, path, resolved_path, sizeof(resolved_path));
             if (!resolved_path[0]) {
-                kfree(path);
-                return ret_err(ENOENT);
+kfree(path);
+                    return ret_err(ENOENT);
             }
             /* Copy argv array (NULL-terminated) */
             int argc = 0;
@@ -16400,6 +16813,16 @@ xorg_trace_done:;
             if (kenvp) { for (int i=0;i<envc;i++) if (kenvp[i]) kfree((void*)kenvp[i]); kfree(kenvp); }
             for (int i=0;i<argc;i++) if (kargv[i]) kfree((void*)kargv[i]);
             if (kargv) kfree((void*)kargv);
+            if (rc != 0) {
+                static uint64_t exec_err_left = 12;
+                if (exec_err_left) {
+                    exec_err_left--;
+                    kprintf("execve: FAIL tid=%llu path=%s rpath=%s rc=%d argc=%d\n",
+                        (unsigned long long)(cur && cur->tid ? cur->tid : 1),
+                        path ? path : "?", resolved_path[0] ? resolved_path : "?",
+                        rc, argc);
+                }
+            }
             if (rc != 0 && cur && cur->name[0] &&
                 (strstr(cur->name, "openrc") || strstr(cur->name, "linuxrc")))
                 kprintf("execve-fail: tid=%llu path=%s rc=%d argc=%d envc=%d\n",
@@ -17067,29 +17490,12 @@ xorg_trace_done:;
                         (unsigned long long)(uintptr_t)argp);
             }
             if (fd < 0 || fd >= THREAD_MAX_FD) {
-                if (cur && cur->name[0] && (strstr(cur->name, "/sh") || strstr(cur->name, "busybox")))
-                    kprintf("shell-ioctl-EBADF: fd=%d req=0x%llx (range) fds=[%s,%s,%s]\n",
-                        fd, (unsigned long long)req,
-                        thread_fd_path(cur, 0) ? thread_fd_path(cur, 0) : "-",
-                        thread_fd_path(cur, 1) ? thread_fd_path(cur, 1) : "-",
-                        thread_fd_path(cur, 2) ? thread_fd_path(cur, 2) : "-");
                 return ret_err(EBADF);
             }
             struct fs_file *f = cur->fds[fd];
             if (!f) {
-                if (cur && cur->name[0] && (strstr(cur->name, "/sh") || strstr(cur->name, "busybox")))
-                    kprintf("shell-ioctl-EBADF: fd=%d req=0x%llx (nil) fds=[%s,%s,%s]\n",
-                        fd, (unsigned long long)req,
-                        thread_fd_path(cur, 0) ? thread_fd_path(cur, 0) : "-",
-                        thread_fd_path(cur, 1) ? thread_fd_path(cur, 1) : "-",
-                        thread_fd_path(cur, 2) ? thread_fd_path(cur, 2) : "-");
                 return ret_err(EBADF);
             }
-            if (fbdev_is_fb0_file(f))
-                kprintf("fb-ioctl: fd=%d req=0x%llx arg=0x%llx path=%s\n",
-                    fd, (unsigned long long)req,
-                    (unsigned long long)(uintptr_t)argp,
-                    f->path ? f->path : "-");
 
             /* Common ioctl numbers on Linux x86_64 */
             enum {
@@ -17193,7 +17599,6 @@ xorg_trace_done:;
                         uint32_t c_ispeed, c_ospeed;
                     } tio;
                     if (!argp) return ret_err(EFAULT);
-                    xorg_tcgets_mark("pty-pre-copy", req, (uintptr_t)argp);
                     memset(&tio, 0, sizeof(tio));
                     pty_get_termios(f, &tio.c_iflag, &tio.c_oflag, &tio.c_cflag,
                                     &tio.c_lflag, tio.c_cc, sizeof(tio.c_cc));
@@ -17201,7 +17606,6 @@ xorg_trace_done:;
                     tio.c_ospeed = 9600;
                     /* 36 bytes = Linux struct termios (flags + c_line + NCCS=19). */
                     if (copy_to_user_safe(argp, &tio, 36) != 0) return ret_err(EFAULT);
-                    xorg_tcgets_mark("pty-post-copy", req, (uintptr_t)argp);
                     return 0;
                 }
                 if (req == TCSETS || req == TCSETSW || req == TCSETSF ||
@@ -17395,10 +17799,6 @@ xorg_trace_done:;
             /* Linux fbdev ioctls on /dev/fb0 (Xorg Driver "fbdev"). */
             if (fbdev_is_fb0_file(f)) {
                 uint32_t fbcmd = (uint32_t)req & 0xffffu;
-                static int fb0_ioctl_log = 64;
-                if (fb0_ioctl_log-- > 0)
-                    kprintf("fbdev-ioctl: req=0x%llx nr=0x%x active=%d\n",
-                            (unsigned long long)req, fbcmd, fbdev_is_active());
                 if (req == FBIOGET_VSCREENINFO || fbcmd == 0x4600) {
                     struct fb_var_screeninfo v;
                     if (!argp) return ret_err(EFAULT);
@@ -17717,7 +18117,6 @@ xorg_trace_done:;
                 /* isatty(3) is TCGETS success. Lying here for /dev/null made ash
                  * think stdin was interactive, read EOF, exit, and respawn-loop. */
                 if (!devfs_is_tty_file(f)) return ret_err(ENOTTY);
-                xorg_tcgets_mark("pre-copy", req, (uintptr_t)argp);
                 struct termios_k tio;
                 memset(&tio, 0, sizeof(tio));
                 tio.c_iflag = 0x00000100u /* ICRNL */ | 0x00000400u /* IXON */;
@@ -17742,7 +18141,6 @@ xorg_trace_done:;
                 size_t safe_sz = 36;
                 if (safe_sz > sizeof(tio)) safe_sz = sizeof(tio);
                 if (copy_to_user_safe(argp, &tio, safe_sz) != 0) return ret_err(EFAULT);
-                xorg_tcgets_mark("post-copy", req, (uintptr_t)argp);
                 return 0;
             }
             if (req == FIONREAD && devfs_is_tty_file(f)) {
@@ -18467,6 +18865,7 @@ xorg_trace_done:;
             /* Prefer process fd table (CLONE_FILES / CLONE_THREAD). */
             struct fs_file *f = syscall_fd_get(cur, fd);
             if (!f) return ret_err(EBADF);
+            if (f->type == FS_TYPE_INOTIFY) return ret_err(EBADF);
             if (cnt == 0) return 0;
             if (f->type == FS_TYPE_DIR) return ret_err(EISDIR);
             if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
@@ -18533,6 +18932,7 @@ xorg_trace_done:;
             if (iovcnt <= 0 || iovcnt > 64) return ret_err(EINVAL);
             struct fs_file *f = syscall_fd_get(cur, fd);
             if (!f) return ret_err(EBADF);
+            if (f->type == FS_TYPE_INOTIFY) return ret_err(EAGAIN);
 
             struct iovec_k { uint64_t base; uint64_t len; };
             struct iovec_k iov[64];
@@ -18765,6 +19165,7 @@ xorg_trace_done:;
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
             struct fs_file *f = syscall_fd_get(cur, fd);
             if (!f) return ret_err(EBADF);
+            if (cnt == 0) return 0;
             if (cur && cur->name[0] && strstr(cur->name, "openrc")) {
                 static int openrc_read_dbg_left = 24;
                 if (openrc_read_dbg_left-- > 0) {
@@ -18813,6 +19214,37 @@ xorg_trace_done:;
                 if (rr > 0 && copy_to_user_safe(bufp, info, (size_t)rr) != 0)
                     return ret_err(EFAULT);
                 return (rr >= 0) ? (uint64_t)rr : ret_read_err(rr);
+            }
+            if (f->type == FS_TYPE_INOTIFY)
+                return ret_err(EAGAIN);
+            if (f->type == FS_TYPE_TIMERFD && f->driver_private) {
+                if (cnt < sizeof(uint64_t)) return ret_err(EINVAL);
+                if (!bufp || !user_range_ok(bufp, sizeof(uint64_t))) return ret_err(EFAULT);
+                timerfd_state_k *t = (timerfd_state_k *)f->driver_private;
+                for (;;) {
+                    uint64_t now = timerfd_now_ns(t->clock_id);
+                    unsigned long irqf = 0;
+                    acquire_irqsave(&t->lock, &irqf);
+                    timerfd_update_at(t, now);
+                    uint64_t count = t->expirations;
+                    if (count) t->expirations = 0;
+                    release_irqrestore(&t->lock, irqf);
+                    if (count) {
+                        if (copy_to_user_safe(bufp, &count, sizeof(count)) != 0) {
+                            acquire_irqsave(&t->lock, &irqf);
+                            if (count > UINT64_MAX - t->expirations)
+                                t->expirations = UINT64_MAX;
+                            else
+                                t->expirations += count;
+                            release_irqrestore(&t->lock, irqf);
+                            return ret_err(EFAULT);
+                        }
+                        return sizeof(count);
+                    }
+                    if (f->flags & O_NONBLOCK_LINUX) return ret_err(EAGAIN);
+                    if (thread_has_interrupt_signal(cur)) return ret_err(EINTR);
+                    thread_sleep(1);
+                }
             }
             if (!bufp || !user_range_ok(bufp, cnt)) {
                 if (is_init_user(cur))
@@ -19341,7 +19773,7 @@ xorg_trace_done:;
             }
             if (is_init_user(cur) && strstr(path, ".so") != NULL) {
                 dl_fd_note(fd, path);
-                kprintf("boot: open ok fd=%d path=%s\n", fd, path);
+                devel_printf("boot: open ok fd=%d path=%s\n", fd, path);
                 g_dl_post_open_left = 32;
             }
             kfree(path);
@@ -19406,6 +19838,10 @@ xorg_trace_done:;
                 f = fs_create_file(tmpname);
                 if (!f)
                     return ret_err(ENOENT);
+                /* O_TMPFILE applies mode at inode creation, before the file is
+                 * detached from its temporary name and later linked into place. */
+                mode_t um = cur ? (mode_t)(cur->umask & 07777u) : (mode_t)0022;
+                (void)fs_chmod(tmpname, (create_mode & ~um) & 07777u);
                 (void)fs_unlink(tmpname);
                 created = 1;
             }
@@ -19414,7 +19850,7 @@ xorg_trace_done:;
             if (!f)
                 f = fs_open(path);
             if (!f) {
-                /* chvt: "console"->/console, "tty"->/tty, "tty0"->/tty0, "vc/0"->/dev/vc/0 (handled by devfs) */
+                /* chvt: console and tty aliases are handled by devfs. */
                 if (strcmp(path, "/console") == 0) f = fs_open("/dev/console");
                 else if (strcmp(path, "/tty") == 0) f = fs_open("/dev/tty");
                 else if (strcmp(path, "/tty0") == 0) f = fs_open("/dev/tty0");
@@ -19437,12 +19873,12 @@ xorg_trace_done:;
                     created = 1;
                 } else {
                     //klogprintf("openat() returned ENOENT for %s\n", path);
+                    if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(path))
+                        kprintf("dl-trace openat ENOENT path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
                     if (is_init_user(cur) || (cur && cur->name[0] &&
                         (strstr(cur->name, "openrc") || strstr(cur->name, "busybox") ||
                          strstr(cur->name, "/sh") || strstr(cur->name, "linuxrc"))))
                         devel_printf("pid1 openat ENOENT path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
-                    if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(path))
-                        kprintf("dl-trace openat ENOENT path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
                     return ret_err(ENOENT);
                 }
             } else {
@@ -19500,13 +19936,13 @@ xorg_trace_done:;
             if (is_init_user(cur) && strstr(path, ".so") != NULL) {
                 dl_fd_note(fd, path);
                 pid1_dl_verify_file_id(cur, fd);
-                kprintf("boot: openat ok fd=%d path=%s flags=0x%x\n", fd, path, flags);
+                devel_printf("boot: openat ok fd=%d path=%s flags=0x%x\n", fd, path, flags);
                 g_dl_post_open_left = 32;
                 if (f) {
                     unsigned char hdr[4];
                     ssize_t hr = fs_read(f, hdr, sizeof(hdr), 0);
                     f->pos = 0;
-                    kprintf("boot: openat verify-read fd=%d got=%zd magic=%02x%02x%02x%02x\n",
+                    devel_printf("boot: openat verify-read fd=%d got=%zd magic=%02x%02x%02x%02x\n",
                         fd, hr, hdr[0], hdr[1], hdr[2], hdr[3]);
                 }
             } else if (is_init_user(cur) || (cur && cur->name[0] && strstr(cur->name, "openrc"))) {
@@ -19532,17 +19968,21 @@ xorg_trace_done:;
             int type_base = type & ~(O_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
             if (domain != AF_UNIX_LOCAL || !sv_u || (uintptr_t)sv_u + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT)
                 return ret_err(EAFNOSUPPORT);
-            if (type_base != SOCK_STREAM_LOCAL || protocol != 0)
+            if ((type_base != SOCK_STREAM_LOCAL && type_base != SOCK_DGRAM_LOCAL) || protocol != 0)
                 return ret_err(EOPNOTSUPP);
-            unix_stream_conn_t *conn = (unix_stream_conn_t *)kmalloc(sizeof(*conn));
+            unix_stream_conn_t *conn = type_base == SOCK_STREAM_LOCAL
+                ? (unix_stream_conn_t *)kmalloc(sizeof(*conn)) : NULL;
+            unix_dgram_pair_t *pair = type_base == SOCK_DGRAM_LOCAL
+                ? (unix_dgram_pair_t *)kmalloc(sizeof(*pair)) : NULL;
             ksock_net_t *s0 = (ksock_net_t *)kmalloc(sizeof(*s0));
             ksock_net_t *s1 = (ksock_net_t *)kmalloc(sizeof(*s1));
             struct fs_file *f0 = (struct fs_file *)kmalloc(sizeof(*f0));
             struct fs_file *f1 = (struct fs_file *)kmalloc(sizeof(*f1));
             char *p0 = (char *)kmalloc(24);
             char *p1 = (char *)kmalloc(24);
-            if (!conn || !s0 || !s1 || !f0 || !f1 || !p0 || !p1) {
+            if ((!conn && !pair) || !s0 || !s1 || !f0 || !f1 || !p0 || !p1) {
                 if (conn) kfree(conn);
+                if (pair) kfree(pair);
                 if (s0) kfree(s0);
                 if (s1) kfree(s1);
                 if (f0) kfree(f0);
@@ -19551,9 +19991,14 @@ xorg_trace_done:;
                 if (p1) kfree(p1);
                 return ret_err(ENOMEM);
             }
-            memset(conn, 0, sizeof(*conn));
-            conn->refs = 2;
-            conn->lock.lock = 0;
+            if (conn) {
+                memset(conn, 0, sizeof(*conn));
+                conn->refs = 2;
+            }
+            if (pair) {
+                memset(pair, 0, sizeof(*pair));
+                pair->refs = 2;
+            }
             memset(s0, 0, sizeof(*s0));
             memset(s1, 0, sizeof(*s1));
             memset(f0, 0, sizeof(*f0));
@@ -19564,14 +20009,16 @@ xorg_trace_done:;
             s1->sock_domain = AF_UNIX_LOCAL;
             s0->unix_domain_stub = 1;
             s1->unix_domain_stub = 1;
-            s0->type_base = SOCK_STREAM_LOCAL;
-            s1->type_base = SOCK_STREAM_LOCAL;
+            s0->type_base = type_base;
+            s1->type_base = type_base;
             s0->connected = 1;
             s1->connected = 1;
             s0->nonblock = (type & O_NONBLOCK_LINUX) ? 1 : 0;
             s1->nonblock = s0->nonblock;
             s0->unix_conn = conn;
             s1->unix_conn = conn;
+            s0->unix_dgram = pair;
+            s1->unix_dgram = pair;
             s0->unix_end = 0;
             s1->unix_end = 1;
             s0->kref = 1;
@@ -19584,6 +20031,7 @@ xorg_trace_done:;
             f1->driver_private = s1;
             f0->refcount = 1;
             f1->refcount = 1;
+            f0->flags = f1->flags = type & O_NONBLOCK_LINUX;
             int fd0 = thread_fd_alloc(f0);
             int fd1 = thread_fd_alloc(f1);
             if (fd0 < 0 || fd1 < 0) {
@@ -19595,6 +20043,10 @@ xorg_trace_done:;
                 thread_fd_close(fd0);
                 thread_fd_close(fd1);
                 return ret_err(EMFILE);
+            }
+            if (cur->process && (type & SOCK_CLOEXEC_LINUX)) {
+                cur->process->fd_cloexec[fd0] = 1;
+                cur->process->fd_cloexec[fd1] = 1;
             }
             int fds[2] = { fd0, fd1 };
             if (copy_to_user_safe(sv_u, fds, sizeof(fds)) != 0) {
@@ -19667,6 +20119,186 @@ xorg_trace_done:;
                 thread_fd_close(fd1);
                 return ret_err(EFAULT);
             }
+            return 0;
+        }
+        case SYS_timerfd_create: {
+            enum { TFD_CLOEXEC_K = 02000000, TFD_NONBLOCK_K = 00004000 };
+            int clock_id = (int)a1;
+            int flags = (int)a2;
+            if (clock_id != 0 && clock_id != 1 && clock_id != 7 &&
+                clock_id != 8 && clock_id != 9)
+                return ret_err(EINVAL);
+            if (flags & ~(TFD_CLOEXEC_K | TFD_NONBLOCK_K))
+                return ret_err(EINVAL);
+            timerfd_state_k *t = (timerfd_state_k *)kmalloc(sizeof(*t));
+            struct fs_file *f = (struct fs_file *)kmalloc(sizeof(*f));
+            char *path = (char *)kmalloc(24);
+            if (!t || !f || !path) {
+                if (t) kfree(t);
+                if (f) kfree(f);
+                if (path) kfree(path);
+                return ret_err(ENOMEM);
+            }
+            memset(t, 0, sizeof(*t));
+            memset(f, 0, sizeof(*f));
+            t->clock_id = clock_id;
+            snprintf(path, 24, "anon_inode:[timerfd]");
+            f->path = path;
+            f->type = FS_TYPE_TIMERFD;
+            f->driver_private = t;
+            f->flags = flags & TFD_NONBLOCK_K;
+            f->refcount = 1;
+            int fd = thread_fd_alloc(f);
+            if (fd < 0) {
+                timerfd_fs_file_destroy(f);
+                return ret_err(EMFILE);
+            }
+            if (cur->process && (flags & TFD_CLOEXEC_K))
+                cur->process->fd_cloexec[fd] = 1;
+            return (uint64_t)(unsigned)fd;
+        }
+        case SYS_timerfd_settime:
+        case SYS_timerfd_gettime: {
+            int fd = (int)a1;
+            if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
+            struct fs_file *f = syscall_fd_get(cur, fd);
+            if (!f || f->type != FS_TYPE_TIMERFD || !f->driver_private)
+                return ret_err(EBADF);
+            timerfd_state_k *t = (timerfd_state_k *)f->driver_private;
+            if (num == SYS_timerfd_gettime) {
+                void *out_u = (void *)(uintptr_t)a2;
+                if (!out_u || !user_range_ok(out_u, sizeof(timerfd_itimerspec_k)))
+                    return ret_err(EFAULT);
+                timerfd_itimerspec_k out;
+                uint64_t now = timerfd_now_ns(t->clock_id);
+                unsigned long irqf = 0;
+                acquire_irqsave(&t->lock, &irqf);
+                timerfd_get_spec_locked(t, now, &out);
+                release_irqrestore(&t->lock, irqf);
+                return copy_to_user_safe(out_u, &out, sizeof(out)) == 0 ? 0 : ret_err(EFAULT);
+            }
+            enum { TFD_TIMER_ABSTIME_K = 1, TFD_TIMER_CANCEL_ON_SET_K = 2 };
+            int flags = (int)a2;
+            const void *new_u = (const void *)(uintptr_t)a3;
+            void *old_u = (void *)(uintptr_t)a4;
+            if (flags & ~(TFD_TIMER_ABSTIME_K | TFD_TIMER_CANCEL_ON_SET_K))
+                return ret_err(EINVAL);
+            if ((flags & TFD_TIMER_CANCEL_ON_SET_K) &&
+                (!(flags & TFD_TIMER_ABSTIME_K) || (t->clock_id != 0 && t->clock_id != 8)))
+                return ret_err(EINVAL);
+            if (!new_u || !user_range_ok(new_u, sizeof(timerfd_itimerspec_k)) ||
+                (old_u && !user_range_ok(old_u, sizeof(timerfd_itimerspec_k))))
+                return ret_err(EFAULT);
+            timerfd_itimerspec_k spec, old;
+            if (copy_from_user_raw(&spec, new_u, sizeof(spec)) != 0)
+                return ret_err(EFAULT);
+            if (!timerfd_spec_valid(&spec.interval) || !timerfd_spec_valid(&spec.value))
+                return ret_err(EINVAL);
+            uint64_t now = timerfd_now_ns(t->clock_id);
+            uint64_t value = timerfd_timespec_ns(&spec.value);
+            unsigned long irqf = 0;
+            acquire_irqsave(&t->lock, &irqf);
+            timerfd_get_spec_locked(t, now, &old);
+            t->interval_ns = timerfd_timespec_ns(&spec.interval);
+            t->armed = spec.value.sec != 0 || spec.value.nsec != 0;
+            t->expirations = 0;
+            t->cancel_on_set = !!(flags & TFD_TIMER_CANCEL_ON_SET_K);
+            if (t->armed) {
+                if (flags & TFD_TIMER_ABSTIME_K)
+                    t->deadline_ns = value;
+                else
+                    t->deadline_ns = value > UINT64_MAX - now ? UINT64_MAX : now + value;
+            }
+            release_irqrestore(&t->lock, irqf);
+            if (old_u && copy_to_user_safe(old_u, &old, sizeof(old)) != 0)
+                return ret_err(EFAULT);
+            return 0;
+        }
+        case SYS_inotify_init:
+        case SYS_inotify_init1: {
+            enum { IN_CLOEXEC_K = 02000000, IN_NONBLOCK_K = 00004000 };
+            int flags = (num == SYS_inotify_init1) ? (int)a1 : 0;
+            if (flags & ~(IN_CLOEXEC_K | IN_NONBLOCK_K))
+                return ret_err(EINVAL);
+            inotify_state_k *state = (inotify_state_k *)kmalloc(sizeof(*state));
+            struct fs_file *f = (struct fs_file *)kmalloc(sizeof(*f));
+            char *path = (char *)kmalloc(24);
+            if (!state || !f || !path) {
+                if (state) kfree(state);
+                if (f) kfree(f);
+                if (path) kfree(path);
+                return ret_err(ENOMEM);
+            }
+            memset(state, 0, sizeof(*state));
+            memset(f, 0, sizeof(*f));
+            state->next_wd = 1;
+            snprintf(path, 24, "anon_inode:[inotify]");
+            f->path = path;
+            f->type = FS_TYPE_INOTIFY;
+            f->driver_private = state;
+            f->flags = flags & IN_NONBLOCK_K;
+            f->refcount = 1;
+            int fd = thread_fd_alloc(f);
+            if (fd < 0) {
+                inotify_fs_file_destroy(f);
+                return ret_err(EMFILE);
+            }
+            if (cur->process && (flags & IN_CLOEXEC_K))
+                cur->process->fd_cloexec[fd] = 1;
+            return (uint64_t)(unsigned)fd;
+        }
+        case SYS_inotify_add_watch: {
+            int fd = (int)a1;
+            if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
+            struct fs_file *f = syscall_fd_get(cur, fd);
+            if (!f || f->type != FS_TYPE_INOTIFY || !f->driver_private)
+                return ret_err(EBADF);
+            char *raw = copy_user_cstr((const char *)(uintptr_t)a2, 4096);
+            if (!raw) return ret_err(EFAULT);
+            char path[4096];
+            resolve_kernel_path(cur, raw, path, sizeof(path));
+            kfree(raw);
+            if (!path[0]) return ret_err(ENOENT);
+            uint32_t mask = (uint32_t)a3;
+            enum { IN_ONLYDIR_K = 0x01000000u, IN_DONT_FOLLOW_K = 0x02000000u,
+                   IN_MASK_CREATE_K = 0x10000000u, IN_MASK_ADD_K = 0x20000000u };
+            struct stat st;
+            if ((mask & IN_DONT_FOLLOW_K ? vfs_lstat(path, &st) : vfs_stat(path, &st)) != 0)
+                return ret_err(ENOENT);
+            if ((mask & IN_ONLYDIR_K) && (st.st_mode & 0170000u) != S_IFDIR)
+                return ret_err(ENOTDIR);
+            inotify_state_k *state = (inotify_state_k *)f->driver_private;
+            for (inotify_watch_k *w = state->watches; w; w = w->next) {
+                if (strcmp(w->path, path) != 0) continue;
+                if (mask & IN_MASK_CREATE_K) return ret_err(EEXIST);
+                w->mask = (mask & IN_MASK_ADD_K) ? (w->mask | mask) : mask;
+                return (uint64_t)(unsigned)w->wd;
+            }
+            if (state->next_wd <= 0) return ret_err(ENOSPC);
+            size_t len = strlen(path) + 1;
+            inotify_watch_k *w = (inotify_watch_k *)kmalloc(sizeof(*w) + len);
+            if (!w) return ret_err(ENOMEM);
+            w->wd = state->next_wd++;
+            w->mask = mask;
+            memcpy(w->path, path, len);
+            w->next = state->watches;
+            state->watches = w;
+            return (uint64_t)(unsigned)w->wd;
+        }
+        case SYS_inotify_rm_watch: {
+            int fd = (int)a1;
+            if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
+            struct fs_file *f = syscall_fd_get(cur, fd);
+            if (!f || f->type != FS_TYPE_INOTIFY || !f->driver_private)
+                return ret_err(EBADF);
+            inotify_state_k *state = (inotify_state_k *)f->driver_private;
+            inotify_watch_k **link = &state->watches;
+            while (*link && (*link)->wd != (int)a2)
+                link = &(*link)->next;
+            if (!*link) return ret_err(EINVAL);
+            inotify_watch_k *w = *link;
+            *link = w->next;
+            kfree(w);
             return 0;
         }
         case SYS_eventfd:
@@ -19784,7 +20416,12 @@ xorg_trace_done:;
             if (pid1_dl_trace_thread(cur) && pid1_dl_trace_fd(cur, fd))
                 pid1_dl_log_fd(cur, "close", fd);
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
-            int r = thread_fd_close(fd);
+            int r = thread_fd_close_for(cur, fd);
+            if (r != 0 && is_init_user(cur)) {
+                struct fs_file *proc_fd = cur->process ? cur->process->fds[fd] : NULL;
+                klogprintf("pid1 close EBADF fd=%d process_fd=%p thread_fd=%p\n",
+                           fd, (void *)proc_fd, (void *)cur->fds[fd]);
+            }
             return (r == 0) ? 0ULL : ret_err(EBADF);
         }
         case 436: { /* close_range(first, last, flags) — glibc posix_spawn / apt */
@@ -19808,7 +20445,7 @@ xorg_trace_done:;
                         cur->process->fd_cloexec[fd] = 1;
                     continue;
                 }
-                (void)thread_fd_close((int)fd);
+                (void)thread_fd_close_for(cur, (int)fd);
             }
             return 0;
         }
@@ -19883,7 +20520,7 @@ xorg_trace_done:;
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
             if (!st_u) return ret_err(EFAULT);
             if ((uintptr_t)st_u + STAT_COPY_SIZE > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            struct fs_file *f = cur->fds[fd];
+            struct fs_file *f = syscall_fd_get(cur, fd);
             if (!f) return ret_err(EBADF);
             struct stat st;
             if (vfs_fstat(f, &st) != 0) return ret_err(EINVAL);
@@ -19972,20 +20609,6 @@ xorg_trace_done:;
                 if (!path_u) return ret_err(EFAULT);
                 char *kpath = copy_user_cstr(path_u, 256);
                 if (!kpath) return ret_err(EFAULT);
-                {
-                    static int xorg_nf_mark = 0;
-                    int xorg_nf = 0;
-                    if (xorg_nf_mark < 300 && cur && cur->name && cur->name[0]) {
-                        const char *z = cur->name;
-                        for (; *z; z++) {
-                            if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { xorg_nf = 1; break; }
-                        }
-                    }
-                    if (xorg_nf) {
-                        xorg_nf_mark++;
-                        kprintf("nf: MARK1 kpath=%s\n", kpath);
-                    }
-                }
                 char path[256];
                 int rc_resolve = 0;
                 if (kpath[0] == '/') {
@@ -20027,30 +20650,14 @@ xorg_trace_done:;
                 /* Respect AT_SYMLINK_NOFOLLOW: behave like lstat() when requested.
                    ld.so may stat a symlink path after open(); following keeps
                    st_dev/st_ino consistent with fstat(fd) on the resolved object. */
-                if (cur && cur->ring == 3 && strstr(path, ".so") != NULL)
+                if (cur && cur->ring == 3 && path_is_shared_library(path))
                     flags &= ~AT_SYMLINK_NOFOLLOW;
-                is_in_tty0_stat_xorg_warn(path);
                 int sr = (flags & AT_SYMLINK_NOFOLLOW) ? vfs_lstat(path, &st) : vfs_stat(path, &st);
-                {
-                    static int xorg_mark3 = 0;
-                    thread_t *cur3 = thread_current();
-                    int x3 = 0;
-                    if (cur3 && cur3->name && cur3->name[0]) {
-                        const char *z = cur3->name;
-                        for (; *z; z++) {
-                            if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { x3 = 1; break; }
-                        }
-                    }
-                    if (x3 && xorg_mark3 < 300) {
-                        xorg_mark3++;
-                        kprintf("nf: MARK3 stat-returned sr=%d path=%s\n", sr, path);
-                    }
-                }
                 if (sr != 0) {
-                    if (is_init_user(cur) || (cur && cur->name[0] && strstr(cur->name, "openrc")))
-                        devel_printf("pid1 newfstatat ENOENT path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
                     /* Only spam ENOENT for ld.so paths — OpenRC probes
                      * /proc/vz, /.dockerenv, /usr/etc/* constantly. */
+                    if (is_init_user(cur) || (cur && cur->name[0] && strstr(cur->name, "openrc")))
+                        devel_printf("pid1 newfstatat ENOENT path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
                     if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(path))
                         kprintf("dl-trace newfstatat ENOENT path=%s flags=0x%x dirfd=%d\n", path, flags, dirfd);
                     return ret_err(ENOENT);
@@ -20102,21 +20709,6 @@ xorg_trace_done:;
                 memcpy(tmp, &cs, sizeof(cs));
                 memset(tmp + sizeof(cs), 0, STAT_COPY_SIZE - sizeof(cs));
                 if (copy_to_user_safe(st_u, tmp, STAT_COPY_SIZE) != 0) return ret_err(EFAULT);
-            }
-            {
-                static int xorg_mark4 = 0;
-                thread_t *cur4 = thread_current();
-                int x4 = 0;
-                if (cur4 && cur4->name && cur4->name[0]) {
-                    const char *z = cur4->name;
-                    for (; *z; z++) {
-                        if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { x4 = 1; break; }
-                    }
-                }
-                if (x4 && xorg_mark4 < 300) {
-                    xorg_mark4++;
-                    kprintf("nf: MARK4 copyout-done newfstatat\n");
-                }
             }
             return 0;
         }
@@ -20477,6 +21069,8 @@ xorg_trace_done:;
                 PR_GET_PDEATHSIG = 2,
                 PR_GET_DUMPABLE = 3,
                 PR_SET_DUMPABLE = 4,
+                PR_GET_SECUREBITS = 27,
+                PR_SET_SECUREBITS = 28,
                 PR_SET_NAME = 15,
                 PR_GET_NAME = 16,
                 PR_SET_SECCOMP = 22,
@@ -20495,6 +21089,21 @@ xorg_trace_done:;
             }
             if (option == PR_GET_DUMPABLE) {
                 return p ? (uint64_t)(unsigned)p->dumpable : 1;
+            }
+            if (option == PR_GET_SECUREBITS)
+                return p ? (uint64_t)p->secure_bits : 0;
+            if (option == PR_SET_SECUREBITS) {
+                if (!p || arg2 & ~0xffUL) return ret_err(EINVAL);
+                if (cur->euid != 0) return ret_err(EPERM);
+                /* A locked bit and its associated setting cannot be changed. */
+                for (unsigned shift = 0; shift < 8; shift += 2) {
+                    unsigned pair = 3u << shift;
+                    if ((p->secure_bits & (2u << shift)) &&
+                        ((p->secure_bits ^ (unsigned)arg2) & pair))
+                        return ret_err(EPERM);
+                }
+                p->secure_bits = (unsigned int)arg2;
+                return 0;
             }
             if (option == PR_SET_NAME) {
                 /* arg2 = user pointer to ≤16-byte name (not NUL-padded required). */
@@ -20682,7 +21291,15 @@ xorg_trace_done:;
             const char *type_u = (const char*)(uintptr_t)a3;
             uint64_t mnt_flags = a4;
             const char *data_u = (const char *)(uintptr_t)a5;
-            enum { MS_REMOUNT_LOCAL = 32u };
+            enum {
+                MS_REMOUNT_LOCAL = 32u,
+                MS_BIND_LOCAL = 4096u,
+                MS_REC_LOCAL = 16384u,
+                MS_UNBINDABLE_LOCAL = 1u << 17,
+                MS_PRIVATE_LOCAL = 1u << 18,
+                MS_SLAVE_LOCAL = 1u << 19,
+                MS_SHARED_LOCAL = 1u << 20,
+            };
             if (!tgt_u) return ret_err(EINVAL);
             char *k_tgt_raw = copy_user_cstr(tgt_u, 256);
             if (!k_tgt_raw) return ret_err(EFAULT);
@@ -20701,6 +21318,31 @@ xorg_trace_done:;
                 return 0;
             }
 
+            /* Propagation flags change mount namespace metadata, not the
+             * mounted filesystem. We currently use a single namespace. */
+            if (mnt_flags & (MS_UNBINDABLE_LOCAL | MS_PRIVATE_LOCAL |
+                             MS_SLAVE_LOCAL | MS_SHARED_LOCAL)) {
+                struct stat st;
+                if (vfs_stat(target, &st) != 0) return ret_err(ENOENT);
+                return 0;
+            }
+
+            if (mnt_flags & MS_BIND_LOCAL) {
+                if (!src_u) return ret_err(EINVAL);
+                char *k_src_raw = copy_user_cstr(src_u, 256);
+                if (!k_src_raw) return ret_err(EFAULT);
+                char source[256];
+                resolve_kernel_path(cur, k_src_raw, source, sizeof(source));
+                kfree(k_src_raw);
+                if (!source[0]) return ret_err(EINVAL);
+                struct stat src_st, dst_st;
+                if (vfs_stat(source, &src_st) != 0 || vfs_stat(target, &dst_st) != 0)
+                    return ret_err(ENOENT);
+                if (fs_bind_mount_file(source, target) != 0)
+                    return ret_err(EINVAL);
+                return 0;
+            }
+
             if (!type_u) return ret_err(EINVAL);
             char *k_type = copy_user_cstr(type_u, 64);
             if (!k_type) return ret_err(EFAULT);
@@ -20712,16 +21354,18 @@ xorg_trace_done:;
             int rc = -1;
             int errno_out = EINVAL;
             if (strcmp(k_type, "proc") == 0 || strcmp(k_type, "procfs") == 0) {
-                struct fs_driver *md = fs_get_mount_driver(target);
+                struct fs_driver *md = fs_get_mount_driver_exact(target);
                 if (md && md->ops && md->ops->name &&
                     (strcmp(md->ops->name, "proc") == 0 || strcmp(md->ops->name, "procfs") == 0)) {
-                    rc = 0;
+                    rc = procfs_mount(target);
+                } else if (md) {
+                    errno_out = EBUSY;
                 } else {
                     (void)procfs_register();
                     ramfs_mkdir(target);
                     rc = procfs_mount(target);
-                    if (rc != 0) errno_out = EBUSY;
                 }
+                if (rc != 0) errno_out = EBUSY;
             } else if (strcmp(k_type, "sysfs") == 0) {
                 /* Already mounted (boot pre-mount or prior SYS_mount): treat as ok. */
                 struct fs_driver *md = fs_get_mount_driver(target);
@@ -20737,6 +21381,17 @@ xorg_trace_done:;
                         errno_out = EBUSY;
                 } else {
                     errno_out = EBUSY;
+                }
+            } else if (strcmp(k_type, "cgroup2") == 0) {
+                struct fs_driver *md = fs_get_mount_driver_exact(target);
+                if (md && md->ops && md->ops->name &&
+                    strcmp(md->ops->name, "cgroup2") == 0) {
+                    rc = 0;
+                } else if (md) {
+                    errno_out = EBUSY;
+                } else {
+                    rc = cgroupfs_mount(target);
+                    if (rc != 0) errno_out = EBUSY;
                 }
             } else if (strcmp(k_type, "devfs") == 0 || strcmp(k_type, "devtmpfs") == 0) {
                 /* Linux devtmpfs — device nodes only; never alias tmpfs. */
@@ -21274,7 +21929,8 @@ xorg_trace_done:;
                 boot_io_log(cur, "mmap", (int)(int64_t)a5, (uint64_t)a2);
             }
             uint64_t mr = user_syscall_mmap(cur, a1, a2, a3, a4, a5, a6);
-            if ((int64_t)mr < 0 && pid1_dl_trace_thread(cur)) {
+            if ((int64_t)mr < 0 && !(a2 == 0 && (int64_t)mr == -EINVAL) &&
+                pid1_dl_trace_thread(cur)) {
                 kprintf("dl-race mmap syscall errno=%d addr=0x%llx len=0x%llx prot=0x%x "
                     "flags=0x%x fd=%lld off=0x%llx\n",
                     (int)(-(int64_t)mr),
@@ -21888,26 +22544,11 @@ if (is_watch_proc(cur)) {
                         (unsigned long long)a1);
                 }
             }
-            return ret_err(ENOSYS);
+return ret_err(ENOSYS);
     }
-    {
-        static int xorg_mark5 = 0;
-        thread_t *cur5 = thread_current();
-        int x5 = 0;
-        if (cur5 && cur5->name && cur5->name[0]) {
-            const char *z = cur5->name;
-            for (; *z; z++) {
-                if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { x5 = 1; break; }
-            }
-        }
-        if (x5 && xorg_mark5 < 300) {
-            xorg_mark5++;
-            kprintf("xorg-ret: nr=%llu\n", (unsigned long long)num);
-        }
-    }
+
     return 0;
 }
-
 uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
     thread_t *trace_t = syscall_resolve_thread();
     if (!trace_t)
@@ -22091,24 +22732,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             (unsigned long long)a6);
     }
     uint64_t ret = syscall_do_inner(num, a1, a2, a3, a4, a5, a6);
-    {
-        /* TEMP: xorg-done only for ioctl after console phase (arm by KDSETMODE). */
-        static int xorg_done_left = 800;
-        static int xorg_done_armed = 0;
-        if (num == SYS_ioctl && a2 == 0x4b3a)
-            xorg_done_armed = 1;
-        thread_t *dt = thread_current();
-        int dx = 0;
-        if (dt && dt->name && dt->name[0]) {
-            const char *z = dt->name;
-            for (; *z; z++) {
-                if (*z == 'X' && z[1] == 'o' && z[2] == 'r' && z[3] == 'g') { dx = 1; break; }
-            }
-        }
-        if (dx && xorg_done_armed && num == SYS_ioctl && xorg_done_left-- > 0)
-            kprintf("xorg-done: nr=%llu ret=0x%llx\n",
-                    (unsigned long long)num, (unsigned long long)ret);
-    }
     if (trace_t && trace_t->fork_child_user_rip && trace_t->name[0] &&
         strstr(trace_t->name, "linuxrc")) {
         static int linuxrc_child_done_left = 48;
@@ -22163,7 +22786,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             (unsigned long long)ret);
         if ((int64_t)ret < 0) {
             int err = (int)(-(int64_t)ret);
-            kprintf("%s syscall exit err: tid=%llu n=%llu errno=%d\n",
+            devel_printf("%s syscall exit err: tid=%llu n=%llu errno=%d\n",
                 trace_net ? "net" : (trace_shell ? "shell" : "pid1"),
                 (unsigned long long)(trace_t && trace_t->tid ? trace_t->tid : 1),
                 (unsigned long long)num,
@@ -22182,7 +22805,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         if (g_dl_post_open_left > 0) {
             g_dl_post_open_left--;
             int err = (int64_t)ret < 0 ? (int)(-(int64_t)ret) : 0;
-            kprintf("dl-post %s(%llu) ret=0x%llx err=%d a1=0x%llx left=%d\n",
+            devel_printf("dl-post %s(%llu) ret=0x%llx err=%d a1=0x%llx left=%d\n",
                 dl_tail_scname(num), (unsigned long long)num,
                 (unsigned long long)ret, err,
                 (unsigned long long)a1, g_dl_post_open_left);
@@ -22190,7 +22813,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         if (g_dl_compact_left > 0) {
             g_dl_compact_left--;
             int err = (int64_t)ret < 0 ? (int)(-(int64_t)ret) : 0;
-            kprintf("dl-compact %s(%llu) ret=0x%llx err=%d a1=0x%llx a2=0x%llx\n",
+            devel_printf("dl-compact %s(%llu) ret=0x%llx err=%d a1=0x%llx a2=0x%llx\n",
                 dl_tail_scname(num), (unsigned long long)num,
                 (unsigned long long)ret, err,
                 (unsigned long long)a1, (unsigned long long)a2);
@@ -22306,5 +22929,3 @@ void syscall_init(void) {
     klogprintf("syscall: int0x80+SYSCALL ok; mmap cap < USER_STACK_TOP=0x%llx\n",
         (unsigned long long)(uint64_t)USER_STACK_TOP);
 }
-
-

@@ -1,4 +1,5 @@
 SHELL := /bin/bash
+.DEFAULT_GOAL := all
 
 ASM := nasm
 ASM_ELF_FLAGS := -f elf64 -P scripts/gnu-stack.nasm
@@ -29,10 +30,6 @@ AUTOCONF_DIR := $(BUILD_DIR)/include
 AUTO_CONF := $(AUTOCONF_DIR)/config/auto.conf
 AUTOCONF_H := $(AUTOCONF_DIR)/generated/autoconf.h
 
-# Sync auto.conf to CONFIG_FILE before -include (handles for-production switch).
-$(shell mkdir -p $(AUTOCONF_DIR)/config $(AUTOCONF_DIR)/generated && \
-	$(GENCONFIG) $(CONFIG_FILE) $(AUTOCONF_DIR) >/dev/null)
--include $(AUTO_CONF)
 
 # y and m both mean "enabled / linked in" until real modules exist.
 config_enabled = $(filter y m,$(1))
@@ -42,6 +39,7 @@ CC := gcc -m64
 CFLAGS_EXTRA ?=
 OPTFLAGS ?= -g
 CFLAGS := $(OPTFLAGS) -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel \
+	-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
 	-Wa,--noexecstack \
 	-Iinc -I$(AUTOCONF_DIR) -include kconfig.h -MMD -MP $(CFLAGS_EXTRA)
 LDFLAGS := -m elf_x86_64 -z noexecstack
@@ -53,18 +51,19 @@ define mark_noexecstack
 		--set-section-flags .note.GNU-stack=contents,readonly $(1)
 endef
 
-CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -path './third_party' -prune -o -path './tools' -prune -o -path './userland' -prune -o -path './core/nss_dns_shim' -prune -o -path './core/nss_files_shim' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
+SOURCE_DIRS := boot core cpu crypto drv fs libc mem mm net syscall
+CSRCS := $(shell find $(SOURCE_DIRS) -path 'core/nss_dns_shim' -prune -o -path 'core/nss_files_shim' -prune -o -type f -name '*.c' -print | sort)
 COBJS := $(patsubst %.c,$(BUILD_DIR)/%.c.o,$(CSRCS))
 DEPS := $(COBJS:.o=.d)
 
-ASMSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -type f -name '*.asm' -print | sed 's|^\./||')
+ASMSRCS := $(shell find $(SOURCE_DIRS) -type f -name '*.asm' -print | sort)
 ASMOBJS := $(patsubst %.asm,$(BUILD_DIR)/%.asm.o,$(ASMSRCS))
 
 # GAS (preprocessed) assembly sources
-SSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -type f -name '*.S' -print | sed 's|^\./||')
+SSRCS := $(shell find $(SOURCE_DIRS) -type f -name '*.S' -print | sort)
 SOBJS := $(patsubst %.S,$(BUILD_DIR)/%.S.o,$(SSRCS))
 
-MULTIBOOT_SRC := $(shell find . -path './build' -prune -o -path './iso' -prune -o -type f -name 'multiboot.asm' -print | sed 's|^\./||')
+MULTIBOOT_SRC := $(filter %/multiboot.asm,$(ASMSRCS))
 MULTIBOOT_OBJ := $(if $(MULTIBOOT_SRC),$(BUILD_DIR)/$(MULTIBOOT_SRC:.asm=.asm.o),)
 OTHER_ASM_OBJS := $(filter-out $(MULTIBOOT_OBJ) $(BUILD_DIR)/cpu/smp/ap_trampoline.asm.o,$(ASMOBJS))
 PAYLOAD_COBJS := $(filter-out $(STUB_OBJ),$(COBJS))
@@ -86,13 +85,24 @@ ASCII_PF2_SRC := $(firstword $(wildcard /usr/share/grub/ascii.pf2 /boot/grub/fon
 SYS_CA_PEM := $(BUILD_DIR)/certs/axonos-system-ca.pem
 SYS_CA_BLOB_OBJ := $(BUILD_DIR)/certs/axonos-system-ca.blob.o
 
-.PHONY: all kernel iso clean run run-uefi for-production config oldconfig
+.PHONY: all kernel iso clean run run-uefi for-production config oldconfig archive test test-build test-boot FORCE
 
 all: iso
 
 # Regenerate autoconf when config.cfg changes (or on `make config`).
-$(AUTO_CONF) $(AUTOCONF_H): $(CONFIG_FILE) $(GENCONFIG)
-	@$(GENCONFIG) $(CONFIG_FILE) $(AUTOCONF_DIR)
+$(AUTO_CONF) $(AUTOCONF_H) &: $(CONFIG_FILE) $(GENCONFIG) scripts/genconfig.py FORCE
+	@bash $(GENCONFIG) $(CONFIG_FILE) $(AUTOCONF_DIR)
+
+FORCE:
+
+# Rebuild when compiler/options change, not only when sources change.
+BUILD_FLAGS := $(BUILD_DIR)/build.flags
+$(BUILD_FLAGS): FORCE
+	@mkdir -p $(dir $@)
+	@printf '%s\n' '$(CC)' '$(CFLAGS)' '$(ASM)' '$(ASM_ELF_FLAGS)' '$(LDFLAGS)' > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv -f $@.tmp $@
+
+$(COBJS) $(SOBJS) $(ASMOBJS): $(BUILD_FLAGS)
 
 config: $(AUTO_CONF)
 	@echo "Active config: $(CONFIG_FILE)"
@@ -110,6 +120,11 @@ $(BUILD_DIR)/%.asm.o: %.asm
 	@$(ASM) $(ASM_ELF_FLAGS) -o $@ $<
 
 $(BUILD_DIR)/crypto/%.c.o: crypto/%.c $(AUTOCONF_H)
+	@mkdir -p $(dir $@)
+	@echo "CC [O2]		$<"
+	@$(CC) $(CFLAGS) -O2 -c -o $@ $<
+
+$(BUILD_DIR)/syscall/dispatch/syscall_dispatch.c.o: syscall/dispatch/syscall_dispatch.c $(AUTOCONF_H)
 	@mkdir -p $(dir $@)
 	@echo "CC [O2]		$<"
 	@$(CC) $(CFLAGS) -O2 -c -o $@ $<
@@ -219,10 +234,10 @@ $(ASCII_PF2_BLOB_OBJ): $(ASCII_PF2)
 	rm -f $@.tmp
 	@$(call mark_noexecstack,$@)
 
-$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(NSS_FILES_BLOB_OBJ) $(SYS_CA_BLOB_OBJ) $(ASCII_PF2_BLOB_OBJ) $(PAYLOAD_COBJS)
+$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(NSS_FILES_BLOB_OBJ) $(SYS_CA_BLOB_OBJ) $(ASCII_PF2_BLOB_OBJ) $(PAYLOAD_COBJS) linker.payload.ld
 	@mkdir -p $(BUILD_DIR)
 	@echo "LD		$@"
-	@ld $(LDFLAGS) -T linker.payload.ld -o $@ $^
+	@ld $(LDFLAGS) -T linker.payload.ld -o $@ $(filter %.o,$^)
 
 $(PAYLOAD_LZ4): $(PAYLOAD_ELF)
 	@echo "LZ4		$<"
@@ -238,16 +253,17 @@ $(PAYLOAD_BLOB_OBJ): $(PAYLOAD_LZ4)
 		"$@"
 	@$(call mark_noexecstack,$@)
 
-$(KERNEL_ELF): $(MULTIBOOT_OBJ) $(STUB_OBJ) $(PAYLOAD_BLOB_OBJ)
+$(KERNEL_ELF): $(MULTIBOOT_OBJ) $(STUB_OBJ) $(PAYLOAD_BLOB_OBJ) linker.stub.ld
 	@mkdir -p $(BUILD_DIR)
 	@echo "LD		$@"
-	@ld $(LDFLAGS) -T linker.stub.ld -o $@ $^
+	@ld $(LDFLAGS) -T linker.stub.ld -o $@ $(filter %.o,$^)
 
 $(KERNEL_BIN): $(KERNEL_ELF)
 	@objcopy -O binary $< $@
 
 $(GRUB_DIR)/grub.cfg: | $(GRUB_DIR)
-	
+	@echo "Missing $@: restore the tracked GRUB configuration" >&2
+	@exit 1
 
 $(GRUB_DIR):
 	@mkdir -p $(GRUB_DIR)
@@ -300,6 +316,14 @@ run-uefi: archive iso
 test-boot:
 	@tools/headless-openrc-boot.sh
 
+test-build:
+	@python3 tools/test-build.py
+
+test: test-build
+	@set -e; for test in tools/test-*.py; do \
+		[ "$$test" = tools/test-build.py ] || python3 "$$test"; \
+	done
+
 # Run with bridged networking (real IP from router) - requires sudo and br0 bridge
 run-bridge: iso
 	@echo "Note: Requires bridge 'br0' to be configured. Run with sudo."
@@ -329,6 +353,7 @@ POPULATE_APT_ROOTFS := tools/populate-apt-rootfs.sh
 INJECT_APT_ROOTFS := tools/inject-apt-rootfs.sh
 
 archive:
+	@mkdir -p $(BUILD_DIR) $(ISO_BOOT)
 	@if [ ! -f iso/boot/initfs.sfs ]; then \
 		if [ -f initfs.sfs ]; then \
 			cp -f initfs.sfs iso/boot/initfs.sfs; \
@@ -337,12 +362,8 @@ archive:
 		elif [ -f iso/boot/initfs.cpio ]; then \
 			$(MKINITFS_SQUASH) iso/boot/initfs.cpio iso/boot/initfs.sfs; \
 		else \
-			wget -P build apm.axont.ru/Packages/initfs.tar.xz; \
-			tar -xf build/initfs.tar.xz -C iso/boot/; \
-			rm -f build/initfs.tar.xz; \
-			if [ -f iso/boot/initfs.cpio ]; then \
-				$(MKINITFS_SQUASH) iso/boot/initfs.cpio iso/boot/initfs.sfs; \
-			fi; \
+			echo "Missing initfs: supply a trusted initfs.sfs or initfs.cpio locally" >&2; \
+			exit 1; \
 		fi; \
 	fi
 	@test -f iso/boot/initfs.sfs

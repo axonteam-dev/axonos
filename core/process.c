@@ -79,6 +79,7 @@ static process_t *process_alloc_locked(process_t *parent) {
         if (p->ngroups < 0)
             p->ngroups = 0;
         p->dumpable = parent->dumpable;
+        p->secure_bits = parent->secure_bits;
         if (p->ngroups > AXON_NGROUPS_MAX)
             p->ngroups = AXON_NGROUPS_MAX;
         if (p->ngroups > 0)
@@ -551,6 +552,7 @@ void process_exec_reset(process_t *process, thread_t *thread) {
         }
     }
     /* POSIX/Linux execve: interval timers are disarmed; the signal mask is kept. */
+    process->secure_bits &= ~(1u << 4); /* SECBIT_KEEP_CAPS resets on exec */
     process->itimer_expire_ms = 0;
     process->itimer_interval_ms = 0;
     process_posix_timers_flush_pid(process->pid);

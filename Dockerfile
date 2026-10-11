@@ -23,6 +23,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xorg \
     git \
     make \
+    python3 \
+    lz4 \
+    openssl \
+    ca-certificates \
+    wget \
+    squashfs-tools \
+    cpio \
     && rm -rf /var/lib/apt/lists/* && \
     update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 && \
     update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-12 100

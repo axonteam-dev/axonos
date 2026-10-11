@@ -29,6 +29,8 @@ int ramfs_fill_stat(struct fs_file *file, struct stat *st);
 /* Set regular file length (ftruncate). Returns 0 or negative -errno. */
 int ramfs_ftruncate(struct fs_file *file, off_t length);
 int ramfs_chmod(const char *path, mode_t mode);
+/* fchmod on an anonymous O_TMPFILE inode with no pathname. */
+int ramfs_fchmod_file(struct fs_file *file, mode_t mode);
 int ramfs_chown(const char *path, uid_t uid, gid_t gid);
 int ramfs_lchown(const char *path, uid_t uid, gid_t gid);
 /* Linux xattr on ramfs/tmpfs inodes (see xattr.h). */

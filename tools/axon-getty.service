@@ -1,0 +1,12 @@
+[Unit]
+Description=AxonOS console login
+DefaultDependencies=no
+
+[Service]
+Type=simple
+ExecStart=/bin/busybox getty -L 38400 tty1
+Restart=always
+RestartSec=1
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty1

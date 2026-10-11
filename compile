@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${1:-}" == --help ]]; then
+    echo "Usage: ./compile [make targets/options] (default: iso)"
+    exit 0
+fi
+exec make -C "$root" -j"${JOBS:-$(nproc)}" "$@"

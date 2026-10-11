@@ -786,7 +786,12 @@ static void page_fault_handler(cpu_registers_t* regs) {
         /* Additional diagnostics to help pinpoint cause in user mode */
         if (user) {
             /* dump instruction bytes at RIP */
-            if ((uintptr_t)regs->rip < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+            if ((regs->error_code & 0x11u) == 0x10u &&
+                ((regs->rip ^ cr2) & ~0xFFFULL) == 0) {
+                /* Instruction fetch from an unmapped page: dereferencing RIP
+                 * here faults again in the exception handler (VMware #DF). */
+                klogprintf("code @ RIP: (instruction page not present)\n");
+            } else if ((uintptr_t)regs->rip < (uintptr_t)MMIO_IDENTITY_LIMIT) {
                 const unsigned char *code = (const unsigned char*)(uintptr_t)regs->rip;
                 klogprintf("code @ RIP: ");
                 for (int i = 0; i < 32; i++) kprintf("%02x ", (unsigned)code[i]);
@@ -895,7 +900,7 @@ static void page_fault_handler(cpu_registers_t* regs) {
 pte_dump_done:
             /* show syscall_kernel_rsp0 if set */
             {
-                extern uint64_t syscall_kernel_rsp0;
+extern uint64_t syscall_kernel_rsp0;
                 if ((uintptr_t)syscall_kernel_rsp0 != 0 && (uintptr_t)syscall_kernel_rsp0 + 8*16 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
                     klogprintf("syscall_kernel_rsp0=0x%llx\n", (unsigned long long)syscall_kernel_rsp0);
                 } else {
@@ -907,12 +912,14 @@ pte_dump_done:
             {
                 extern thread_t *thread_current(void);
                 extern thread_t *thread_get_current_user(void);
+                extern uint64_t g_last_syscall_nr;
                 thread_t *ft = thread_current();
                 if (!ft || ft->ring != 3)
                     ft = thread_get_current_user();
-                klogprintf("user-pf-fatal: tid=%llu name=%s rip=0x%llx rax=0x%llx cr2=0x%llx err=0x%llx fs=0x%llx rsp=0x%llx\n",
+                klogprintf("user-pf-fatal: tid=%llu name=%s sc=%llu rip=0x%llx rax=0x%llx cr2=0x%llx err=0x%llx fs=0x%llx rsp=0x%llx\n",
                         (unsigned long long)(ft && ft->tid ? ft->tid : 0),
                         (ft && ft->name[0]) ? ft->name : "?",
+                        (unsigned long long)g_last_syscall_nr,
                         (unsigned long long)regs->rip,
                         (unsigned long long)regs->rax,
                         (unsigned long long)cr2,

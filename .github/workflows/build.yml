@@ -1,0 +1,38 @@
+name: Build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential nasm lz4 python3 grub-pc-bin grub-common xorriso mtools openssl
+      - name: Test build configuration
+        run: make test-build
+      - name: Clean default kernel build
+        run: |
+          ./configure BUILD_DIR=build-ci
+          ./compile BUILD_DIR=build-ci kernel
+          grub-file --is-x86-multiboot2 build-ci/axonos.elf
+      - name: Switch to production and build ISO
+        run: |
+          ./configure BUILD_DIR=build-ci CONFIG_FILE=config.production.cfg
+          ./compile BUILD_DIR=build-ci CONFIG_FILE=config.production.cfg OPTFLAGS='-O0 -g0' iso
+          grub-file --is-x86-multiboot2 build-ci/axonos.elf
+      - uses: actions/upload-artifact@v4
+        with:
+          name: axonos-production
+          path: |
+            build-ci/axonos.iso
+            build-ci/axonos.elf
+          if-no-files-found: error

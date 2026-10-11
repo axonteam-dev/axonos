@@ -27,11 +27,12 @@
 #include <syscall.h>
 #include <utsname_host.h>
 #include <keyring.h>
+#include <cgroup.h>
 
 struct procfs_handle {
-	int kind; /* 1=root, 2=pid_dir, 3=pid_file, 4=symlink, 5=pid_fd_dir, 6=pid_fd_link, 7=plain, 8=proc_sys_dir, 9=proc_sys_file, 10=bus_root, 11=bus_usb_dir, 12=tty_dir, 13=scsi_dir, 14=net_dir, 15=task_dir, 16=bus_pci_dir, 17=task_tid_dir */
+	int kind; /* 1=root, 2=pid_dir, 3=pid_file, 4=symlink, 5=pid_fd_dir, 6=pid_fd_link, 7=plain, 8=proc_sys_dir, 9=proc_sys_file, 10=bus_root, 11=bus_usb_dir, 12=tty_dir, 13=scsi_dir, 14=net_dir, 15=task_dir, 16=bus_pci_dir, 17=task_tid_dir, 18=pid_link */
 	int pid;
-	int file_id; /* pid_file: 0=cmdline,1=stat,2=status,3=statm; sys/plain: ids; pid_fd_link: fd number */
+	int file_id; /* pid_file: 0=cmdline,1=stat,2=status,3=statm; sys/plain: ids; pid_fd_link: fd number; pid_link: 0=exe,1=self,2=thread-self */
 	size_t pos;
 	int is_task;
 	char *cache;
@@ -41,6 +42,25 @@ struct procfs_handle {
 static struct fs_driver procfs_driver;
 static struct fs_driver_ops procfs_ops;
 static spinlock_t procfs_lock = { 0 };
+
+/*
+ * Real boot command line (Multiboot2 tag type 1), captured by
+ * core/entry/init.c before PID 1 is started. Written once during boot and
+ * only read afterwards, so a plain copy is enough here.
+ */
+#define PROCFS_CMDLINE_MAX 1024
+static char g_kernel_cmdline[PROCFS_CMDLINE_MAX];
+
+void procfs_set_kernel_cmdline(const char *cmdline, size_t len) {
+	if (!cmdline)
+		return;
+	size_t n = 0;
+	while (n < len && n + 1 < sizeof(g_kernel_cmdline) && cmdline[n] && cmdline[n] != '\n' &&
+	       cmdline[n] != '\r')
+		n++;
+	memcpy(g_kernel_cmdline, cmdline, n);
+	g_kernel_cmdline[n] = '\0';
+}
 
 /* Linux /proc/<pid>: pid is TGID. Resolve process leader, else fall back to tid. */
 static thread_t *procfs_thread_by_id(int id) {
@@ -277,6 +297,37 @@ static void procfs_sanitize_comm(char *comm, size_t cap) {
     }
 }
 
+/* kind 18 targets: 0=/proc/<pid>/exe, 1=/proc/self, 2=/proc/thread-self.
+ * Returns a NUL-terminated link body (caller frees) or NULL when the target
+ * does not exist (Linux: /proc/<kernel-thread>/exe readlink -> ENOENT). */
+static char *procfs_pid_link_target(struct procfs_handle *h) {
+    if (!h) return NULL;
+    if (h->file_id != 0) {
+        char b[32];
+        int n = snprintf(b, sizeof(b), "/proc/%d", h->pid);
+        if (n <= 0 || (size_t)n >= sizeof(b)) return NULL;
+        char *s = (char *)kmalloc((size_t)n + 1);
+        if (!s) return NULL;
+        memcpy(s, b, (size_t)n + 1);
+        return s;
+    }
+    thread_t *t = procfs_thread_by_id(h->pid);
+    if (!t || !t->proc_exe[0]) return NULL;
+    size_t n = strlen(t->proc_exe);
+    char *s = (char *)kmalloc(n + 1);
+    if (!s) return NULL;
+    memcpy(s, t->proc_exe, n + 1);
+    return s;
+}
+
+static size_t procfs_link_target_len(struct procfs_handle *h) {
+    char *t = procfs_pid_link_target(h);
+    if (!t) return 0;
+    size_t n = strlen(t);
+    kfree(t);
+    return n;
+}
+
 static ssize_t procfs_show_cmdline(char *buf, size_t size, void *priv) {
     int pid = (int)(uintptr_t)priv;
     if (!buf || size == 0) return 0;
@@ -294,6 +345,17 @@ static ssize_t procfs_show_cmdline(char *buf, size_t size, void *priv) {
     memcpy(buf, comm, len);
     if (len < size) buf[len++] = '\0';
     return (ssize_t)len;
+}
+
+/* Unified cgroup hierarchy: one membership line per process, e.g. 0::/. */
+static ssize_t procfs_show_cgroup(char *buf, size_t size, int pid) {
+    if (!buf || !size) return 0;
+    thread_t *t = procfs_thread_by_id(pid);
+    if (!t) return -1;
+    process_t *p = t->process ? t->process : process_find((uint64_t)(unsigned)pid);
+    int n = cgroup_show_path(p, buf, size);
+    if (n < 0) return -1;
+    return (ssize_t)((size_t)n < size ? (size_t)n : size);
 }
 
 /* Linux /proc/<pid>/environ: NUL-separated KEY=val from execve envp.
@@ -457,7 +519,8 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
         if (strlen(comm) > 15) comm[15] = '\0';
         procfs_sanitize_comm(comm, sizeof(comm));
     }
-    int ppid = (t->parent_tid >= 0) ? t->parent_tid : 0;
+    int ppid = t->process ? (int)process_ppid(t) :
+               (t->parent_tid >= 0 ? t->parent_tid : 0);
     int pgrp = (t->pgid >= 0) ? t->pgid : (int)t->tid;
     int sid = (t->sid >= 0) ? t->sid : pgrp;
     int tty_nr = 0;
@@ -539,7 +602,8 @@ static ssize_t procfs_show_status(char *buf, size_t size, void *priv) {
         if (strlen(comm) > 15) comm[15] = '\0';
         procfs_sanitize_comm(comm, sizeof(comm));
     }
-    int ppid = (t->parent_tid >= 0) ? t->parent_tid : 0;
+    int ppid = t->process ? (int)process_ppid(t) :
+               (t->parent_tid >= 0 ? t->parent_tid : 0);
     int pgrp = (t->pgid >= 0) ? t->pgid : (int)t->tid;
     int sid = (t->sid >= 0) ? t->sid : pgrp;
     const char *cap_hex = (t->euid == 0) ? "000001ffffffffff" : "0000000000000000";
@@ -908,9 +972,10 @@ static ssize_t procfs_show_filesystems(char *buf, size_t size, void *priv) {
     static const char text[] =
         "nodev\tsysfs\n"
         "nodev\tproc\n"
-        "nodev\tdevtmpfs\n"
-        "nodev\ttmpfs\n"
-        "nodev\tramfs\n"
+         "nodev\tdevtmpfs\n"
+         "nodev\ttmpfs\n"
+         "nodev\tramfs\n"
+         "nodev\tcgroup2\n"
         /* ext2 omitted: no on-disk mount yet (BusyBox auto-probe). */
         "\tminix\n"
         "\tvfat\n"
@@ -1099,11 +1164,14 @@ static ssize_t procfs_generate_plain(int file_id, char *buf, size_t cap) {
 	if (file_id == 19) return procfs_show_mountinfo(buf, cap, NULL);
 	if (file_id == 18) {
 		/* Linux /proc/cmdline — trailing newline required. */
-		const char *s = "BOOT_IMAGE=axonos init=/sbin/openrc-init\n";
+		const char *s = g_kernel_cmdline[0]
+		                ? g_kernel_cmdline
+		                : "BOOT_IMAGE=axonos";
 		size_t n = strlen(s);
-		if (n > cap) n = cap;
+		if (n + 1 > cap) n = cap - 1;
 		memcpy(buf, s, n);
-		return (ssize_t)n;
+		buf[n] = '\n';
+		return (ssize_t)(n + 1);
 	}
 	if (file_id == 40) return procfs_show_scsi(buf, cap, NULL);
 	if (file_id == 41 || file_id == 42) return procfs_show_pci(buf, cap, NULL);
@@ -1210,12 +1278,23 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 		 * process_create (next_pid vs thread id), so looking up tid in
 		 * process_find() missed /proc/self/fd and apt hung in readdir. */
 		int pid = -1;
+		int self_link = 0; /* bare /proc/self (or thread-self) is a symlink */
 		if (first_len == 4 && strncmp(p, "self", 4) == 0) {
 			thread_t *ct = thread_get_current_user();
 			if (!ct) ct = thread_current();
 			pid = procfs_tgid(ct);
 			if (pid <= 0)
 				pid = ct ? (int)ct->tid : -1;
+			if (!slash)
+				self_link = 1;
+		} else if (first_len == 11 && strncmp(p, "thread-self", 11) == 0) {
+			thread_t *ct = thread_get_current_user();
+			if (!ct) ct = thread_current();
+			pid = procfs_tgid(ct);
+			if (pid <= 0)
+				pid = ct ? (int)ct->tid : -1;
+			if (!slash)
+				self_link = 2;
 		} else {
 			/* numeric pid? */
 			char tmp[32];
@@ -1466,6 +1545,17 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
                 return 0;
             }
 			if (pid < 0) { kfree(h); kfree(pp); kfree(f); return -1; }
+			if (self_link) {
+				/* Linux: readlink("/proc/self") == "/proc/<tgid>" */
+				h->kind = 18;
+				h->pid = pid;
+				h->file_id = self_link;
+				f->type = FS_TYPE_REG;
+				f->size = procfs_link_target_len(h);
+				f->driver_private = h;
+				*out_file = f;
+				return 0;
+			}
 			/* pid directory */
 			h->kind = 2;
 			h->pid = pid;
@@ -1681,6 +1771,9 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					h->kind = 3; h->pid = pid; h->file_id = 3; f->type = FS_TYPE_REG;
 				} else if (strncmp(rest, "environ", 7) == 0 && rest[7] == '\0') {
 					h->kind = 3; h->pid = pid; h->file_id = 4; f->type = FS_TYPE_REG;
+				} else if (strncmp(rest, "cgroup", 6) == 0 && rest[6] == '\0') {
+					if (!procfs_thread_by_id(pid)) { kfree(h); kfree(pp); kfree(f); return -1; }
+					h->kind = 3; h->pid = pid; h->file_id = 5; f->type = FS_TYPE_REG;
 				} else if (strncmp(rest, "mounts", 6) == 0 && rest[6] == '\0') {
 					/* /proc/self/mounts == /proc/mounts (Linux) */
 					h->kind = 7; h->file_id = 16; f->type = FS_TYPE_REG; f->size = 0;
@@ -1688,6 +1781,13 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					procfs_fill_kind7_cache(h, f);
 					*out_file = f;
 					return 0;
+				} else if (strncmp(rest, "exe", 3) == 0 && rest[3] == '\0') {
+					/* readlink target of the running binary; systemd PID 1 needs it */
+					h->kind = 18;
+					h->pid = pid;
+					h->file_id = 0;
+					f->type = FS_TYPE_REG;
+					f->size = procfs_link_target_len(h);
 				} else if (strncmp(rest, "mountinfo", 9) == 0 && rest[9] == '\0') {
 					/* /proc/self/mountinfo == /proc/mountinfo (lsblk needs it) */
 					h->kind = 7; h->file_id = 19; f->type = FS_TYPE_REG; f->size = 0;
@@ -1708,6 +1808,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					else if (h->file_id == 2) full = procfs_show_status(h->cache, cap, (void*)(uintptr_t)h->pid);
 					else if (h->file_id == 3) full = procfs_show_statm(h->cache, cap, (void*)(uintptr_t)h->pid);
 					else if (h->file_id == 4) full = procfs_show_environ(h->cache, cap, (void*)(uintptr_t)h->pid);
+					else if (h->file_id == 5) full = procfs_show_cgroup(h->cache, cap, h->pid);
 					if (full > 0) {
 						f->size = (size_t)full;
 						h->cache_len = f->size;
@@ -1755,11 +1856,11 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
     }
 
     if (h->kind == 2) {
-        /* /proc/<pid> dir: entries task/cmdline/stat/status/statm/environ/mounts/mountinfo */
-        const char *names[8] = { "task", "cmdline", "stat", "status", "statm", "environ", "mounts", "mountinfo" };
-        const uint8_t types[8] = { EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
+        /* /proc/<pid> directory entries */
+        const char *names[10] = { "task", "cmdline", "stat", "status", "statm", "environ", "mounts", "mountinfo", "exe", "cgroup" };
+        const uint8_t types[10] = { EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
                                    EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
-                                   EXT2_FT_REG_FILE, EXT2_FT_REG_FILE };
+                                   EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK, EXT2_FT_REG_FILE };
         size_t pos = 0;
         size_t written = 0;
         uint8_t *out = (uint8_t*)buf;
@@ -1799,7 +1900,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
                 pos += rec_len;
             }
         }
-        for (int idx = 0; idx < 8; idx++) {
+        for (int idx = 0; idx < 10; idx++) {
             size_t namelen = strlen(names[idx]);
             size_t rec_len = 8 + namelen;
             rec_len = (rec_len + 3) & ~3u;
@@ -2152,6 +2253,22 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 	}
 
 	/* pid fd directory listing is served from the open-time snapshot (kind 1 path). */
+	/* /proc/<pid>/exe, /proc/self, /proc/thread-self link bodies */
+	if (h->kind == 18) {
+		char *target = procfs_pid_link_target(h);
+		if (!target) return -1;
+		size_t tlen = strlen(target);
+		ssize_t ret = 0;
+		if ((size_t)offset < tlen) {
+			size_t tocopy = tlen - (size_t)offset;
+			if (tocopy > size) tocopy = size;
+			memcpy(buf, target + offset, tocopy);
+			ret = (ssize_t)tocopy;
+		}
+		kfree(target);
+		return ret;
+	}
+
 	/* pid fd symlink target */
 	if (h->kind == 6) {
 		thread_t *t = procfs_thread_by_id(h->pid);
@@ -2234,6 +2351,12 @@ int procfs_fill_stat(struct fs_file *file, struct stat *st) {
         st->st_mode = S_IFLNK | 0777;
         st->st_nlink = 1;
         st->st_size = (off_t)file->size;
+    } else if (h->kind == 18) {
+        /* exe/self links: S_IFLNK so readlink(2) accepts them */
+        st->st_ino = 0;
+        st->st_mode = S_IFLNK | 0777;
+        st->st_nlink = 1;
+        st->st_size = (off_t)file->size;
     } else if (h->kind == 9) {
         int rw = (h->file_id == SYSCTL_HOSTNAME || h->file_id == SYSCTL_DOMAINNAME);
         st->st_ino = 0;
@@ -2276,5 +2399,3 @@ int procfs_mount(const char *path) {
     if (!path) return -1;
     return fs_mount(path, &procfs_driver);
 }
-
-

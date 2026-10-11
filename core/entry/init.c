@@ -69,12 +69,14 @@
 #include <e1000.h>
 #include <keyring.h>
 #include <timekeeping.h>
+#include <cgroup.h>
 void ata_dma_init(void);
 void scsi_init(void);
 int pvscsi_init(void);
 int mptspi_init(void);
 
 static char g_cwd[256] = "/";
+static int boot_wants_systemd;
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
 extern const char nss_dns_so_blob_start[];
@@ -449,6 +451,8 @@ void kernel_sysfs_populate_default(void) {
         sysfs_mkdir("/sys/kernel");
         sysfs_mkdir("/sys/class");
         sysfs_mkdir("/sys/bus");
+        sysfs_mkdir("/sys/fs");
+        sysfs_mkdir("/sys/fs/cgroup");
         sysfs_mkdir("/sys/bus/scsi");
         sysfs_mkdir("/sys/bus/scsi/devices");
         sysfs_mkdir("/sys/bus/ata");
@@ -498,8 +502,16 @@ static int boot_try_run_init(void) {
                 "/bin/sh",
                 NULL
         };
-        for (int i = 0; candidates[i]; i++) {
-                const char *p = candidates[i];
+        static const char *systemd_candidates[] = {
+                "/usr/lib/systemd/systemd",
+                "/sbin/init",
+                "/linuxrc",
+                "/bin/sh",
+                NULL
+        };
+        const char *const *init_paths = boot_wants_systemd ? systemd_candidates : candidates;
+        for (int i = 0; init_paths[i]; i++) {
+                const char *p = init_paths[i];
                 struct stat st;
                 if (vfs_stat(p, &st) != 0) {
                         klogprintf("boot: skip init %s (not found)\n", p);
@@ -575,6 +587,35 @@ static int boot_try_run_init(void) {
         return -1;
 }
 
+static void boot_select_init(uint32_t magic, uint64_t info)
+{
+        if (magic != 0x36d76289u || !info)
+                return;
+        const uint8_t *p = (const uint8_t *)(uintptr_t)info;
+        uint32_t total = *(const uint32_t *)p;
+        if (total < 16 || total > 1024u * 1024u)
+                return;
+        for (uint32_t off = 8; off + 8 <= total; ) {
+                uint32_t type = *(const uint32_t *)(p + off);
+                uint32_t size = *(const uint32_t *)(p + off + 4);
+                if (size < 8 || size > total - off)
+                        break;
+                if (type == 1 && size > 8) {
+                        const char *cmdline = (const char *)(p + off + 8);
+                        size_t len = size - 8;
+                        size_t n = 0;
+                        while (n < len && cmdline[n]) n++;
+                        /* Keep the real boot command line for /proc/cmdline (systemd reads it). */
+                        procfs_set_kernel_cmdline(cmdline, n);
+                        if (n < len && strstr(cmdline, "axon.init=systemd"))
+                                boot_wants_systemd = 1;
+                }
+                if (size > UINT32_MAX - 7u)
+                        break;
+                off += (size + 7u) & ~7u;
+        }
+}
+
 /*
  * start_kernel() — the AxonOS analog of Linux init/main.c start_kernel().
  * The decompressor (boot/kzip_stub.c decompress_kernel) has already imaged
@@ -582,6 +623,7 @@ static int boot_try_run_init(void) {
  * (multiboot_magic, multiboot_info) in RDI/RSI — Linux's rsi=boot_params.
  */
 void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
+        boot_select_init(multiboot_magic, multiboot_info);
         enable_cursor();
         sysinfo_init(multiboot_magic, multiboot_info);
 
@@ -1894,6 +1936,9 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 else
                         klogprintf("boot: warning: failed to mount /sys\n");
         }
+        /* systemd needs a unified hierarchy before PID 1 starts. */
+        if (cgroupfs_register() == 0 && cgroupfs_mount("/sys/fs/cgroup") != 0)
+                klogprintf("boot: warning: failed to mount cgroup2\n");
 
         /* Final printk snapshot for /var/log/kernel (ring stays authoritative via /dev/kmsg). */
         klog_sync_varlog();

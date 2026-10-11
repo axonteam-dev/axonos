@@ -654,6 +654,9 @@ static int pml4_map_one(void *pml4_ptr, uint64_t va, uint64_t pa, uint64_t flags
 
 /* Validate minimal ELF64 header */
 static int elf_validate_header(const Elf64_Ehdr *eh, size_t len);
+static int parse_shebang(const uint8_t *buf, size_t n,
+                         char *out_interp, size_t out_interp_sz,
+                         char *out_arg, size_t out_arg_sz);
 
 /*
  * Linux open_exec: the main binary and PT_INTERP must be openable before
@@ -662,7 +665,7 @@ static int elf_validate_header(const Elf64_Ehdr *eh, size_t len);
  * execve's ENOENT returned to RIP in a zeroed image (add [rax],al with
  * rax=-ENOENT -> #PF CR2=0xfffffffffffffffe).
  */
-static int elf_probe_exec_open(const char *path) {
+static int elf_probe_exec_open_depth(const char *path, unsigned depth) {
     struct fs_file *f;
     Elf64_Ehdr eh;
     Elf64_Phdr *phdrs;
@@ -670,20 +673,28 @@ static int elf_probe_exec_open(const char *path) {
     int i;
     char interp[192];
 
-    if (!path)
+    if (!path || depth >= 8)
         return -1;
     f = fs_open(path);
     if (!f)
         return -1;
     if (fs_read(f, &eh, sizeof(eh), 0) != (ssize_t)sizeof(eh) ||
         !elf_validate_header(&eh, sizeof(eh))) {
+        uint8_t hdr[256];
+        char arg[64];
+        ssize_t nr = fs_read(f, hdr, sizeof(hdr) - 1, 0);
         fs_file_free(f);
-        return 0; /* shebang / non-ELF: file exists */
+        if (nr <= 0 || !parse_shebang(hdr, (size_t)nr, interp,
+                                      sizeof(interp), arg, sizeof(arg)))
+            return -1;
+        /* A script is executable only if its interpreter is executable too.
+         * Check the whole bounded chain before discarding the caller's mm. */
+        return elf_probe_exec_open_depth(interp, depth + 1);
     }
     if (eh.e_phoff == 0 || eh.e_phnum == 0 ||
         eh.e_phentsize != sizeof(Elf64_Phdr)) {
         fs_file_free(f);
-        return 0;
+        return -1;
     }
     phsz = (size_t)eh.e_phnum * (size_t)eh.e_phentsize;
     if (phsz == 0 || phsz > 256u * 1024u) {
@@ -725,9 +736,16 @@ static int elf_probe_exec_open(const char *path) {
         struct fs_file *ip = fs_open(interp);
         if (!ip)
             return -1;
+        ssize_t nr = fs_read(ip, &eh, sizeof(eh), 0);
         fs_file_free(ip);
+        if (nr != (ssize_t)sizeof(eh) || !elf_validate_header(&eh, sizeof(eh)))
+            return -1;
     }
     return 0;
+}
+
+static int elf_probe_exec_open(const char *path) {
+    return elf_probe_exec_open_depth(path, 0);
 }
 
 static int elf_validate_header(const Elf64_Ehdr *eh, size_t len) {
@@ -1356,10 +1374,8 @@ int elf_load_from_path_info(const char *path, uint64_t load_base_override,
         out_tls->align = 0;
     }
     struct fs_file *f = fs_open(path);
-    if (!f) {
-        //kprintf("execve: open failed: %s\n", path ? path : "(null)");
+    if (!f)
         return -1;
-    }
     size_t fsz = f->size;
 
     /* Read only the ELF header first (avoid buffering whole file). */
@@ -2157,6 +2173,10 @@ static int try_exec_shebang(const char *resolved_path,
 
 int kernel_execve_from_path(const char *path, const char *const argv[],
                             const char *const envp[]) {
+    /* Failed exec must return with the old image, VMAs and fork state intact.
+     * This includes missing/dangling shebang interpreters, not just PT_INTERP. */
+    if (elf_probe_exec_open(path) != 0)
+        return -1;
     thread_t *cur = thread_current();
     if (!cur || cur->ring != 3)
         cur = thread_get_current_user();
@@ -2237,9 +2257,13 @@ int kernel_execve_from_path(const char *path, const char *const argv[],
             mm_release(dead);
         } else {
             /*
-             * Past Linux exec_mmap: oldmm already mmput. Keep nascent mm so the
-             * child can still return the errno to userspace (Go ForkExec).
+             * Past exec_mmap the old user RIP/stack no longer exist. Linux
+             * treats a late loader failure as fatal; returning an errno here
+             * would resume the old RIP in the new, incomplete address space.
              */
+            kprintf("execve: fatal loader failure path=%s rc=%d\n",
+                    path ? path : "?", rc);
+            syscall_user_fatal_exit(11); /* SIGSEGV; does not return */
         }
         return rc;
     }
@@ -2320,7 +2344,6 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
 
     int r = elf_load_from_path_info(curpath, 0, &main_info, &main_tls);
     if (r == -2) {
-        /* unsupported ELF format */
         return -2;
     }
     if (r != 0) {
@@ -2383,20 +2406,8 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
      * near 0x2000000 and would skip the scrub). */
     exec_scrub_stale_image_tail(main_info.loaded_hi);
 
-    /* Sanity: after replacing busybox with openrc PIE, PLT @+0x30d0 must be
-     * ff25 — not busybox AVX (c57e) or zeros (0000 → add [rax],al → #PF CR2=0). */
-    if (path && strstr(path, "openrc") &&
-        main_info.load_base == 0x400000ULL && main_info.loaded_hi > 0x4030d0ULL) {
-        const uint8_t *p = (const uint8_t *)(uintptr_t)0x4030d0ULL;
-        uint64_t got = *(const uint64_t *)(uintptr_t)0x40c050ULL;
-        devel_printf("exec-image: @0x4030d0 %02x %02x %02x %02x got@0x40c050=0x%llx (want ff25)\n",
-                (unsigned)p[0], (unsigned)p[1], (unsigned)p[2], (unsigned)p[3],
-                (unsigned long long)got);
-        if (p[0] != 0xffu || p[1] != 0x25u) {
-            kprintf("exec-image: BAD image at PLT (not openrc) — abort exec\n");
-            return -1;
-        }
-    }
+    /* ELF validation must not depend on a program name or fixed PLT/GOT
+     * offsets: those change between builds, and static binaries need no PLT. */
     /* PG_US for the loaded image comes from make_private / mark_user_range_exec.
      * Remapping 0x400000..0x800000 as identity would alias the vfork parent. */
     {
@@ -2494,7 +2505,8 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         thread_t *tc = thread_current();
         if (elf_needs_private_user_pages(tc)) {
             uintptr_t tip_lo = final_stack > 0x40000u ? (final_stack - 0x40000u) : final_stack;
-            if (exec_map_stack_tip(tc, tip_lo, stack_top) != 0) return -1;
+            if (exec_map_stack_tip(tc, tip_lo, stack_top) != 0)
+                return -1;
         }
     }
 
@@ -2633,6 +2645,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
             cur_user->syscall_frame_kbuf[15] = (uint64_t)final_stack;
         }
         thread_proc_env_set(cur_user, envp);
+        thread_proc_exe_set(cur_user, path);
         /* update display name */
         strncpy(cur_user->name, path, sizeof(cur_user->name) - 1);
         cur_user->name[sizeof(cur_user->name) - 1] = '\0';
@@ -2682,7 +2695,8 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         thread_t *caller = thread_current();
         extern void user_thread_entry(void);
         thread_t *ut = thread_create_blocked(user_thread_entry, path ? path : "user");
-        if (!ut) return -1;
+        if (!ut)
+            return -1;
         /*
          * kernel_execve_init_from_path prepared the image in a nascent mm.
          * Share that mm object with the new task; do not clone page tables
@@ -2775,6 +2789,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
             caller->state = THREAD_BLOCKED;
         }
         thread_proc_env_set(ut, envp);
+        thread_proc_exe_set(ut, path);
         /* A kernel-launched program is a session and process-group leader.
          * PID1 must keep sid/pgid=1 (thread_mark_init_user); do not clobber
          * with the thread slot id after that. */
@@ -2929,5 +2944,3 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
     enter_user_mode(entry, final_stack);
     return 0; /* not reached */
 }
-
-

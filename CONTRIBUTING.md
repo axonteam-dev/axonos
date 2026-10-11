@@ -3,7 +3,7 @@ If you're here, you probably already know this is a kernel, not a web app. Good.
 Before you write code: build it. Boot it. Break it. Fix it. Then open a PR.
 
 ```bash
-make archive   # pulls initfs on first run — needs network
+make archive   # uses tracked initfs.sfs or a trusted local image
 make iso       # use sudo if iso/boot is root-owned from an old build
 make run       # QEMU, needs ../disk.img — run make disk once if missing
 ```

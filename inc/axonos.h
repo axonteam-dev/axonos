@@ -1,14 +1,14 @@
-#pragma once
+        #pragma once
 
-#include <stdint.h>
+        #include <stdint.h>
 
-#define OS_NAME "axonOS"
-#define OS_VERSION "4.0.1"
-#define OS_PREFIX "beta"
-#define OS_AUTHORS "Axon Team"
+        #define OS_NAME "axonOS"
+        #define OS_VERSION "4.1.0" 
+        #define OS_PREFIX "stable"
+        #define OS_AUTHORS "Axon Team"
 
-/* Syscall globals (defined in syscall64/syscall.c). */
-extern uint64_t syscall_kernel_rsp0;
+        /* Syscall globals (defined in syscall64/syscall.c). */
+        extern uint64_t syscall_kernel_rsp0;
 extern uint64_t syscall_user_rsp_saved;
 extern uint64_t syscall_user_return_rip;
 extern uint64_t syscall_user_return_rax;

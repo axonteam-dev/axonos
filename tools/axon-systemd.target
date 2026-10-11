@@ -1,0 +1,4 @@
+[Unit]
+Description=AxonOS systemd boot target
+DefaultDependencies=no
+Wants=axon-getty.service

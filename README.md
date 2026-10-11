@@ -1,3 +1,5 @@
+[Build instructions](docs/BUILDING.md)
+
 ```text
 axonOS is an operating system created in Russia with the GNU GRUB bootloader and a kernel built on Linux semantics. This operating system is intended to be a more secure alternative to the Linux kernel (or at least to the kernel of any given distribution), but **for now** the project is under development, and the system **cannot** yet be a full replacement for GNU/Linux.
 

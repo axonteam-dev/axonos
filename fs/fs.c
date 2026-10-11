@@ -30,6 +30,8 @@ struct mount_entry {
         char path[64];
         size_t path_len;
         struct fs_driver *driver;
+        unsigned int refs;
+        char bind_source[64]; /* nonempty for a regular-file bind mount */
 };
 
 static struct mount_entry g_mounts[MAX_FS_MOUNTS];
@@ -306,12 +308,15 @@ int fs_mount(const char *path, struct fs_driver *drv) {
         if (!path || !drv) return -1;
         size_t len = strlen(path);
         if (len == 0 || len >= sizeof(g_mounts[0].path)) return -1;
-        /* Linux: remounting the same fstype on the same path is a no-op success for
-         * our virtual mounts; a different driver on a busy mountpoint is EBUSY. */
+        /* A second mount of the same filesystem covers the first one. Keep its
+         * depth so unmounting the new layer does not remove the original mount. */
         for (int i = 0; i < g_mount_count; i++) {
                 if (g_mounts[i].path_len == len && strcmp(g_mounts[i].path, path) == 0) {
-                        if (g_mounts[i].driver == drv)
+                        if (g_mounts[i].driver == drv && !g_mounts[i].bind_source[0] &&
+                            g_mounts[i].refs != UINT32_MAX) {
+                                g_mounts[i].refs++;
                                 return 0;
+                        }
                         return -1; /* busy: something else already mounted here */
                 }
         }
@@ -322,7 +327,41 @@ int fs_mount(const char *path, struct fs_driver *drv) {
         strcpy(g_mounts[g_mount_count].path, path);
         g_mounts[g_mount_count].path_len = len;
         g_mounts[g_mount_count].driver = drv;
+        g_mounts[g_mount_count].refs = 1;
+        g_mounts[g_mount_count].bind_source[0] = '\0';
         g_mount_count++;
+        return 0;
+}
+
+int fs_bind_mount_file(const char *source, const char *target) {
+        if (!source || !target || strcmp(source, target) == 0 ||
+            strlen(source) >= sizeof(g_mounts[0].bind_source) ||
+            strlen(target) >= sizeof(g_mounts[0].path) ||
+            g_mount_count >= MAX_FS_MOUNTS || fs_get_mount_driver_exact(target))
+                return -1;
+
+        struct stat src_stat, dst_stat;
+        if (vfs_stat(source, &src_stat) != 0 || vfs_stat(target, &dst_stat) != 0 ||
+            (src_stat.st_mode & 0170000u) != S_IFREG ||
+            (dst_stat.st_mode & 0170000u) != S_IFREG)
+                return -1;
+
+        /* Keep the source backing file, not a snapshot: writes via either path
+         * must reach the same inode (notably /run/machine-id -> /etc/machine-id). */
+        struct fs_driver *drv = fs_get_mount_driver(source);
+        if (!drv)
+                return -1;
+        for (int i = 0; i < g_mount_count; i++) {
+                if (g_mounts[i].bind_source[0] && strcmp(g_mounts[i].path, source) == 0)
+                        return -1; /* avoid recursive bind resolution */
+        }
+
+        struct mount_entry *m = &g_mounts[g_mount_count++];
+        strcpy(m->path, target);
+        m->path_len = strlen(target);
+        m->driver = drv;
+        m->refs = 1;
+        strcpy(m->bind_source, source);
         return 0;
 }
 
@@ -349,12 +388,18 @@ int fs_unmount(const char *path) {
         if (!path) return -1;
         for (int i = 0; i < g_mount_count; i++) {
                 if (strcmp(g_mounts[i].path, path) == 0) {
+                        if (g_mounts[i].refs > 1) {
+                                g_mounts[i].refs--;
+                                return 0;
+                        }
                         // remove this mount by shifting remaining entries
                         for (int j = i; j + 1 < g_mount_count; j++) g_mounts[j] = g_mounts[j+1];
                         // clear last
                         g_mounts[--g_mount_count].driver = NULL;
                         g_mounts[g_mount_count].path[0] = '\0';
                         g_mounts[g_mount_count].path_len = 0;
+                        g_mounts[g_mount_count].refs = 0;
+                        g_mounts[g_mount_count].bind_source[0] = '\0';
                         return 0;
                 }
         }
@@ -368,6 +413,10 @@ static void fs_file_mark_opened(struct fs_file *file) {
 
 struct fs_file *fs_open_nofollow(const char *path) {
         if (!path) return NULL;
+        for (int i = 0; i < g_mount_count; i++) {
+                if (g_mounts[i].bind_source[0] && strcmp(g_mounts[i].path, path) == 0)
+                        return fs_open_nofollow(g_mounts[i].bind_source);
+        }
         struct fs_driver *mount_drv = fs_match_mount(path);
         if (mount_drv && mount_drv->ops && mount_drv->ops->open) {
                 struct fs_file *file = NULL;
@@ -520,14 +569,19 @@ static char *fs_resolve_symlinks(const char *path) {
 
                         struct fs_file *pf = fs_open_nofollow(prefix);
                         if (!pf) {
-                                /* prefix does not exist -> stop resolving and return current path */
+                                /* A missing prefix must not expose link text as file data. */
                                 kfree(prefix);
-                                return cur;
+                                kfree(cur);
+                                return NULL;
                         }
                         struct stat st;
                         int sr = vfs_fstat(pf, &st);
                         fs_file_free(pf);
-                        if (sr != 0) { kfree(prefix); return cur; }
+                        if (sr != 0) {
+                                kfree(prefix);
+                                kfree(cur);
+                                return NULL;
+                        }
 
                         if ((st.st_mode & S_IFLNK) == S_IFLNK) {
                                 /* read link target */
@@ -535,7 +589,8 @@ static char *fs_resolve_symlinks(const char *path) {
                                 size_t tlen = 0;
                                 if (fs_readlink_no_resolve(prefix, target, sizeof(target), &tlen) != 0) {
                                         kfree(prefix);
-                                        return cur;
+                                        kfree(cur);
+                                        return NULL;
                                 }
 
                                 /* remaining path after this component (including leading slash if any) */
@@ -594,7 +649,9 @@ static char *fs_resolve_symlinks(const char *path) {
                 }
                 if (!restarted) return cur;
         }
-        return cur;
+        /* Too many links: never return a partially resolved symlink. */
+        kfree(cur);
+        return NULL;
 }
 
 /* Try drivers in registration order. Drivers should return -1 if they do not handle the path. */
@@ -633,16 +690,11 @@ struct fs_file *fs_create_file(const char *path) {
 
 struct fs_file *fs_open(const char *path) {
         if (!path) return NULL;
-        int dbg = 0;
         int direct_miss = 0;
 
         /* Fast path: most paths have no symlinks. Try direct open first. */
         struct fs_file *f = fs_open_nofollow(path);
         if (f) {
-                /* Git's .git/ paths should never need symlink resolution; avoid heavy resolve path. */
-                if (strstr(path, "/.git/") != NULL) {
-                        return f;
-                }
                 struct stat st;
                 int sr = vfs_fstat(f, &st);
                 if (sr == 0 && (st.st_mode & S_IFLNK) != S_IFLNK) {
@@ -653,12 +705,6 @@ struct fs_file *fs_open(const char *path) {
                 fs_file_free(f);
         } else {
                 direct_miss = 1;
-        }
-
-        /* Git's .git/ paths should never need symlink resolution; if not found directly,
-           treat as missing instead of walking prefixes (can hang under concurrent ops). */
-        if (strstr(path, "/.git/") != NULL) {
-                return NULL;
         }
 
         char *resolved_path = fs_resolve_symlinks(path);
@@ -703,8 +749,16 @@ struct fs_file *fs_open(const char *path) {
                 }
         }
 
-        kfree(resolved_path);
         fs_file_mark_opened(result);
+        if (result) {
+                struct stat st;
+                if (vfs_fstat(result, &st) != 0 ||
+                    (st.st_mode & 0170000u) == S_IFLNK) {
+                        fs_file_free(result);
+                        result = NULL;
+                }
+        }
+        kfree(resolved_path);
         return result;
 }
 
@@ -792,6 +846,14 @@ void fs_file_free(struct fs_file *file) {
         }
         if (file->type == FS_TYPE_SIGNALFD) {
                 signalfd_fs_file_destroy(file);
+                return;
+        }
+        if (file->type == FS_TYPE_INOTIFY) {
+                inotify_fs_file_destroy(file);
+                return;
+        }
+        if (file->type == FS_TYPE_TIMERFD) {
+                timerfd_fs_file_destroy(file);
                 return;
         }
         for (int i = 0; i < g_drivers_count; i++) {

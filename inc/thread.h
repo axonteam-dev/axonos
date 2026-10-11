@@ -222,6 +222,9 @@ typedef struct thread {
          * (or stash it in the sigframe if a handler runs). */
         uint8_t restore_sigmask;
         uint64_t saved_sigmask_orig;
+        /* Executable path recorded at execve; backs /proc/<pid>/exe readlink
+         * (systemd PID 1 refuses to start without /proc/self/exe). */
+        char proc_exe[128];
 } thread_t;
 
 extern int init;
@@ -310,6 +313,8 @@ thread_t* thread_find_child_of(int parent_tid);
 // per-thread fd helpers
 int thread_fd_alloc(struct fs_file *file); /* returns fd or -1 */
 int thread_fd_close(int fd);
+/* Close in the explicitly resolved syscall task, not a stale current_user. */
+int thread_fd_close_for(thread_t *cur, int fd);
 int thread_fd_dup(int oldfd);
 int thread_fd_dup2(int oldfd, int newfd);
 int thread_fd_isatty(int fd);
@@ -317,5 +322,7 @@ int thread_fd_isatty(int fd);
 void thread_proc_env_free(thread_t *t);
 void thread_proc_env_set(thread_t *t, const char *const envp[]);
 void thread_proc_env_inherit(thread_t *child, thread_t *parent);
+/* Record exec target for /proc/<pid>/exe (empty string clears it). */
+void thread_proc_exe_set(thread_t *t, const char *path);
 
 #endif // THREAD_H 

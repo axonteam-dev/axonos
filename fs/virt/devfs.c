@@ -61,6 +61,7 @@ static void *devfs_driver_data = NULL;
 static int devfs_open(const char *path, struct fs_file **out_file);
 static void devfs_release(struct fs_file *file);
 static int devfs_tty_try_erase(struct devfs_tty *t, int tty);
+static int devfs_path_to_tty(const char *path);
 
 /* devfs is a virtual filesystem: device nodes are not removable from userspace.
    However we must implement unlink() so tools like BusyBox rm report EPERM
@@ -77,14 +78,31 @@ static int devfs_unlink(const char *path) {
 }
 
 static int devfs_chmod(const char *path, mode_t mode) {
-    (void)mode;
     if (!path) return -1;
+    int tty = devfs_path_to_tty(path);
+    if (tty >= 0 && tty < DEVFS_TTY_COUNT) {
+        thread_t *caller = thread_get_current_user();
+        if (caller && caller->euid != 0 && caller->euid != dev_ttys[tty].node_uid)
+            return -1;
+        dev_ttys[tty].node_mode = mode & 07777u;
+        return 0;
+    }
     struct fs_file *f = NULL;
     if (devfs_open(path, &f) == 0 && f) {
         devfs_release(f);
         return 0;
     }
     return -1;
+}
+
+int devfs_chown(const char *path, uid_t uid, gid_t gid) {
+    int tty = devfs_path_to_tty(path);
+    if (tty < 0 || tty >= DEVFS_TTY_COUNT) return -1;
+    thread_t *caller = thread_get_current_user();
+    if (caller && caller->euid != 0) return -1;
+    if (uid != (uid_t)-1) dev_ttys[tty].node_uid = uid;
+    if (gid != (gid_t)-1) dev_ttys[tty].node_gid = gid;
+    return 0;
 }
 
 static inline uint32_t devfs_tty_cols(void) {
@@ -2066,6 +2084,18 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
                         console_clear_screen_attr(tty->current_attr);
                         console_set_cursor(0, 0);
                     }
+                } else if (ch == '7') {
+                    /* DECSC: save cursor position (apk progress bar uses \e7/\e8). */
+                    tty->dec_saved_x = tty->cursor_x;
+                    tty->dec_saved_y = tty->cursor_y;
+                    devfs_tty_vt_reset(tty);
+                } else if (ch == '8') {
+                    /* DECRC: restore cursor position. */
+                    tty->cursor_x = tty->dec_saved_x;
+                    tty->cursor_y = tty->dec_saved_y;
+                    tty->need_wrap = 0;
+                    if (tty_on_vga) console_set_cursor(tty->cursor_x, tty->cursor_y);
+                    devfs_tty_vt_reset(tty);
                 } else {
                     /* A syntactically complete but unsupported ESC function. */
                     devfs_tty_vt_reset(tty);
@@ -2676,6 +2706,12 @@ int devfs_fill_stat(struct fs_file *file, struct stat *st) {
     st->st_uid = 0;
     st->st_gid = 0;
     st->st_size = 0;
+    int tty = devfs_path_to_tty(p);
+    if (tty >= 0 && tty < DEVFS_TTY_COUNT) {
+        st->st_mode = (mode_t)(S_IFCHR | dev_ttys[tty].node_mode);
+        st->st_uid = dev_ttys[tty].node_uid;
+        st->st_gid = dev_ttys[tty].node_gid;
+    }
     /* Linux: /dev/ttyN = char 4:N, /dev/console = char 5:1, /dev/tty = 5:0.
        Xorg's xf86HasTTYs() requires major(st_rdev)==TTY_MAJOR (4) for /dev/tty0. */
     if (strcmp(p, "/dev/console") == 0) {
@@ -2711,6 +2747,9 @@ int devfs_register(void) {
     /* init ttys */
     for (int i = 0; i < DEVFS_TTY_COUNT; i++) {
         dev_ttys[i].id = i;
+        dev_ttys[i].node_mode = 0620;
+        dev_ttys[i].node_uid = 0;
+        dev_ttys[i].node_gid = 5; /* tty */
         dev_ttys[i].cursor_x = get_cursor_x();
         dev_ttys[i].cursor_y = get_cursor_y();
         devfs_tty_init_scroll(&dev_ttys[i]);
@@ -3492,5 +3531,3 @@ int devfs_get_device_id(const char *path) {
     if (idx < 0) return -1;
     return dev_blocks[idx].device_id;
 }
-
-

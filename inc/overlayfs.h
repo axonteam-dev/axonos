@@ -23,6 +23,9 @@ struct fs_driver *overlayfs_get_driver(void);
 int overlayfs_fill_stat(struct fs_file *file, struct stat *st);
 int overlayfs_ftruncate(struct fs_file *file, off_t length);
 int overlayfs_symlink(const char *path, const char *target);
+/* Link an open (anonymous, e.g. O_TMPFILE) overlay file into newpath by
+ * linking its inner upper inode. Returns 0 / -errno-ish (ramfs semantics). */
+int overlayfs_link_open_file(struct fs_file *file, const char *newpath);
 int overlayfs_chown(const char *path, uid_t uid, gid_t gid);
 int overlayfs_lchown(const char *path, uid_t uid, gid_t gid);
 ssize_t overlayfs_getxattr(const char *path, const char *name, void *value, size_t size);

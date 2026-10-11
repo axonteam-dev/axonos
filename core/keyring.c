@@ -23,6 +23,7 @@
 #include <rtc.h>
 #include <heap.h>
 #include <vga.h>
+#include <thread.h>
 
 #define KEYRING_MAX 64
 #define KEY_DESC_MAX 64
@@ -397,6 +398,21 @@ long keyctl_do(int cmd, long a2, long a3, long a4, long a5) {
         }
         release(&g_kr_lock);
         return (long)serial;
+    }
+    case KEYCTL_SETPERM: {
+        uint32_t serial = (uint32_t)a2;
+        uint32_t perms = (uint32_t)a3;
+        thread_t *caller = thread_get_current_user();
+        acquire(&g_kr_lock);
+        kr_slot_t *s = slot_by_serial(serial);
+        if (!s) { release(&g_kr_lock); return -126; } /* ENOKEY */
+        if (caller && caller->euid != 0 && caller->euid != s->uid) {
+            release(&g_kr_lock);
+            return -1; /* EPERM */
+        }
+        s->perms = perms;
+        release(&g_kr_lock);
+        return 0;
     }
     case KEYCTL_UPDATE: {
         uint32_t serial = (uint32_t)a2;

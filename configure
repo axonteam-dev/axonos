@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${1:-}" == --help ]]; then
+    echo "Usage: ./configure [CONFIG_FILE=path] [BUILD_DIR=path]"
+    exit 0
+fi
+for tool in make python3 gcc ld objcopy nm nasm lz4; do
+    command -v "$tool" >/dev/null || { echo "Missing build tool: $tool" >&2; exit 1; }
+done
+exec make -C "$root" config "$@"

@@ -29,6 +29,8 @@ struct cgroup {
 	uint32_t subtree; /* bit0 memory, bit1 pids, bit2 cpu */
 	uint32_t nprocs;
 	uint64_t procs[CGROUP_PROCS_MAX];
+	uint32_t open_count;
+	int removed;
 };
 
 enum {
@@ -42,6 +44,7 @@ enum {
 	CG_FILE_PIDS_CUR,
 	CG_FILE_CPU_MAX,
 	CG_FILE_STAT,
+	CG_FILE_EVENTS,
 };
 
 struct cgroupfs_handle {
@@ -224,6 +227,8 @@ static int cg_file_id(const char *base)
 		return CG_FILE_CPU_MAX;
 	if (strcmp(base, "cgroup.stat") == 0)
 		return CG_FILE_STAT;
+	if (strcmp(base, "cgroup.events") == 0)
+		return CG_FILE_EVENTS;
 	return 0;
 }
 
@@ -327,6 +332,16 @@ static int cg_move_pid(struct cgroup *dst, uint64_t pid)
 	return 0;
 }
 
+static int cg_populated(struct cgroup *cg)
+{
+	if (cg->nprocs)
+		return 1;
+	for (struct cgroup *child = cg->child; child; child = child->sibling)
+		if (cg_populated(child))
+			return 1;
+	return 0;
+}
+
 static ssize_t cg_show(struct cgroup *cg, int fid, char *buf, size_t cap)
 {
 	uint32_t i;
@@ -336,7 +351,7 @@ static ssize_t cg_show(struct cgroup *cg, int fid, char *buf, size_t cap)
 		return 0;
 	switch (fid) {
 	case CG_FILE_CONTROLLERS:
-		return snprintf(buf, cap, "cpuset cpu io memory pids\n");
+		return snprintf(buf, cap, "cpu memory pids\n");
 	case CG_FILE_SUBTREE: {
 		char tmp[64];
 		size_t n = 0;
@@ -380,6 +395,8 @@ static ssize_t cg_show(struct cgroup *cg, int fid, char *buf, size_t cap)
 		return snprintf(buf, cap, "max 100000\n");
 	case CG_FILE_STAT:
 		return snprintf(buf, cap, "nr_descendants %u\n", cg->nprocs);
+	case CG_FILE_EVENTS:
+		return snprintf(buf, cap, "populated %d\nfrozen 0\n", cg_populated(cg));
 	default:
 		return 0;
 	}
@@ -492,22 +509,28 @@ static int cgroupfs_mkdir_op(const char *path)
 
 	if (!rel)
 		return -1;
+	/* Linux mkdir() on an existing cgroup, including the hierarchy root,
+	 * returns EEXIST.  The syscall layer maps this driver's -4 to EEXIST. */
+	if (rel[0] == '\0' || strcmp(rel, "/") == 0)
+		return -4;
 	if (cg_split(rel, dir, sizeof(dir), base, sizeof(base)) != 0)
 		return -1;
 	if (!cg_name_ok(base) || cg_file_id(base))
 		return -1;
-	parent = cg_walk(dir);
-	if (!parent)
-		return -1;
 	acquire_irqsave(&g_cg_lock, &fl);
+	parent = cg_walk(dir);
+	if (!parent) {
+		release_irqrestore(&g_cg_lock, fl);
+		return -2; /* ENOENT */
+	}
 	if (cg_find_child(parent, base)) {
 		release_irqrestore(&g_cg_lock, fl);
-		return 0;
+		return -4; /* EEXIST */
 	}
 	n = (struct cgroup *)kmalloc(sizeof(*n));
 	if (!n) {
 		release_irqrestore(&g_cg_lock, fl);
-		return -1;
+		return -5; /* ENOMEM */
 	}
 	memset(n, 0, sizeof(*n));
 	strncpy(n->name, base, CGROUP_NAME_MAX - 1);
@@ -520,6 +543,51 @@ static int cgroupfs_mkdir_op(const char *path)
 	return 0;
 }
 
+int cgroupfs_rmdir(const char *path)
+{
+	const char *rel = cg_rel(path);
+	char dir[128], base[CGROUP_NAME_MAX];
+	unsigned long fl = 0;
+	int free_now;
+	struct cgroup *victim, *parent;
+	struct cgroup **link;
+
+	if (!rel) return -2; /* ENOENT */
+	if (!rel[0] || strcmp(rel, "/") == 0) return -16; /* EBUSY */
+	if (cg_split(rel, dir, sizeof(dir), base, sizeof(base)) != 0 || !cg_name_ok(base))
+		return -22; /* EINVAL */
+	acquire_irqsave(&g_cg_lock, &fl);
+	parent = cg_walk(dir);
+	if (!parent) { release_irqrestore(&g_cg_lock, fl); return -2; }
+	link = &parent->child;
+	while (*link && strcmp((*link)->name, base) != 0)
+		link = &(*link)->sibling;
+	if (!*link) { release_irqrestore(&g_cg_lock, fl); return -2; }
+	victim = *link;
+	if (victim->child || victim->nprocs) {
+		release_irqrestore(&g_cg_lock, fl);
+		return -39; /* ENOTEMPTY: child cgroup or resident process */
+	}
+	*link = victim->sibling;
+	victim->parent = victim->sibling = NULL;
+	victim->removed = 1;
+	free_now = victim->open_count == 0;
+	release_irqrestore(&g_cg_lock, fl);
+	if (free_now) kfree(victim);
+	return 0;
+}
+
+static void cg_put_open(struct cgroup *cg)
+{
+	if (!cg) return;
+	unsigned long fl = 0;
+	acquire_irqsave(&g_cg_lock, &fl);
+	if (cg->open_count) cg->open_count--;
+	int free_now = cg->removed && cg->open_count == 0;
+	release_irqrestore(&g_cg_lock, fl);
+	if (free_now) kfree(cg);
+}
+
 static int cgroupfs_open(const char *path, struct fs_file **out_file)
 {
 	const char *rel;
@@ -529,6 +597,7 @@ static int cgroupfs_open(const char *path, struct fs_file **out_file)
 	struct fs_file *f;
 	struct cgroupfs_handle *h;
 	char *pp;
+	unsigned long fl = 0;
 
 	if (!path || !out_file)
 		return -1;
@@ -537,6 +606,7 @@ static int cgroupfs_open(const char *path, struct fs_file **out_file)
 		return -1;
 	if (cg_split(rel, dir, sizeof(dir), base, sizeof(base)) != 0)
 		return -1;
+	acquire_irqsave(&g_cg_lock, &fl);
 	if (!base[0] || strcmp(rel, "/") == 0) {
 		cg = &g_cgroup_root;
 		fid = 0;
@@ -555,15 +625,20 @@ static int cgroupfs_open(const char *path, struct fs_file **out_file)
 			fid = 0;
 		}
 	}
+	if (cg) cg->open_count++;
+	release_irqrestore(&g_cg_lock, fl);
 	if (!cg)
 		return -1;
 	f = (struct fs_file *)kmalloc(sizeof(*f));
-	if (!f)
+	if (!f) {
+		cg_put_open(cg);
 		return -1;
+	}
 	memset(f, 0, sizeof(*f));
 	pp = (char *)kmalloc(strlen(path) + 1);
 	if (!pp) {
 		kfree(f);
+		cg_put_open(cg);
 		return -1;
 	}
 	memcpy(pp, path, strlen(path) + 1);
@@ -571,6 +646,7 @@ static int cgroupfs_open(const char *path, struct fs_file **out_file)
 	if (!h) {
 		kfree(pp);
 		kfree(f);
+		cg_put_open(cg);
 		return -1;
 	}
 	memset(h, 0, sizeof(*h));
@@ -582,7 +658,9 @@ static int cgroupfs_open(const char *path, struct fs_file **out_file)
 	if (fid) {
 		h->cache = (char *)kmalloc(4096);
 		if (h->cache) {
+			acquire_irqsave(&g_cg_lock, &fl);
 			ssize_t n = cg_show(cg, fid, h->cache, 4096);
+			release_irqrestore(&g_cg_lock, fl);
 
 			h->cache_len = n > 0 ? (size_t)n : 0;
 			f->size = h->cache_len;
@@ -612,10 +690,12 @@ static ssize_t cgroupfs_read(struct fs_file *file, void *buf, size_t size, size_
 	}
 	/* directory listing */
 	{
+		unsigned long fl = 0;
+		acquire_irqsave(&g_cg_lock, &fl);
 		static const char *files[] = {
 			"cgroup.controllers", "cgroup.subtree_control", "cgroup.procs",
 			"cgroup.threads", "memory.max", "memory.current",
-			"pids.max", "pids.current", "cpu.max", "cgroup.stat"
+			"pids.max", "pids.current", "cpu.max", "cgroup.stat", "cgroup.events"
 		};
 		unsigned i;
 		struct cgroup *c;
@@ -684,6 +764,7 @@ static ssize_t cgroupfs_read(struct fs_file *file, void *buf, size_t size, size_
 			}
 			pos += rec_len;
 		}
+		release_irqrestore(&g_cg_lock, fl);
 	}
 	return (ssize_t)written;
 }
@@ -711,6 +792,7 @@ static void cgroupfs_release(struct fs_file *file)
 	if (h) {
 		if (h->cache)
 			kfree(h->cache);
+		cg_put_open(h->cg);
 		kfree(h);
 	}
 	if (file->path)
@@ -731,7 +813,10 @@ int cgroupfs_fill_stat(struct fs_file *file, struct stat *st)
 	st->st_gid = 0;
 	st->st_size = (off_t)file->size;
 	if (h->file_id)
-		st->st_mode = S_IFREG | 0644;
+		st->st_mode = S_IFREG |
+			((h->file_id == CG_FILE_SUBTREE || h->file_id == CG_FILE_PROCS ||
+			  h->file_id == CG_FILE_THREADS || h->file_id == CG_FILE_MEM_MAX ||
+			  h->file_id == CG_FILE_PIDS_MAX) ? 0644 : 0444);
 	else {
 		st->st_mode = S_IFDIR | 0755;
 		st->st_nlink = 2;

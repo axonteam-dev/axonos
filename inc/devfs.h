@@ -17,6 +17,9 @@ typedef struct thread thread_t;
 #endif
 struct devfs_tty {
     int id;
+    mode_t node_mode;
+    uid_t node_uid;
+    gid_t node_gid;
     uint8_t *screen; /* console backing buffer (4 bytes per cell: glyph16LE, attr) */
     uint32_t cursor_x;
     uint32_t cursor_y;
@@ -199,9 +202,9 @@ void devfs_remove_partitions_of(const char *whole_path);
 
 /* Fill a POSIX-like stat struct for a devfs file handle. */
 int devfs_fill_stat(struct fs_file *file, struct stat *st);
+int devfs_chown(const char *path, uid_t uid, gid_t gid);
 
 /* Enumerate registered block devices (created via devfs_create_block_node). */
 int devfs_block_count(void);
 int devfs_block_get(int index, char *out_name, size_t out_cap, int *out_device_id, uint32_t *out_sectors);
-
 

@@ -76,6 +76,8 @@ struct fs_driver {
 int fs_register_driver(struct fs_driver *drv);
 int fs_unregister_driver(struct fs_driver *drv);
 int fs_mount(const char *path, struct fs_driver *drv);
+/* Bind an existing regular file at another existing regular-file path. */
+int fs_bind_mount_file(const char *source, const char *target);
 /* Unmount previously mounted path. Returns 0 on success, -1 on error */
 int fs_unmount(const char *path);
 /* Return driver mounted for path (NULL if none) — longest prefix match. */
@@ -138,6 +140,8 @@ int fs_unlink(const char *path);
 /* Linux eventfd(2) counter fd. */
 #define FS_TYPE_EVENTFD 0x45464446u /* 'EFDF' */
 #define FS_TYPE_SIGNALFD 0x53464446u /* 'SFDF' */
+#define FS_TYPE_INOTIFY  0x494E4F54u /* 'INOT' */
+#define FS_TYPE_TIMERFD  0x54494D46u /* 'TIMF' */
 
 /* Called by fs_file_free on final unref; tears down TCP/unix private state. */
 void net_fs_file_destroy(struct fs_file *f);
@@ -146,6 +150,8 @@ void epoll_fs_file_destroy(struct fs_file *f);
 /* Called by fs_file_free on final unref of an eventfd. */
 void eventfd_fs_file_destroy(struct fs_file *f);
 void signalfd_fs_file_destroy(struct fs_file *f);
+void inotify_fs_file_destroy(struct fs_file *f);
+void timerfd_fs_file_destroy(struct fs_file *f);
 /* Linux: closing fd removes it from every epoll set in that process. */
 struct thread;
 void epoll_notify_fd_closed(struct thread *thr, int fd);

@@ -84,6 +84,13 @@ typedef struct syscall_frame {
 #define SYS_pipe    22
 #define SYS_eventfd 284
 #define SYS_eventfd2 290
+#define SYS_timerfd_create 283
+#define SYS_timerfd_settime 286
+#define SYS_timerfd_gettime 287
+#define SYS_inotify_init 253
+#define SYS_inotify_add_watch 254
+#define SYS_inotify_rm_watch 255
+#define SYS_inotify_init1 294
 #define SYS_signalfd 282
 #define SYS_signalfd4 289
 #define SYS_dup3    292
@@ -229,5 +236,3 @@ int maybe_deliver_pending_signal(uint64_t syscall_ret);
 /* Deliver pending user signal before interrupt/exception iretq (patches regs). */
 int maybe_deliver_pending_signal_iretq(cpu_registers_t *regs);
 /* vfork child exec (or fatal exit): restore parent snapshot and unblock blocked parent. */
-
-

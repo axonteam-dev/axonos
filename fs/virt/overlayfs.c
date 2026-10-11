@@ -95,6 +95,19 @@ static int ov_upper_open(const char *path, struct fs_file **out)
     return u->ops->open(mapped, out);
 }
 
+static int ov_upper_remove(const char *path)
+{
+    struct fs_driver *u = ov_upper();
+    char mapped[512];
+    if (ov_map_upper(path, mapped, sizeof(mapped)) != 0)
+        return -1;
+    if (g_ov_upperdir[0] == 0)
+        return ramfs_remove(path);
+    if (u && u->ops && u->ops->unlink)
+        return u->ops->unlink(mapped);
+    return -1;
+}
+
 static int ov_upper_create(const char *path, struct fs_file **out)
 {
     struct fs_driver *u = ov_upper();
@@ -192,29 +205,45 @@ static int ov_ensure_parent_upper(const char *path)
     if (ov_upper_open(tmp, &chk) == 0) {
         int ok = (chk->type == FS_TYPE_DIR);
         ov_release_inner(chk);
-        return ok ? 0 : -1;
+        if (ok)
+            return 0;
+        /* Upper object shadows a lower directory (stale copy-up/whiteout). */
+        kprintf("overlay: parentfix drop upper non-dir path=%s lower_dir=%d\n", tmp, ov_lower_is_dir(tmp));
+        if (ov_lower_is_dir(tmp) && ov_upper_remove(tmp) == 0) {
+            /* Re-materialize the directory so children can be created under it. */
+            if (ov_upper_mkdir(tmp) == 0)
+                return 0;
+        }
+        return -1;
     }
 
     /* Recurse first so /a/b materializes /a before /a/b. */
-    if (ov_ensure_parent_upper(tmp) != 0)
+    if (ov_ensure_parent_upper(tmp) != 0) {
+        kprintf("overlay: parentfail recurse path=%s\n", path);
         return -1;
+    }
 
     /* Materialize lower-only directory into upper (no whiteout). */
-    if (ramfs_path_is_whiteout(tmp) && g_ov_upperdir[0] == 0)
+    if (ramfs_path_is_whiteout(tmp) && g_ov_upperdir[0] == 0) {
+        kprintf("overlay: parentfail whiteout path=%s\n", path);
         return -1;
+    }
     if (ov_upper_mkdir(tmp) == 0)
         return 0;
+    kprintf("overlay: parentfail mkdir %s (upperdir=%s)\n", path, g_ov_upperdir[0] ? g_ov_upperdir : "ramfs");
     /* EEXIST / race: confirm upper dir now. */
     if (ov_upper_open(tmp, &chk) == 0) {
         int ok = (chk->type == FS_TYPE_DIR);
         ov_release_inner(chk);
         if (ok)
             return 0;
+        kprintf("overlay: parentfail notdir path=%s\n", path);
         return -1;
     }
     /* Parent missing on upper but present on lower — create empty upper dir. */
     if (ov_lower_is_dir(tmp) && ov_upper_mkdir(tmp) == 0)
         return 0;
+    kprintf("overlay: parentfail lowonly path=%s lower=%d\n", path, ov_lower_is_dir(tmp));
     return -1;
 }
 
@@ -677,9 +706,11 @@ static int overlay_create(const char *path, struct fs_file **out_file)
 static int overlay_mkdir(const char *path)
 {
     int r;
+    int was_whiteout;
     if (!overlay_active || !path)
         return -1;
-    if (ramfs_path_is_whiteout(path)) {
+    was_whiteout = ramfs_path_is_whiteout(path);
+    if (was_whiteout) {
         if (ramfs_remove(path) != 0)
             return -1;
     }
@@ -691,7 +722,10 @@ static int overlay_mkdir(const char *path)
             ov_release_inner(chk);
             return is_dir ? -4 : -3; /* EEXIST / ENOTDIR */
         }
-        if (ov_lower_is_dir(path))
+        /* A whiteout made the lower directory absent from the merged view.
+         * Recreating it must create an upper directory, not return EEXIST
+         * after merely removing the whiteout (apk hook directory reuse). */
+        if (!was_whiteout && ov_lower_is_dir(path))
             return -4;
     }
     if (ov_ensure_parent_upper(path) != 0)
@@ -904,13 +938,41 @@ int overlayfs_symlink(const char *path, const char *target)
 {
     if (!overlay_active || !path || !target)
         return -1;
+    /* symlink(2) never replaces an existing dentry, including one that only
+     * exists in the lower layer or is itself a dangling symlink. BusyBox's
+     * --install -s relies on EEXIST to keep its own executable intact. */
+    if (!ramfs_path_is_whiteout(path)) {
+        struct fs_file *existing = NULL;
+        if (overlay_open(path, &existing) == 0) {
+            overlay_release(existing);
+            return -4; /* EEXIST */
+        }
+    }
     if (ramfs_path_is_whiteout(path)) {
         if (ramfs_remove(path) != 0)
             return -1;
     }
     if (ov_ensure_parent_upper(path) != 0)
-        return -1;
-    return ramfs_symlink(path, target);
+        return -2;
+    {
+        int r = ramfs_symlink(path, target);
+        if (r == -4) {
+            static int symlink_eexist_warn = 8;
+            if (symlink_eexist_warn > 0) {
+                symlink_eexist_warn--;
+                struct fs_file *up = NULL, *lo = NULL;
+                int hu = (ov_upper_open(path, &up) == 0);
+                int hl = (squashfs_open_path(path, &lo) == 0);
+                kprintf("overlay: symlink EEXIST path=%s hu=%d hl=%d up_type=%d lo_type=%d\n",
+                        path, hu, hl, hu ? up->type : -1, hl ? lo->type : -1);
+                if (hu) ov_release_inner(up);
+                if (hl) ov_release_inner(lo);
+            }
+        } else if (r != 0) {
+            kprintf("overlay: symlink fail path=%s target=%s r=%d\n", path, target, r);
+        }
+        return r;
+    }
 }
 
 /*
@@ -1089,6 +1151,25 @@ int overlayfs_ftruncate(struct fs_file *file, off_t length)
         }
         return trc;
     }
+}
+
+int overlayfs_link_open_file(struct fs_file *file, const char *newpath)
+{
+    struct overlay_file_handle *fh;
+    struct fs_file *inner;
+    char mapped[512];
+
+    if (!file || !newpath || newpath[0] != '/')
+        return -1;
+    if (file->fs_private != (void *)&overlay_driver)
+        return -1;
+    fh = (struct overlay_file_handle *)file->driver_private;
+    if (!fh || !fh->inner)
+        return -1;
+    inner = fh->inner;
+    if (ov_map_upper(newpath, mapped, sizeof(mapped)) != 0)
+        return -1;
+    return ramfs_link_open_file(inner, mapped);
 }
 
 int overlayfs_mount_root(void)

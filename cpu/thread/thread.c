@@ -727,6 +727,7 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->sc_a1 = t->sc_a2 = t->sc_a3 = t->sc_a4 = t->sc_a5 = t->sc_a6 = 0;
         t->fork_child_to_publish = NULL;
         t->proc_environ = NULL;
+        t->proc_exe[0] = '\0';
         t->uaccess_begin = 0;
         t->uaccess_end = 0;
         t->uaccess_resume_rip = 0;
@@ -893,6 +894,7 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->sc_a1 = t->sc_a2 = t->sc_a3 = t->sc_a4 = t->sc_a5 = t->sc_a6 = 0;
         t->fork_child_to_publish = NULL;
         t->proc_environ = NULL;
+        t->proc_exe[0] = '\0';
         t->uaccess_begin = 0;
         t->uaccess_end = 0;
         t->uaccess_resume_rip = 0;
@@ -1052,11 +1054,8 @@ int thread_fd_alloc(struct fs_file *file) {
     return -1;
 }
 
-int thread_fd_close(int fd) {
+int thread_fd_close_for(thread_t *cur, int fd) {
     static int pipe_fd_trace_left = 160;
-    thread_t *cur = thread_current();
-    if (!cur || cur->ring != 3)
-        cur = thread_get_current_user();
     if (!cur || fd < 0 || fd >= THREAD_MAX_FD) return -1;
     struct fs_file *f = cur->process ? cur->process->fds[fd] : cur->fds[fd];
     if (!f) return -1;
@@ -1074,6 +1073,13 @@ int thread_fd_close(int fd) {
     epoll_notify_fd_closed(cur, fd);
     fs_file_free(f);
     return 0;
+}
+
+int thread_fd_close(int fd) {
+    thread_t *cur = thread_current();
+    if (!cur || cur->ring != 3 || cur->state != THREAD_RUNNING)
+        cur = thread_get_current_user();
+    return thread_fd_close_for(cur, fd);
 }
 
 int thread_fd_dup(int oldfd) {
@@ -1732,6 +1738,7 @@ void thread_proc_env_set(thread_t *t, const char *const envp[]) {
 void thread_proc_env_inherit(thread_t *child, thread_t *parent) {
         if (!child || !parent)
                 return;
+        thread_proc_exe_set(child, parent->proc_exe);
         thread_proc_env_free(child);
         if (!parent->proc_environ)
                 return;
@@ -1762,4 +1769,15 @@ void thread_proc_env_inherit(thread_t *child, thread_t *parent) {
         }
         arr[n] = NULL;
         child->proc_environ = arr;
+}
+
+void thread_proc_exe_set(thread_t *t, const char *path) {
+        if (!t)
+                return;
+        if (!path) {
+                t->proc_exe[0] = '\0';
+                return;
+        }
+        strncpy(t->proc_exe, path, sizeof(t->proc_exe) - 1);
+        t->proc_exe[sizeof(t->proc_exe) - 1] = '\0';
 }

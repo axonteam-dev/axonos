@@ -67,6 +67,8 @@ typedef struct process {
     uint32_t itimer_interval_ms;
     /* prctl(PR_SET_DUMPABLE): 0/1/2 — Linux default is 1 (SUID_DUMP_USER). */
     int dumpable;
+    /* Linux PR_GET/SET_SECUREBITS, inherited at fork. */
+    unsigned int secure_bits;
     /* Resource limits (Linux rlimit64). Only NOFILE is enforced on open. */
     uint64_t rlim_nofile_cur;
     uint64_t rlim_nofile_max;

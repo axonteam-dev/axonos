@@ -13,6 +13,5 @@ initfs.sfs
 *dsc
 *.xz
 .cursor/
-.github/
 .vscode/
 AGENTS.md

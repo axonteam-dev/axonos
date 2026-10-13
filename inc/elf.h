@@ -62,6 +62,7 @@ typedef struct {
 enum {
     ELF_PT_LOAD    = 1,
     ELF_PT_DYNAMIC = 2,
+    ELF_PT_INTERP  = 3,
     ELF_DT_NULL    = 0,
     ELF_DT_RELA    = 7,
     ELF_DT_RELASZ  = 8,
@@ -105,5 +106,4 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
 
 int elf_load_from_path_info(const char *path, uint64_t load_base_override,
                             elf_load_info_t *out_info, elf_tls_info_t *out_tls);
-
 

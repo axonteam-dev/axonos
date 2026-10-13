@@ -994,6 +994,15 @@ static int elf_apply_rela_buffer(mm_t *mm, uint64_t load_base,
 static int elf_apply_rela_relative(struct fs_file *f, uint64_t load_base,
                                    const Elf64_Ehdr *eh, const Elf64_Phdr *phdrs, int phnum) {
     if (!f || !eh || !phdrs || phnum <= 0) return 0;
+    /* Linux load_elf_binary maps an interpreted executable and supplies its
+     * load bias/auxv to ld.so; the interpreter owns all dynamic relocations.
+     * Applying the main program's RELA here both violates that contract and
+     * rejects large Go PIEs (dockerd has a ~10MB RELA table) at our static
+     * relocation buffer limit. Never call userspace IFUNC resolvers here for
+     * a PT_INTERP executable either. */
+    for (int i = 0; i < phnum; i++)
+        if (phdrs[i].p_type == ELF_PT_INTERP)
+            return 0;
     thread_t *tc = elf_bprm_thread();
     mm_t *mm = (tc && elf_needs_private_user_pages(tc)) ? tc->mm : NULL;
     uint64_t text_lo = 0, text_hi = 0;

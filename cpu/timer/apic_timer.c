@@ -368,6 +368,7 @@ void apic_timer_handler(cpu_registers_t* regs) {
 
     /* Charge CPU time before any schedule/publish side effects. */
     thread_account_timer_tick(regs && ((regs->cs & 3) == 3));
+    if (regs) thread_sample_irq_rip(regs->rip, (regs->cs & 3) == 3);
     /* Wall-clock, process timers, timeout scan, NIC poll and power requests are
      * BSP-only: their shared state is not per-CPU, and one global clock owner is
      * all the subsystems need.  AP ticks handle only accounting + scheduling. */

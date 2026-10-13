@@ -391,8 +391,9 @@ void detect_hv_and_read_tsc()
                 if (a15 != 0 && b15 != 0 && c15 != 0) {
                     uint64_t crystal_hz = (uint64_t)c15;
                     uint64_t tsc_hz = (crystal_hz * (uint64_t)b15) / (uint64_t)a15;
-                    double tsc_mhz = (double)tsc_hz / 1000000.0;
-                    klogprintf("%s: TSC freq read from hypervisor : %0.3f MHz\n", hv_prefix, tsc_mhz);
+                    klogprintf("%s: TSC freq read from hypervisor : %llu.%03llu MHz\n",
+                        hv_prefix, (unsigned long long)(tsc_hz / 1000000ULL),
+                        (unsigned long long)((tsc_hz / 1000ULL) % 1000ULL));
                     klogprintf("%s: Host bus clock speed read from hypervisor : %llu Hz\n", hv_prefix, (unsigned long long)crystal_hz);
                     /* Provide a simple clock offset estimate (0 for now) to match kernel flavor output */
                     klogprintf("%s: using clock offset of %llu ns\n", hv_prefix, (unsigned long long)0);
@@ -403,8 +404,9 @@ void detect_hv_and_read_tsc()
                     cpuid(0x16u, 0, &a16, &b16, &c16, &d16);
                     if (a16 != 0) {
                             uint64_t tsc_hz = (uint64_t)a16 * 1000000ULL;
-                            double tsc_mhz = (double)tsc_hz / 1000000.0;
-                            klogprintf("%s: TSC freq read from hypervisor : %0.3f MHz\n", hv_prefix, tsc_mhz);
+                            klogprintf("%s: TSC freq read from hypervisor : %llu.%03llu MHz\n",
+                                hv_prefix, (unsigned long long)(tsc_hz / 1000000ULL),
+                                (unsigned long long)((tsc_hz / 1000ULL) % 1000ULL));
                     }
                 }
             }
@@ -415,8 +417,9 @@ void detect_hv_and_read_tsc()
                 cpuid(0x16u, 0, &a16, &b16, &c16, &d16);
                 if (a16 != 0) {
                     uint64_t tsc_hz = (uint64_t)a16 * 1000000ULL;
-                    double tsc_mhz = (double)tsc_hz / 1000000.0;
-                    klogprintf("%s: TSC freq read from hypervisor : %0.3f MHz\n", hv_prefix, tsc_mhz);
+                    klogprintf("%s: TSC freq read from hypervisor : %llu.%03llu MHz\n",
+                        hv_prefix, (unsigned long long)(tsc_hz / 1000000ULL),
+                        (unsigned long long)((tsc_hz / 1000ULL) % 1000ULL));
                 }
             }
         }
@@ -563,5 +566,4 @@ const char* sysinfo_hypervisor_name(void) { return sys_hv_name; }
 int sysinfo_is_hypervisor(void) { return sys_hv_present; }
 uint64_t sysinfo_tsc_hz_hint(void) { return sys_tsc_hz_hint_value; }
 int sysinfo_tsc_hz_hint_is_exact(void) { return sys_tsc_hz_hint_exact; }
-
 

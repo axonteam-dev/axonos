@@ -23,6 +23,7 @@ struct fs_file {
     /* Stable page-cache key. 0 means this handle is not cacheable. */
     uint64_t backing_id;
     uint64_t backing_gen;
+    int limit_accounted;      /* counted once per open file description */
 };
 
 /* Filesystem driver operations (minimal set) */
@@ -104,6 +105,12 @@ struct fs_file *fs_open(const char *path);
 struct fs_file *fs_open_nofollow(const char *path);
 ssize_t fs_read(struct fs_file *file, void *buf, size_t size, size_t offset);
 ssize_t fs_write(struct fs_file *file, const void *buf, size_t size, size_t offset);
+uint64_t fs_file_max_get(void);
+int fs_file_max_set(uint64_t value);
+uint32_t fs_nr_open_get(void);
+int fs_nr_open_set(uint64_t value);
+int fs_file_account(struct fs_file *file);
+int fs_file_open_error_get(void);
 /* Live page-cache generation for a handle; defaults to backing_gen. */
 uint64_t fs_current_generation(struct fs_file *file);
 void fs_file_free(struct fs_file *file);

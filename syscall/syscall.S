@@ -235,6 +235,15 @@ syscall_entry64:
     movq    %rsp, %rdi
     call    syscall_epilogue_probe
 
+    /* Separate the IRETQ control frame from RCX/R11. They are clobbered by
+     * ordinary SYSCALL but must be restored as GPRs by rt_sigreturn. Reserve
+     * 40 bytes for the five control words and 8 bytes for CALL alignment. */
+    movq    %rsp, %rdi
+    subq    $48, %rsp
+    leaq    8(%rsp), %rsi
+    call    syscall_prepare_iret_frame
+    addq    $8, %rsp
+
     // Restore registers.
     popq    %r15
     popq    %r14
@@ -252,20 +261,7 @@ syscall_entry64:
     popq    %rcx
     popq    %rax
 
-    // Return to user with IRETQ using the saved return RIP (rcx), flags (r11) and user RSP.
-    // USER_DS = 0x23, USER_CS = 0x1B (see cpu/gdt.c)
-    pushq   $0x23
-    // After popping saved GPRs, %rsp points at the saved user RSP slot pushed on entry.
-    // pushq above moved %rsp, so the saved user RSP is now at 8(%rsp).
-    pushq   8(%rsp)
-    /* Ensure user returns with interrupts enabled (IF=1).
-       Some implementations of SYSCALL may present masked RFLAGS in r11
-       (per MSR_FMASK), and restoring them verbatim would leave user mode
-       with IF=0, effectively "disabling interrupts" for the user process. */
-    orq     $0x200, %r11
-    pushq   %r11
-    pushq   $0x1B
-    pushq   %rcx
+    // The prepared RIP, CS, RFLAGS, RSP, SS frame follows the 15 GPRs.
     clts
     iretq
 
@@ -313,4 +309,3 @@ syscall_child_return_from_frame:
     pushq   %rcx
     clts
     iretq
-

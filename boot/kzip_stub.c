@@ -38,10 +38,14 @@ enum {
 };
 
 enum {
-        /* Keep MB2 tags out of the payload load window (~1MiB) and stub (0x08000000). */
-        MB2_COPY_ADDR = 0x01000000u,
         MB2_COPY_MAX  = 2u * 1024u * 1024u
 };
+
+/* GRUB reserves ELF PT_LOAD p_memsz, including this BSS buffer. A fixed copy
+ * at 16MiB is NOT reserved: a large initfs loaded near 1MiB crosses that
+ * address. Copying MB2 there before parking initfs corrupts its compressed
+ * blocks, even though the archive still starts with valid SquashFS magic. */
+static uint8_t mb2_copy[MB2_COPY_MAX] __attribute__((aligned(4096)));
 
 /*
  * Scratch for LZ4 output. Keep this window SMALL: a 128MiB arena at 0x05000000
@@ -432,8 +436,8 @@ static uint64_t preserve_multiboot_info(uint64_t multiboot_info) {
         if (total_size < 16 || total_size > MB2_COPY_MAX) {
                 return multiboot_info;
         }
-        uint8_t *dst = (uint8_t *)(uintptr_t)MB2_COPY_ADDR;
-        memcpy_local(dst, src, (size_t)total_size);
+        uint8_t *dst = mb2_copy;
+        memmove_local(dst, src, (size_t)total_size);
         return (uint64_t)(uintptr_t)dst;
 }
 

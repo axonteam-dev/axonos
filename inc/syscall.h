@@ -1,6 +1,12 @@
 #pragma once
 
 #include <stdint.h>
+typedef struct thread thread_t;
+
+/* Detailed init diagnostics are opt-in via the kernel command line. */
+void syscall_configure_init_trace(const char *cmdline);
+void syscall_start_init_monitor(void);
+void syscall_kbrequest_event(void);
 
 typedef struct syscall_frame {
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
@@ -231,6 +237,8 @@ extern uint64_t syscall_exit_to_shell_flag;
 __attribute__((noreturn)) void syscall_return_to_shell(void);
 /* Terminate current user thread after fatal trap (GPF etc.); schedule parent/shell. */
 void syscall_user_fatal_exit(int signo);
+/* Bounded OpenRC spawn/pipe diagnostics; no scheduling or user-memory reads. */
+void syscall_trace_init_spawn(thread_t *t, const char *event, uint64_t a, uint64_t b);
 /* Deliver pending user signal before SYSCALL iretq (patches syscall frame). */
 int maybe_deliver_pending_signal(uint64_t syscall_ret);
 /* Deliver pending user signal before interrupt/exception iretq (patches regs). */

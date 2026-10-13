@@ -916,6 +916,25 @@ extern uint64_t syscall_kernel_rsp0;
                 thread_t *ft = thread_current();
                 if (!ft || ft->ring != 3)
                     ft = thread_get_current_user();
+                if (ft) {
+                    uintptr_t start = 0, end = 0;
+                    uint64_t offset = 0;
+                    int kind = 0, prot = 0;
+                    struct fs_file *file = NULL;
+                    if (user_vma_lookup_after(ft, (uintptr_t)cr2, &start, &end,
+                                              &kind, &prot, &file, &offset) == 0 &&
+                        cr2 >= start && cr2 < end) {
+                        klogprintf("fault-vma: [0x%llx,0x%llx) prot=%d kind=%d off=0x%llx file=%s\n",
+                            (unsigned long long)start, (unsigned long long)end,
+                            prot, kind, (unsigned long long)offset,
+                            file && file->path ? file->path : "(anonymous)");
+                    } else {
+                        klogprintf("fault-vma: no mapping for 0x%llx\n",
+                            (unsigned long long)cr2);
+                    }
+                    if (file)
+                        fs_file_free(file);
+                }
                 klogprintf("user-pf-fatal: tid=%llu name=%s sc=%llu rip=0x%llx rax=0x%llx cr2=0x%llx err=0x%llx fs=0x%llx rsp=0x%llx\n",
                         (unsigned long long)(ft && ft->tid ? ft->tid : 0),
                         (ft && ft->name[0]) ? ft->name : "?",

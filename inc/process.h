@@ -7,11 +7,11 @@
 #include <stat.h>
 
 /* Match THREAD_MAX_FD; docker/containerd expect ≥1024 NOFILE soft. */
-#define PROCESS_MAX_FD 1024
+#define PROCESS_MAX_FD 2048
 #define PROCESS_SIGNAL_MAX 64
 /* Linux-ish defaults for RLIMIT_NOFILE (getrlimit/setrlimit/prlimit64). */
 #define PROCESS_RLIMIT_NOFILE_SOFT 1024ULL
-#define PROCESS_RLIMIT_NOFILE_HARD 1048576ULL
+#define PROCESS_RLIMIT_NOFILE_HARD ((uint64_t)PROCESS_MAX_FD)
 #ifndef AXON_NGROUPS_MAX
 #define AXON_NGROUPS_MAX 32
 #endif

@@ -20,3 +20,5 @@ int cgroupfs_mount(const char *path);
 /* Remove an empty cgroup directory, ignoring its virtual control files. */
 int cgroupfs_rmdir(const char *path);
 int cgroupfs_fill_stat(struct fs_file *file, struct stat *st);
+/* Returns 1 for a cgroupfs handle, 0 for another filesystem. */
+int cgroupfs_poll(struct fs_file *file, short events, short *revents);

@@ -23,7 +23,9 @@ mb2_end:
 section .bss
 align 16
 stack_bottom:
-        resb 16384
+        ; SquashFS metadata (8KiB) nests a miniz decoder (>8KiB) during
+        ; start_kernel, before a scheduled task supplies a separate stack.
+        resb 131072
 stack_top:
 
 align 8
@@ -63,7 +65,7 @@ extern decompress_kernel
 bits 32
 _start:
         ; Set up our own stack first. Relying on loader's stack is fragile.
-        mov esp, stack_top ; stack top: 16KB by default
+        mov esp, stack_top ; bootstrap stack: 128KiB
 
         ; IMPORTANT: Save Multiboot2 registers BEFORE any calls.
         ; print_vga/check_cpuid/etc may clobber AL/EBX -> magic becomes 0x36d76200 and info ptr breaks.

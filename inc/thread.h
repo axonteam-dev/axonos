@@ -16,7 +16,7 @@ typedef enum {
         THREAD_SLEEPING
 } thread_state_t;
 
-#define THREAD_MAX_FD 1024
+#define THREAD_MAX_FD 2048
 
 typedef struct thread {
         context_t context;
@@ -225,11 +225,18 @@ typedef struct thread {
         /* Executable path recorded at execve; backs /proc/<pid>/exe readlink
          * (systemd PID 1 refuses to start without /proc/self/exe). */
         char proc_exe[128];
+        /* Last timer-interrupted instruction, separate from syscall-entry RIP. */
+        uint64_t last_irq_user_rip;
+        uint64_t last_irq_kernel_rip;
+        uint64_t sigreturn_rcx, sigreturn_r11;
+        uint8_t sigreturn_restore_gprs;
+        int fs_open_error;
 } thread_t;
 
 extern int init;
 
 void thread_init();
+void thread_sample_irq_rip(uint64_t rip, int user_mode);
 /* Per-CPU idle thread created at boot (cpu index 0 .. smp_cpu_count()-1). */
 thread_t *thread_idle_for_cpu(int cpu);
 /* Mark thread runnable with a fresh FIFO position (no-op if already READY). */

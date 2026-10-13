@@ -135,6 +135,22 @@ static int ramfs_mkdir_p(const char *path)
         return 0;
 }
 
+/* Packaged configuration belongs to userspace. Seed only an absent inode,
+ * including preserving empty files and dangling administrator symlinks. */
+static int boot_seed_file_if_missing(const char *path, const void *data,
+                                     size_t len, mode_t mode)
+{
+        struct stat st;
+        if (vfs_lstat(path, &st) == 0)
+                return 0;
+        struct fs_file *file = fs_create_file(path);
+        if (!file) return -1;
+        ssize_t written = fs_write(file, data, len, 0);
+        fs_file_free(file);
+        if (written != (ssize_t)len) return -1;
+        return fs_chmod(path, mode);
+}
+
 /*
  * Install into overlay upper (ramfs). Upper wins over squashfs lower — same as
  * Linux overlay. Borrowed file points at immutable boot blob (no ftruncate
@@ -607,6 +623,8 @@ static void boot_select_init(uint32_t magic, uint64_t info)
                         while (n < len && cmdline[n]) n++;
                         /* Keep the real boot command line for /proc/cmdline (systemd reads it). */
                         procfs_set_kernel_cmdline(cmdline, n);
+                        if (n < len)
+                                syscall_configure_init_trace(cmdline);
                         if (n < len && strstr(cmdline, "axon.init=systemd"))
                                 boot_wants_systemd = 1;
                 }
@@ -1132,6 +1150,7 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
         /* Keep NIC driver non-intrusive until full net stack is wired.
            This avoids affecting boot stability on machines where NIC init timing is sensitive. */
         thread_init();
+        syscall_start_init_monitor();
         smp_boot_aps();
  
         iothread_init();
@@ -1259,22 +1278,15 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
         ps2_mouse_init();
         /* Linux input_register_device → evdev: /dev/input/eventN for libinput/SDL. */
         evdev_init();
-        /* /etc/passwd and /etc/group so whoami/id/groups/adduser work.
-           Use static buffers to avoid heap overflow. Seed a normal user so
-           `adduser miha root` (BusyBox: add existing user to group) is meaningful. */
+        /* Minimal fallback accounts for images without account databases.
+         * Never replace packaged accounts, group IDs, or password hashes. */
         (void)ramfs_mkdir("/etc");
         (void)ramfs_mkdir("/root");
         (void)ramfs_mkdir("/home");
         static const char root_passwd_line[] =
                 "root:x:0:0:root:/root:/bin/sh\n";
         const size_t root_passwd_len = sizeof(root_passwd_line) - 1;
-        struct fs_file *pf = fs_create_file("/etc/passwd");
-        if (!pf) pf = fs_open("/etc/passwd");
-        if (pf) {
-                (void)vfs_ftruncate(pf, 0);
-                fs_write(pf, root_passwd_line, root_passwd_len, 0);
-                fs_file_free(pf);
-        }
+        (void)boot_seed_file_if_missing("/etc/passwd", root_passwd_line, root_passwd_len, 0644);
         /* Member lists required: BusyBox id(1) getgrouplist fails on "root:x:0:".
          * Include Linux base groups OpenRC checkpath expects (uucp for /run/lock). */
         static const char root_group_line[] =
@@ -1315,39 +1327,19 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 "messagebus:x:101:\n"
                 "nogroup:x:65534:\n";
         const size_t root_group_len = sizeof(root_group_line) - 1;
-        struct fs_file *gf = fs_create_file("/etc/group");
-        if (!gf) gf = fs_open("/etc/group");
-        if (gf) {
-                (void)vfs_ftruncate(gf, 0);
-                fs_write(gf, root_group_line, root_group_len, 0);
-                fs_file_free(gf);
-        }
+        (void)boot_seed_file_if_missing("/etc/group", root_group_line, root_group_len, 0644);
         /* adduser expects /etc/shadow to exist and appends entries with O_APPEND. */
         {
-                /* empty password field = login with Enter */
+                /* A bare-image fallback must not create a passwordless root. */
                 static const char root_shadow[] =
-                        "root::0:0:99999:7:::\n";
-                struct fs_file *sf = fs_create_file("/etc/shadow");
-                if (!sf) sf = fs_open("/etc/shadow");
-                if (sf) {
-                        (void)vfs_ftruncate(sf, 0);
-                        fs_write(sf, root_shadow, sizeof(root_shadow) - 1, 0);
-                        fs_file_free(sf);
-                }
+                        "root:!:0:0:99999:7:::\n";
+                (void)boot_seed_file_if_missing("/etc/shadow", root_shadow, sizeof(root_shadow) - 1, 0600);
         }
         /* adduser/addgroup may readlink /etc/gshadow; create minimal file. */
         {
                 static const char root_gshadow[] =
-                        "root::root,miha\n"
-                        "users::miha\n"
-                        "miha::miha\n";
-                struct fs_file *gsf = fs_create_file("/etc/gshadow");
-                if (!gsf) gsf = fs_open("/etc/gshadow");
-                if (gsf) {
-                        (void)vfs_ftruncate(gsf, 0);
-                        fs_write(gsf, root_gshadow, sizeof(root_gshadow) - 1, 0);
-                        fs_file_free(gsf);
-                }
+                        "root:!::\n";
+                (void)boot_seed_file_if_missing("/etc/gshadow", root_gshadow, sizeof(root_gshadow) - 1, 0600);
         }
         (void)ramfs_mkdir("/var");
         /* Do NOT mkdir /var/run — squashfs has /var/run -> /run. mkdir on overlay
@@ -1467,13 +1459,7 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         "tmpfs\t\t/run\t\ttmpfs\tmode=0755,nosuid,nodev\t0\t0\n"
                         "tmpfs\t\t/tmp\t\ttmpfs\tmode=1777,nosuid,nodev\t0\t0\n"
                         "tmpfs\t\t/dev/shm\ttmpfs\tmode=1777,nosuid,nodev\t0\t0\n";
-                struct fs_file *ff = fs_create_file("/etc/fstab");
-                if (!ff) ff = fs_open("/etc/fstab");
-                if (ff) {
-                        (void)vfs_ftruncate(ff, 0);
-                        fs_write(ff, fstab, sizeof(fstab) - 1, 0);
-                        fs_file_free(ff);
-                }
+                (void)boot_seed_file_if_missing("/etc/fstab", fstab, sizeof(fstab) - 1, 0644);
         }
         /* Do not create /etc/conf.d/rc — OpenRC 0.53 warns and wants rc.conf only. */
         (void)fs_unlink("/etc/conf.d/rc");
@@ -1602,14 +1588,7 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         "ethers: files\n"
                         "rpc: files\n"
                         "netgroup: files\n";
-                (void)fs_unlink("/etc/nsswitch.conf");
-                struct fs_file *nf = fs_create_file("/etc/nsswitch.conf");
-                if (!nf) nf = fs_open("/etc/nsswitch.conf");
-                if (nf) {
-                        (void)vfs_ftruncate(nf, 0);
-                        fs_write(nf, nsswitch, sizeof(nsswitch) - 1, 0);
-                        fs_file_free(nf);
-                }
+                (void)boot_seed_file_if_missing("/etc/nsswitch.conf", nsswitch, sizeof(nsswitch) - 1, 0644);
         }
         /*
          * Resolver files must exist before the first opkg/wget invocation.
@@ -1860,14 +1839,8 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         "\t;;\n"
                         "esac\n"
                         "exit 0\n";
-                (void)fs_unlink("/usr/share/udhcpc/default.script");
-                struct fs_file *us = fs_create_file("/usr/share/udhcpc/default.script");
-                if (!us) us = fs_open("/usr/share/udhcpc/default.script");
-                if (us) {
-                        fs_write(us, udhcpc_script, sizeof(udhcpc_script) - 1, 0);
-                        fs_file_free(us);
-                }
-                (void)fs_chmod("/usr/share/udhcpc/default.script", S_IFREG | 0755);
+                (void)boot_seed_file_if_missing("/usr/share/udhcpc/default.script",
+                    udhcpc_script, sizeof(udhcpc_script) - 1, 0755);
         }
         /* No /etc/termcap stub: ncurses uses terminfo from initfs (…/terminfo/l/linux). */
 

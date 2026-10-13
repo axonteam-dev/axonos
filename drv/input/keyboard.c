@@ -1,4 +1,5 @@
 #include <keyboard.h>
+#include <syscall.h>
 #include <idt.h>
 #include <vga.h>
 #include <spinlock.h>
@@ -297,7 +298,10 @@ void keyboard_process_scancode(uint8_t scancode) {
                 switch (scancode) {
                         case 0x1D: /* Right Ctrl */ ctrl_pressed = true; break;
                         case 0x38: /* Right Alt (AltGr) */ alt_pressed = true; break;
-                        case 0x48: /* Up */    kbd_push_sequence(target_tty_for_user, "\x1B[A"); break;
+                        case 0x48: /* Alt-Up: Linux Spawn_Console / kbrequest. */
+                                if (alt_pressed) syscall_kbrequest_event();
+                                else kbd_push_sequence(target_tty_for_user, "\x1B[A");
+                                break;
                         case 0x50: /* Down */  kbd_push_sequence(target_tty_for_user, "\x1B[B"); break;
                         case 0x4B: /* Left */  g_kbd_left_makes++; kbd_push_sequence(target_tty_for_user, "\x1B[D"); break;
                         case 0x4D: /* Right */ kbd_push_sequence(target_tty_for_user, "\x1B[C"); break;
@@ -351,7 +355,8 @@ void keyboard_process_scancode(uint8_t scancode) {
                 case 0x52: // Insert
                 case 0x53: // Delete
                         /* Always send ANSI sequences to TTY (thread_get_current_user() is NULL in ISR) */
-                        if (scancode == 0x48) kbd_push_sequence(target_tty_for_user, "\x1B[A");
+                        if (scancode == 0x48 && alt_pressed) syscall_kbrequest_event();
+                        else if (scancode == 0x48) kbd_push_sequence(target_tty_for_user, "\x1B[A");
                         else if (scancode == 0x50) kbd_push_sequence(target_tty_for_user, "\x1B[B");
                         else if (scancode == 0x4B) { g_kbd_left_makes++; kbd_push_sequence(target_tty_for_user, "\x1B[D"); }
                         else if (scancode == 0x4D) kbd_push_sequence(target_tty_for_user, "\x1B[C");

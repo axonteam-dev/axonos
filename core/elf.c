@@ -14,7 +14,7 @@
 #include <process.h>
 
 static int kernel_execve_into_mm(const char *path, const char *const argv[],
-                                 const char *const envp[]);
+                                 const char *const envp[], mm_t *resume_mm);
 #include <devfs.h>
 #include <pty.h>
 #include <gdt.h>
@@ -2118,7 +2118,7 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
 static int try_exec_shebang(const char *resolved_path,
                             const char *orig_path,
                             const char *const argv[],
-                            const char *const envp[]) {
+                            const char *const envp[], mm_t *resume_mm) {
     if (!resolved_path || !orig_path) return -1;
     struct fs_file *f = fs_open(resolved_path);
     if (!f) return -1;
@@ -2164,7 +2164,7 @@ static int try_exec_shebang(const char *resolved_path,
                       has_arg ? "'" : "");
     /* shebang: run interpreter with script path as argv0 */
 
-    int rc = kernel_execve_into_mm(k_interp, nargv, envp);
+    int rc = kernel_execve_into_mm(k_interp, nargv, envp, resume_mm);
     kfree((void*)nargv);
     kfree(k_interp);
     if (k_arg) kfree(k_arg);
@@ -2173,6 +2173,7 @@ static int try_exec_shebang(const char *resolved_path,
 
 int kernel_execve_from_path(const char *path, const char *const argv[],
                             const char *const envp[]) {
+    syscall_trace_init_spawn(thread_current(), "exec-start", 0, 0);
     /* Failed exec must return with the old image, VMAs and fork state intact.
      * This includes missing/dangling shebang interpreters, not just PT_INTERP. */
     if (elf_probe_exec_open(path) != 0)
@@ -2181,7 +2182,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[],
     if (!cur || cur->ring != 3)
         cur = thread_get_current_user();
     if (!cur)
-        return kernel_execve_into_mm(path, argv, envp);
+        return kernel_execve_into_mm(path, argv, envp, NULL);
 
     /* Drop Soft_COW fork marker before touching a new mm (vfork child). */
     cur->fork_child_user_rip = 0;
@@ -2242,7 +2243,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[],
             (unsigned long long)(cur->tid ? cur->tid : 1),
             (unsigned long long)(new_mm->cr3 ? new_mm->cr3 : 0));
 
-    int rc = kernel_execve_into_mm(path, argv, envp);
+    int rc = kernel_execve_into_mm(path, argv, envp, NULL);
     if (rc != 0) {
         if (cur->mm_ptemplate) {
             mm_release(cur->mm_ptemplate);
@@ -2293,7 +2294,7 @@ int kernel_execve_init_from_path(const char *path, const char *const argv[],
     caller->mm = new_mm;
     mm_switch(new_mm);
 
-    int rc = kernel_execve_into_mm(path, argv, envp);
+    int rc = kernel_execve_into_mm(path, argv, envp, old_mm ? old_mm : mm_kernel());
 
     caller->mm = old_mm;
     mm_switch(old_mm ? old_mm : mm_kernel());
@@ -2302,7 +2303,7 @@ int kernel_execve_init_from_path(const char *path, const char *const argv[],
 }
 
 static int kernel_execve_into_mm(const char *path, const char *const argv[],
-                                 const char *const envp[]) {
+                                 const char *const envp[], mm_t *resume_mm) {
     if (!path) return -1;
     /* IMPORTANT:
        Symlinks are resolved by VFS (`fs_open()` does it via `fs_resolve_symlinks()`).
@@ -2348,7 +2349,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
     }
     if (r != 0) {
         /* Not an ELF. Try shebang scripts (e.g. /linuxrc). */
-        return try_exec_shebang(curpath, path, argv, envp);
+        return try_exec_shebang(curpath, path, argv, envp, resume_mm);
     }
     {
         thread_t *tr = thread_get_current_user();
@@ -2758,6 +2759,8 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         int is_pid1_path = (strcmp(path, "/linuxrc") == 0 ||
             strcmp(path, "/init") == 0 ||
             strcmp(path, "/sbin/init") == 0 ||
+            strcmp(path, "/usr/lib/systemd/systemd") == 0 ||
+            strcmp(path, "/lib/systemd/systemd") == 0 ||
             strcmp(path, "/sbin/openrc-init") == 0 ||
             strcmp(path, "/usr/sbin/openrc-init") == 0);
         if (is_pid1_path)
@@ -2809,6 +2812,15 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
             (void)pty_set_fg_pgrp(ut->fds[0], ut->pgid);
         }
         syscall_bind_kstack_for_thread(ut);
+        /* The loader's boot stack lives in the compressed stub at 0x08xxxxxx,
+         * inside the mmap window. Do not resume it on init's mm: ld.so can
+         * replace that VA, and an init fault then double-faults in the context
+         * switch back to the kernel caller. The wrapper keeps its new_mm ref
+         * until this caller resumes; ut owns a separate retained reference. */
+        if (caller && resume_mm) {
+            caller->mm = resume_mm;
+            mm_switch(resume_mm);
+        }
         /* Now make the new user thread runnable. */
         thread_unblock((int)ut->tid);
         /* schedule immediately; when caller resumes, the program has terminated */
@@ -2855,6 +2867,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         if (tc) {
             process_sync_from_thread(tc->process, tc);
             process_exec_reset(tc->process, tc);
+            syscall_trace_init_spawn(tc, "exec-ready", entry, final_stack);
         }
     }
 

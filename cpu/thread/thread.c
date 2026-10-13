@@ -100,6 +100,13 @@ static int thread_is_any_idle(const thread_t *t) {
         return 0;
 }
 
+void thread_sample_irq_rip(uint64_t rip, int user_mode) {
+        thread_t *cur = thread_current();
+        if (!cur || cur->ring != 3) return;
+        if (user_mode) cur->last_irq_user_rip = rip;
+        else cur->last_irq_kernel_rip = rip;
+}
+
 void thread_account_timer_tick(int user_mode) {
         int cpu = smp_sched_cpu_id();
         if (cpu < 0 || cpu >= SMP_MAX_CPUS)
@@ -205,6 +212,18 @@ static uint64_t thread_vruntime_delta(const thread_t *t) {
 
 static inline void sched_set_current(thread_t *t) {
         current_cpu[smp_sched_cpu_id()] = t;
+}
+
+static void thread_account_block_nolock(thread_t *t) {
+        /* prev_saved charges RUNNING outgoing tasks, but blocking changes the
+         * state before that callback. Charge here while ownership is known.
+         * Otherwise short-sleep poll/RX workers keep their old low vruntime
+         * and can indefinitely outrank READY fork children when their timeout
+         * expires during the scheduling scan. External/idempotent blocks must
+         * not charge a task that isn't executing. */
+        if (t && t == thread_current() && t->state == THREAD_RUNNING &&
+            !thread_is_any_idle(t))
+                t->sched_vruntime += thread_vruntime_delta(t);
 }
 
 static void thread_note_ready_nolock(thread_t *t) {
@@ -515,6 +534,8 @@ void thread_init() {
         main_thread.sched_target_cpu = -1;
         main_thread.state = THREAD_RUNNING;
         main_thread.tid = 0;
+        /* Linux init_fs starts with 0022; PID 1 inherits it at exec. */
+        main_thread.umask = 0022;
         main_thread.nice = 0;
         main_thread.sched_fifo_seq = 0;
         main_thread.start_ticks = timer_ticks;
@@ -682,6 +703,7 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->state = st;
         thread_t *creator = thread_current();
         t->nice = creator ? creator->nice : 0;
+        t->umask = creator ? creator->umask : 0022;
         t->sched_fifo_seq = 0;
         t->sched_vruntime = creator ? creator->sched_vruntime : 0;
         t->start_ticks = timer_ticks;
@@ -821,6 +843,7 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->sid = (int)t->tid;
         /* inherit credentials, file descriptors and attached tty from current thread if available */
         thread_t *tc = thread_current();
+        t->umask = 0022;
         if (tc) {
                 t->nice = tc->nice;
                 t->sched_vruntime = tc->sched_vruntime;
@@ -1033,10 +1056,13 @@ int thread_fd_alloc(struct fs_file *file) {
     if (!cur || cur->ring != 3)
         cur = thread_get_current_user();
     if (!cur) return -1;
-    for (int i = 0; i < THREAD_MAX_FD; i++) {
+    uint64_t limit = cur->process ? cur->process->rlim_nofile_cur : THREAD_MAX_FD;
+    if (limit > THREAD_MAX_FD) limit = THREAD_MAX_FD;
+    for (int i = 0; i < (int)limit; i++) {
         struct fs_file *existing = cur->process ?
                 cur->process->fds[i] : cur->fds[i];
         if (existing == NULL) {
+            if (fs_file_account(file) != 0) return -23; /* ENFILE */
             cur->fds[i] = file;
             if (cur->process)
                     cur->process->fds[i] = file;
@@ -1051,7 +1077,7 @@ int thread_fd_alloc(struct fs_file *file) {
             return i;
         }
     }
-    return -1;
+    return -24; /* EMFILE */
 }
 
 int thread_fd_close_for(thread_t *cur, int fd) {
@@ -1220,6 +1246,7 @@ void thread_block(int pid) {
                         return; /* idempotent — vfork arms block twice */
                 }
                 if (threads[i]->state != THREAD_TERMINATED) {
+                        thread_account_block_nolock(threads[i]);
                         threads[i]->state = THREAD_BLOCKED;
                         threads[i]->sleep_until = 0; /* no timeout */
                         release_irqrestore(&sched_lock, irqf);
@@ -1237,6 +1264,7 @@ int thread_block_current_atomic(void) {
         acquire_irqsave(&sched_lock, &irqf);
         thread_t *cur = thread_current();
         if (cur && cur->state == THREAD_RUNNING) {
+                thread_account_block_nolock(cur);
                 cur->state = THREAD_BLOCKED;
                 cur->sleep_until = 0;
                 blocked = 1;
@@ -1250,7 +1278,9 @@ void thread_block_with_timeout(int pid, uint32_t timeout_ms) {
         unsigned long irqf;
         acquire_irqsave(&sched_lock, &irqf);
         for (int i = 0; i < thread_count; ++i) {
-                if (threads[i] && threads[i]->tid == pid && threads[i]->state != THREAD_BLOCKED) {
+                if (threads[i] && threads[i]->tid == pid && threads[i]->state != THREAD_BLOCKED &&
+                    threads[i]->state != THREAD_TERMINATED) {
+                        thread_account_block_nolock(threads[i]);
                         threads[i]->state = THREAD_BLOCKED;
                         threads[i]->sleep_until = deadline;
                         release_irqrestore(&sched_lock, irqf);
@@ -1269,6 +1299,7 @@ void thread_sleep(uint32_t ms) {
                 return;
         unsigned long irqf;
         acquire_irqsave(&sched_lock, &irqf);
+        thread_account_block_nolock(c);
         c->sleep_until = thread_deadline_ms(ms);
         c->state = THREAD_SLEEPING;
         release_irqrestore(&sched_lock, irqf);

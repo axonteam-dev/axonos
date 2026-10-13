@@ -39,6 +39,7 @@ CC := gcc -m64
 CFLAGS_EXTRA ?=
 OPTFLAGS ?= -g
 CFLAGS := $(OPTFLAGS) -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel \
+	-mgeneral-regs-only \
 	-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
 	-Wa,--noexecstack \
 	-Iinc -I$(AUTOCONF_DIR) -include kconfig.h -MMD -MP $(CFLAGS_EXTRA)

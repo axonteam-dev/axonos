@@ -10,6 +10,7 @@
 #include <exec.h>
 #include <mmio.h>
 #include <pit.h>
+#include <syscall.h>
 
 extern void kprintf(const char *fmt, ...);
 
@@ -509,6 +510,7 @@ void process_release_vfork_parent(process_t *child,
          * Parent CR3 is installed by the scheduler when it actually runs.
          */
         wake->vfork_waiting = 0;
+        syscall_trace_init_spawn(wake, "vfork-release", child->pid, (uint64_t)reason);
         if (wake->name[0] &&
             (strstr(wake->name, "linuxrc") || strstr(wake->name, "/bin/sh") ||
              strstr(wake->name, "busybox") || strstr(wake->name, "init")))

@@ -1331,25 +1331,11 @@ int mm_switch(mm_t *mm) {
 
 /*
  * Leave `dead` before mm_release frees its page tables.
- * Prefer another live task mm; otherwise activate swapper (mm_kernel).
+ * Activate swapper, not an arbitrary task's mm. A different process can have
+ * unmapped the bootstrap stack VA or replaced it with a private file mapping.
  */
 int mm_switch_away_from(mm_t *dead) {
     if (!g_mm_ready) mm_init();
-    int n = thread_get_count();
-    for (int i = 0; i < n; i++) {
-        thread_t *t = thread_get_by_index(i);
-        if (!t || !t->mm || t->mm == dead)
-            continue;
-        if (!t->mm->pml4)
-            continue;
-        uint64_t cr3 = t->mm->cr3 ? t->mm->cr3 : (uint64_t)(uintptr_t)t->mm->pml4;
-        if (!cr3 || cr3 >= (uint64_t)MMIO_IDENTITY_LIMIT)
-            continue;
-        if ((paging_read_cr3() & ~0xFFFULL) == (cr3 & ~0xFFFULL))
-            return 0;
-        paging_write_cr3(cr3);
-        return 0;
-    }
     if (dead != &g_kernel_mm)
         return mm_switch(&g_kernel_mm);
     return -1;

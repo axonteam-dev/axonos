@@ -59,7 +59,7 @@ int mm_demote_user_identity(mm_t *mm);
 
 /* Switch CPU CR3 to provided mm (or kernel mm when NULL). */
 int mm_switch(mm_t *mm);
-/* Leave `dead` before releasing it — never loads stale g_kernel_mm. */
+/* Leave `dead` on the permanent kernel direct map before releasing it. */
 int mm_switch_away_from(mm_t *dead);
 
 /* Ensure [va_begin, va_end) is mapped to private pages in mm.

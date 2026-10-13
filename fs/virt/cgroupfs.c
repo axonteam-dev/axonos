@@ -26,6 +26,7 @@ struct cgroup {
 	uint64_t memory_max;
 	uint64_t pids_max;
 	uint32_t pids_current;
+	uint64_t event_seq;
 	uint32_t subtree; /* bit0 memory, bit1 pids, bit2 cpu */
 	uint32_t nprocs;
 	uint64_t procs[CGROUP_PROCS_MAX];
@@ -53,6 +54,7 @@ struct cgroupfs_handle {
 	size_t pos;
 	char *cache;
 	size_t cache_len;
+	uint64_t seen_events;
 };
 
 static struct cgroup g_cgroup_root;
@@ -278,8 +280,10 @@ void cgroup_task_enter(process_t *p, struct cgroup *cg)
 		cg = &g_cgroup_root;
 	acquire_irqsave(&g_cg_lock, &fl);
 	p->cgroup = cg;
-	for (w = cg; w; w = w->parent)
+	for (w = cg; w; w = w->parent) {
+		if (w->pids_current == 0) w->event_seq++;
 		w->pids_current++;
+	}
 	if (cg->nprocs < CGROUP_PROCS_MAX)
 		cg->procs[cg->nprocs++] = p->pid;
 	release_irqrestore(&g_cg_lock, fl);
@@ -304,8 +308,10 @@ void cgroup_task_leave(process_t *p)
 		}
 	}
 	for (w = cg; w; w = w->parent) {
-		if (w->pids_current)
+		if (w->pids_current) {
+			if (w->pids_current == 1) w->event_seq++;
 			w->pids_current--;
+		}
 	}
 	p->cgroup = NULL;
 	release_irqrestore(&g_cg_lock, fl);
@@ -321,14 +327,64 @@ int cgroup_show_path(process_t *p, char *buf, size_t cap)
 	return snprintf(buf, cap, "0::%s\n", path);
 }
 
+static int cg_is_ancestor(struct cgroup *ancestor, struct cgroup *cg)
+{
+	for (; cg; cg = cg->parent)
+		if (cg == ancestor) return 1;
+	return 0;
+}
+
 static int cg_move_pid(struct cgroup *dst, uint64_t pid)
 {
-	process_t *p = process_find(pid);
-
+	process_t *p;
+	unsigned long fl = 0;
+	if (pid == 0) {
+		thread_t *t = thread_current();
+		p = t ? t->process : NULL;
+	} else {
+		p = process_find(pid);
+	}
 	if (!p || !dst)
 		return -1;
-	cgroup_task_leave(p);
-	cgroup_task_enter(p, dst);
+	/* Removal and insertion must be one namespace transaction: rmdir and
+	 * populated/pids readers must never observe a half-completed migration. */
+	acquire_irqsave(&g_cg_lock, &fl);
+	if (dst->removed) {
+		release_irqrestore(&g_cg_lock, fl);
+		return -1;
+	}
+	struct cgroup *src = p->cgroup;
+	if (src == dst) {
+		release_irqrestore(&g_cg_lock, fl);
+		return 0;
+	}
+	if (dst->nprocs >= CGROUP_PROCS_MAX) {
+		release_irqrestore(&g_cg_lock, fl);
+		return -1;
+	}
+	if (src) {
+		for (uint32_t i = 0; i < src->nprocs; i++) {
+			if (src->procs[i] == p->pid) {
+				src->procs[i] = src->procs[--src->nprocs];
+				break;
+			}
+		}
+		for (struct cgroup *w = src; w; w = w->parent) {
+			if (w->pids_current) {
+				if (w->pids_current == 1 && !cg_is_ancestor(w, dst))
+					w->event_seq++;
+				w->pids_current--;
+			}
+		}
+	}
+	p->cgroup = dst;
+	dst->procs[dst->nprocs++] = p->pid;
+	for (struct cgroup *w = dst; w; w = w->parent) {
+		if (w->pids_current == 0 && !cg_is_ancestor(w, src))
+			w->event_seq++;
+		w->pids_current++;
+	}
+	release_irqrestore(&g_cg_lock, fl);
 	return 0;
 }
 
@@ -474,13 +530,20 @@ static ssize_t cg_store(struct cgroup *cg, int fid, const char *buf, size_t size
 		uint64_t pid = 0;
 		size_t i = 0;
 
-		while (i < size && (buf[i] < '0' || buf[i] > '9'))
+		while (i < size && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\n'))
 			i++;
+		if (i == size || buf[i] < '0' || buf[i] > '9')
+			return -1;
 		while (i < size && buf[i] >= '0' && buf[i] <= '9') {
-			pid = pid * 10ull + (uint64_t)(buf[i] - '0');
+			uint64_t digit = (uint64_t)(buf[i] - '0');
+			if (pid > (~0ULL - digit) / 10ull)
+				return -1;
+			pid = pid * 10ull + digit;
 			i++;
 		}
-		if (pid == 0)
+		while (i < size && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\n'))
+			i++;
+		if (i != size)
 			return -1;
 		if (cg_move_pid(cg, pid) != 0)
 			return -1;
@@ -588,6 +651,40 @@ static void cg_put_open(struct cgroup *cg)
 	if (free_now) kfree(cg);
 }
 
+static int cg_refresh_cache(struct cgroupfs_handle *h, struct fs_file *file)
+{
+	if (!h->cache) {
+		h->cache = (char *)kmalloc(4096);
+		if (!h->cache) return -12; /* ENOMEM, not a fabricated empty file */
+	}
+	unsigned long fl = 0;
+	acquire_irqsave(&g_cg_lock, &fl);
+	ssize_t n = cg_show(h->cg, h->file_id, h->cache, 4096);
+	h->seen_events = h->cg->event_seq;
+	h->cache_len = n > 0 ? (size_t)n : 0;
+	release_irqrestore(&g_cg_lock, fl);
+	file->size = h->cache_len;
+	return n < 0 ? (int)n : 0;
+}
+
+int cgroupfs_poll(struct fs_file *file, short events, short *revents)
+{
+	if (!file || file->fs_private != &cgroup_driver || !file->driver_private)
+		return 0;
+	struct cgroupfs_handle *h = file->driver_private;
+	/* kernfs default readiness includes EOF. Notifications are separate from
+	 * readable data: only an unread populated transition raises ERR|PRI. */
+	short ready = events & (0x001 | 0x004 | 0x040 | 0x100);
+	unsigned long fl = 0;
+	acquire_irqsave(&g_cg_lock, &fl);
+	if (h->cg->removed || (h->file_id == CG_FILE_EVENTS &&
+	    h->seen_events != h->cg->event_seq))
+		ready |= 0x008 | (events & 0x002); /* POLLERR is unconditional */
+	release_irqrestore(&g_cg_lock, fl);
+	*revents = ready;
+	return 1;
+}
+
 static int cgroupfs_open(const char *path, struct fs_file **out_file)
 {
 	const char *rel;
@@ -653,17 +750,14 @@ static int cgroupfs_open(const char *path, struct fs_file **out_file)
 	h->cg = cg;
 	h->file_id = fid;
 	f->path = pp;
+	f->fs_private = &cgroup_driver;
 	f->driver_private = h;
 	f->type = fid ? FS_TYPE_REG : FS_TYPE_DIR;
 	if (fid) {
-		h->cache = (char *)kmalloc(4096);
-		if (h->cache) {
-			acquire_irqsave(&g_cg_lock, &fl);
-			ssize_t n = cg_show(cg, fid, h->cache, 4096);
-			release_irqrestore(&g_cg_lock, fl);
-
-			h->cache_len = n > 0 ? (size_t)n : 0;
-			f->size = h->cache_len;
+		if (cg_refresh_cache(h, f) != 0) {
+			if (h->cache) kfree(h->cache);
+			kfree(h); kfree(pp); kfree(f); cg_put_open(cg);
+			return -12;
 		}
 	}
 	*out_file = f;
@@ -681,6 +775,13 @@ static ssize_t cgroupfs_read(struct fs_file *file, void *buf, size_t size, size_
 		return -1;
 	h = (struct cgroupfs_handle *)file->driver_private;
 	if (h->file_id) {
+		if (size == 0) return 0;
+		/* seq_file-style rewind: a new read from offset zero observes current
+		 * membership/populated state, not the snapshot from open(). */
+		if (offset == 0) {
+			int rc = cg_refresh_cache(h, file);
+			if (rc != 0) return rc;
+		}
 		if (!h->cache || offset >= h->cache_len)
 			return 0;
 		if (size > h->cache_len - offset)

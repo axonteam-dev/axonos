@@ -14,6 +14,7 @@
 #include <pagecache.h>
 #include <zlib_inflate.h>
 #include <klog.h>
+#include <mm.h>
 
 #define SQUASHFS_METADATA_SIZE 8192
 #define SQUASHFS_NAME_LEN 256
@@ -99,6 +100,15 @@ struct meta_cache_ent {
 
 #define META_CACHE_SLOTS 16
 #define DATA_CACHE_SLOTS 32
+#define DIR_CACHE_SLOTS 256
+
+struct dir_cache_ent {
+    uint32_t parent_inode;
+    uint64_t inode_ref;
+    uint16_t type;
+    int valid;
+    char name[SQUASHFS_NAME_LEN + 1];
+};
 
 struct data_cache_ent {
     uint64_t abs_pos;
@@ -119,6 +129,7 @@ struct squashfs_sb {
     int meta_cache_next;
     struct data_cache_ent data_cache[DATA_CACHE_SLOTS];
     int data_cache_next;
+    struct dir_cache_ent dir_cache[DIR_CACHE_SLOTS];
     char mount_prefix[64]; /* "" for overlay lower, or "/squash" etc. */
     size_t mount_prefix_len;
 };
@@ -153,7 +164,21 @@ static int sq_in_range(const struct squashfs_sb *s, uint64_t off, size_t n)
     return 1;
 }
 
-static int sq_read_data_block(struct squashfs_sb *s, uint64_t abs_pos, uint32_t size_field,
+/* Independent fingerprint of compressed input, only evaluated on failure.
+ * A known-good host block with a different CRC here means the image bytes
+ * differ in the guest; do not mistake that for a decompressor/VM fix. */
+static uint32_t sq_input_crc32(const uint8_t *data, size_t len)
+{
+    uint32_t crc = 0xffffffffu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (unsigned bit = 0; bit < 8; bit++)
+            crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
+
+static int sq_read_data_block_direct(struct squashfs_sb *s, uint64_t abs_pos, uint32_t size_field,
                               void *out, size_t out_cap, size_t *out_len, size_t expected_unc)
 {
     uint32_t csize;
@@ -168,8 +193,11 @@ static int sq_read_data_block(struct squashfs_sb *s, uint64_t abs_pos, uint32_t 
     csize = size_field & ~SQUASHFS_COMPRESSED_BIT_BLOCK;
     if (csize == 0)
         return -1;
-    if (!sq_in_range(s, abs_pos, csize))
+    if (!sq_in_range(s, abs_pos, csize)) {
+        klogprintf("squashfs: data outside image pos=0x%llx size=%u image_size=%zu\n",
+            (unsigned long long)abs_pos, csize, s->size);
         return -1;
+    }
 
     /* data cache */
     for (i = 0; i < DATA_CACHE_SLOTS; i++) {
@@ -190,8 +218,13 @@ static int sq_read_data_block(struct squashfs_sb *s, uint64_t abs_pos, uint32_t 
         memcpy(out, src, csize);
         got = csize;
     } else {
-        if (zlib_inflate(out, out_cap, &got, src, csize) != 0)
+        if (zlib_inflate(out, out_cap, &got, src, csize) != 0) {
+            klogprintf("squashfs: inflate failed pos=0x%llx size=%u cap=%zu image=%p header=%02x%02x crc=%08x\n",
+                (unsigned long long)abs_pos, csize, out_cap, (const void *)s->image,
+                (unsigned)src[0], (unsigned)(csize > 1 ? src[1] : 0),
+                (unsigned)sq_input_crc32(src, csize));
             return -1;
+        }
         if (expected_unc && got != expected_unc && got > expected_unc)
             return -1;
     }
@@ -217,7 +250,21 @@ static int sq_read_data_block(struct squashfs_sb *s, uint64_t abs_pos, uint32_t 
     return 0;
 }
 
-static int sq_read_metadata_block(struct squashfs_sb *s, uint64_t abs_pos,
+/* The image and caches are kernel/physical identity pointers. Their numeric
+ * addresses can name unrelated user mappings under a process CR3. Keep the
+ * kernel direct map active through the entire source/cache transaction. All
+ * callers pass kernel bounce buffers, never a userspace destination. */
+static int sq_read_data_block(struct squashfs_sb *s, uint64_t abs_pos, uint32_t size_field,
+                              void *out, size_t out_cap, size_t *out_len, size_t expected_unc)
+{
+    mm_dm_ctx_t dm = mm_enter_direct_map();
+    int rc = sq_read_data_block_direct(s, abs_pos, size_field, out, out_cap,
+                                       out_len, expected_unc);
+    mm_leave_direct_map(dm);
+    return rc;
+}
+
+static int sq_read_metadata_block_direct(struct squashfs_sb *s, uint64_t abs_pos,
                                   uint8_t *out, size_t *out_len, uint64_t *next_pos)
 {
     uint16_t header;
@@ -278,7 +325,7 @@ static int sq_read_metadata_block(struct squashfs_sb *s, uint64_t abs_pos,
 }
 
 /* Read `want` bytes from metadata stream starting at (block_abs, offset). */
-static int sq_meta_read(struct squashfs_sb *s, uint64_t *block_abs, uint16_t *offset,
+static int sq_meta_read_direct(struct squashfs_sb *s, uint64_t *block_abs, uint16_t *offset,
                         void *dst, size_t want)
 {
     uint8_t *out = (uint8_t *)dst;
@@ -294,7 +341,24 @@ static int sq_meta_read(struct squashfs_sb *s, uint64_t *block_abs, uint16_t *of
         return 0;
 
     while (done < want) {
-        if (sq_read_metadata_block(s, *block_abs, blk, &blk_len, &next) != 0)
+        const uint8_t *data = blk;
+        int cached = 0;
+        /* Directory/inode parsers request tiny slices. Copying an entire 8K
+         * cached metadata block for every 8-byte dirent made repeated startup
+         * pathname lookups unnecessarily expensive. Copy only the slice. */
+        for (int i = 0; i < META_CACHE_SLOTS; i++) {
+            struct meta_cache_ent *e = &s->meta_cache[i];
+            if (e->valid && e->abs_pos == *block_abs) {
+                if (!sq_in_range(s, *block_abs, 2)) return -1;
+                data = e->data;
+                blk_len = e->len;
+                next = *block_abs + 2 + (rd16(s->image + *block_abs) &
+                    (uint16_t)~SQUASHFS_COMPRESSED_BIT);
+                cached = 1;
+                break;
+            }
+        }
+        if (!cached && sq_read_metadata_block_direct(s, *block_abs, blk, &blk_len, &next) != 0)
             return -1;
         if (*offset > blk_len)
             return -1;
@@ -304,7 +368,7 @@ static int sq_meta_read(struct squashfs_sb *s, uint64_t *block_abs, uint16_t *of
             if (take > avail)
                 take = avail;
             if (take && out)
-                memcpy(out + done, blk + *offset, take);
+                memcpy(out + done, data + *offset, take);
             done += take;
             *offset = (uint16_t)(*offset + take);
             if (*offset >= blk_len && done < want) {
@@ -314,6 +378,17 @@ static int sq_meta_read(struct squashfs_sb *s, uint64_t *block_abs, uint16_t *of
         }
     }
     return 0;
+}
+
+static int sq_meta_read(struct squashfs_sb *s, uint64_t *block_abs, uint16_t *offset,
+                        void *dst, size_t want)
+{
+    /* Keep image/cache pointers in the direct map for the whole transaction,
+     * including cross-block reads and the final slice copy. */
+    mm_dm_ctx_t dm = mm_enter_direct_map();
+    int rc = sq_meta_read_direct(s, block_abs, offset, dst, want);
+    mm_leave_direct_map(dm);
+    return rc;
 }
 
 static int sq_load_fragment_table(struct squashfs_sb *s)
@@ -587,7 +662,7 @@ static void sq_inode_info_free(struct squashfs_inode_info *ino)
     }
 }
 
-static int sq_lookup_dir(struct squashfs_sb *s, const struct squashfs_inode_info *dir,
+static int sq_lookup_dir_uncached(struct squashfs_sb *s, const struct squashfs_inode_info *dir,
                          const char *name, uint64_t *out_inode_ref, uint16_t *out_type)
 {
     uint64_t block_abs;
@@ -655,6 +730,42 @@ static int sq_lookup_dir(struct squashfs_sb *s, const struct squashfs_inode_info
         }
     }
     return -1; /* not found */
+}
+
+static int sq_lookup_dir(struct squashfs_sb *s, const struct squashfs_inode_info *dir,
+                         const char *name, uint64_t *out_inode_ref, uint16_t *out_type)
+{
+    if (!s || !dir || !name || !out_inode_ref ||
+        (dir->type != SQUASHFS_DIR_TYPE && dir->type != SQUASHFS_LDIR_TYPE))
+        return -1;
+    size_t len = strlen(name);
+    if (len > SQUASHFS_NAME_LEN) return -1;
+    uint32_t hash = 2166136261u ^ dir->inode_number;
+    for (size_t i = 0; i < len; i++)
+        hash = (hash ^ (uint8_t)name[i]) * 16777619u;
+    /* Cache only immutable lower-fs entries, never overlay paths or misses.
+     * An allocation/decode error must not become a persistent negative hit. */
+    mm_dm_ctx_t dm = mm_enter_direct_map();
+    struct dir_cache_ent *e = &s->dir_cache[hash % DIR_CACHE_SLOTS];
+    int rc = 0;
+    uint16_t type = 0;
+    if (e->valid && e->parent_inode == dir->inode_number && strcmp(e->name, name) == 0) {
+        *out_inode_ref = e->inode_ref;
+        type = e->type;
+    } else {
+        rc = sq_lookup_dir_uncached(s, dir, name, out_inode_ref, &type);
+        if (rc == 0) {
+            e->valid = 0;
+            e->parent_inode = dir->inode_number;
+            e->inode_ref = *out_inode_ref;
+            e->type = type;
+            memcpy(e->name, name, len + 1);
+            e->valid = 1;
+        }
+    }
+    if (rc == 0 && out_type) *out_type = type;
+    mm_leave_direct_map(dm);
+    return rc;
 }
 
 static int sq_path_to_inode_n(struct squashfs_sb *s, const char *path,
@@ -798,8 +909,11 @@ static int sq_file_read(struct squashfs_sb *s, const struct squashfs_inode_info 
 
     block_buf_cap = s->block_size;
     block_buf = (uint8_t *)kmalloc(block_buf_cap);
-    if (!block_buf)
+    if (!block_buf) {
+        klogprintf("squashfs: read buffer allocation failed size=%zu inode=%u\n",
+            block_buf_cap, ino->inode_number);
         return -1;
+    }
 
     while (done < size) {
         size_t file_off = offset + done;
@@ -848,11 +962,15 @@ static int sq_file_read(struct squashfs_sb *s, const struct squashfs_inode_info 
                     (uint64_t)(block_index + 1) * s->block_size > ino->file_size)
                     expected = (size_t)(ino->file_size - (uint64_t)block_index * s->block_size);
                 if (sq_read_data_block(s, data_pos, bsize, block_buf, block_buf_cap, &unc_len, expected) != 0) {
+                    klogprintf("squashfs: block read failed inode=%u index=%u file_off=0x%zx size_field=0x%x\n",
+                        ino->inode_number, block_index, file_off, bsize);
                     kfree(block_buf);
                     return -1;
                 }
             }
             if (block_off >= unc_len) {
+                klogprintf("squashfs: short block inode=%u index=%u off=%u decoded=%zu\n",
+                    ino->inode_number, block_index, block_off, unc_len);
                 kfree(block_buf);
                 return -1;
             }

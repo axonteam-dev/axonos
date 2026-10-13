@@ -713,48 +713,6 @@ static uint8_t parse_color_code(char bg, char fg) {
         return (background << 4) | foreground;
 }
 
-void ftos(double n, char *buf, int precision) {
-        int i = 0;
-        int sign = 1;
-        if (n < 0) {
-                sign = -1;
-                n = -n;
-        }
-
-        double integer_part = (int)n;
-        double fractional_part = n - integer_part;
-
-        // Вывод целой части
-        while (integer_part > 0) {
-                buf[i++] = ((int)integer_part % 10) + '0';
-                integer_part /= 10;
-        }
-
-        // Вывод точки
-        buf[i++] = '.';
-
-        // Вывод дробной части
-        for (int j = 0; j < precision; j++) {
-                fractional_part *= 10;
-                buf[i++] = (int)fractional_part + '0';
-                fractional_part -= (int)fractional_part;
-        }
-
-        // Добавление знака
-        if (sign == -1) {
-                buf[i++] = '-';
-        }
-
-        // Обратная запись строки
-        for (int j = 0; j < i / 2; j++) {
-                char temp = buf[j];
-                buf[j] = buf[i - j - 1];
-                buf[i - j - 1] = temp;
-        }
-
-        buf[i] = '\0';
-}
-
 static int utoa_rev(unsigned long long v, unsigned base, int upper, char *out)
 {
         const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";

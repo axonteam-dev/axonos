@@ -31,6 +31,7 @@ void pit_handler(cpu_registers_t* regs) {
         /* Before thread_init(), PIT is only an early clock source. */
         if (!init) return;
         thread_account_timer_tick(regs && ((regs->cs & 3) == 3));
+        if (regs) thread_sample_irq_rip(regs->rip, (regs->cs & 3) == 3);
         process_itimer_tick(pit_get_time_ms());
         if (smp_sched_cpu_id() == 0)
                 syscall_net_l2_irq_poll();

@@ -43,6 +43,17 @@ BITS 64
 
 extern isr_dispatch
 
+; Interrupted userspace may set DF and has no C ABI stack-alignment contract.
+; Keep the register-frame pointer in saved/callee-saved RBX across the C call.
+%macro DISPATCH_ISR 0
+        cld
+        mov rdi, rsp
+        mov rbx, rsp
+        and rsp, -16
+        call isr_dispatch
+        mov rsp, rbx
+%endmacro
+
 section .text
 
 %define ISR_ATTR 0x8E ; not used here but for documentation
@@ -57,8 +68,7 @@ isr%1:
         push rax                        ; fake error code
         mov rax, %1
         push rax                        ; interrupt number
-        mov rdi, rsp                ; rdi -> cpu_registers_t
-        call isr_dispatch
+        DISPATCH_ISR
         add rsp, 16                 ; pop vector + error code
         POP_REGS
         iretq
@@ -95,8 +105,7 @@ isr%1:
         push    rax                     ; error_code
         mov     rax, %1
         push    rax                     ; interrupt_number
-        mov     rdi, rsp                ; rdi -> cpu_registers_t
-        call    isr_dispatch
+        DISPATCH_ISR
         add     rsp, 16                 ; pop interrupt_number + error_code
         pop     r15
         pop     r14
@@ -135,4 +144,4 @@ isr_stub_table:
 %rep 256
         dq isr%+i
 %assign i i+1
-%endrep 
+%endrep

@@ -16,6 +16,10 @@
 #include <isofs.h>
 #include <squashfs.h>
 #include <overlayfs.h>
+#include <klog.h>
+#include <spinlock.h>
+#include <process.h>
+#include <thread.h>
 
 #ifndef EIO
 #define EIO 5
@@ -26,6 +30,62 @@
 
 static struct fs_driver *g_drivers[MAX_FS_DRIVERS];
 static int g_drivers_count = 0;
+static spinlock_t file_limit_lock;
+static uint64_t file_limit_max = 65536;
+static uint64_t file_limit_count;
+static uint32_t nr_open_limit = PROCESS_MAX_FD;
+
+uint64_t fs_file_max_get(void) { return __atomic_load_n(&file_limit_max, __ATOMIC_ACQUIRE); }
+uint32_t fs_nr_open_get(void) { return __atomic_load_n(&nr_open_limit, __ATOMIC_ACQUIRE); }
+int fs_file_open_error_get(void) {
+        thread_t *t = thread_current();
+        return t ? t->fs_open_error : 0;
+}
+
+int fs_file_max_set(uint64_t value) {
+        if (!value || value > 0x7fffffffffffffffULL) return -22;
+        unsigned long flags;
+        acquire_irqsave(&file_limit_lock, &flags);
+        file_limit_max = value;
+        release_irqrestore(&file_limit_lock, flags);
+        return 0;
+}
+
+int fs_nr_open_set(uint64_t value) {
+        /* The present fd table is fixed-size, not a sparse billion-entry array.
+         * Reject unsupported sizes instead of advertising nonexistent capacity. */
+        if (value < 64 || value > PROCESS_MAX_FD) return -22;
+        __atomic_store_n(&nr_open_limit, (uint32_t)value, __ATOMIC_RELEASE);
+        return 0;
+}
+
+int fs_file_account(struct fs_file *file) {
+        if (!file) return -9;
+        unsigned long flags;
+        acquire_irqsave(&file_limit_lock, &flags);
+        if (!file->limit_accounted) {
+                thread_t *caller = thread_current();
+                if (file_limit_count >= file_limit_max && caller &&
+                    caller->ring == 3 && caller->euid != 0) {
+                        release_irqrestore(&file_limit_lock, flags);
+                        return -23; /* ENFILE */
+                }
+                file_limit_count++;
+                file->limit_accounted = 1;
+        }
+        release_irqrestore(&file_limit_lock, flags);
+        return 0;
+}
+
+static void fs_file_unaccount(struct fs_file *file) {
+        unsigned long flags;
+        acquire_irqsave(&file_limit_lock, &flags);
+        if (file->limit_accounted) {
+                file->limit_accounted = 0;
+                if (file_limit_count) file_limit_count--;
+        }
+        release_irqrestore(&file_limit_lock, flags);
+}
 struct mount_entry {
         char path[64];
         size_t path_len;
@@ -406,12 +466,18 @@ int fs_unmount(const char *path) {
         return -1;
 }
 
-static void fs_file_mark_opened(struct fs_file *file) {
-        if (!file) return;
+static int fs_file_mark_opened(struct fs_file *file) {
+        if (!file) return -9;
         if (file->refcount < 1) file->refcount = 1;
+        int rc = fs_file_account(file);
+        thread_t *t = thread_current();
+        if (rc < 0 && t) t->fs_open_error = -rc;
+        return rc;
 }
 
 struct fs_file *fs_open_nofollow(const char *path) {
+        thread_t *caller = thread_current();
+        if (caller) caller->fs_open_error = 0;
         if (!path) return NULL;
         for (int i = 0; i < g_mount_count; i++) {
                 if (g_mounts[i].bind_source[0] && strcmp(g_mounts[i].path, path) == 0)
@@ -424,7 +490,7 @@ struct fs_file *fs_open_nofollow(const char *path) {
 
                 if (rr == 0 && file) {
                         if (!file->fs_private) file->fs_private = (void*)mount_drv;
-                        fs_file_mark_opened(file);
+                        if (fs_file_mark_opened(file) != 0) { fs_file_free(file); return NULL; }
                         return file;
                 }
 
@@ -445,14 +511,17 @@ struct fs_file *fs_open_nofollow(const char *path) {
                                 if (m->ops->open(path, &mount_file) == 0 && mount_file) {
                                         if (!mount_file->fs_private) mount_file->fs_private = (void*)m;
 
-                                        fs_file_mark_opened(file);
+                                        if (fs_file_mark_opened(file) != 0) {
+                                                if (mount_file->refcount < 1) mount_file->refcount = 1;
+                                                fs_file_free(file); fs_file_free(mount_file); return NULL;
+                                        }
                                         fs_file_free(file);
-                                        fs_file_mark_opened(mount_file);
+                                        if (fs_file_mark_opened(mount_file) != 0) { fs_file_free(mount_file); return NULL; }
                                         return mount_file;
                                 }
                         }
                         if (!file->fs_private) file->fs_private = (void*)drv;
-                        fs_file_mark_opened(file);
+                        if (fs_file_mark_opened(file) != 0) { fs_file_free(file); return NULL; }
                         return file;
                 }
                 if (r < 0 && r != -1) return NULL; // real error
@@ -689,6 +758,8 @@ struct fs_file *fs_create_file(const char *path) {
 }
 
 struct fs_file *fs_open(const char *path) {
+        thread_t *caller = thread_current();
+        if (caller) caller->fs_open_error = 0;
         if (!path) return NULL;
         int direct_miss = 0;
 
@@ -749,7 +820,7 @@ struct fs_file *fs_open(const char *path) {
                 }
         }
 
-        fs_file_mark_opened(result);
+        if (fs_file_mark_opened(result) != 0) { fs_file_free(result); return NULL; }
         if (result) {
                 struct stat st;
                 if (vfs_fstat(result, &st) != 0 ||
@@ -763,6 +834,7 @@ struct fs_file *fs_open(const char *path) {
 }
 
 ssize_t fs_read(struct fs_file *file, void *buf, size_t size, size_t offset) {
+        static int read_error_budget = 16;
         if (!file || !file->path) return -EIO;
         /* debug logging removed */
         for (int i = 0; i < g_drivers_count; i++) {
@@ -773,9 +845,16 @@ ssize_t fs_read(struct fs_file *file, void *buf, size_t size, size_t offset) {
                 /* debug logging removed */
                 if (!drv->ops->read) return -EIO;
                 ssize_t rr = drv->ops->read(file, buf, size, offset);
+                if (rr < 0 && read_error_budget-- > 0)
+                        klogprintf("fs-read: driver=%s path=%s off=0x%zx size=%zu rc=%lld\n",
+                                drv->ops->name ? drv->ops->name : "?",
+                                file->path, offset, size, (long long)rr);
                 if (rr < 0 && rr == -1) return -EIO;
                 return rr;
         }
+        if (read_error_budget-- > 0)
+                klogprintf("fs-read: no driver path=%s owner=%p handle=%p\n",
+                        file->path, file->fs_private, file->driver_private);
         return -EIO;
 }
 
@@ -824,6 +903,7 @@ void fs_file_free(struct fs_file *file) {
         }
         /* prev == 1: last reference — we own the object from here on. */
         __atomic_store_n(&file->refcount, 0, __ATOMIC_RELAXED);
+        fs_file_unaccount(file);
         if (file->type == FS_TYPE_PIPE) {
                 pipe_release_end(file);
                 if (file->path)

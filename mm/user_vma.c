@@ -225,6 +225,26 @@ static int user_vma_tid_matches_runner_mm_nolock(thread_t *runner, uint64_t reco
     return 0;
 }
 
+/* Faults must also find inherited mm-scoped VMAs. A fork child's unfaulted
+ * shared-library pages need not have an entry in the tid-keyed mirror. */
+static user_vma_t *user_vma_find_fault_nolock(thread_t *runner, uintptr_t va) {
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        user_vma_t *v = &g_user_vmas[i];
+        if (v->used && user_vma_tid_matches_runner_mm_nolock(runner, v->tid) &&
+            va >= v->addr && va - v->addr < v->len)
+            return v;
+    }
+    user_vma_t *vmas = runner ? user_vma_mm_storage(runner->mm, 0) : NULL;
+    if (vmas) {
+        for (int i = 0; i < USER_VMA_MAX; i++) {
+            user_vma_t *v = &vmas[i];
+            if (v->used && va >= v->addr && va - v->addr < v->len)
+                return v;
+        }
+    }
+    return NULL;
+}
+
 static int user_vma_split_runner_at_nolock(thread_t *runner,
                                             uintptr_t split_va) {
     if (!runner)
@@ -765,21 +785,9 @@ int user_vma_allows_write(thread_t *runner, uintptr_t va) {
     unsigned long fl = 0;
     int allow = 0;
     acquire_irqsave(&g_user_vma_lock, &fl);
-    for (int i = 0; i < USER_VMA_MAX; i++) {
-        if (!g_user_vmas[i].used)
-            continue;
-        if (!user_vma_tid_matches_runner_mm_nolock(runner,
-                                                   (uint64_t)g_user_vmas[i].tid))
-            continue;
-        if ((g_user_vmas[i].prot & 2) == 0)
-            continue;
-        uintptr_t a = g_user_vmas[i].addr;
-        uintptr_t e = a + g_user_vmas[i].len;
-        if (va >= a && va < e) {
-            allow = 1;
-            break;
-        }
-    }
+    user_vma_t *v = user_vma_find_fault_nolock(runner, va);
+    if (v && (v->prot & 2))
+        allow = 1;
     release_irqrestore(&g_user_vma_lock, fl);
     return allow;
 }
@@ -1080,6 +1088,8 @@ int user_vma_lookup_after(thread_t *runner, uintptr_t addr,
     unsigned long fl = 0;
     user_vma_t *best = NULL;
     acquire_irqsave(&g_user_vma_lock, &fl);
+    if (runner)
+        best = user_vma_find_fault_nolock(runner, addr);
     for (int i = 0; i < USER_VMA_MAX; i++) {
         if (!g_user_vmas[i].used)
             continue;
@@ -1276,16 +1286,24 @@ static int user_vma_fill_file_page(thread_t *t, const user_vma_t *hit, uint64_t 
         if (avail < n)
             n = (size_t)avail;
         nr = fs_read(hit->file, kbuf, n, (size_t)foff);
-        if (nr < 0)
+        if (nr < 0) {
+            klogprintf("filemap-fault: read failed va=0x%llx off=0x%llx rc=%lld path=%s\n",
+                (unsigned long long)lo, (unsigned long long)foff,
+                (long long)nr, hit->file->path ? hit->file->path : "?");
             return 0;
+        }
         if ((size_t)nr < 0x1000u)
             memset(kbuf + (size_t)nr, 0, 0x1000u - (size_t)nr);
     }
     /* Process mm (not swapper): copy via PA like user_mmap_copyin_file. */
     if (t && t->mm && t->mm->pml4 && t->mm != mm_kernel()) {
         share = t->mm_ptemplate ? t->mm_ptemplate : mm_kernel();
-        if (mm_copy_to_user(t->mm, share, lo, kbuf, 0x1000u) != 0)
+        if (mm_copy_to_user(t->mm, share, lo, kbuf, 0x1000u) != 0) {
+            klogprintf("filemap-fault: copy failed va=0x%llx off=0x%llx prot=%d path=%s\n",
+                (unsigned long long)lo, (unsigned long long)foff,
+                hit->prot, hit->file->path ? hit->file->path : "?");
             return 0;
+        }
         return 1;
     }
     memcpy((void *)(uintptr_t)lo, kbuf, 0x1000u);
@@ -1304,23 +1322,10 @@ int user_vma_fault_lazy_anon(uint64_t cr2) {
     uintptr_t va2m = (uintptr_t)(cr2 & ~(uint64_t)(PAGE_SIZE_2M - 1));
     int rc = 0;
     acquire_irqsave(&g_user_vma_lock, &fl);
-    user_vma_t *hit = NULL;
-    for (int i = 0; i < USER_VMA_MAX; i++) {
-        if (!g_user_vmas[i].used) continue;
-        if (!user_vma_tid_matches_runner_mm_nolock(t, (uint64_t)g_user_vmas[i].tid)) continue;
-        if (g_user_vmas[i].kind != USER_VMA_KIND_MMAP_LAZY &&
-            g_user_vmas[i].kind != USER_VMA_KIND_ELF_LOAD &&
-            !user_vma_is_filemap(&g_user_vmas[i]))
-            continue;
-        uint64_t a64 = (uint64_t)g_user_vmas[i].addr;
-        uint64_t end64 = a64 + (uint64_t)g_user_vmas[i].len;
-        if (end64 < a64) continue;
-        if ((uint64_t)cr2 >= a64 && (uint64_t)cr2 < end64) {
-            hit = &g_user_vmas[i];
-            break;
-        }
-    }
-    if (!hit) {
+    user_vma_t *hit = user_vma_find_fault_nolock(t, (uintptr_t)cr2);
+    if (!hit || (hit->kind != USER_VMA_KIND_MMAP_LAZY &&
+                 hit->kind != USER_VMA_KIND_ELF_LOAD &&
+                 !user_vma_is_filemap(hit))) {
         release_irqrestore(&g_user_vma_lock, fl);
         return 0;
     }
@@ -1394,17 +1399,10 @@ int user_vma_fault_nonpresent(uint64_t cr2, uint64_t err) {
     user_vma_t hit_copy;
     int found = 0;
     acquire_irqsave(&g_user_vma_lock, &fl);
-    for (int i = 0; i < USER_VMA_MAX; i++) {
-        if (!g_user_vmas[i].used) continue;
-        if (!user_vma_tid_matches_runner_mm_nolock(t, (uint64_t)g_user_vmas[i].tid)) continue;
-        uint64_t a64 = (uint64_t)g_user_vmas[i].addr;
-        uint64_t end64 = a64 + (uint64_t)g_user_vmas[i].len;
-        if (end64 < a64) continue;
-        if ((uint64_t)cr2 >= a64 && (uint64_t)cr2 < end64) {
-            hit_copy = g_user_vmas[i];
-            found = 1;
-            break;
-        }
+    user_vma_t *hit = user_vma_find_fault_nolock(t, (uintptr_t)cr2);
+    if (hit) {
+        hit_copy = *hit;
+        found = 1;
     }
     release_irqrestore(&g_user_vma_lock, fl);
     if (!found) return 0;

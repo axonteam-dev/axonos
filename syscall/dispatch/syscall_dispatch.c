@@ -434,7 +434,353 @@ static thread_t *wait4_find_by_tgid(int pid_arg)
 
 static uint64_t wait4_reap_found_thread(thread_t *waiter, thread_t *zombie);
 
+static void wait4_block_recheck(thread_t *waiter, int pid_arg) {
+    int tid = (int)(waiter->tid ? waiter->tid : 1);
+    /* Publish BLOCKED before rechecking the condition. An exit before this
+     * publication is caught by the scan; an exit after it wakes the waiter. */
+    thread_block(tid);
+    int ready = wait4_find_thread_zombie(waiter, pid_arg) != NULL;
+    if (!ready && waiter->process) {
+        int has_child = 0;
+        process_t *dead = process_find_child(waiter->process, pid_arg,
+            waiter->process->pgid, 1, &has_child);
+        ready = !has_child || (dead && (!dead->leader ||
+            dead->leader->state == THREAD_TERMINATED));
+    }
+    if (ready)
+        thread_unblock(tid);
+}
+
 static uint64_t wait4_wait_one_tgid(thread_t *waiter);
+
+static int openrc_services_stage;
+static spinlock_t kbrequest_lock;
+static uint64_t kbrequest_pid;
+static int kbrequest_signal;
+
+static int kbrequest_register(thread_t *cur, int signal) {
+    if (!cur || cur->euid != 0) return -1; /* EPERM */
+    if (signal < 1 || signal > 64 || signal == SIGKILL) return -22; /* EINVAL */
+    unsigned long flags;
+    acquire_irqsave(&kbrequest_lock, &flags);
+    kbrequest_pid = process_pid(cur);
+    kbrequest_signal = signal;
+    release_irqrestore(&kbrequest_lock, flags);
+    return 0;
+}
+
+void syscall_kbrequest_event(void) {
+    unsigned long flags;
+    acquire_irqsave(&kbrequest_lock, &flags);
+    uint64_t pid = kbrequest_pid;
+    int signal = kbrequest_signal;
+    release_irqrestore(&kbrequest_lock, flags);
+    process_t *p = pid ? process_find(pid) : NULL;
+    thread_t *t = p ? p->leader : NULL;
+    if (!t || t->state == THREAD_TERMINATED || signal < 1 || signal > 64) return;
+    thread_set_pending_signal(t, signal);
+}
+static int init_verbose_trace;
+
+void syscall_configure_init_trace(const char *cmdline) {
+    if (!cmdline)
+        return;
+    const char *p = cmdline;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if ((size_t)(p - start) == sizeof("init.trace=1") - 1 &&
+            memcmp(start, "init.trace=1", sizeof("init.trace=1") - 1) == 0)
+            init_verbose_trace = 1;
+    }
+}
+
+static int openrc_spawn_family(const thread_t *t) {
+    if (!t)
+        return 0;
+    if (strstr(t->name, "openrc"))
+        return 1;
+    process_t *p = t->process ? t->process->parent : NULL;
+    /* Service -> shell -> ifup -> udhcpc -> lease hook -> ip is deeper than
+     * three generations. Keep a bound for corrupted parent chains, but do not
+     * hide the actual DHCP hook while only reporting its waiting ancestors. */
+    for (int depth = 0; p && depth < 16; depth++, p = p->parent) {
+        if (p->leader && strstr(p->leader->name, "openrc"))
+            return 1;
+    }
+    return 0;
+}
+
+void syscall_trace_init_spawn(thread_t *t, const char *event, uint64_t a, uint64_t b) {
+    static int parent_budget = 32, child_budget = 20;
+    static uint64_t services_pid[64];
+    static unsigned services_events[64];
+    if (!init_verbose_trace || !openrc_spawn_family(t))
+        return;
+    int *budget = strstr(t->name, "openrc") ? &parent_budget : &child_budget;
+    if (openrc_services_stage) {
+        uint64_t pid = process_pid(t);
+        unsigned slot = (unsigned)(pid % 64);
+        if (services_pid[slot] != pid) {
+            services_pid[slot] = pid;
+            services_events[slot] = 0;
+        }
+        if (services_events[slot]++ >= 16)
+            return;
+    } else {
+        if (*budget <= 0)
+            return;
+        (*budget)--;
+    }
+    klogprintf("init-spawn: %s pid=%llu tid=%llu state=%d vfork=%d a=0x%llx b=0x%llx name=%s\n",
+        event, (unsigned long long)process_pid(t), (unsigned long long)t->tid,
+        (int)t->state, t->vfork_waiting,
+        (unsigned long long)a, (unsigned long long)b, t->name);
+}
+
+static uint64_t openrc_runlevel_pid;
+static int openrc_runlevel_budget = 24;
+static uint64_t openrc_child_pid[64];
+static unsigned openrc_child_events[64];
+
+static int init_runtime_thread(const thread_t *t) {
+    return t && ((openrc_services_stage && openrc_spawn_family(t)) ||
+        (process_pid((thread_t *)t) == 1 && strstr(t->name, "systemd")));
+}
+
+static struct {
+    uint64_t pid, progress_ms, number, arg1;
+    int active;
+    unsigned reports;
+    char read_path[96];
+} init_progress[64];
+
+static void init_monitor_note_spawn(thread_t *child) {
+    if (!init_runtime_thread(child)) return;
+    unsigned slot = (unsigned)(child->tid % 64);
+    init_progress[slot].pid = process_pid(child);
+    init_progress[slot].progress_ms = pit_get_time_ms();
+    init_progress[slot].number = (uint64_t)-1; /* no syscall entry yet */
+    init_progress[slot].arg1 = 0;
+    init_progress[slot].active = 0;
+    init_progress[slot].reports = 0;
+    init_progress[slot].read_path[0] = '\0';
+}
+
+static void init_monitor_entry(void) {
+    for (;;) {
+        /* Scheduler bindings are one-shot; renew before every sleep/wakeup. */
+        thread_t *self = thread_current();
+        if (self) self->bound_cpu = 0;
+        thread_sleep(1000);
+        uint64_t now = pit_get_time_ms();
+        for (int i = 0; i < thread_get_count(); i++) {
+            /* Userspace and its task teardown are BSP-only. Copy under IF=0,
+             * then restore IRQs before logging or touching the VFS. */
+            unsigned long flags;
+            asm volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+            thread_t *t = thread_get_by_index(i);
+            int report = 0, state = 0, waitpid = 0, active = 0;
+            int child_state = -1, child_waiter = -1, child_parent = -1, child_status = 0;
+            int child_bound = -1, child_vfork = 0;
+            uint64_t child_vruntime = 0, child_kernel_rip = 0;
+            uint64_t child_user_sample = 0, child_kernel_sample = 0;
+            uint64_t child_pid = 0, child_tid = 0, child_rip = 0;
+            char child_name[32] = {0};
+            uint64_t pid = 0, tid = 0, number = 0, arg1 = 0, rip = 0;
+            char name[32], path[96];
+            if (t && t->ring == 3 && t->state != THREAD_TERMINATED) {
+                unsigned slot = (unsigned)(t->tid % 64);
+                pid = process_pid(t);
+                if (init_progress[slot].pid == pid &&
+                    init_progress[slot].progress_ms &&
+                    now - init_progress[slot].progress_ms >= 5000 &&
+                    init_progress[slot].reports < 3) {
+                    init_progress[slot].reports++;
+                    report = 1;
+                    tid = t->tid;
+                    state = (int)t->state;
+                    waitpid = t->wait_upid;
+                    rip = t->saved_user_rip;
+                    number = init_progress[slot].number;
+                    arg1 = init_progress[slot].arg1;
+                    active = init_progress[slot].active;
+                    memcpy(name, t->name, sizeof(name)); name[31] = '\0';
+                    memcpy(path, init_progress[slot].read_path, sizeof(path));
+                    if (number == SYS_waitid || number == SYS_wait4) {
+                        thread_t *child = waitpid > 0 ? wait4_find_by_tgid(waitpid) : NULL;
+                        if (!child && waitpid <= 0 && t->process) {
+                            /* Observation only: process_find_child can relink
+                             * orphans, which a diagnostic must not do. */
+                            process_t *p = t->process->first_child;
+                            for (int guard = 0; p && guard < 1024; guard++, p = p->next_sibling) {
+                                if (waitpid == 0 && p->pgid != t->process->pgid) continue;
+                                if (waitpid < -1 && p->pgid != -waitpid) continue;
+                                if (p->leader) { child = p->leader; break; }
+                            }
+                        }
+                        if (child) {
+                            child_pid = (uint64_t)(unsigned)wait4_thread_pid(child);
+                            child_tid = child->tid;
+                            child_state = (int)child->state;
+                            child_waiter = child->waiter_tid;
+                            child_parent = child->parent_tid;
+                            child_status = child->exit_status;
+                            child_bound = child->bound_cpu;
+                            child_vfork = child->vfork_waiting;
+                            child_vruntime = child->sched_vruntime;
+                            child_kernel_rip = child->context.rip;
+                            child_user_sample = child->last_irq_user_rip;
+                            child_kernel_sample = child->last_irq_kernel_rip;
+                            child_rip = child->saved_user_rip;
+                            memcpy(child_name, child->name, sizeof(child_name));
+                            child_name[31] = '\0';
+                        }
+                    }
+                }
+            }
+            asm volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
+            if (report)
+                klogprintf("init-stall: pid=%llu tid=%llu name=%s state=%d active=%d last-n=%lld a1=0x%llx waitpid=%d rip=0x%llx last-read=%s\n",
+                    (unsigned long long)pid, (unsigned long long)tid, name,
+                    state, active, (long long)number, (unsigned long long)arg1,
+                    waitpid, (unsigned long long)rip, path);
+            if (report && (number == SYS_waitid || number == SYS_wait4))
+                klogprintf("init-wait-child: parent=%llu wanted=%d found=%llu tid=%llu name=%s state=%d parent-tid=%d waiter=%d status=0x%x rip=0x%llx bound=%d vfork=%d vruntime=%llu k-rip=0x%llx irq-user=0x%llx irq-kernel=0x%llx\n",
+                    (unsigned long long)pid, waitpid,
+                    (unsigned long long)child_pid, (unsigned long long)child_tid,
+                    child_name, child_state, child_parent, child_waiter,
+                    (unsigned)child_status, (unsigned long long)child_rip,
+                    child_bound, child_vfork, (unsigned long long)child_vruntime,
+                    (unsigned long long)child_kernel_rip,
+                    (unsigned long long)child_user_sample,
+                    (unsigned long long)child_kernel_sample);
+        }
+    }
+}
+
+void syscall_start_init_monitor(void) {
+    thread_t *monitor = thread_create_blocked(init_monitor_entry, "init-monitor");
+    if (monitor) {
+        monitor->bound_cpu = 0;
+        thread_unblock((int)monitor->tid);
+    }
+}
+
+static void init_trace_read(thread_t *t, struct fs_file *f, int fd,
+                            off_t before, ssize_t n, size_t count) {
+    static struct {
+        uint64_t pid;
+        struct fs_file *file;
+        off_t next;
+        unsigned reads;
+    } samples[64];
+    static unsigned budget = 128;
+    if (!init_runtime_thread(t) || !f || !f->path)
+        return;
+    unsigned progress_slot = (unsigned)(t->tid % 64);
+    strncpy(init_progress[progress_slot].read_path, f->path,
+            sizeof(init_progress[progress_slot].read_path) - 1);
+    init_progress[progress_slot].read_path[sizeof(init_progress[progress_slot].read_path) - 1] = '\0';
+    if (!budget)
+        return;
+    uint64_t pid = process_pid(t);
+    unsigned slot = (unsigned)(pid % 64);
+    if (samples[slot].pid != pid || samples[slot].file != f ||
+        samples[slot].next != before || before == 0) {
+        samples[slot].pid = pid;
+        samples[slot].file = f;
+        samples[slot].reads = 0;
+    }
+    samples[slot].next = f->pos;
+    unsigned reads = ++samples[slot].reads;
+    /* Byte-at-a-time shell reads are normal. Never log every byte: print
+     * exponential samples and EOF/errors, with the actual path and offset. */
+    if (n > 0 && (reads > 65536 || (reads & (reads - 1)) != 0))
+        return;
+    budget--;
+    void (*log)(const char *, ...) = (init_verbose_trace || n < 0) ?
+        klogprintf : klogprintf_logonly;
+    log("init-read: pid=%llu fd=%d path=%s pos=%lld->%lld count=%zu ret=%lld sample=%u\n",
+        (unsigned long long)pid, fd, f->path, (long long)before,
+        (long long)f->pos, count, (long long)n, reads);
+}
+static int fs_mkdir_errno(int r);
+
+static void openrc_trace_mkdir(thread_t *t, int dirfd, const char *path,
+                               mode_t mode, int result) {
+    static int budget = 24;
+    if (t && openrc_runlevel_pid && process_pid(t) == openrc_runlevel_pid &&
+        result == 0 && strcmp(path, "/run/openrc/rc.starting") == 0 &&
+        !openrc_services_stage) {
+        openrc_services_stage = 1;
+        openrc_runlevel_budget = 64;
+        klogprintf("openrc-stage: service-start trace armed pid=%llu\n",
+            (unsigned long long)process_pid(t));
+    }
+    if (!init_verbose_trace || !t || !openrc_runlevel_pid || process_pid(t) != openrc_runlevel_pid ||
+        budget <= 0)
+        return;
+    budget--;
+    klogprintf("openrc-mkdir: pid=%llu dirfd=%d path=\"%s\" mode=0x%x raw=%d errno=%d\n",
+        (unsigned long long)process_pid(t), dirfd, path, (unsigned int)mode,
+        result, result == 0 ? 0 : fs_mkdir_errno(result));
+}
+
+static void openrc_trace_deptree_open(thread_t *t, const char *path, int flags, int fd) {
+    if (!t || !path || fd < 0 || (flags & 3) != 0 ||
+        !strstr(t->name, "openrc") || openrc_runlevel_pid ||
+        strcmp(path, "/run/openrc/deptree") != 0)
+        return;
+    openrc_runlevel_pid = process_pid(t);
+    klogprintf("openrc-stage: reading generated deptree pid=%llu fd=%d\n",
+        (unsigned long long)openrc_runlevel_pid, fd);
+}
+
+static void openrc_trace_deptree_read(thread_t *t, struct fs_file *f, int fd,
+                                     off_t before, ssize_t n, const void *data,
+                                     const void *user_buf) {
+    static unsigned reads;
+    if (!t || !f || !f->path || process_pid(t) != openrc_runlevel_pid ||
+        strcmp(f->path, "/run/openrc/deptree") != 0)
+        return;
+    reads++;
+    /* The initial budget can expire before EOF; retain visibility into service
+     * selection and waits after dependency loading has actually completed. */
+    if (n == 0 && before > 0 && !openrc_services_stage)
+        openrc_runlevel_budget = 48;
+    if (!init_verbose_trace)
+        return;
+    /* First chunks, exponential samples, and EOF/errors: no unbounded spam. */
+    if (n > 0 && reads > 4 && ((reads & (reads - 1)) != 0 || reads > 1024))
+        return;
+    const uint8_t *bytes = data;
+    uint32_t hash = 2166136261u;
+    size_t lines = 0, zeros = 0;
+    for (ssize_t i = 0; i < n; i++) {
+        hash = (hash ^ bytes[i]) * 16777619u;
+        lines += bytes[i] == '\n';
+        zeros += bytes[i] == 0;
+    }
+    struct stat st;
+    int stat_rc = vfs_fstat(f, &st);
+    klogprintf("deptree-read: call=%u fd=%d file=%p pos=%lld->%lld size=%zu inode-size=%lld n=%lld nl=%zu zero=%zu hash=%08x\n",
+        reads, fd, (void *)f, (long long)before, (long long)f->pos, f->size,
+        stat_rc == 0 ? (long long)st.st_size : -1LL, (long long)n, lines, zeros, hash);
+    if (n > 0 && reads <= 4) {
+        uint8_t verify[1024];
+        size_t len = (size_t)n < sizeof(verify) ? (size_t)n : sizeof(verify);
+        int copied = t->mm ? mm_copy_from_user(t->mm, verify,
+            (uint64_t)(uintptr_t)user_buf, len) : -1;
+        klogprintf("deptree-copy: rc=%d match=%d head=%02x%02x%02x%02x live-cr3=0x%llx task-cr3=0x%llx\n",
+            copied, copied == 0 && memcmp(verify, data, len) == 0,
+            (unsigned)bytes[0], (unsigned)(n > 1 ? bytes[1] : 0),
+            (unsigned)(n > 2 ? bytes[2] : 0), (unsigned)(n > 3 ? bytes[3] : 0),
+            (unsigned long long)paging_read_cr3(),
+            (unsigned long long)(t->mm ? t->mm->cr3 : 0));
+    }
+}
 
 void syscall_user_fatal_exit(int signo) {
     /* Exception handlers run in the context of the faulting thread. Prefer
@@ -818,6 +1164,8 @@ static void fork_child_finish_post_robust(thread_t *child) {
 
 __attribute__((noreturn)) static void fork_child_return_entry(void) {
     thread_t *self = thread_current();
+    syscall_trace_init_spawn(self, "child-enter", self ? self->saved_user_rip : 0,
+                             self ? self->saved_user_rsp : 0);
     if (self) {
         static int fork_child_entry_dbg_left = 24;
         if (fork_child_entry_dbg_left-- > 0) {
@@ -1246,6 +1594,7 @@ static void fork_wake_up_new_task(thread_t *parent, thread_t *child,
     if (!parent || !child)
         return;
     int ctid = (int)(child->tid ? child->tid : 1);
+    init_monitor_note_spawn(child);
     /*
      * Refresh child GPRs from the parent's syscall snapshot while blocked.
      * For defer_wake (Linux vfork) the copy is repeated in the syscall epilogue
@@ -1287,6 +1636,8 @@ uint64_t syscall_maybe_vfork_wait(uint64_t parent_ret) {
     else
         cur->vfork_saved_ret = parent_ret;
     int parent_tid = (int)(cur->tid ? cur->tid : 1);
+    syscall_trace_init_spawn(cur, "vfork-wait", parent_ret,
+                             cur->fork_child_to_publish ? cur->fork_child_to_publish->tid : 0);
     if (cur->name[0] && strstr(cur->name, "linuxrc"))
         devel_printf("vfork-wait: parent=%d ret=%llu rdi=0x%llx\n", parent_tid,
                 (unsigned long long)parent_ret,
@@ -1309,6 +1660,7 @@ uint64_t syscall_maybe_vfork_wait(uint64_t parent_ret) {
         if (cur->vfork_waiting)
             thread_yield();
     }
+    syscall_trace_init_spawn(cur, "vfork-resume", cur->vfork_saved_ret, 0);
 
     if (cur->mm) {
         mm_switch(cur->mm);
@@ -1381,6 +1733,24 @@ void syscall_finalize_user_frame(uint64_t *frame) {
         cur->saved_syscall_frame[12] = cur->saved_user_rdx;
     if (cur->syscall_frame_kbuf)
         cur->syscall_frame_kbuf[12] = cur->saved_user_rdx;
+}
+
+void syscall_prepare_iret_frame(uint64_t *frame, uint64_t *out) {
+    uint64_t rip = frame[13], flags = frame[4] | 0x200ULL, rsp = frame[15];
+    thread_t *cur = thread_current();
+    /* Assembly reserves the destination below the live frame before calling
+     * us. memmove is required: the 15-GPR source and destination overlap. */
+    memmove(out, frame, 15 * sizeof(uint64_t));
+    if (cur && cur->sigreturn_restore_gprs) {
+        out[13] = cur->sigreturn_rcx;
+        out[4] = cur->sigreturn_r11;
+        cur->sigreturn_restore_gprs = 0;
+    }
+    out[15] = rip;
+    out[16] = 0x1B; /* USER_CS, matching syscall.S and cpu/gdt.c */
+    out[17] = flags;
+    out[18] = rsp;
+    out[19] = 0x23; /* USER_DS */
 }
 
 void syscall_epilogue_probe(uint64_t *frame) {
@@ -2127,6 +2497,7 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define ENOMEM  12
 #define ERANGE  34
 #define EMFILE  24
+#define ENFILE  23
 #define ENOEXEC 8
 /* no child processes */
 #define ECHILD  10
@@ -2198,6 +2569,33 @@ int syscall_pipe_watch_owner_tid;
 
 static ssize_t pipe_read_bytes(pipe_t *p, void *buf, size_t cnt, thread_t *cur, int nonblock);
 static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t *cur, int nonblock);
+
+static void openrc_pipe_wait_owners(pipe_t *p, thread_t *reader) {
+    static int snapshots = 3;
+    if (!p || !openrc_spawn_family(reader) || snapshots <= 0)
+        return;
+    snapshots--;
+    int shown = 0;
+    int n = thread_get_count();
+    for (int i = 0; i < n && shown < 8; i++) {
+        thread_t *owner = thread_get_by_index(i);
+        if (!owner || owner->ring != 3 || owner->state == THREAD_TERMINATED)
+            continue;
+        for (int fd = 0; fd < THREAD_MAX_FD && shown < 8; fd++) {
+            struct fs_file *f = owner->process ? owner->process->fds[fd] : owner->fds[fd];
+            if (!f || f->type != FS_TYPE_PIPE || f->driver_private != p ||
+                !fs_pipe_is_write_end(f))
+                continue;
+            shown++;
+            klogprintf("init-pipe: id=%llu writer-pid=%llu tid=%llu fd=%d refs=%d state=%d name=%s\n",
+                (unsigned long long)p->id, (unsigned long long)process_pid(owner),
+                (unsigned long long)owner->tid, fd, f->refcount, (int)owner->state, owner->name);
+        }
+    }
+    if (!shown)
+        klogprintf("init-pipe: id=%llu no live writer descriptors endpoints=%d\n",
+            (unsigned long long)p->id, p->refcount);
+}
 
 /* Linux eventfd(2): 64-bit counter used by curl's async DNS waiter. */
 enum {
@@ -2454,7 +2852,7 @@ static ssize_t signalfd_read_bytes(thread_t *thr, struct fs_file *f, void *buf, 
                 uint8_t info[128];
                 uint32_t signo = 0;
                 int i;
-                for (i = 1; i <= 63; i++) {
+                for (i = 1; i <= 64; i++) {
                     uint64_t bit = 1ULL << (i - 1);
                     if (ready & bit) {
                         signo = (uint32_t)i;
@@ -2536,6 +2934,7 @@ static ssize_t pipe_read_bytes(pipe_t *p, void *buf, size_t cnt, thread_t *cur, 
         if (p->refcount < 2) {
             int ref = p->refcount;
             release_irqrestore(&p->lock, fl);
+            syscall_trace_init_spawn(cur, "pipe-eof", p->id, (uint64_t)ref);
             if (pipe_trace_left-- > 0)
                 devel_printf("pipe: EOF id=%llu tid=%d pref=%d\n",
                         (unsigned long long)p->id,
@@ -2547,11 +2946,16 @@ static ssize_t pipe_read_bytes(pipe_t *p, void *buf, size_t cnt, thread_t *cur, 
         uint64_t id = p->id;
         if (!nonblock)
             p->reader_waiter_tid = waiter;
+        /* Publish the waiter AND block under the pipe lock. A writer/close
+         * between unlock and thread_block used to wake a running reader,
+         * then lose that wakeup when the reader finally blocked (OpenRC). */
+        if (!nonblock && waiter >= 0)
+            thread_block(waiter);
         release_irqrestore(&p->lock, fl);
         if (nonblock)
             return -EAGAIN;
-        if (waiter >= 0)
-            thread_block(waiter);
+        syscall_trace_init_spawn(cur, "pipe-read-wait", id, (uint64_t)ref);
+        openrc_pipe_wait_owners(p, cur);
         if (pipe_trace_left-- > 0)
             devel_printf("pipe: read-wait id=%llu tid=%d pref=%d\n",
                     (unsigned long long)id, waiter, ref);
@@ -2566,6 +2970,10 @@ static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t
     const char *src = (const char *)buf;
     while (written < cnt) {
         acquire_irqsave(&p->lock, &fl);
+        if (p->refcount < 2) {
+            release_irqrestore(&p->lock, fl);
+            return written > 0 ? (ssize_t)written : -EPIPE;
+        }
         size_t used = (p->head >= p->tail) ? (p->head - p->tail) : (p->size - p->tail + p->head);
         size_t free = (p->size - 1) > used ? (p->size - 1 - used) : 0;
         if (free > 0) {
@@ -2594,11 +3002,11 @@ static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t
         int waiter = cur ? (int)cur->tid : -1;
         if (!nonblock)
             p->writer_waiter_tid = waiter;
+        if (!nonblock && waiter >= 0)
+            thread_block(waiter);
         release_irqrestore(&p->lock, fl);
         if (nonblock)
             return written > 0 ? (ssize_t)written : -EAGAIN;
-        if (waiter >= 0)
-            thread_block(waiter);
         thread_yield();
     }
     return (ssize_t)written;
@@ -5822,6 +6230,14 @@ static int net_apply_ipv4(uint32_t ip_be, uint32_t mask_be, uint32_t gw_be, uint
     return 0;
 }
 
+static int net_delete_default_route(uint32_t gateway) {
+    if (!g_net.gw_be || (gateway && gateway != g_net.gw_be))
+        return -ESRCH;
+    g_net.gw_be = 0;
+    g_net.gw_mac_valid = 0;
+    return 0;
+}
+
 static int net_run_dhcp(void) {
     if (net_stack_init() != 0) return -1;
     dhcp_lease_t lease;
@@ -6860,19 +7276,21 @@ static int netlink_build_route_dump(ksock_net_t *s, uint16_t req_type, uint32_t 
         /* No routes until IPv4 is configured. */
     } else {
         size_t mstart = 0;
-        if (nl_msg_begin(s->nl_rx, sizeof(s->nl_rx), &off, &mstart, msg_type, NLM_F_MULTI_LOCAL, seq, s->nl_pid) != 0) return -1;
         rtmsg_k rm;
-        memset(&rm, 0, sizeof(rm));
-        rm.rtm_family = AF_INET_LOCAL;
-        rm.rtm_table = 254;
-        rm.rtm_protocol = 3;
-        rm.rtm_scope = 0;
-        rm.rtm_type = 1;
-        if (nl_append_blob(s->nl_rx, sizeof(s->nl_rx), &off, &rm, sizeof(rm)) != 0) return -1;
-        { uint32_t gw = be32(g_net.gw_be); uint32_t oif = 2;
-          if (nl_append_attr_blob(s->nl_rx, sizeof(s->nl_rx), &off, RTA_GATEWAY_LOCAL, &gw, 4) != 0) return -1;
-          if (nl_append_attr_u32(s->nl_rx, sizeof(s->nl_rx), &off, RTA_OIF_LOCAL, oif) != 0) return -1; }
-        if (nl_msg_end(s->nl_rx, sizeof(s->nl_rx), &off, mstart) != 0) return -1;
+        if (g_net.gw_be) {
+            if (nl_msg_begin(s->nl_rx, sizeof(s->nl_rx), &off, &mstart, msg_type, NLM_F_MULTI_LOCAL, seq, s->nl_pid) != 0) return -1;
+            memset(&rm, 0, sizeof(rm));
+            rm.rtm_family = AF_INET_LOCAL;
+            rm.rtm_table = 254;
+            rm.rtm_protocol = 3;
+            rm.rtm_scope = 0;
+            rm.rtm_type = 1;
+            if (nl_append_blob(s->nl_rx, sizeof(s->nl_rx), &off, &rm, sizeof(rm)) != 0) return -1;
+            { uint32_t gw = be32(g_net.gw_be); uint32_t oif = 2;
+              if (nl_append_attr_blob(s->nl_rx, sizeof(s->nl_rx), &off, RTA_GATEWAY_LOCAL, &gw, 4) != 0) return -1;
+              if (nl_append_attr_u32(s->nl_rx, sizeof(s->nl_rx), &off, RTA_OIF_LOCAL, oif) != 0) return -1; }
+            if (nl_msg_end(s->nl_rx, sizeof(s->nl_rx), &off, mstart) != 0) return -1;
+        }
 
         if (nl_msg_begin(s->nl_rx, sizeof(s->nl_rx), &off, &mstart, msg_type, NLM_F_MULTI_LOCAL, seq, s->nl_pid) != 0) return -1;
         memset(&rm, 0, sizeof(rm));
@@ -7036,8 +7454,13 @@ static int netlink_apply_request(ksock_net_t *s, const uint8_t *packet,
             if (route->rtm_family != AF_INET_LOCAL || oif != 2) {
                 error = EINVAL;
             } else if (h->nlmsg_type == RTM_DELROUTE_LOCAL) {
-                g_net.gw_be = 0;
-                g_net.gw_mac_valid = 0;
+                if (route->rtm_dst_len || route->rtm_src_len) {
+                    error = ESRCH;
+                } else {
+                    (void)netlink_get_attr_u32(attrs, attrs_len, RTA_GATEWAY_LOCAL, &wire_gw);
+                    int rc = net_delete_default_route(be32(wire_gw));
+                    if (rc < 0) error = -rc;
+                }
             } else if (netlink_get_attr_u32(attrs, attrs_len,
                                             RTA_GATEWAY_LOCAL,
                                             &wire_gw) != 0) {
@@ -7381,7 +7804,7 @@ static int thread_fetch_pending_signal(thread_t *t, uint64_t mask) {
     if (mask == 0) mask = ~0ULL;
     /* Always allow SIGCHLD to wake waits to avoid init deadlocks. */
     mask |= (1ULL << (SIGCHLD - 1));
-    for (int sig = 1; sig <= 63; sig++) {
+    for (int sig = 1; sig <= 64; sig++) {
         uint64_t bit = 1ULL << (sig - 1);
         if ((mask & bit) && (t->pending_signals & bit)) {
             t->pending_signals &= ~bit;
@@ -8161,9 +8584,11 @@ static uint64_t wait4_wait_one_tgid(thread_t *waiter)
             c->waiter_tid = waiter_slot;
         wait4_arm_children(waiter, tgid);
         {
-            int block_tid = (int)(waiter->tid ? waiter->tid : 1);
-            thread_block(block_tid);
-            thread_yield();
+            syscall_trace_init_spawn(waiter, "waitpid-block", (uint64_t)(unsigned)tgid,
+                                     c ? (uint64_t)c->state : 0);
+            wait4_block_recheck(waiter, tgid);
+            if (waiter->state == THREAD_BLOCKED)
+                thread_yield();
             waiter = thread_current();
             if (waiter && waiter->ring == 3)
                 syscall_restore_live_frame_from_snapshot(waiter, "wait4-tgid");
@@ -8416,9 +8841,29 @@ static void wait_wake_parent(thread_t *child, int send_sigchld)
         pt = pp->leader;
     if (pt) {
         ptid = (int)(pt->tid ? pt->tid : 1);
+        int trace_parent = init_verbose_trace && openrc_services_stage && openrc_spawn_family(child);
+        if (trace_parent) {
+            /* A long-lived service shell spends its initial allowance on
+             * setup. Re-arm it when a child exits, not just at process birth. */
+            uint64_t pid = process_pid(pt);
+            unsigned slot = (unsigned)(pid % 64);
+            openrc_child_pid[slot] = pid;
+            openrc_child_events[slot] = 0;
+            if (pid == openrc_runlevel_pid)
+                openrc_runlevel_budget = 32;
+            klogprintf("openrc-wake: child=%llu parent=%llu tid=%d before=%d waitpid=%d rip=0x%llx pending=0x%llx mask=0x%llx\n",
+                (unsigned long long)process_pid(child), (unsigned long long)pid,
+                ptid, (int)pt->state, pt->wait_upid,
+                (unsigned long long)pt->saved_user_rip,
+                (unsigned long long)pt->pending_signals,
+                (unsigned long long)pt->saved_sig_mask);
+        }
         if (send_sigchld)
             thread_set_pending_signal(pt, SIGCHLD);
         thread_unblock(ptid);
+        if (trace_parent)
+            klogprintf("openrc-wake: parent=%llu after=%d\n",
+                (unsigned long long)process_pid(pt), (int)pt->state);
         if (child->attached_tty >= 0) {
             devfs_tty_restore_sane(child->attached_tty);
             if (pt->attached_tty == child->attached_tty)
@@ -8623,7 +9068,10 @@ enum {
     EPOLLONESHOT_K = 1u << 30,
     EPOLLET_K = 1u << 31,
     POLLIN_K = 0x001,
+    POLLPRI_K = 0x002,
     POLLOUT_K = 0x004,
+    POLLRDNORM_K = 0x040,
+    POLLWRNORM_K = 0x100,
     POLLERR_K = 0x008,
     POLLHUP_K = 0x010,
     POLLNVAL_K = 0x020,
@@ -8940,6 +9388,15 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
         release_irqrestore(&t->lock, irqf);
         return revents;
     }
+    short cgroup_revents;
+    if (cgroupfs_poll(f, events, &cgroup_revents))
+        return cgroup_revents;
+    /* Linux vfs_poll() defaults to readable/writable for regular files,
+     * including EOF. Readiness means read() will not block, not that it will
+     * return positive bytes. BusyBox read uses ppoll before reading the EOF
+     * of cgroup.events; treating EOF as not-ready parked OpenRC forever. */
+    if (f->type == FS_TYPE_REG || f->type == FS_TYPE_DIR)
+        return events & (POLLIN_K | POLLOUT_K | POLLRDNORM_K | POLLWRNORM_K);
     if (events & POLLOUT_K) revents |= POLLOUT_K;
     if (events & POLLIN_K) {
         if (f->type == FS_TYPE_DIR) {
@@ -8960,7 +9417,8 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
 
 static int epoll_interest_to_poll(uint32_t ev) {
     short pe = 0;
-    if (ev & (EPOLLIN_K | EPOLLPRI_K)) pe |= POLLIN_K;
+    if (ev & EPOLLIN_K) pe |= POLLIN_K;
+    if (ev & EPOLLPRI_K) pe |= POLLPRI_K;
     if (ev & EPOLLRDHUP_K) pe |= POLLRDHUP_K | POLLIN_K;
     if (ev & EPOLLOUT_K) pe |= POLLOUT_K;
     /* ERR/HUP are always reported by Linux when they occur. */
@@ -8971,7 +9429,7 @@ static int epoll_interest_to_poll(uint32_t ev) {
 static uint32_t poll_to_epoll_revents(short revents, uint32_t interest) {
     uint32_t out = 0;
     if ((interest & EPOLLIN_K) && (revents & POLLIN_K)) out |= EPOLLIN_K;
-    if ((interest & EPOLLPRI_K) && (revents & POLLIN_K)) out |= EPOLLPRI_K;
+    if ((interest & EPOLLPRI_K) && (revents & POLLPRI_K)) out |= EPOLLPRI_K;
     if ((interest & EPOLLOUT_K) && (revents & POLLOUT_K)) out |= EPOLLOUT_K;
     if ((interest & EPOLLRDHUP_K) && (revents & POLLRDHUP_K)) out |= EPOLLRDHUP_K;
     /* ERR/HUP always reported even if not in interest (Linux). */
@@ -9187,8 +9645,9 @@ typedef struct {
 typedef struct {
     uint64_t uc_flags;
     uint64_t uc_link;
-    uint64_t uc_stack_ss_sp, uc_stack_ss_size;
+    uint64_t uc_stack_ss_sp;
     uint32_t uc_stack_ss_flags, uc_pad;
+    uint64_t uc_stack_ss_size;
     k_sigcontext_t uc_mcontext;
     uint64_t uc_sigmask[2];
 } k_ucontext_t;
@@ -9292,7 +9751,7 @@ static int signal_prepare_next(thread_t *cur, int *sig_out, user_sigaction_t *sa
     uint64_t pending = cur->pending_signals & ~blocked;
     if (!pending) return 0;
     int sig = 0;
-    for (int s = 1; s <= 63 && !sig; s++) {
+    for (int s = 1; s <= 64 && !sig; s++) {
         if (pending & (1ULL << (s - 1))) sig = s;
     }
     if (sig <= 0) return 0;
@@ -9472,7 +9931,7 @@ int maybe_deliver_pending_signal(uint64_t syscall_ret) {
         sc.r8  = cur->saved_user_r8;
         sc.r9  = cur->saved_user_r9;
         sc.r10 = cur->saved_user_r10;
-        sc.r11 = cur->saved_user_r11;
+        sc.r11 = cur->sigreturn_restore_gprs ? cur->sigreturn_r11 : cur->saved_user_r11;
         sc.r12 = cur->saved_user_r12;
         sc.r13 = cur->saved_user_r13;
         sc.r14 = cur->saved_user_r14;
@@ -9483,7 +9942,7 @@ int maybe_deliver_pending_signal(uint64_t syscall_ret) {
         sc.rbx = cur->saved_user_rbx;
         sc.rdx = cur->saved_user_rdx;
         sc.rax = restart_syscall ? frame[14] : syscall_ret;
-        sc.rcx = cur->saved_user_rcx;
+        sc.rcx = cur->sigreturn_restore_gprs ? cur->sigreturn_rcx : cur->saved_user_rcx;
         sc.rsp = old_rsp;
         sc.rip = old_rip;
         sc.eflags = cur->saved_user_r11;
@@ -10293,7 +10752,7 @@ static int rlimit_set(thread_t *cur, int resource, uint64_t soft, uint64_t hard)
             p->rlim_nproc_max = hard;
             return 0;
         case RLIMIT_NOFILE_K:
-            /* Store requested limits; open paths still cannot exceed THREAD_MAX_FD. */
+            if (hard > fs_nr_open_get()) return EPERM;
             p->rlim_nofile_cur = soft;
             p->rlim_nofile_max = hard;
             return 0;
@@ -10656,6 +11115,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                  * Defer publication; the syscall epilogue unblocks the child
                  * after the parent has entered its block. */
                 if ((flags & CLONE_VFORK_OLD) && child->process && cur->process) {
+                    syscall_trace_init_spawn(cur, "spawn-clone", child_user_tid, child_rsp);
                     process_set_vfork_parent(child->process, cur->process);
                     cur->vfork_waiting = 1;
                     cur->vfork_saved_ret = (uint64_t)child_user_tid;
@@ -11941,6 +12401,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 mode_t um = cur ? (mode_t)(cur->umask & 07777u) : (mode_t)0022;
                 mode_t applied = (mode & ~um) & 07777u;
                 int r = fs_mkdir(path);
+                openrc_trace_mkdir(cur, -100, path, mode, r);
                 if (r == 0) {
                     /* Linux mkdir: mode & ~umask; tmux needs 0700 so (mode&07)==0. */
                     (void)fs_chmod(path, applied | S_IFDIR);
@@ -11972,6 +12433,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 mode_t um = cur ? (mode_t)(cur->umask & 07777u) : (mode_t)0022;
                 mode_t applied = (mode & ~um) & 07777u;
                 int r = fs_mkdir(path);
+                openrc_trace_mkdir(cur, dirfd, path, mode, r);
                 if (r == 0) {
                     (void)fs_chmod(path, applied | S_IFDIR);
                     return 0;
@@ -17340,7 +17802,7 @@ kfree(path);
                          * still name the fork child.  The syscall issuer is the
                          * stable tcur captured at entry.
                          */
-                        thread_block((int)(tcur->tid ? tcur->tid : 1));
+                        wait4_block_recheck(tcur, w4_pid);
                         if (tcur->state == THREAD_BLOCKED) {
                             thread_yield();
                             syscall_restore_live_frame_from_snapshot(tcur, "wait4-any");
@@ -17405,16 +17867,20 @@ kfree(path);
                 return ret_err(EINVAL);
             if (idtype == P_ALL)
                 pid_arg = -1;
-            else if (idtype == P_PID)
+            else if (idtype == P_PID) {
+                if (id <= 0) return ret_err(EINVAL);
                 pid_arg = id;
-            else if (idtype == P_PGID)
+            } else if (idtype == P_PGID) {
+                if (id < 0) return ret_err(EINVAL);
                 pid_arg = (id == 0) ? 0 : -id;
-            else
+            } else
                 return ret_err(EINVAL);
             if (infop && !user_range_ok((const void *)(uintptr_t)infop, 128))
                 return ret_err(EFAULT);
             if (!cur->process)
                 return ret_err(ECHILD);
+            cur->wait_upid = pid_arg;
+            cur->wait_options = options;
             for (;;) {
                 thread_t *waiter = cur;
                 int has_child = 0;
@@ -17442,6 +17908,7 @@ kfree(path);
                         }
                         *(int32_t *)(si + 8) = code;
                         *(int32_t *)(si + 16) = dead_pid;
+                        *(uint32_t *)(si + 20) = (uint32_t)dead->uid;
                         *(int32_t *)(si + 24) = si_status;
                         if (copy_to_user_safe((void *)(uintptr_t)infop, si, 128) != 0)
                             return ret_err(EFAULT);
@@ -17464,19 +17931,36 @@ kfree(path);
                 }
                 if (!has_child)
                     return ret_err(ECHILD);
-                if (options & WNOHANG)
+                if (options & WNOHANG) {
+                    if (infop) {
+                        uint8_t si[128];
+                        memset(si, 0, sizeof(si));
+                        if (copy_to_user_safe((void *)(uintptr_t)infop, si, sizeof(si)) != 0)
+                            return ret_err(EFAULT);
+                    }
                     return 0;
+                }
                 if (wait4_eintr_pending(waiter))
                     return ret_err(EINTR);
                 wait4_arm_children(waiter, pid_arg);
-                thread_block((int)(waiter->tid ? waiter->tid : 1));
-                thread_yield();
-                syscall_restore_live_frame_from_snapshot(waiter, "waitid");
+                wait4_block_recheck(waiter, pid_arg);
+                if (waiter->state == THREAD_BLOCKED) {
+                    thread_yield();
+                    syscall_restore_live_frame_from_snapshot(waiter, "waitid");
+                }
                 cur = waiter;
             }
         }
 
         case SYS_ioctl: {
+            if ((uint32_t)a2 == 0x4B4E) { /* KDSIGACCEPT; arg is signal, not a pointer */
+                if (a3 > 64) return ret_err(EINVAL);
+                struct fs_file *tty = syscall_fd_get(cur, (int)a1);
+                if (!tty) return ret_err(EBADF);
+                if (!devfs_is_tty_file(tty)) return ret_err(ENOTTY);
+                int rc = kbrequest_register(cur, (int)a3);
+                return rc < 0 ? ret_err(-rc) : 0;
+            }
             int fd = (int)a1;
             uint64_t req = a2;
             void *argp = (void*)(uintptr_t)a3;
@@ -18273,9 +18757,16 @@ kfree(path);
                     if (copy_from_user_raw(&rt, argp, sizeof(rt)) != 0) return ret_err(EFAULT);
                     if (net_stack_init() != 0) return ret_err(ENETDOWN);
                     if (req == SIOCDELRT_LOCAL) {
-                        g_net.gw_be = 0;
-                        g_net.gw_mac_valid = 0;
-                        return 0;
+                        uint32_t destination = 0, mask = 0, gateway = 0;
+                        memcpy(&destination, rt.rt_dst.sa_data + 2, 4);
+                        memcpy(&mask, rt.rt_genmask.sa_data + 2, 4);
+                        memcpy(&gateway, rt.rt_gateway.sa_data + 2, 4);
+                        /* Only the stored default route can be removed here.
+                         * A second delete must fail, not keep userspace's
+                         * `while route del ...` loop running forever. */
+                        if (destination || mask) return ret_err(ESRCH);
+                        int rc = net_delete_default_route(be32(gateway));
+                        return rc < 0 ? ret_err(-rc) : 0;
                     }
                     if (rt.rt_gateway.sa_family == AF_INET_LOCAL) {
                         uint32_t wire = 0;
@@ -19323,6 +19814,8 @@ kfree(path);
                 }
                 if (copy_to_user_safe(bufp, tmp, (size_t)rr) != 0) { kfree(tmp); return ret_err(EFAULT); }
                 f->pos += (size_t)rr;
+                init_trace_read(cur, f, fd, read_pos, rr, cnt);
+                openrc_trace_deptree_read(cur, f, fd, read_pos, rr, tmp, bufp);
                 if (pid1_dl_trace_thread(cur) && pid1_dl_trace_fd(cur, fd)) {
                     const char *dp = thread_fd_path(cur, fd);
                     kprintf("dl-trace read fd=%d path=%s off=%lld cnt=0x%zx ret=%zd\n",
@@ -19337,6 +19830,8 @@ kfree(path);
                 kfree(tmp);
                 return (uint64_t)rr;
             }
+            init_trace_read(cur, f, fd, read_pos, rr, cnt);
+            openrc_trace_deptree_read(cur, f, fd, read_pos, rr, tmp, bufp);
             if (f->path && strcmp(f->path, "/etc/inittab") == 0 && f->pos == 0) {
             }
             if (pid1_dl_trace_thread(cur) && pid1_dl_trace_fd(cur, fd)) {
@@ -19714,6 +20209,7 @@ kfree(path);
 
             /* POSIX: O_CREAT|O_EXCL must fail if file already exists. */
             struct fs_file *f = fs_open(path);
+            if (!f && fs_file_open_error_get() == 23) { kfree(path); return ret_err(ENFILE); }
             if (!f) {
                 if (strcmp(path, "/console") == 0) f = fs_open("/dev/console");
                 else if (strcmp(path, "/tty") == 0) f = fs_open("/dev/tty");
@@ -19760,8 +20256,9 @@ kfree(path);
             if (f)
                 f->flags = flags;
             int fd = thread_fd_alloc(f);
-            if (fd < 0) { fs_file_free(f); kfree(path); return ret_err(EBADF); }
+            if (fd < 0) { fs_file_free(f); kfree(path); return ret_err(fd == -23 ? ENFILE : EMFILE); }
             (void)fs_file_set_user_path(f, path);
+            openrc_trace_deptree_open(cur, path, flags, fd);
             if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(path)) {
                 if (strstr(path, "libeinfo")) {
                     dl_watch_start();
@@ -19849,6 +20346,7 @@ kfree(path);
             /* POSIX: O_CREAT|O_EXCL must fail if file already exists. */
             if (!f)
                 f = fs_open(path);
+            if (!f && fs_file_open_error_get() == 23) return ret_err(ENFILE);
             if (!f) {
                 /* chvt: console and tty aliases are handled by devfs. */
                 if (strcmp(path, "/console") == 0) f = fs_open("/dev/console");
@@ -19908,11 +20406,12 @@ kfree(path);
             if (f)
                 f->flags = flags;
             int fd = thread_fd_alloc(f);
-            if (fd < 0) { fs_file_free(f); return ret_err(EBADF); }
+            if (fd < 0) { fs_file_free(f); return ret_err(fd == -23 ? ENFILE : EMFILE); }
             if (cur->process)
                 cur->process->fd_cloexec[fd] =
                     (flags & 02000000) ? 1 : 0;
             (void)fs_file_set_user_path(f, path);
+            openrc_trace_deptree_open(cur, path, flags, fd);
             if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(path)) {
                 if (strstr(path, "libeinfo"))
                     dl_watch_start();
@@ -20105,6 +20604,8 @@ kfree(path);
                 cur->process->fd_cloexec[fd1] = 1;
             }
             int fds[2] = { fd0, fd1 };
+            syscall_trace_init_spawn(cur, "pipe-create", p->id,
+                                     ((uint64_t)(unsigned)fd0 << 32) | (unsigned)fd1);
 #if DEVEL_DEBUG
             syscall_pipe_watch_active = 1;
             syscall_pipe_watch_owner_tid = (int)(cur->tid ? cur->tid : 1);
@@ -22204,6 +22705,7 @@ kfree(path);
         }
         case SYS_exit_group: {
             (void)a1;
+            syscall_trace_init_spawn(cur, "exit-group-enter", a1, 0);
             if (cur && cur->name[0] && strstr(cur->name, "linuxrc"))
                 devel_printf("linuxrc-exit-group-enter: tid=%llu code=%llu parent=%d waiter=%d\n",
                     (unsigned long long)(cur->tid ? cur->tid : 1),
@@ -22222,6 +22724,7 @@ kfree(path);
                 }
                 devfs_tty_remove_waiter_from_all_ttys((int)(cur->tid ? cur->tid : 1));
                 exit_group_reap_peer_threads(cur);
+                syscall_trace_init_spawn(cur, "exit-group-peers-done", 0, 0);
                 int code = (int)a1;
                 cur->exit_status = (code & 0xFF) << 8;
                 process_mark_zombie(cur->process, cur->exit_status);
@@ -22237,6 +22740,7 @@ kfree(path);
                 user_vma_remove_all_for_tid((uint64_t)(cur->tid ? cur->tid : 1));
                 /* close all FDs so pipes/sockets release (reader gets EOF, wait4 can proceed) */
                 thread_close_all_fds(cur);
+                syscall_trace_init_spawn(cur, "exit-group-fds-done", 0, 0);
                 if (user_range_ok((const void *)(uintptr_t)cur->clear_child_tid, 4)) {
                     uint32_t zero = 0;
                     copy_to_user_safe((void*)(uintptr_t)cur->clear_child_tid, &zero, 4);
@@ -22282,9 +22786,11 @@ if (is_watch_proc(cur)) {
                     console_kd_reset_for_dead_owner(cur->attached_tty);
                  if (cur->mm && cur->mm != mm_kernel()) {
                      mm_t *dead_mm = cur->mm;
+                     syscall_trace_init_spawn(cur, "exit-group-mm-enter", 0, 0);
                      cur->mm = NULL;
                      (void)mm_switch_away_from(dead_mm);
                      mm_release(dead_mm);
+                     syscall_trace_init_spawn(cur, "exit-group-mm-done", 0, 0);
                  }
                  if (thread_get_current_user() == cur)
                      thread_set_current_user(NULL);
@@ -22292,6 +22798,9 @@ if (is_watch_proc(cur)) {
                 process_release_vfork_parent(exiting_proc, PROCESS_VFORK_EXIT);
                 if (!ignore_sigchld || cur->waiter_tid >= 0)
                     wait_wake_parent(cur, !ignore_sigchld);
+                syscall_trace_init_spawn(cur, "exit-group-parent-woken",
+                    (uint64_t)(unsigned)cur->parent_tid,
+                    (uint64_t)(unsigned)cur->waiter_tid);
             }
             thread_t *kcur = thread_current();
             if (kcur && kcur->tid != 0) {
@@ -22310,10 +22819,18 @@ if (is_watch_proc(cur)) {
             if (copy_from_user_raw(&uc, (const void *)uc_ptr, sizeof(uc)) != 0)
                 return ret_err(EFAULT);
             k_sigcontext_t *sc = &uc.uc_mcontext;
+            /* SYSCALL normally clobbers RCX/R11, but rt_sigreturn restores the
+             * complete interrupted context, including arbitrary IRQ-time GPRs.
+             * Keep them separate from the IRETQ RIP/RFLAGS control slots. */
+            cur->sigreturn_rcx = sc->rcx;
+            cur->sigreturn_r11 = sc->r11;
+            cur->sigreturn_restore_gprs = 1;
             cur->saved_user_r8  = sc->r8;
             cur->saved_user_r9  = sc->r9;
             cur->saved_user_r10 = sc->r10;
-            cur->saved_user_r11 = sc->r11;
+            /* syscall.S uses the R11 slot for IRETQ RFLAGS, not the interrupted
+             * general-purpose R11. These differ for IRQ-delivered SIGCHLD. */
+            cur->saved_user_r11 = sc->eflags;
             cur->saved_user_r12 = sc->r12;
             cur->saved_user_r13 = sc->r13;
             cur->saved_user_r14 = sc->r14;
@@ -22323,7 +22840,9 @@ if (is_watch_proc(cur)) {
             cur->saved_user_rbp = sc->rbp;
             cur->saved_user_rbx = sc->rbx;
             cur->saved_user_rdx = sc->rdx;
-            cur->saved_user_rcx = sc->rcx;
+            /* Likewise the RCX slot is the IRETQ RIP. Restoring sc->rcx here
+             * resumed at an unrelated address after an asynchronous signal. */
+            cur->saved_user_rcx = sc->rip;
             cur->saved_user_rip = sc->rip;
             cur->saved_user_rsp = sc->rsp;
             cur->saved_sig_mask = uc.uc_sigmask[0];
@@ -22731,7 +23250,98 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             (unsigned long long)a5,
             (unsigned long long)a6);
     }
+    int runlevel_trace = init_verbose_trace && trace_t && openrc_runlevel_pid &&
+        process_pid(trace_t) == openrc_runlevel_pid && openrc_runlevel_budget > 0 &&
+        (openrc_services_stage || (num != SYS_read && num != SYS_mmap));
+    if (runlevel_trace) {
+        openrc_runlevel_budget--;
+        klogprintf("openrc-step: enter n=%llu a1=0x%llx a2=0x%llx rip=0x%llx\n",
+            (unsigned long long)num, (unsigned long long)a1,
+            (unsigned long long)a2, (unsigned long long)trace_t->saved_user_rip);
+    }
+    int child_trace = init_verbose_trace && openrc_services_stage && trace_t &&
+        process_pid(trace_t) != openrc_runlevel_pid &&
+        openrc_spawn_family(trace_t) &&
+        (num == SYS_execve || num == SYS_wait4 || num == SYS_read ||
+         num == SYS_write || num == SYS_fork || num == SYS_vfork ||
+         num == SYS_clone || num == SYS_exit || num == SYS_exit_group ||
+         num == SYS_rt_sigsuspend || num == SYS_futex || num == SYS_poll ||
+         num == SYS_open || num == SYS_openat);
+    if (child_trace) {
+        uint64_t pid = process_pid(trace_t);
+        unsigned slot = (unsigned)(pid % 64);
+        if (openrc_child_pid[slot] != pid) {
+            openrc_child_pid[slot] = pid;
+            openrc_child_events[slot] = 0;
+        }
+        /* Reserve late diagnostics for control flow, rather than spending the
+         * whole allowance on dynamic-loader reads and library opens. */
+        int io = num == SYS_read || num == SYS_write ||
+                 num == SYS_open || num == SYS_openat;
+        if (io && openrc_child_events[slot] >= 8)
+            child_trace = 0;
+        else if (openrc_child_events[slot] >= 32)
+            child_trace = 0;
+        else
+            openrc_child_events[slot]++;
+    }
+    if (child_trace) {
+        klogprintf("openrc-child: enter pid=%llu tid=%llu name=%s n=%llu a1=0x%llx a2=0x%llx rip=0x%llx\n",
+            (unsigned long long)process_pid(trace_t),
+            (unsigned long long)trace_t->tid, trace_t->name,
+            (unsigned long long)num, (unsigned long long)a1,
+            (unsigned long long)a2, (unsigned long long)trace_t->saved_user_rip);
+    }
+    if (init_runtime_thread(trace_t)) {
+        unsigned slot = (unsigned)(trace_t->tid % 64);
+        uint64_t pid = process_pid(trace_t);
+        if (init_progress[slot].pid != pid)
+            init_progress[slot].read_path[0] = '\0';
+        init_progress[slot].pid = pid;
+        init_progress[slot].progress_ms = pit_get_time_ms();
+        init_progress[slot].number = num;
+        init_progress[slot].arg1 = a1;
+        init_progress[slot].active = 1;
+        init_progress[slot].reports = 0;
+    }
+    static unsigned init_wait_budget = 128;
+    int init_wait_trace = init_wait_budget && init_runtime_thread(trace_t) &&
+        (num == SYS_wait4 || num == SYS_futex || num == SYS_poll ||
+         num == SYS_rt_sigsuspend || num == 23 || num == 232 ||
+         num == 270 || num == 271 || num == 281 || num == 441);
+    if (init_wait_trace) {
+        init_wait_budget--;
+        void (*log)(const char *, ...) = init_verbose_trace ?
+            klogprintf : klogprintf_logonly;
+        log("init-wait: enter pid=%llu name=%s n=%llu a1=0x%llx a2=0x%llx a3=0x%llx rip=0x%llx\n",
+            (unsigned long long)process_pid(trace_t), trace_t->name,
+            (unsigned long long)num, (unsigned long long)a1,
+            (unsigned long long)a2, (unsigned long long)a3,
+            (unsigned long long)trace_t->saved_user_rip);
+    }
     uint64_t ret = syscall_do_inner(num, a1, a2, a3, a4, a5, a6);
+    if (init_runtime_thread(trace_t)) {
+        unsigned slot = (unsigned)(trace_t->tid % 64);
+        if (init_progress[slot].pid == process_pid(trace_t)) {
+            init_progress[slot].active = 0;
+            init_progress[slot].progress_ms = pit_get_time_ms();
+            init_progress[slot].reports = 0;
+        }
+    }
+    if (init_wait_trace) {
+        void (*log)(const char *, ...) = init_verbose_trace ?
+            klogprintf : klogprintf_logonly;
+        log("init-wait: leave pid=%llu n=%llu ret=0x%llx\n",
+            (unsigned long long)process_pid(trace_t), (unsigned long long)num,
+            (unsigned long long)ret);
+    }
+    if (child_trace)
+        klogprintf("openrc-child: leave pid=%llu n=%llu ret=0x%llx\n",
+            (unsigned long long)process_pid(trace_t), (unsigned long long)num,
+            (unsigned long long)ret);
+    if (runlevel_trace)
+        klogprintf("openrc-step: leave n=%llu ret=0x%llx\n",
+            (unsigned long long)num, (unsigned long long)ret);
     if (trace_t && trace_t->fork_child_user_rip && trace_t->name[0] &&
         strstr(trace_t->name, "linuxrc")) {
         static int linuxrc_child_done_left = 48;

@@ -1057,6 +1057,7 @@ enum {
 	SYSCTL_VERSION = 24,
 	SYSCTL_PID_MAX = 25,
 	SYSCTL_FILE_MAX = 30,
+	SYSCTL_NR_OPEN = 31,
 };
 
 #define PROC_PID_MAX 512 /* matches cpu/thread/thread.c MAX_THREADS */
@@ -1085,7 +1086,10 @@ static ssize_t procfs_sysctl_show(int file_id, char *buf, size_t size) {
 		len = (size_t)snprintf(tmp, sizeof(tmp), "%d\n", PROC_PID_MAX);
 		break;
 	case SYSCTL_FILE_MAX:
-		len = (size_t)snprintf(tmp, sizeof(tmp), "%d\n", PROCESS_MAX_FD);
+		len = (size_t)snprintf(tmp, sizeof(tmp), "%llu\n", (unsigned long long)fs_file_max_get());
+		break;
+	case SYSCTL_NR_OPEN:
+		len = (size_t)snprintf(tmp, sizeof(tmp), "%u\n", fs_nr_open_get());
 		break;
 	default:
 		return -1;
@@ -1100,6 +1104,24 @@ static ssize_t procfs_write(struct fs_file *file, const void *buf, size_t size, 
 	if (!file || !file->driver_private || !buf) return -1;
 	struct procfs_handle *h = (struct procfs_handle*)file->driver_private;
 	if (!h) return -1;
+	if (h->kind == 9 && (h->file_id == SYSCTL_FILE_MAX || h->file_id == SYSCTL_NR_OPEN)) {
+		thread_t *ct = thread_current();
+		if (!ct || ct->euid != 0) return -13; /* EACCES */
+		const uint8_t *bytes = buf;
+		size_t i = 0;
+		uint64_t value = 0;
+		while (i < size && (bytes[i] == ' ' || bytes[i] == '\t' || bytes[i] == '\n')) i++;
+		if (i == size || bytes[i] < '0' || bytes[i] > '9') return -22;
+		while (i < size && bytes[i] >= '0' && bytes[i] <= '9') {
+			uint64_t digit = bytes[i++] - '0';
+			if (value > (UINT64_MAX - digit) / 10) return -22;
+			value = value * 10 + digit;
+		}
+		while (i < size && (bytes[i] == ' ' || bytes[i] == '\t' || bytes[i] == '\n')) i++;
+		if (i != size) return -22;
+		int rc = h->file_id == SYSCTL_FILE_MAX ? fs_file_max_set(value) : fs_nr_open_set(value);
+		return rc < 0 ? rc : (ssize_t)size;
+	}
 	if (h->kind == 9 && (h->file_id == SYSCTL_HOSTNAME || h->file_id == SYSCTL_DOMAINNAME)) {
 		thread_t *ct = thread_current();
 		if (!ct || ct->euid != 0) return -1;
@@ -1352,10 +1374,11 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 						return 0;
 					}
 					const char *name = slash2 + 1;
-					if (strcmp(name, "file-max") == 0) {
+					if (strcmp(name, "file-max") == 0 || strcmp(name, "nr_open") == 0) {
 						char tmp[64];
-						ssize_t sl = procfs_sysctl_show(SYSCTL_FILE_MAX, tmp, sizeof(tmp));
-						h->kind = 9; h->file_id = SYSCTL_FILE_MAX; f->type = FS_TYPE_REG;
+						int fid = strcmp(name, "file-max") == 0 ? SYSCTL_FILE_MAX : SYSCTL_NR_OPEN;
+						ssize_t sl = procfs_sysctl_show(fid, tmp, sizeof(tmp));
+						h->kind = 9; h->file_id = fid; f->type = FS_TYPE_REG;
 						f->size = (sl > 0) ? (size_t)sl : 0;
 						f->driver_private = h;
 						*out_file = f;
@@ -1933,7 +1956,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 		const char *names_kernel[] = {
 			"hostname", "domainname", "ostype", "osrelease", "version", "pid_max"
 		};
-		const char *names_fs[] = { "file-max" };
+		const char *names_fs[] = { "file-max", "nr_open" };
 		const char *const *names;
 		int ncount;
 		int is_file_dir;
@@ -2358,7 +2381,8 @@ int procfs_fill_stat(struct fs_file *file, struct stat *st) {
         st->st_nlink = 1;
         st->st_size = (off_t)file->size;
     } else if (h->kind == 9) {
-        int rw = (h->file_id == SYSCTL_HOSTNAME || h->file_id == SYSCTL_DOMAINNAME);
+        int rw = (h->file_id == SYSCTL_HOSTNAME || h->file_id == SYSCTL_DOMAINNAME ||
+                  h->file_id == SYSCTL_FILE_MAX || h->file_id == SYSCTL_NR_OPEN);
         st->st_ino = 0;
         st->st_mode = S_IFREG | (rw ? 0644 : 0444);
         st->st_nlink = 1;

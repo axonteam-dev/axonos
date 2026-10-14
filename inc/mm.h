@@ -26,6 +26,7 @@ typedef struct mm_struct {
     uintptr_t brk_base;
     uintptr_t brk_current;
     uintptr_t mmap_cursor;
+    uint32_t membarrier_private_registered;
 } mm_t;
 
 /* Initialize mm subsystem and capture the bootstrap kernel address space. */

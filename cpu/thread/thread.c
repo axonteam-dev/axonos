@@ -328,6 +328,7 @@ static int thread_context_valid(thread_t *t) {
 #define SYSCALL_KSTACK_SIZE (128 * 1024)
 
 static void thread_free_resources(thread_t *t) {
+        futex_cancel_thread(t);
         if (!t) return;
         /* mm may have been released in SYS_exit, but be defensive */
         if (t->mm && t->mm != mm_kernel()) {
@@ -1237,22 +1238,18 @@ void thread_stop(int pid) {
 void thread_block(int pid) {
         unsigned long irqf;
         acquire_irqsave(&sched_lock, &irqf);
-        for (int i = 0; i < thread_count; ++i) {
-                if (!threads[i] || threads[i]->tid != (uint64_t)(unsigned)pid)
-                        continue;
-                if (threads[i]->state == THREAD_BLOCKED) {
-                        threads[i]->sleep_until = 0;
-                        release_irqrestore(&sched_lock, irqf);
-                        return; /* idempotent — vfork arms block twice */
-                }
-                if (threads[i]->state != THREAD_TERMINATED) {
-                        thread_account_block_nolock(threads[i]);
-                        threads[i]->state = THREAD_BLOCKED;
-                        threads[i]->sleep_until = 0; /* no timeout */
-                        release_irqrestore(&sched_lock, irqf);
-                        return;
-                }
-                break;
+        thread_t *t = thread_get(pid);
+        if (t && t->state == THREAD_BLOCKED) {
+                t->sleep_until = 0;
+                release_irqrestore(&sched_lock, irqf);
+                return; /* idempotent — vfork arms block twice */
+        }
+        if (t && t->state != THREAD_TERMINATED) {
+                thread_account_block_nolock(t);
+                t->state = THREAD_BLOCKED;
+                t->sleep_until = 0;
+                release_irqrestore(&sched_lock, irqf);
+                return;
         }
         release_irqrestore(&sched_lock, irqf);
         klogprintf("thread_block: thread %d not found or terminated\n", pid);
@@ -1277,15 +1274,11 @@ void thread_block_with_timeout(int pid, uint32_t timeout_ms) {
         uint32_t deadline = timeout_ms ? thread_deadline_ms(timeout_ms) : 0;
         unsigned long irqf;
         acquire_irqsave(&sched_lock, &irqf);
-        for (int i = 0; i < thread_count; ++i) {
-                if (threads[i] && threads[i]->tid == pid && threads[i]->state != THREAD_BLOCKED &&
-                    threads[i]->state != THREAD_TERMINATED) {
-                        thread_account_block_nolock(threads[i]);
-                        threads[i]->state = THREAD_BLOCKED;
-                        threads[i]->sleep_until = deadline;
-                        release_irqrestore(&sched_lock, irqf);
-                        return;
-                }
+        thread_t *t = thread_get(pid);
+        if (t && t->state != THREAD_BLOCKED && t->state != THREAD_TERMINATED) {
+                thread_account_block_nolock(t);
+                t->state = THREAD_BLOCKED;
+                t->sleep_until = deadline;
         }
         release_irqrestore(&sched_lock, irqf);
 }
@@ -1572,14 +1565,11 @@ void thread_unblock(int pid) {
         unsigned long irqf;
         int woke = 0;
         acquire_irqsave(&sched_lock, &irqf);
-        for (int i = 0; i < thread_count; ++i) {
-                if (threads[i] && threads[i]->tid == pid &&
-                    (threads[i]->state == THREAD_BLOCKED || threads[i]->state == THREAD_SLEEPING)) {
-                        threads[i]->sleep_until = 0;
-                        thread_note_ready_nolock(threads[i]);
-                        woke = 1;
-                        break;
-                }
+        thread_t *t = thread_get(pid);
+        if (t && (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING)) {
+                t->sleep_until = 0;
+                thread_note_ready_nolock(t);
+                woke = t->state == THREAD_READY;
         }
         release_irqrestore(&sched_lock, irqf);
         /* Keyboard/pipe wakeups must be visible to the next schedule point —
@@ -1594,14 +1584,12 @@ void thread_unblock_fork_child(int pid) {
         int cpu = smp_sched_cpu_id();
         int woke = 0;
         acquire_irqsave(&sched_lock, &irqf);
-        for (int i = 0; i < thread_count; ++i) {
-                thread_t *t = threads[i];
-                if (!t || t->tid != (uint64_t)(unsigned)pid)
-                        continue;
+        thread_t *t = thread_get(pid);
+        if (t) {
                 /* Keep the first post-fork dispatch on the parent's CPU; another
                    CPU can otherwise run the child before the parent has iretq'd. */
                 if (cpu >= 0 && cpu < SMP_MAX_CPUS)
-                        t->bound_cpu = cpu;
+                        t->bound_cpu = t->ring == 3 ? 0 : cpu;
                 if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING) {
                         thread_t *cur = current_cpu[cpu >= 0 && cpu < SMP_MAX_CPUS ? cpu : 0];
                         t->sleep_until = 0;
@@ -1617,9 +1605,8 @@ void thread_unblock_fork_child(int pid) {
                         thread_note_ready_nolock(t);
                         /* note_ready bumps fifo_seq; win equal-vruntime ties. */
                         t->sched_fifo_seq = 0;
-                        woke = 1;
+                        woke = t->state == THREAD_READY;
                 }
-                break;
         }
         release_irqrestore(&sched_lock, irqf);
         if (woke)
@@ -1661,13 +1648,11 @@ void thread_send_sighup_to_pgrp(int pgrp) {
 
 // get thread info by pid
 thread_t* thread_get(int pid) {
-        uint64_t want = (uint64_t)(unsigned)pid;
-        for (int i = 0; i < thread_count; ++i) {
-                if (threads[i] && threads[i]->tid == want) {
-                        return threads[i];
-                }
-        }
-        return NULL;
+        /* Scheduler TIDs are table slots in both create paths. Linux TGIDs
+         * are separate process identities; never scan or interpret them here. */
+        if (pid < 0 || pid >= MAX_THREADS) return NULL;
+        thread_t *t = threads[pid];
+        return t && t->tid == (uint64_t)(unsigned)pid ? t : NULL;
 }
 
 thread_t* thread_find_child_of(int parent_tid) {

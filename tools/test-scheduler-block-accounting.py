@@ -32,6 +32,10 @@ static thread_t *threads[] = {&sleeper, &child}, *current = &sleeper;
 static int thread_count = 2, child_selected;
 static uint32_t sched_fifo_counter;
 static thread_t *thread_current(void) { return current; }
+static thread_t *thread_get(int tid) {
+    for (int i = 0; i < thread_count; i++) if (threads[i]->tid == (uint64_t)tid) return threads[i];
+    return NULL;
+}
 static int thread_is_any_idle(const thread_t *t) { return t->idle; }
 static uint32_t thread_deadline_ms(uint32_t delay) { return 100 + delay; }
 static void acquire_irqsave(spinlock_t *l, unsigned long *f) {

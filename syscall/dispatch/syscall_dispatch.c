@@ -454,6 +454,25 @@ static void wait4_block_recheck(thread_t *waiter, int pid_arg) {
 static uint64_t wait4_wait_one_tgid(thread_t *waiter);
 
 static int openrc_services_stage;
+static long membarrier_private(mm_t *mm, unsigned int command, unsigned int flags) {
+    enum { QUERY = 0, PRIVATE_EXPEDITED = 8, REGISTER_PRIVATE_EXPEDITED = 16 };
+    if (flags) return -22; /* EINVAL: CPU-specific/global commands unsupported */
+    if (command == QUERY) return PRIVATE_EXPEDITED | REGISTER_PRIVATE_EXPEDITED;
+    if (!mm) return -22;
+    if (command == REGISTER_PRIVATE_EXPEDITED) {
+        __atomic_store_n(&mm->membarrier_private_registered, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
+    if (command != PRIVATE_EXPEDITED) return -22;
+    if (!__atomic_load_n(&mm->membarrier_private_registered, __ATOMIC_ACQUIRE))
+        return -1; /* EPERM */
+    /* All userspace currently executes on BSP (thread_schedule enforces it).
+     * There is no other CPU executing a participating userspace thread to
+     * interrupt. A full local fence supplies the private expedited barrier.
+     * Add cross-CPU rendezvous before allowing userspace on APs. */
+    asm volatile("mfence" ::: "memory");
+    return 0;
+}
 static spinlock_t kbrequest_lock;
 static uint64_t kbrequest_pid;
 static int kbrequest_signal;
@@ -9961,9 +9980,15 @@ int maybe_deliver_pending_signal(uint64_t syscall_ret) {
         }
 
         frame[8]  = (uint64_t)sig;
+        cur->saved_user_rdi = frame[8];
         if (sa.flags & SA_SIGINFO) {
             frame[9]  = (uint64_t)(frame_start + RT_SIGFRAME_INFO_OFF); /* rsi = info */
             frame[12] = (uint64_t)(frame_start + RT_SIGFRAME_UC_OFF);   /* rdx = uc */
+            /* The final syscall epilogue reconciles RDX from this snapshot.
+             * Preserve handler arguments there too, after the interrupted
+             * register image has been copied into ucontext. */
+            cur->saved_user_rsi = frame[9];
+            cur->saved_user_rdx = frame[12];
         }
         frame[13] = handler;
         frame[15] = (uint64_t)frame_start;
@@ -11856,6 +11881,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             int res = futex_syscall((uintptr_t)a1, (int)a2, (int)a3, (const void*)(uintptr_t)a4, (uintptr_t)a5, (int)a6);
             if (res < 0) return ret_err(-res);
             return (uint64_t)res;
+        }
+        case 324: { /* membarrier(command, flags, cpu_id) */
+            return (uint64_t)membarrier_private(cur->mm, (unsigned int)a1, (unsigned int)a2);
         }
         case SYS_rseq:
             /* No restartable-sequence implementation: advertising registration
@@ -16127,27 +16155,27 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             int pid = (int)a1;
             size_t len = (size_t)a2;
             void *mask_u = (void*)(uintptr_t)a3;
-            uint64_t self = (uint64_t)(cur->tid ? cur->tid : 1);
+            uint64_t self = linux_task_tid(cur);
             if (pid != 0 && (uint64_t)pid != self) return ret_err(ESRCH);
-            if (!mask_u || len < 8 || (uintptr_t)mask_u + len > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            uint64_t mask = smp_default_affinity_mask();
-            size_t copy = len < 8 ? len : 8;
-            if (copy_to_user_safe(mask_u, &mask, copy) != 0) return ret_err(EFAULT);
-            for (size_t i = 8; i < len; i++) {
-                char zero = 0;
-                if (copy_to_user_safe((char*)mask_u + i, &zero, 1) != 0) return ret_err(EFAULT);
-            }
-            return 0;
+            if (len < sizeof(uint64_t) || len % sizeof(uint64_t)) return ret_err(EINVAL);
+            if (!mask_u || !user_range_ok(mask_u, sizeof(uint64_t))) return ret_err(EFAULT);
+            /* Match the scheduler's real userspace CPU eligibility. Go uses
+             * the raw syscall's returned byte count to determine GOMAXPROCS. */
+            uint64_t mask = 1;
+            if (copy_to_user_safe(mask_u, &mask, sizeof(mask)) != 0) return ret_err(EFAULT);
+            return sizeof(mask);
         }
         case SYS_sched_setaffinity: {
-            /* sched_setaffinity(pid, len, user_mask) — accept and ignore mask. */
+            /* Userspace is restricted to BSP; intersect requested mask with it. */
             int pid = (int)a1;
             size_t len = (size_t)a2;
             const void *mask_u = (const void *)(uintptr_t)a3;
-            uint64_t self = (uint64_t)(cur->tid ? cur->tid : 1);
+            uint64_t self = linux_task_tid(cur);
             if (pid != 0 && (uint64_t)pid != self) return ret_err(ESRCH);
-            if (len == 0 || !mask_u || !user_range_ok(mask_u, len))
-                return ret_err(EFAULT);
+            if (len == 0) return ret_err(EINVAL);
+            uint8_t first;
+            if (!mask_u || copy_from_user_raw(&first, mask_u, 1) != 0) return ret_err(EFAULT);
+            if (!(first & 1)) return ret_err(EINVAL);
             return 0;
         }
         case SYS_sched_setscheduler: {

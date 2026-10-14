@@ -7,6 +7,7 @@ typedef struct thread thread_t;
 void syscall_configure_init_trace(const char *cmdline);
 void syscall_start_init_monitor(void);
 void syscall_kbrequest_event(void);
+void futex_cancel_thread(thread_t *thread);
 
 typedef struct syscall_frame {
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;

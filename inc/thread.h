@@ -231,6 +231,7 @@ typedef struct thread {
         uint64_t sigreturn_rcx, sigreturn_r11;
         uint8_t sigreturn_restore_gprs;
         int fs_open_error;
+        void *active_futex_waiter;
 } thread_t;
 
 extern int init;

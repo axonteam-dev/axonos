@@ -661,12 +661,12 @@ static void init_monitor_entry(void) {
             }
             asm volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
             if (report)
-                klogprintf("init-stall: pid=%llu tid=%llu name=%s state=%d active=%d last-n=%lld a1=0x%llx waitpid=%d rip=0x%llx last-read=%s\n",
+                klogprintf_logonly("init-stall: pid=%llu tid=%llu name=%s state=%d active=%d last-n=%lld a1=0x%llx waitpid=%d rip=0x%llx last-read=%s\n",
                     (unsigned long long)pid, (unsigned long long)tid, name,
                     state, active, (long long)number, (unsigned long long)arg1,
                     waitpid, (unsigned long long)rip, path);
             if (report && (number == SYS_waitid || number == SYS_wait4))
-                klogprintf("init-wait-child: parent=%llu wanted=%d found=%llu tid=%llu name=%s state=%d parent-tid=%d waiter=%d status=0x%x rip=0x%llx bound=%d vfork=%d vruntime=%llu k-rip=0x%llx irq-user=0x%llx irq-kernel=0x%llx\n",
+                klogprintf_logonly("init-wait-child: parent=%llu wanted=%d found=%llu tid=%llu name=%s state=%d parent-tid=%d waiter=%d status=0x%x rip=0x%llx bound=%d vfork=%d vruntime=%llu k-rip=0x%llx irq-user=0x%llx irq-kernel=0x%llx\n",
                     (unsigned long long)pid, waitpid,
                     (unsigned long long)child_pid, (unsigned long long)child_tid,
                     child_name, child_state, child_parent, child_waiter,
@@ -1754,22 +1754,21 @@ void syscall_finalize_user_frame(uint64_t *frame) {
         cur->syscall_frame_kbuf[12] = cur->saved_user_rdx;
 }
 
-void syscall_prepare_iret_frame(uint64_t *frame, uint64_t *out) {
+void syscall_prepare_iret_frame(uint64_t *frame) {
     uint64_t rip = frame[13], flags = frame[4] | 0x200ULL, rsp = frame[15];
     thread_t *cur = thread_current();
-    /* Assembly reserves the destination below the live frame before calling
-     * us. memmove is required: the 15-GPR source and destination overlap. */
-    memmove(out, frame, 15 * sizeof(uint64_t));
     if (cur && cur->sigreturn_restore_gprs) {
-        out[13] = cur->sigreturn_rcx;
-        out[4] = cur->sigreturn_r11;
+        frame[13] = cur->sigreturn_rcx;
+        frame[4] = cur->sigreturn_r11;
         cur->sigreturn_restore_gprs = 0;
     }
-    out[15] = rip;
-    out[16] = 0x1B; /* USER_CS, matching syscall.S and cpu/gdt.c */
-    out[17] = flags;
-    out[18] = rsp;
-    out[19] = 0x23; /* USER_DS */
+    /* frame[0..14] is the complete GPR image. Append IRETQ's five control
+     * words directly after it, avoiding a full register-frame copy per syscall. */
+    frame[15] = rip;
+    frame[16] = 0x1B; /* USER_CS */
+    frame[17] = flags;
+    frame[18] = rsp;
+    frame[19] = 0x23; /* USER_DS */
 }
 
 void syscall_epilogue_probe(uint64_t *frame) {
@@ -3059,6 +3058,7 @@ static inline int fs_open_nonblock(const struct fs_file *f)
 #define IPPROTO_UDP_LOCAL     17
 #define IPPROTO_RAW_LOCAL     255 /* ioctl-only fd (busybox udhcpc) */
 #define NETLINK_ROUTE_LOCAL   0
+#define NETLINK_KOBJECT_UEVENT_LOCAL 15
 
 #define ETH_TYPE_IPV4         0x0800
 #define ETH_TYPE_ARP          0x0806
@@ -8953,6 +8953,8 @@ static ssize_t net_sock_write_userspace(thread_t *cur, int fd, ksock_net_t *s, c
         return unix_stream_write_from_user(s, bufp, cnt);
     }
     if (s->sock_domain == AF_NETLINK_LOCAL) {
+        if (s->protocol != NETLINK_ROUTE_LOCAL)
+            return -EOPNOTSUPP;
         if (!bufp || cnt == 0) return -EINVAL;
         if (cnt < sizeof(nlmsghdr_k) || !user_range_ok(bufp, cnt)) return -EFAULT;
         uint8_t pkt[256];
@@ -9485,6 +9487,9 @@ static ssize_t net_sock_read_userspace(thread_t *cur, ksock_net_t *s, void *bufp
     }
     if (s->sock_domain == AF_NETLINK_LOCAL) {
         if (cnt == 0) return 0;
+        if (s->protocol == NETLINK_KOBJECT_UEVENT_LOCAL &&
+            s->nl_rx_off >= s->nl_rx_len)
+            return -EAGAIN;
         if (!bufp || !user_range_ok(bufp, cnt)) return -EFAULT;
         if (s->nl_rx_off >= s->nl_rx_len)
             return 0; /* EOF after dump — ip(8) treats EAGAIN as OVERRUN */
@@ -9550,30 +9555,16 @@ static ssize_t net_sock_read_userspace(thread_t *cur, ksock_net_t *s, void *bufp
         if (chunk > 65536) chunk = 65536;
         uint8_t *tmp = (uint8_t *)kmalloc(chunk);
         if (!tmp) return -ENOMEM;
-        size_t total = 0;
-        for (;;) {
-            for (int pump = 0; pump < 2; pump++) {
-                (void)net_tcp_service(&s->tcp, &ops, 32);
-                if (s->tcp.rx_len > 0)
-                    break;
-                if (s->tcp.peer_rst)
-                    break;
-            }
-            if (s->tcp.established && net_tcp_rx_room(&s->tcp) > 0)
-                (void)net_tcp_window_update(&s->tcp, &ops);
-            uint32_t tmo = s->nonblock ? 0u : 120000u;
-            int rr = net_tcp_recv(&s->tcp, &ops, tmp + total, chunk - total, tmo);
-            if (rr > 0) {
-                total += (size_t)rr;
-                if (total >= chunk || rr < (int)(chunk - total))
-                    break;
-                for (int pump = 0; pump < 2; pump++) {
-                    (void)net_tcp_service(&s->tcp, &ops, 32);
-                }
-                continue;
-            }
-            if (total > 0)
-                break;
+        /* net_tcp_recv() drains queued frames and updates the window itself.
+         * Pre-pumping 2*32 times here (then pumping again inside recv) spent
+         * most HTTP fetch time in empty per-frame NIC scans. */
+        /* Linux TCP recvmsg returns as soon as any data is available unless
+         * MSG_WAITALL is explicitly requested. The previous loop compared a
+         * positive read to the *remaining* count and could wait 120 seconds
+         * for a full buffer even after receiving half an HTTP response. */
+        uint32_t tmo = s->nonblock ? 0u : 120000u;
+        int rr = net_tcp_recv(&s->tcp, &ops, tmp, chunk, tmo);
+        if (rr <= 0) {
             kfree(tmp);
             if (rr == 0) return 0;
             if (rr == -4) return -ECONNRESET;
@@ -9581,12 +9572,12 @@ static ssize_t net_sock_read_userspace(thread_t *cur, ksock_net_t *s, void *bufp
                 return (ssize_t)(s->nonblock ? -EAGAIN : -ETIMEDOUT);
             return (ssize_t)(s->nonblock ? -EAGAIN : -EIO);
         }
-        if (copy_to_user_safe(bufp, tmp, total) != 0) {
+        if (copy_to_user_safe(bufp, tmp, (size_t)rr) != 0) {
             kfree(tmp);
             return -EFAULT;
         }
         kfree(tmp);
-        return (ssize_t)total;
+        return (ssize_t)rr;
     }
     if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
         if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return -EFAULT;
@@ -10714,6 +10705,8 @@ enum {
     RLIMIT_NOFILE_K = 7,
     RLIMIT_MEMLOCK_K = 8,
     RLIMIT_AS_K = 9,
+    RLIMIT_RTPRIO_K = 14,
+    RLIMIT_RTTIME_K = 15,
 };
 
 static int rlimit_get(thread_t *cur, int resource, uint64_t *soft, uint64_t *hard) {
@@ -10735,6 +10728,14 @@ static int rlimit_get(thread_t *cur, int resource, uint64_t *soft, uint64_t *har
         case RLIMIT_NOFILE_K:
             s = p ? p->rlim_nofile_cur : PROCESS_RLIMIT_NOFILE_SOFT;
             h = p ? p->rlim_nofile_max : PROCESS_RLIMIT_NOFILE_HARD;
+            break;
+        case RLIMIT_RTPRIO_K:
+            s = p ? p->rlim_rtprio_cur : 0;
+            h = p ? p->rlim_rtprio_max : 0;
+            break;
+        case RLIMIT_RTTIME_K:
+            s = p ? p->rlim_rttime_cur : ~0ULL;
+            h = p ? p->rlim_rttime_max : ~0ULL;
             break;
         case RLIMIT_AS_K:
         case RLIMIT_DATA_K:
@@ -10780,6 +10781,16 @@ static int rlimit_set(thread_t *cur, int resource, uint64_t soft, uint64_t hard)
             if (hard > fs_nr_open_get()) return EPERM;
             p->rlim_nofile_cur = soft;
             p->rlim_nofile_max = hard;
+            return 0;
+        case RLIMIT_RTPRIO_K:
+            if (hard > p->rlim_rtprio_max && cur->euid != 0) return EPERM;
+            p->rlim_rtprio_cur = soft;
+            p->rlim_rtprio_max = hard;
+            return 0;
+        case RLIMIT_RTTIME_K:
+            if (hard > p->rlim_rttime_max && cur->euid != 0) return EPERM;
+            p->rlim_rttime_cur = soft;
+            p->rlim_rttime_max = hard;
             return 0;
         case RLIMIT_AS_K:
         case RLIMIT_DATA_K:
@@ -12651,6 +12662,113 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (copy_to_user_safe(tp, &ts, sizeof(ts)) != 0) return ret_err(EFAULT);
             return 0;
         }
+        case 164: { /* settimeofday(struct timeval *, struct timezone *) */
+            struct timeval_k { int64_t tv_sec; int64_t tv_usec; } tv;
+            const void *tv_u = (const void *)(uintptr_t)a1;
+            if (!tv_u || !user_range_ok(tv_u, sizeof(tv)) ||
+                copy_from_user_raw(&tv, tv_u, sizeof(tv)) != 0)
+                return ret_err(EFAULT);
+            if (!cur || cur->euid != 0)
+                return ret_err(EPERM);
+            if (tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1000000 ||
+                tv.tv_sec > (0x7fffffffffffffffLL - tv.tv_usec) / 1000000ll)
+                return ret_err(EINVAL);
+            timekeeping_set_real_us(tv.tv_sec * 1000000ll + tv.tv_usec);
+            return 0;
+        }
+        case 159: { /* adjtimex(struct timex *) — x86_64 Linux ABI */
+            struct timex_linux64 {
+                uint32_t modes;
+                uint32_t pad0;
+                int64_t offset, freq, maxerror, esterror;
+                int32_t status;
+                uint32_t pad1;
+                int64_t constant, precision, tolerance;
+                struct { int64_t tv_sec, tv_usec; } time;
+                int64_t tick, ppsfreq, jitter;
+                int32_t shift;
+                uint32_t pad2;
+                int64_t stabil, jitcnt, calcnt, errcnt, stbcnt;
+                int32_t tai;
+                uint32_t reserved[11];
+            } tx;
+            enum {
+                ADJ_OFFSET_K = 0x0001,
+                ADJ_MAXERROR_K = 0x0004,
+                ADJ_ESTERROR_K = 0x0008,
+                ADJ_STATUS_K = 0x0010,
+                ADJ_TIMECONST_K = 0x0020,
+                ADJ_MICRO_K = 0x1000,
+                ADJ_NANO_K = 0x2000,
+                STA_PLL_K = 0x0001,
+                STA_INS_K = 0x0010,
+                STA_DEL_K = 0x0020,
+                STA_UNSYNC_K = 0x0040,
+                STA_FREQHOLD_K = 0x0080
+            };
+            const uint32_t supported = ADJ_OFFSET_K | ADJ_MAXERROR_K |
+                ADJ_ESTERROR_K | ADJ_STATUS_K | ADJ_TIMECONST_K |
+                ADJ_MICRO_K | ADJ_NANO_K;
+            const int32_t writable_status = STA_PLL_K | STA_INS_K |
+                STA_DEL_K | STA_UNSYNC_K | STA_FREQHOLD_K;
+            const void *tx_u = (const void *)(uintptr_t)a1;
+            static int32_t clock_status = STA_UNSYNC_K;
+            static int64_t clock_maxerror;
+            static int64_t clock_esterror;
+            static int64_t clock_constant;
+            int time_state;
+            int64_t sec, nsec;
+
+            _Static_assert(sizeof(tx) == 208, "x86_64 struct timex ABI size");
+            if (!tx_u || !user_range_ok(tx_u, sizeof(tx)) ||
+                copy_from_user_raw(&tx, tx_u, sizeof(tx)) != 0)
+                return ret_err(EFAULT);
+            if ((tx.modes & ~supported) ||
+                ((tx.modes & ADJ_MICRO_K) && (tx.modes & ADJ_NANO_K)))
+                return ret_err(EINVAL);
+            if (tx.modes && (!cur || cur->euid != 0))
+                return ret_err(EPERM);
+            if ((tx.modes & ADJ_OFFSET_K) &&
+                (tx.offset < -500000 || tx.offset > 500000))
+                return ret_err(EINVAL);
+            if ((tx.modes & ADJ_STATUS_K) &&
+                (tx.status & ~writable_status))
+                return ret_err(EINVAL);
+
+            if (tx.modes & ADJ_OFFSET_K)
+                timekeeping_adjtime_us(tx.offset);
+            if (tx.modes & ADJ_MAXERROR_K)
+                clock_maxerror = tx.maxerror;
+            if (tx.modes & ADJ_ESTERROR_K)
+                clock_esterror = tx.esterror;
+            if (tx.modes & ADJ_STATUS_K)
+                clock_status = tx.status;
+            if (tx.modes & ADJ_TIMECONST_K)
+                clock_constant = tx.constant;
+
+            ktime_get_real_ts64(&sec, &nsec);
+            tx.freq = 0; /* No frequency-trimmed hardware clocksource. */
+            tx.status = clock_status;
+            tx.maxerror = clock_maxerror;
+            tx.esterror = clock_esterror;
+            tx.constant = clock_constant;
+            tx.precision = 1;
+            tx.tolerance = 500000;
+            tx.time.tv_sec = sec;
+            tx.time.tv_usec = nsec / 1000;
+            if (copy_to_user_safe((void *)(uintptr_t)a1, &tx, sizeof(tx)) != 0)
+                return ret_err(EFAULT);
+
+            if (clock_status & STA_UNSYNC_K)
+                time_state = 5; /* TIME_ERROR */
+            else if (clock_status & STA_INS_K)
+                time_state = 1; /* TIME_INS */
+            else if (clock_status & STA_DEL_K)
+                time_state = 2; /* TIME_DEL */
+            else
+                time_state = 0; /* TIME_OK */
+            return (uint64_t)time_state;
+        }
         case SYS_gettimeofday: { /* Linux x86_64 nr 96 */
             /* gettimeofday(struct timeval *tv, struct timezone *tz) */
             void *tv_u = (void*)(uintptr_t)a1;
@@ -14210,8 +14328,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return ret_err(ESOCKTNOSUPPORT);
             } else if (domain == AF_NETLINK_LOCAL) {
                 if (!(type_base == SOCK_RAW_LOCAL || type_base == SOCK_DGRAM_LOCAL)) return ret_err(ESOCKTNOSUPPORT);
-                if (!(protocol == 0 || protocol == NETLINK_ROUTE_LOCAL)) return ret_err(EPROTONOSUPPORT);
-                protocol = NETLINK_ROUTE_LOCAL;
+                if (!(protocol == 0 || protocol == NETLINK_ROUTE_LOCAL ||
+                      protocol == NETLINK_KOBJECT_UEVENT_LOCAL))
+                    return ret_err(EPROTONOSUPPORT);
+                if (protocol == 0)
+                    protocol = NETLINK_ROUTE_LOCAL;
             } else if (domain == AF_INET6) {
                 /* Stub: create IPv4 socket when tools (wget) request IPv6 */
                 domain = AF_INET_LOCAL;
@@ -14251,7 +14372,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             s->unix_domain_stub = unix_stub;
             s->type_base = type_base;
             if (domain == AF_NETLINK_LOCAL) {
-                s->protocol = NETLINK_ROUTE_LOCAL;
+                s->protocol = protocol;
             } else if (domain == AF_PACKET_LOCAL) {
                 /* socket() protocol is htons(ethertype); store host-order ethertype. */
                 s->protocol = protocol;
@@ -14706,7 +14827,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 #endif
                 /* Linux: O_NONBLOCK connect sends SYN and returns EINPROGRESS;
                  * completion is via poll/select + SO_ERROR. curl/musl rely on this. */
-                uint32_t conn_tmo = s->nonblock ? 0u : 6000u;
+                /* CDN SYN/ACK loss is rare but real; 6s was shorter than a
+                 * useful retransmit window on a busy virtualized link. */
+                uint32_t conn_tmo = s->nonblock ? 0u : 15000u;
                 g_net_tcp_connect_active = 1;
                 int rc = net_tcp_connect(&s->tcp, &ops, s->peer_ip_be, s->peer_port, s->local_port, conn_tmo);
                 g_net_tcp_connect_active = 0;
@@ -14982,10 +15105,23 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (copy_from_user_raw(&olen, optlen_u, 4) != 0) return ret_err(EFAULT);
             enum {
                 SOL_SOCKET_LOCAL = 1,
+                SO_TYPE_LOCAL = 3,
                 SO_ERROR_LOCAL = 4,
+                SO_DOMAIN_LOCAL = 39,
                 SOL_IPV6_LOCAL = 41,
                 IPV6_V6ONLY_LOCAL = 26
             };
+            if (level == SOL_SOCKET_LOCAL &&
+                (optname == SO_TYPE_LOCAL || optname == SO_DOMAIN_LOCAL)) {
+                int value = optname == SO_TYPE_LOCAL ? s->type_base : s->sock_domain;
+                if (!optval_u || olen < sizeof(value)) return ret_err(EINVAL);
+                if (copy_to_user_safe(optval_u, &value, sizeof(value)) != 0)
+                    return ret_err(EFAULT);
+                olen = sizeof(value);
+                if (copy_to_user_safe(optlen_u, &olen, sizeof(olen)) != 0)
+                    return ret_err(EFAULT);
+                return 0;
+            }
             if (level == SOL_SOCKET_LOCAL && optname == SO_ERROR_LOCAL &&
                 s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge &&
                 optval_u && olen >= 4) {
@@ -15058,6 +15194,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
             if (s->sock_domain == AF_NETLINK_LOCAL) {
                 if (!buf_u || len == 0) return ret_err(EINVAL);
+                if (s->protocol != NETLINK_ROUTE_LOCAL) return ret_err(EOPNOTSUPP);
                 if (len < sizeof(nlmsghdr_k) || !user_range_ok(buf_u, len)) return ret_err(EFAULT);
                 uint8_t pkt[256];
                 size_t cp = (len > sizeof(pkt)) ? sizeof(pkt) : len;
@@ -15210,6 +15347,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
             if (s->sock_domain == AF_NETLINK_LOCAL) {
                 if (len == 0) return 0;
+                if (s->protocol == NETLINK_KOBJECT_UEVENT_LOCAL &&
+                    s->nl_rx_off >= s->nl_rx_len)
+                    return ret_err(EAGAIN);
                 if (!buf_u || !user_range_ok(buf_u, len)) return ret_err(EFAULT);
                 if (s->nl_rx_off >= s->nl_rx_len) return 0;
                 size_t avail = s->nl_rx_len - s->nl_rx_off;
@@ -15496,6 +15636,15 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return ret_err(EBADF);
             }
             if (s->sock_domain == AF_NETLINK_LOCAL) {
+                if (s->protocol == NETLINK_KOBJECT_UEVENT_LOCAL &&
+                    s->nl_rx_off >= s->nl_rx_len) {
+                    kfree(flat);
+                    return ret_err(EAGAIN);
+                }
+                if (s->protocol != NETLINK_ROUTE_LOCAL) {
+                    kfree(flat);
+                    return ret_err(EOPNOTSUPP);
+                }
                 uint8_t pkt[256];
                 size_t cp = (sum > sizeof(pkt)) ? sizeof(pkt) : sum;
                 memcpy(pkt, flat, cp);
@@ -15693,7 +15842,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             ksock_net_t *s = NULL;
             if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
             if (s->sock_domain == AF_NETLINK_LOCAL) {
-                if (s->nl_rx_off >= s->nl_rx_len) return 0;
+                if (s->nl_rx_off >= s->nl_rx_len)
+                    return s->protocol == NETLINK_KOBJECT_UEVENT_LOCAL
+                        ? ret_err(EAGAIN) : 0;
                 size_t avail = s->nl_rx_len - s->nl_rx_off;
                 if (m.msg_name && m.msg_namelen >= sizeof(sockaddr_nl_k) &&
                     user_range_ok(m.msg_name, sizeof(sockaddr_nl_k))) {
@@ -17307,7 +17458,7 @@ kfree(path);
                 static uint64_t exec_err_left = 12;
                 if (exec_err_left) {
                     exec_err_left--;
-                    kprintf("execve: FAIL tid=%llu path=%s rpath=%s rc=%d argc=%d\n",
+                    klogprintf_logonly("execve: FAIL tid=%llu path=%s rpath=%s rc=%d argc=%d\n",
                         (unsigned long long)(cur && cur->tid ? cur->tid : 1),
                         path ? path : "?", resolved_path[0] ? resolved_path : "?",
                         rc, argc);
@@ -17315,7 +17466,7 @@ kfree(path);
             }
             if (rc != 0 && cur && cur->name[0] &&
                 (strstr(cur->name, "openrc") || strstr(cur->name, "linuxrc")))
-                kprintf("execve-fail: tid=%llu path=%s rc=%d argc=%d envc=%d\n",
+                klogprintf_logonly("execve-fail: tid=%llu path=%s rc=%d argc=%d envc=%d\n",
                     (unsigned long long)(cur->tid ? cur->tid : 1),
                     path ? path : "?", rc, argc, envc);
             kfree(path);
@@ -20937,6 +21088,22 @@ kfree(path);
         case SYS_close: {
             int fd = (int)a1;
             boot_io_log(cur, "close", fd, 0);
+            static unsigned pid1_stdin_close_trace_left = 32;
+            int trace_pid1_stdin = is_init_user(cur) && fd == 0 &&
+                                   pid1_stdin_close_trace_left > 0;
+            uint64_t close_rip = cur && cur->saved_syscall_frame
+                ? cur->saved_syscall_frame[13]
+                : (cur ? cur->saved_user_rip : 0);
+            struct fs_file *fd_before = NULL;
+            if (cur && fd >= 0 && fd < THREAD_MAX_FD)
+                fd_before = cur->process ? cur->process->fds[fd] : cur->fds[fd];
+            if (trace_pid1_stdin) {
+                pid1_stdin_close_trace_left--;
+                klogprintf_logonly("pid1 close0 attempt tid=%llu name=%s file=%p rip=0x%llx\n",
+                    (unsigned long long)(cur->tid ? cur->tid : 1),
+                    cur->name[0] ? cur->name : "?", (void *)fd_before,
+                    (unsigned long long)close_rip);
+            }
             if (fd == g_dl_libeinfo_fd) {
                 devel_printf("dl-watch: close libeinfo fd=%d\n", fd);
                 g_dl_libeinfo_fd = -1;
@@ -20948,8 +21115,13 @@ kfree(path);
             int r = thread_fd_close_for(cur, fd);
             if (r != 0 && is_init_user(cur)) {
                 struct fs_file *proc_fd = cur->process ? cur->process->fds[fd] : NULL;
-                klogprintf("pid1 close EBADF fd=%d process_fd=%p thread_fd=%p\n",
-                           fd, (void *)proc_fd, (void *)cur->fds[fd]);
+                uint64_t rip = cur->saved_syscall_frame
+                    ? cur->saved_syscall_frame[13] : cur->saved_user_rip;
+                klogprintf("pid1 close EBADF fd=%d process_fd=%p thread_fd=%p tid=%llu name=%s rip=0x%llx\n",
+                           fd, (void *)proc_fd, (void *)cur->fds[fd],
+                           (unsigned long long)(cur->tid ? cur->tid : 1),
+                           cur->name[0] ? cur->name : "?",
+                           (unsigned long long)rip);
             }
             return (r == 0) ? 0ULL : ret_err(EBADF);
         }
@@ -23348,6 +23520,70 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             (unsigned long long)trace_t->saved_user_rip);
     }
     uint64_t ret = syscall_do_inner(num, a1, a2, a3, a4, a5, a6);
+    if (trace_t && trace_t->name[0] &&
+        (num == SYS_read || num == 42 /* connect */ || num == 45 /* recvfrom */ ||
+         num == 47 /* recvmsg */ || num == 51 /* getsockname */ || num == 52 /* getpeername */ ||
+         num == 55 /* getsockopt */ || num == SYS_write || num == 20 /* writev */ ||
+         num == 44 /* sendto */ || num == 46 /* sendmsg */ || num == SYS_poll ||
+         num == 271 /* ppoll */ || num == SYS_readv)) {
+        int apk = strstr(trace_t->name, "apk") != NULL;
+        int docker = strstr(trace_t->name, "dockerd") != NULL;
+        if (apk || docker) {
+            static unsigned apk_left = 24, docker_left = 12;
+            unsigned *left = apk ? &apk_left : &docker_left;
+            int64_t result = (int64_t)ret;
+            /* Keep a small allowance for success, and reserve the end for
+             * the first error/timeout instead of flooding one HTTP transfer. */
+            if (*left && (result < 0 || num == 42 || num == 51 || num == 52 ||
+                          num == 55 || num == SYS_poll || num == 271 || *left > 16)) {
+                ksock_net_t *sock = NULL;
+                (void)socket_file_get(trace_t, (int)a1, &sock);
+                if (sock) {
+                    (*left)--;
+                    klogprintf("%s-net: pid=%llu sc=%llu fd=%d ret=%lld opt=%llu/%llu domain=%d type=%d v6=%d unix=%d local=%u.%u.%u.%u:%u peer=%u.%u.%u.%u:%u conn=%d pending=%d rx=%zu fin=%d rst=%d\n",
+                        apk ? "apk" : "docker", (unsigned long long)process_pid(trace_t),
+                        (unsigned long long)num, (int)a1, (long long)result,
+                        (unsigned long long)a2, (unsigned long long)a3,
+                        sock->sock_domain, sock->type_base, sock->ipv6_stub,
+                        sock->unix_domain_stub,
+                        (unsigned)(g_net.ip_be >> 24), (unsigned)((g_net.ip_be >> 16) & 255),
+                        (unsigned)((g_net.ip_be >> 8) & 255), (unsigned)(g_net.ip_be & 255),
+                        (unsigned)sock->local_port,
+                        (unsigned)(sock->peer_ip_be >> 24), (unsigned)((sock->peer_ip_be >> 16) & 255),
+                        (unsigned)((sock->peer_ip_be >> 8) & 255), (unsigned)(sock->peer_ip_be & 255),
+                        (unsigned)sock->peer_port, sock->connected, sock->tcp.connect_pending,
+                        sock->tcp.rx_len, sock->tcp.peer_fin, sock->tcp.peer_rst);
+                }
+            }
+        }
+    }
+    if (trace_t && trace_t->name[0] && strstr(trace_t->name, "apk") &&
+        (num == SYS_write || num == 20 || num == 44 || num == 46 ||
+         num == SYS_poll || num == 271 || num == SYS_readv || num == 45 || num == 47)) {
+        static unsigned apk_io_budget = 32;
+        if (apk_io_budget--) {
+            if (num == SYS_poll || num == 271) {
+                uint64_t nfds = a2;
+                int fd0 = -1; short ev0 = 0;
+                if (nfds && a1 && user_range_ok((const void *)(uintptr_t)a1, 8)) {
+                    (void)copy_from_user_raw(&fd0, (const void *)(uintptr_t)a1, 4);
+                    (void)copy_from_user_raw(&ev0, (const void *)(uintptr_t)(a1 + 4), 2);
+                }
+                klogprintf_logonly("apk-io: sc=%llu nfds=%llu fd0=%d events=0x%x timeout=0x%llx ret=%lld\n",
+                    (unsigned long long)num, (unsigned long long)nfds, fd0,
+                    (unsigned)(uint16_t)ev0, (unsigned long long)a3, (long long)(int64_t)ret);
+            } else {
+                int fd = (int)a1;
+                size_t count = (num == 44 || num == 46) ? (size_t)a3 : (size_t)a3;
+                ksock_net_t *sock = NULL;
+                (void)socket_file_get(trace_t, fd, &sock);
+                klogprintf_logonly("apk-io: sc=%llu fd=%d count=%zu ret=%lld socket=%d rx=%zu port=%u\n",
+                    (unsigned long long)num, fd, count, (long long)(int64_t)ret,
+                    sock != NULL, sock ? sock->tcp.rx_len : 0,
+                    sock ? (unsigned)sock->peer_port : 0);
+            }
+        }
+    }
     if (init_runtime_thread(trace_t)) {
         unsigned slot = (unsigned)(trace_t->tid % 64);
         if (init_progress[slot].pid == process_pid(trace_t)) {

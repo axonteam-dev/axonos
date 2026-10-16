@@ -39,7 +39,7 @@ static void deliver_args(thread_t *cur,uint64_t *frame,int sig,uint64_t frame_st
 '''+arguments+r'''
 }
 int main(void) {
-    uint64_t area[25]={0}, saved[16]={0}; uint64_t *frame=area+5;
+    uint64_t frame[20]={0}, saved[16]={0};
     thread_t t={.ring=3,.saved_user_rdx=2,.saved_syscall_frame=frame,.syscall_frame_kbuf=saved};
     current=&t; frame[12]=2; /* Go's interrupted FUTEX_WAIT val */
     uint64_t interrupted_rdx=t.saved_user_rdx;
@@ -49,9 +49,9 @@ int main(void) {
     syscall_finalize_user_frame(frame);
     assert(frame[8]==2&&frame[9]==0x5fffe140&&frame[12]==0x5fffe008);
     assert(saved[12]==0x5fffe008);
-    syscall_prepare_iret_frame(frame,area);
-    assert(area[12]==0x5fffe008); /* real third handler argument, not the old futex value */
-    assert(area[15]==0xe43000&&area[18]==0x5fffe000);
+    syscall_prepare_iret_frame(frame);
+    assert(frame[12]==0x5fffe008); /* real third handler argument, not the old futex value */
+    assert(frame[15]==0xe43000&&frame[18]==0x5fffe000);
     uint64_t ordinary[16]={0};t.saved_syscall_frame=ordinary;t.saved_user_rdx=17;t.saved_user_rsi=18;
     deliver_args(&t,ordinary,10,0x5fff0000,0);
     syscall_finalize_user_frame(ordinary);

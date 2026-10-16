@@ -76,8 +76,14 @@ typedef struct process {
     uint64_t rlim_stack_max;
     uint64_t rlim_nproc_cur;
     uint64_t rlim_nproc_max;
+    uint64_t rlim_rtprio_cur;
+    uint64_t rlim_rtprio_max;
+    uint64_t rlim_rttime_cur;
+    uint64_t rlim_rttime_max;
     uint64_t rlim_as_cur;
     uint64_t rlim_as_max;
+    /* Linux /proc/<pid>/oom_score_adj (-1000..1000). */
+    int oom_score_adj;
     /* cgroup v2 membership (fs/cgroup); NULL means the root cgroup. */
     struct cgroup *cgroup;
     /* Linux nsproxy + pid_namespace local pid (core/ns.c). */

@@ -284,34 +284,48 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg archive
 	}
 
 QEMU_MEMORY ?= 3072M
+QEMU_SMP ?= 4
+# Override with `make run-uefi QEMU_ACCEL=` to use QEMU's TCG fallback.
+QEMU_ACCEL ?= -enable-kvm -cpu host
 
 run: archive iso
-	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m $(QEMU_MEMORY) -serial stdio -boot d -hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0,hostfwd=tcp::2222-:22 -vga vmware
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m $(QEMU_MEMORY) -smp $(QEMU_SMP) $(QEMU_ACCEL) -serial stdio -boot d -drive file=../disk.img,format=raw -device e1000,netdev=net0 -netdev user,id=net0,hostfwd=tcp::2222-:22 -vga vmware
 
-# UEFI (OVMF). Same machine as `run`. Needs ovmf; hybrid ISO needs grub-efi-amd64-bin.
-OVMF_CODE ?= $(firstword $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd))
-OVMF_VARS_SRC ?= $(firstword $(wildcard /usr/share/OVMF/OVMF_VARS_4M.fd))
+# UEFI (OVMF). Support Debian's ovmf and Gentoo's edk2-bin layouts.
+OVMF_CODE ?= $(firstword $(wildcard \
+	/usr/share/OVMF/OVMF_CODE_4M.fd \
+	/usr/share/edk2/OvmfX64/OVMF_CODE_4M.fd \
+	/usr/share/edk2/ovmf/OVMF_CODE_4M.fd \
+	/usr/share/edk2/OvmfX64/OVMF_CODE.fd \
+	/usr/share/ovmf/OVMF.fd \
+	/usr/share/qemu/OVMF.fd))
+OVMF_VARS_SRC ?= $(firstword $(wildcard \
+	/usr/share/OVMF/OVMF_VARS_4M.fd \
+	/usr/share/edk2/OvmfX64/OVMF_VARS_4M.fd \
+	/usr/share/edk2/ovmf/OVMF_VARS_4M.fd \
+	/usr/share/edk2/OvmfX64/OVMF_VARS.fd))
 OVMF_VARS := $(BUILD_DIR)/OVMF_VARS.fd
 
 run-uefi: archive iso
-	@test -n "$(OVMF_CODE)" || { echo "run-uefi: OVMF not found (apt install ovmf)" >&2; exit 1; }
-	@if [ ! -d /usr/lib/grub/x86_64-efi ]; then \
-		echo "run-uefi: apt install grub-efi-amd64-bin && make iso" >&2; \
-	fi
+	@test -n "$(OVMF_CODE)" || { echo "run-uefi: OVMF firmware not found (Debian: ovmf; Gentoo: sys-firmware/edk2-bin)" >&2; exit 1; }
+	@test -d /usr/lib/grub/x86_64-efi || { \
+		echo "run-uefi: GRUB EFI modules missing; on Gentoo set GRUB_PLATFORMS=\"pc efi-64\" in /etc/portage/make.conf, then emerge --ask --changed-use sys-boot/grub sys-fs/mtools and rerun make run-uefi" >&2; \
+		exit 1; \
+	}
 	@mkdir -p $(BUILD_DIR)
 	@if [ -n "$(OVMF_VARS_SRC)" ]; then \
 		cp -f "$(OVMF_VARS_SRC)" "$(OVMF_VARS)"; \
 		qemu-system-x86_64 \
 			-drive if=pflash,format=raw,readonly=on,file="$(OVMF_CODE)" \
 			-drive if=pflash,format=raw,file="$(OVMF_VARS)" \
-			-cdrom $(ISO_IMAGE) -m $(QEMU_MEMORY) -smp 4 -serial stdio -boot d \
-			-hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0 \
-			-enable-kvm -cpu host -vga vmware; \
+			-cdrom $(ISO_IMAGE) -m $(QEMU_MEMORY) -smp $(QEMU_SMP) $(QEMU_ACCEL) -serial stdio -boot d \
+			-drive file=../disk.img,format=raw -device e1000,netdev=net0 -netdev user,id=net0 \
+			-vga vmware; \
 	else \
 		qemu-system-x86_64 -bios "$(OVMF_CODE)" \
-			-cdrom $(ISO_IMAGE) -m $(QEMU_MEMORY) -smp 4 -serial stdio -boot d \
-			-hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0 \
-			-enable-kvm -cpu host -vga vmware; \
+			-cdrom $(ISO_IMAGE) -m $(QEMU_MEMORY) -smp $(QEMU_SMP) $(QEMU_ACCEL) -serial stdio -boot d \
+			-drive file=../disk.img,format=raw -device e1000,netdev=net0 -netdev user,id=net0 \
+			-vga vmware; \
 	fi
 
 test-boot:

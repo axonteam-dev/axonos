@@ -1491,7 +1491,8 @@ int mm_cow_mark_user_readonly_l4(mm_t *mm, uint64_t *share_l4, uint64_t va_begin
     return 0;
 }
 
-static int mm_mark_share_user_readonly_page(mm_t *owner, uint64_t *share_l4, uint64_t va) {
+static int mm_mark_share_user_readonly_page(mm_t *owner, uint64_t *share_l4,
+                                            uint64_t va, int allow_identity_cow) {
     if (!owner || !owner->pml4 || !share_l4 || va >= (uint64_t)MMIO_IDENTITY_LIMIT)
         return -1;
 
@@ -1524,6 +1525,19 @@ static int mm_mark_share_user_readonly_page(mm_t *owner, uint64_t *share_l4, uin
 
     uint64_t *share_l1 = (uint64_t *)(uintptr_t)(se2 & ~0xFFFULL);
     uint64_t se1 = share_l1[l1i];
+    if (allow_identity_cow &&
+        (se1 & (PG_PRESENT | PG_US | PG_RW | PG_SOFT_OWNED)) ==
+            (PG_PRESENT | PG_US | PG_RW) &&
+        (se1 & PG_ADDR_MASK) == (va & ~0xFFFULL)) {
+        /* VMA-backed identity pages are process memory, not arbitrary kernel
+         * identity leaves. Protect them lazily without claiming a frame ref. */
+        share_l4[l4i] |= PG_US;
+        share_l3[l3i] |= PG_US;
+        share_l2[l2i] |= PG_US;
+        share_l1[l1i] = (se1 & ~PG_RW) | PG_US | PG_SOFT_COW;
+        invlpg((void *)(uintptr_t)va);
+        return 0;
+    }
     if ((se1 & (PG_PRESENT | PG_US | PG_SOFT_OWNED)) ==
         (PG_PRESENT | PG_US | PG_SOFT_OWNED)) {
         /*
@@ -1573,7 +1587,7 @@ int mm_cow_mark_user_readonly_pair_l4(mm_t *child, mm_t *parent, uint64_t *paren
             frame_release(pa);
             return -1;
         }
-        if (mm_mark_share_user_readonly_page(parent, parent_l4, va) != 0)
+        if (mm_mark_share_user_readonly_page(parent, parent_l4, va, 0) != 0)
             return -1;
     }
     return 0;
@@ -1710,7 +1724,7 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
                                   uint64_t *parent_l4, uint64_t owner_tid,
                                   uint64_t va, uint64_t parent_pa,
                                   uint64_t parent_pte, int protect_parent,
-                                  int shared_hint) {
+                                  int shared_hint, int private_vma_hint) {
     /*
      * shared_hint comes from the fork snapshot probe (MV_SNAP_SHARED) computed
      * once per page BESIDE the walk, not from a fresh O(USER_VMA_MAX=4096) scan
@@ -1771,7 +1785,12 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
          * private heap/mmap (apt's 128MiB cache used to be memcpy'd and the
          * child's xz then died with LZMA_MEM_ERROR).
          */
-        eager = parent_wr && (!owned || mm_fork_va_is_primary_stack(va));
+        int identity_private = src_pa == (va & ~0xFFFULL) && private_vma_hint;
+        /* Eager-copy only unmapped/legacy identity leftovers. Actual VMA-backed
+         * identity pages (notably the initially populated stack window) can
+         * share as unowned Soft_COW pages and allocate only on first write. */
+        eager = parent_wr && ((!owned && !identity_private) ||
+                              (owned && mm_fork_va_is_primary_stack(va)));
         if (eager) {
             private_copy = mm_user_frame_alloc_avoid_va(va, 0);
             if (!private_copy) {
@@ -1836,7 +1855,8 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
         return -1;
     }
     if (!shared && parent_wr && !private_copy && protect_parent && parent &&
-        parent_l4 && mm_mark_share_user_readonly_page(parent, parent_l4, va) != 0)
+        parent_l4 && mm_mark_share_user_readonly_page(parent, parent_l4, va,
+            ((parent_pa & PG_ADDR_MASK) == (va & ~0xFFFULL)) && private_vma_hint) != 0)
         return -1;
     return 0;
 }
@@ -1849,15 +1869,22 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
 #define MV_SNAP_LAZY_FILE 0x04u
 #define MV_SNAP_LAZY_ANON 0x08u
 
-/* Compact probe over the fork snapshot.  g_user_vmas entries (i<g_cnt) carry
- * the full flag set; mm-only entries (i>=g_cnt) contribute SHARED (mm-scoped
- * SHM is authoritative) and otherwise only set *any_mm_only so the caller does
- * not fast-skip a chunk on g/mm divergence. */
+/* Fork snapshots are sorted by address before the page-table walk. VMA ranges
+ * are non-overlapping, so binary-search the first interval whose end exceeds
+ * lo, then visit only overlapping intervals. The former full snapshot scan ran
+ * once per 2MiB chunk and again for every 4KiB leaf. */
 static unsigned mm_mv_probe(const user_vma_t *v, int total, int g_cnt,
                             uintptr_t lo, uintptr_t hi, int *any_mm_only) {
     unsigned f = 0;
     int guard = 0;
-    for (int i = 0; i < total; ++i) {
+    int left = 0, right = total;
+    while (left < right) {
+        int mid = left + (right - left) / 2;
+        uintptr_t end = v[mid].addr + v[mid].len;
+        if (end <= lo) left = mid + 1;
+        else right = mid;
+    }
+    for (int i = left; i < total && v[i].addr < hi; ++i) {
         const user_vma_t *ve = &v[i];
         if (!ve->used)
             continue;
@@ -1885,6 +1912,22 @@ static unsigned mm_mv_probe(const user_vma_t *v, int total, int g_cnt,
     if (any_mm_only)
         *any_mm_only = guard;
     return f;
+}
+
+static void mm_mv_snapshot_sort(user_vma_t *v, int count)
+{
+    /* Bounded to MV_SNAP_CAP=256; insertion sort is cheaper than pulling in
+     * libc qsort in this freestanding fork path. */
+    for (int i = 1; i < count; ++i) {
+        user_vma_t item = v[i];
+        int j = i;
+        while (j > 0 && (v[j - 1].addr > item.addr ||
+               (v[j - 1].addr == item.addr && v[j - 1].len > item.len))) {
+            v[j] = v[j - 1];
+            --j;
+        }
+        v[j] = item;
+    }
 }
 
 static unsigned mm_mv_page_exact(uint64_t owner_tid, mm_t *parent_for_vma,
@@ -1933,6 +1976,8 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
         snap_g = snap_cnt - mm_only;
         if (snap_cnt >= MV_SNAP_CAP || snap_g < 0 || snap_g > snap_cnt)
             snap_full = 1;
+        if (!snap_full)
+            mm_mv_snapshot_sort(snap, snap_cnt);
     }
 
 
@@ -2030,7 +2075,8 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                         if (mm_fork_copy_user_leaf(child, parent_for_vma,
                                 parent_l4, owner_tid, va, pa, e2,
                                 protect_parent,
-                                (parent_for_vma ? shared_pg : 0)) != 0)
+                                (parent_for_vma ? shared_pg : 0),
+                                page_vma || in_brk) != 0)
                             goto out;
                     }
                     continue;
@@ -2091,7 +2137,8 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                     if (mm_fork_copy_user_leaf(child, parent_for_vma,
                             parent_l4, owner_tid, va, pa, e1,
                             protect_parent,
-                            (parent_for_vma ? shared_4k : 0)) != 0)
+                            (parent_for_vma ? shared_4k : 0),
+                            page_vma || in_brk) != 0)
                         goto out;
                 }
             }
@@ -2165,7 +2212,8 @@ static int mm_dup_ensure_brk_copied(mm_t *child, mm_t *parent, uint64_t owner_ti
 		if (mm_fork_copy_user_leaf(child, parent, parent->pml4, owner_tid,
 					   (uint64_t)va, pa, parent_pte, 0,
 					   user_vma_is_shared_page_mm(parent, (uintptr_t)va) ||
-					   user_vma_is_shared_page(owner_tid, (uintptr_t)va)) != 0) {
+					   user_vma_is_shared_page(owner_tid, (uintptr_t)va),
+					   1) != 0) {
 			mm_leave_direct_map(dm);
 			return -1;
 		}
@@ -3955,7 +4003,7 @@ void exec_img_demote_owner(mm_t *mm, uint64_t va_lo, uint64_t va_hi) {
     for (uint64_t va = lo; va < hi; va += 0x1000ULL) {
         /* mm_mark_share_user_readonly_page() no-ops non-owned leaves and only
          * -1 on a huge-leaf split (never present for image windows). */
-        (void)mm_mark_share_user_readonly_page(mm, mm->pml4, va);
+        (void)mm_mark_share_user_readonly_page(mm, mm->pml4, va, 0);
     }
     mm_leave_direct_map(dm);
 }

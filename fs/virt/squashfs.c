@@ -272,14 +272,16 @@ static int sq_read_metadata_block_direct(struct squashfs_sb *s, uint64_t abs_pos
     int compressed;
     const uint8_t *src;
     size_t got = 0;
-    int i;
 
     if (!s || !out || !out_len)
         return -1;
     if (!sq_in_range(s, abs_pos, 2))
         return -1;
 
-    for (i = 0; i < META_CACHE_SLOTS; i++) {
+    {
+        /* Metadata positions are 16-bit aligned; mixing upper block bits gives
+         * a direct-mapped cache slot and avoids a scan on every small field. */
+        unsigned i = (unsigned)(((abs_pos >> 1) ^ (abs_pos >> 17)) % META_CACHE_SLOTS);
         if (s->meta_cache[i].valid && s->meta_cache[i].abs_pos == abs_pos) {
             memcpy(out, s->meta_cache[i].data, s->meta_cache[i].len);
             *out_len = s->meta_cache[i].len;
@@ -314,8 +316,8 @@ static int sq_read_metadata_block_direct(struct squashfs_sb *s, uint64_t abs_pos
         *next_pos = abs_pos + 2 + csize;
 
     {
-        struct meta_cache_ent *e = &s->meta_cache[s->meta_cache_next];
-        s->meta_cache_next = (s->meta_cache_next + 1) % META_CACHE_SLOTS;
+        struct meta_cache_ent *e = &s->meta_cache[
+            ((abs_pos >> 1) ^ (abs_pos >> 17)) % META_CACHE_SLOTS];
         e->abs_pos = abs_pos;
         e->len = got;
         memcpy(e->data, out, got);
@@ -346,8 +348,9 @@ static int sq_meta_read_direct(struct squashfs_sb *s, uint64_t *block_abs, uint1
         /* Directory/inode parsers request tiny slices. Copying an entire 8K
          * cached metadata block for every 8-byte dirent made repeated startup
          * pathname lookups unnecessarily expensive. Copy only the slice. */
-        for (int i = 0; i < META_CACHE_SLOTS; i++) {
-            struct meta_cache_ent *e = &s->meta_cache[i];
+        {
+            struct meta_cache_ent *e = &s->meta_cache[
+                ((*block_abs >> 1) ^ (*block_abs >> 17)) % META_CACHE_SLOTS];
             if (e->valid && e->abs_pos == *block_abs) {
                 if (!sq_in_range(s, *block_abs, 2)) return -1;
                 data = e->data;
@@ -355,7 +358,6 @@ static int sq_meta_read_direct(struct squashfs_sb *s, uint64_t *block_abs, uint1
                 next = *block_abs + 2 + (rd16(s->image + *block_abs) &
                     (uint16_t)~SQUASHFS_COMPRESSED_BIT);
                 cached = 1;
-                break;
             }
         }
         if (!cached && sq_read_metadata_block_direct(s, *block_abs, blk, &blk_len, &next) != 0)
@@ -1248,6 +1250,11 @@ static int squashfs_open_internal(const char *path, struct fs_file **out_file)
         f->type = FS_TYPE_DIR;
     else
         f->type = FS_TYPE_REG;
+    /* The parsed SquashFS inode already identifies symlinks. Let VFS avoid a
+     * second pathname/inode walk for every ordinary open during init/service
+     * startup, while keeping unresolved-link resolution explicit. */
+    f->inode_kind_known = 1;
+    f->is_symlink = sq_is_symlink_type(ino.type);
     if (f->type == FS_TYPE_REG)
         f->backing_id = PAGECACHE_ID_SQUASHFS(ino.inode_number);
     f->backing_gen = 0;

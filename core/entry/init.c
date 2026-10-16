@@ -1413,7 +1413,13 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 klogprintf("boot: warning: failed to mount tmpfs on /run (will retry)\n");
         else
                 klogprintf("boot: tmpfs mounted on /run\n");
+        /* systemd-journald.socket binds AF_UNIX paths under here before
+         * systemd-tmpfiles runs. Provide the parent eagerly so early sysinit
+         * services can connect their stdout/stderr to the journal socket. */
+        (void)ramfs_mkdir("/run/systemd");
+        (void)ramfs_mkdir("/run/systemd/journal");
         (void)ramfs_mkdir("/run/lock");
+        (void)ramfs_chmod("/run/lock", 01777);
         (void)ramfs_mkdir("/run/openrc");
         /* opkg state must live on a writable upper/tmpfs. Keeping it below
          * squashfs /var made libarchive fail creating control/list files. */

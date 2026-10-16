@@ -673,11 +673,16 @@ static int elf_probe_exec_open_depth(const char *path, unsigned depth) {
     int i;
     char interp[192];
 
-    if (!path || depth >= 8)
+    int apk_trigger = path && strncmp(path, "/lib/apk/exec/", 14) == 0;
+    if (!path || depth >= 8) {
+        if (apk_trigger) kprintf("apk-trigger-exec: probe recursion/path invalid depth=%u path=%s\n", depth, path);
         return -1;
+    }
     f = fs_open(path);
-    if (!f)
+    if (!f) {
+        if (apk_trigger) kprintf("apk-trigger-exec: cannot open path=%s fs-error=%d\n", path, fs_file_open_error_get());
         return -1;
+    }
     if (fs_read(f, &eh, sizeof(eh), 0) != (ssize_t)sizeof(eh) ||
         !elf_validate_header(&eh, sizeof(eh))) {
         uint8_t hdr[256];
@@ -685,14 +690,24 @@ static int elf_probe_exec_open_depth(const char *path, unsigned depth) {
         ssize_t nr = fs_read(f, hdr, sizeof(hdr) - 1, 0);
         fs_file_free(f);
         if (nr <= 0 || !parse_shebang(hdr, (size_t)nr, interp,
-                                      sizeof(interp), arg, sizeof(arg)))
+                                      sizeof(interp), arg, sizeof(arg))) {
+            if (apk_trigger) kprintf("apk-trigger-exec: bad/non-shebang path=%s read=%lld head=%02x%02x\n",
+                path, (long long)nr, hdr[0], hdr[1]);
             return -1;
+        }
+        if (apk_trigger)
+            kprintf("apk-trigger-exec: script path=%s bytes=%lld interp=%s arg=%s\n",
+                    path, (long long)nr, interp, arg);
         /* A script is executable only if its interpreter is executable too.
          * Check the whole bounded chain before discarding the caller's mm. */
-        return elf_probe_exec_open_depth(interp, depth + 1);
+        int rc = elf_probe_exec_open_depth(interp, depth + 1);
+        if (apk_trigger && rc != 0)
+            kprintf("apk-trigger-exec: missing/bad interpreter=%s for %s\n", interp, path);
+        return rc;
     }
     if (eh.e_phoff == 0 || eh.e_phnum == 0 ||
         eh.e_phentsize != sizeof(Elf64_Phdr)) {
+        if (apk_trigger) kprintf("apk-trigger-exec: invalid ELF program headers path=%s\n", path);
         fs_file_free(f);
         return -1;
     }
@@ -2140,7 +2155,12 @@ static int try_exec_shebang(const char *resolved_path,
 
     char interp[192];
     char arg[64];
-    if (!parse_shebang(hdr, (size_t)rr, interp, sizeof(interp), arg, sizeof(arg))) return -1;
+    if (!parse_shebang(hdr, (size_t)rr, interp, sizeof(interp), arg, sizeof(arg))) {
+        if (strncmp(resolved_path, "/lib/apk/exec/", 14) == 0)
+            kprintf("apk-trigger-exec: load shebang parse failed path=%s bytes=%lld head=%02x%02x\n",
+                    resolved_path, (long long)rr, hdr[0], hdr[1]);
+        return -1;
+    }
 
     /* Build new argv: [interp, (arg?), orig_path, argv[1..]] */
     int argc = 0;
@@ -2174,6 +2194,9 @@ static int try_exec_shebang(const char *resolved_path,
     /* shebang: run interpreter with script path as argv0 */
 
     int rc = kernel_execve_into_mm(k_interp, nargv, envp, resume_mm);
+    if (strncmp(resolved_path, "/lib/apk/exec/", 14) == 0 && rc != 0)
+        kprintf("apk-trigger-exec: interpreter failed script=%s interp=%s rc=%d\n",
+                resolved_path, interp, rc);
     kfree((void*)nargv);
     kfree(k_interp);
     if (k_arg) kfree(k_arg);
@@ -2335,8 +2358,13 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
                 curpath ? curpath : "?");
     }
 
-    if (!exec_img_path_cached(curpath) && elf_probe_exec_open(curpath) != 0)
+    if (!exec_img_path_cached(curpath) && elf_probe_exec_open(curpath) != 0) {
+        if (strncmp(curpath, "/lib/apk/exec/", 14) == 0)
+            kprintf("apk-trigger-exec: preflight rejected %s\n", curpath);
         return -1;
+    }
+    if (strncmp(curpath, "/lib/apk/exec/", 14) == 0)
+        kprintf("apk-trigger-exec: preflight ok %s\n", curpath);
     {
         thread_t *tc = elf_bprm_thread();
         if (tc) {
@@ -2358,7 +2386,10 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
     }
     if (r != 0) {
         /* Not an ELF. Try shebang scripts (e.g. /linuxrc). */
-        return try_exec_shebang(curpath, path, argv, envp, resume_mm);
+        int rc = try_exec_shebang(curpath, path, argv, envp, resume_mm);
+        if (strncmp(curpath, "/lib/apk/exec/", 14) == 0 && rc != 0)
+            kprintf("apk-trigger-exec: shebang load failed path=%s elf_rc=%d rc=%d\n", curpath, r, rc);
+        return rc;
     }
     {
         thread_t *tr = thread_get_current_user();
@@ -2764,7 +2795,11 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
             user_as_set_brk_after_load(ut, loaded_brk_end,
                 loaded_image_hi > 0 ? (uintptr_t)loaded_image_hi : 0);
         }
-        /* Mark PID 1 only for kernel-launched init candidates */
+        /* Mark PID 1 only for kernel-launched init candidates. Do this after
+         * inheriting stdio below: process_attach_thread() copies the initial
+         * thread's fd table on first attach, and must see the console at
+         * descriptors 0..2 (otherwise syscalls allocate over fd 0 while the
+         * thread mirror still claims it is open). */
         int is_pid1_path = (strcmp(path, "/linuxrc") == 0 ||
             strcmp(path, "/init") == 0 ||
             strcmp(path, "/sbin/init") == 0 ||
@@ -2772,8 +2807,6 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
             strcmp(path, "/lib/systemd/systemd") == 0 ||
             strcmp(path, "/sbin/openrc-init") == 0 ||
             strcmp(path, "/usr/sbin/openrc-init") == 0);
-        if (is_pid1_path)
-            thread_mark_init_user(ut);
         /* inherit basic POSIX-ish attributes and stdio from caller (usually tid0 osh) */
         if (caller) {
             ut->uid = caller->uid;
@@ -2800,6 +2833,8 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
             ut->waiter_tid = (int)caller->tid;
             caller->state = THREAD_BLOCKED;
         }
+        if (is_pid1_path)
+            thread_mark_init_user(ut);
         thread_proc_env_set(ut, envp);
         thread_proc_exe_set(ut, path);
         /* A kernel-launched program is a session and process-group leader.

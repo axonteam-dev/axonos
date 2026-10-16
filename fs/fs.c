@@ -766,14 +766,21 @@ struct fs_file *fs_open(const char *path) {
         /* Fast path: most paths have no symlinks. Try direct open first. */
         struct fs_file *f = fs_open_nofollow(path);
         if (f) {
-                struct stat st;
-                int sr = vfs_fstat(f, &st);
-                if (sr == 0 && (st.st_mode & S_IFLNK) != S_IFLNK) {
-                        return f;  /* regular file or dir, no resolution needed */
+                if (f->inode_kind_known && !f->is_symlink)
+                        return f;  /* driver supplied the authoritative no-follow inode kind */
+                if (f->inode_kind_known && f->is_symlink) {
+                        fs_file_free(f);
+                } else {
+                        struct stat st;
+                        int sr = vfs_fstat(f, &st);
+                        if (sr == 0 && (st.st_mode & S_IFLNK) != S_IFLNK) {
+                                f->inode_kind_known = 1;
+                                return f;  /* regular file or dir, no resolution needed */
+                        }
+                        /* Symlink, or stat failed (driver didn't fill st_mode): resolve before returning.
+                           ld.so open()+read() on an unresolved symlink reads the link text, not the ELF. */
+                        fs_file_free(f);
                 }
-                /* Symlink, or stat failed (driver didn't fill st_mode): resolve before returning.
-                   ld.so open()+read() on an unresolved symlink reads the link text, not the ELF. */
-                fs_file_free(f);
         } else {
                 direct_miss = 1;
         }

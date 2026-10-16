@@ -30,11 +30,13 @@ typedef long ssize_t;
 #define PROCESS_MAX_FD 2048
 #define THREAD_MAX_FD 2048
 struct fs_file { int limit_accounted, refcount; void *driver_private; };
-typedef struct { struct fs_file *fds[2048]; uint64_t rlim_nofile_cur; } process_t;
+typedef struct { struct fs_file *fds[2048]; uint64_t rlim_nofile_cur; int state, oom_score_adj; } process_t;
+#define PROCESS_ALIVE 0
 typedef struct { int ring, euid; process_t *process; struct fs_file *fds[2048]; } thread_t;
 static thread_t caller = {.ring = 3, .euid = 1000};
 static thread_t *thread_current(void) { return &caller; }
 static thread_t *thread_get_current_user(void) { return &caller; }
+static process_t *process_find(uint64_t pid) { (void)pid; return NULL; }
 typedef struct { int held; } spinlock_t;
 static spinlock_t file_limit_lock;
 static uint64_t file_limit_max = 65536, file_limit_count;
@@ -47,7 +49,7 @@ static void release_irqrestore(spinlock_t *l, unsigned long f) { (void)f; assert
     "int fs_file_account(", "static void fs_file_unaccount(",
 )) + "\n" + function(threads, "int thread_fd_alloc(") + r'''
 enum { SYSCTL_HOSTNAME=20, SYSCTL_DOMAINNAME=21, SYSCTL_FILE_MAX=30, SYSCTL_NR_OPEN=31 };
-struct procfs_handle { int kind, file_id; };
+struct procfs_handle { int kind, file_id, pid; };
 static int uts_hostname_set(const char *s, size_t n) { (void)s; (void)n; return 0; }
 static int uts_domainname_set(const char *s, size_t n) { (void)s; (void)n; return 0; }
 static ssize_t procfs_net_store_dhcp(const char *s, size_t n) { (void)s; (void)n; return -1; }

@@ -1,6 +1,7 @@
 [Unit]
 Description=AxonOS console login
 DefaultDependencies=no
+After=systemd-remount-fs.service systemd-tmpfiles-setup.service systemd-sysusers.service axon-network-online.service
 
 [Service]
 Type=simple

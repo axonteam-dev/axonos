@@ -74,12 +74,12 @@ int main(void) {
     frame[14] = 77; /* syscall.S stores rt_sigreturn's restored RAX here */
     uint64_t area[25];
     memcpy(area + 5, frame, sizeof(frame));
-    syscall_prepare_iret_frame(area + 5, area);
-    assert(area[13] == uc.uc_mcontext.rcx); /* restored general RCX, not RIP */
-    assert(area[4] == uc.uc_mcontext.r11); /* restored general R11, not RFLAGS */
-    assert(area[14] == 77);
-    assert(area[15] == uc.uc_mcontext.rip && area[16] == 0x1b);
-    assert(area[17] == uc.uc_mcontext.eflags && area[18] == uc.uc_mcontext.rsp && area[19] == 0x23);
+    syscall_prepare_iret_frame(area + 5);
+    assert(area[5 + 13] == uc.uc_mcontext.rcx); /* restored general RCX, not RIP */
+    assert(area[5 + 4] == uc.uc_mcontext.r11); /* restored general R11, not RFLAGS */
+    assert(area[5 + 14] == 77);
+    assert(area[5 + 15] == uc.uc_mcontext.rip && area[5 + 16] == 0x1b);
+    assert(area[5 + 17] == uc.uc_mcontext.eflags && area[5 + 18] == uc.uc_mcontext.rsp && area[5 + 19] == 0x23);
     assert(!task.sigreturn_restore_gprs);
     /* The ordinary syscall-delivery case still resumes the same RIP/flags. */
     uc.uc_mcontext.rcx = uc.uc_mcontext.rip;
@@ -87,15 +87,15 @@ int main(void) {
     task.saved_user_rsp = (uintptr_t)&uc;
     assert(restore(&task) == 77 && frame[13] == uc.uc_mcontext.rip && frame[4] == 0x202);
     memcpy(area + 5, frame, sizeof(frame));
-    syscall_prepare_iret_frame(area + 5, area);
-    assert(area[13] == uc.uc_mcontext.rcx && area[4] == uc.uc_mcontext.r11);
+    syscall_prepare_iret_frame(area + 5);
+    assert(area[5 + 13] == uc.uc_mcontext.rcx && area[5 + 4] == uc.uc_mcontext.r11);
     /* Normal syscalls still preserve the ordinary GPR image and return value. */
     for (unsigned i = 0; i < 16; i++) frame[i] = 0x100 + i;
     frame[13] = 0x401234; frame[4] = 0x202; frame[15] = 0x5fff0000;
     memcpy(area + 5, frame, sizeof(frame));
-    syscall_prepare_iret_frame(area + 5, area);
-    for (unsigned i = 0; i < 15; i++) assert(area[i] == frame[i]);
-    assert(area[15] == frame[13] && area[17] == frame[4] && area[18] == frame[15]);
+    syscall_prepare_iret_frame(area + 5);
+    for (unsigned i = 0; i < 15; i++) assert(area[5 + i] == frame[i]);
+    assert(area[5 + 15] == frame[13] && area[5 + 17] == frame[4] && area[5 + 18] == frame[15]);
     puts("PASS: rt_sigreturn restores IRQ-time RCX/R11 separately from IRET RIP/RFLAGS; normal GPRs unchanged");
 }
 '''

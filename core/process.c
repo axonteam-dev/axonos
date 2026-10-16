@@ -11,6 +11,7 @@
 #include <mmio.h>
 #include <pit.h>
 #include <syscall.h>
+#include <cgroup.h>
 
 extern void kprintf(const char *fmt, ...);
 
@@ -64,6 +65,10 @@ static process_t *process_alloc_locked(process_t *parent) {
     p->rlim_stack_max = 8ULL * 1024ULL * 1024ULL;
     p->rlim_nproc_cur = 4096ULL;
     p->rlim_nproc_max = 4096ULL;
+    p->rlim_rtprio_cur = 0;
+    p->rlim_rtprio_max = 0;
+    p->rlim_rttime_cur = ~0ULL;
+    p->rlim_rttime_max = ~0ULL;
     p->rlim_as_cur = ~0ULL;
     p->rlim_as_max = ~0ULL;
 
@@ -94,8 +99,13 @@ static process_t *process_alloc_locked(process_t *parent) {
         p->rlim_stack_max = parent->rlim_stack_max;
         p->rlim_nproc_cur = parent->rlim_nproc_cur;
         p->rlim_nproc_max = parent->rlim_nproc_max;
+        p->rlim_rtprio_cur = parent->rlim_rtprio_cur;
+        p->rlim_rtprio_max = parent->rlim_rtprio_max;
+        p->rlim_rttime_cur = parent->rlim_rttime_cur;
+        p->rlim_rttime_max = parent->rlim_rttime_max;
         p->rlim_as_cur = parent->rlim_as_cur;
         p->rlim_as_max = parent->rlim_as_max;
+        p->oom_score_adj = parent->oom_score_adj;
         memcpy(p->cwd, parent->cwd, sizeof(p->cwd));
         memcpy(p->fs_root, parent->fs_root, sizeof(p->fs_root));
         memcpy(p->signal_handlers, parent->signal_handlers,
@@ -366,6 +376,10 @@ void process_mark_zombie(process_t *process, int status) {
     process->exit_status = status;
     process->state = PROCESS_ZOMBIE;
     release_irqrestore(&process_lock, flags);
+    /* cgroup.procs/populated describe live tasks, not waitable zombies.
+     * Leaving membership until wait() made systemd repeatedly SIGKILL stale
+     * PIDs and fail to remove an otherwise-empty service cgroup. */
+    cgroup_task_leave(process);
 }
 
 void process_reparent_children(process_t *process, process_t *new_parent) {
@@ -417,6 +431,9 @@ int process_reap(process_t *parent, process_t *child) {
         }
     }
     release_irqrestore(&process_lock, flags);
+    /* The zombie path already detached cgroup membership; keep reap
+     * idempotent for legacy exit paths as well. */
+    cgroup_task_leave(child);
     thread_detach_process(child);
     kfree(child);
     return 0;
@@ -443,6 +460,9 @@ int process_reap_zombie(process_t *child) {
         }
     }
     release_irqrestore(&process_lock, flags);
+    /* The zombie path already detached cgroup membership; keep reap
+     * idempotent for legacy exit paths as well. */
+    cgroup_task_leave(child);
     thread_detach_process(child);
     kfree(child);
     return 0;
@@ -472,6 +492,9 @@ int process_discard(process_t *parent, process_t *child) {
         }
     }
     release_irqrestore(&process_lock, flags);
+    /* ns_process_inherit() accounts the child before it is published. Roll
+     * that back if clone/exec setup fails before the process can exit. */
+    cgroup_task_leave(child);
     thread_detach_process(child);
     kfree(child);
     return 0;

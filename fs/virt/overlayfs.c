@@ -561,6 +561,8 @@ static struct fs_file *ov_wrap(const char *path, struct fs_file *inner, int laye
     if (inner) {
         f->backing_id = inner->backing_id;
         f->backing_gen = inner->backing_gen;
+        f->inode_kind_known = inner->inode_kind_known;
+        f->is_symlink = inner->is_symlink;
     }
     return f;
 }

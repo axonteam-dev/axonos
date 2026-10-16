@@ -87,6 +87,10 @@ syscall_entry64:
     movq    %r11, %rsp
 .no_switch_syscall_stack:
 
+    /* Reserve aligned space for the five-word IRETQ frame appended after
+     * frame[0..14]. Without this, the frame would overrun the syscall stack. */
+    subq    $48, %rsp
+
     // Store this syscall's user RSP on the kernel stack too.
     // Frame consumers in C expect frame[15] = saved user RSP.
     pushq   syscall_user_rsp_saved(%rip)
@@ -235,14 +239,9 @@ syscall_entry64:
     movq    %rsp, %rdi
     call    syscall_epilogue_probe
 
-    /* Separate the IRETQ control frame from RCX/R11. They are clobbered by
-     * ordinary SYSCALL but must be restored as GPRs by rt_sigreturn. Reserve
-     * 40 bytes for the five control words and 8 bytes for CALL alignment. */
+    /* Append IRETQ controls after the GPR frame without copying all registers. */
     movq    %rsp, %rdi
-    subq    $48, %rsp
-    leaq    8(%rsp), %rsi
     call    syscall_prepare_iret_frame
-    addq    $8, %rsp
 
     // Restore registers.
     popq    %r15

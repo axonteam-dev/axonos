@@ -24,6 +24,8 @@ struct fs_file {
     uint64_t backing_id;
     uint64_t backing_gen;
     int limit_accounted;      /* counted once per open file description */
+    uint8_t inode_kind_known; /* driver already supplied the no-follow inode type */
+    uint8_t is_symlink;       /* unresolved symlink; fs_open must resolve it */
 };
 
 /* Filesystem driver operations (minimal set) */

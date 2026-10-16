@@ -874,6 +874,8 @@ static int ramfs_create(const char *path, struct fs_file **out_file) {
     f->size = 0;
     f->fs_private = ramfs_driver.driver_data;
     f->type = n->is_dir ? FS_TYPE_DIR : FS_TYPE_REG;
+    f->inode_kind_known = 1;
+    f->is_symlink = (n->mode & 0170000u) == 0120000u;
     struct ramfs_file_handle *fh = (struct ramfs_file_handle*)kmalloc(sizeof(*fh));
     if (!fh) {
         kfree(pp);

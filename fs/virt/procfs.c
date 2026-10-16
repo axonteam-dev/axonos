@@ -28,6 +28,7 @@
 #include <utsname_host.h>
 #include <keyring.h>
 #include <cgroup.h>
+#include <crypto_rand.h>
 
 struct procfs_handle {
 	int kind; /* 1=root, 2=pid_dir, 3=pid_file, 4=symlink, 5=pid_fd_dir, 6=pid_fd_link, 7=plain, 8=proc_sys_dir, 9=proc_sys_file, 10=bus_root, 11=bus_usb_dir, 12=tty_dir, 13=scsi_dir, 14=net_dir, 15=task_dir, 16=bus_pci_dir, 17=task_tid_dir, 18=pid_link */
@@ -42,6 +43,9 @@ struct procfs_handle {
 static struct fs_driver procfs_driver;
 static struct fs_driver_ops procfs_ops;
 static spinlock_t procfs_lock = { 0 };
+static spinlock_t procfs_boot_id_lock = { 0 };
+static uint8_t procfs_boot_id[16];
+static int procfs_boot_id_ready;
 
 /*
  * Real boot command line (Multiboot2 tag type 1), captured by
@@ -356,6 +360,13 @@ static ssize_t procfs_show_cgroup(char *buf, size_t size, int pid) {
     int n = cgroup_show_path(p, buf, size);
     if (n < 0) return -1;
     return (ssize_t)((size_t)n < size ? (size_t)n : size);
+}
+
+static ssize_t procfs_show_oom_score_adj(char *buf, size_t size, int pid) {
+	process_t *p = process_find((uint64_t)(unsigned)pid);
+	if (!buf || size == 0 || !p)
+		return -1;
+	return snprintf(buf, size, "%d\n", p->oom_score_adj);
 }
 
 /* Linux /proc/<pid>/environ: NUL-separated KEY=val from execve envp.
@@ -1056,6 +1067,7 @@ enum {
 	SYSCTL_OSRELEASE = 23,
 	SYSCTL_VERSION = 24,
 	SYSCTL_PID_MAX = 25,
+	SYSCTL_BOOT_ID = 26,
 	SYSCTL_FILE_MAX = 30,
 	SYSCTL_NR_OPEN = 31,
 };
@@ -1085,6 +1097,24 @@ static ssize_t procfs_sysctl_show(int file_id, char *buf, size_t size) {
 	case SYSCTL_PID_MAX:
 		len = (size_t)snprintf(tmp, sizeof(tmp), "%d\n", PROC_PID_MAX);
 		break;
+	case SYSCTL_BOOT_ID: {
+		unsigned long flags = 0;
+		acquire_irqsave(&procfs_boot_id_lock, &flags);
+		if (!procfs_boot_id_ready) {
+			crypto_rand_bytes(procfs_boot_id, sizeof(procfs_boot_id));
+			procfs_boot_id[6] = (procfs_boot_id[6] & 0x0fu) | 0x40u;
+			procfs_boot_id[8] = (procfs_boot_id[8] & 0x3fu) | 0x80u;
+			procfs_boot_id_ready = 1;
+		}
+		len = (size_t)snprintf(tmp, sizeof(tmp),
+			"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n",
+			procfs_boot_id[0], procfs_boot_id[1], procfs_boot_id[2], procfs_boot_id[3],
+			procfs_boot_id[4], procfs_boot_id[5], procfs_boot_id[6], procfs_boot_id[7],
+			procfs_boot_id[8], procfs_boot_id[9], procfs_boot_id[10], procfs_boot_id[11],
+			procfs_boot_id[12], procfs_boot_id[13], procfs_boot_id[14], procfs_boot_id[15]);
+		release_irqrestore(&procfs_boot_id_lock, flags);
+		break;
+	}
 	case SYSCTL_FILE_MAX:
 		len = (size_t)snprintf(tmp, sizeof(tmp), "%llu\n", (unsigned long long)fs_file_max_get());
 		break;
@@ -1104,6 +1134,34 @@ static ssize_t procfs_write(struct fs_file *file, const void *buf, size_t size, 
 	if (!file || !file->driver_private || !buf) return -1;
 	struct procfs_handle *h = (struct procfs_handle*)file->driver_private;
 	if (!h) return -1;
+	if (h->kind == 3 && h->file_id == 6) {
+		thread_t *ct = thread_get_current_user();
+		if (!ct) ct = thread_current();
+		process_t *target = process_find((uint64_t)(unsigned)h->pid);
+		if (!target || target->state != PROCESS_ALIVE) return -3; /* ESRCH */
+		if (!ct || (ct->euid != 0 && ct->process != target)) return -13; /* EACCES */
+		char text[16];
+		if (size == 0 || size >= sizeof(text)) return -22; /* EINVAL */
+		memcpy(text, buf, size);
+		text[size] = '\0';
+		size_t i = 0;
+		while (text[i] == ' ' || text[i] == '\t' || text[i] == '\n') i++;
+		int sign = 1;
+		if (text[i] == '-' || text[i] == '+') {
+			if (text[i++] == '-') sign = -1;
+		}
+		if (text[i] < '0' || text[i] > '9') return -22;
+		int value = 0;
+		while (text[i] >= '0' && text[i] <= '9') {
+			value = value * 10 + (text[i++] - '0');
+			if (value > 1000) return -22;
+		}
+		while (text[i] == ' ' || text[i] == '\t' || text[i] == '\n') i++;
+		if (text[i] != '\0') return -22;
+		target->oom_score_adj = value * sign;
+		(void)offset;
+		return (ssize_t)size;
+	}
 	if (h->kind == 9 && (h->file_id == SYSCTL_FILE_MAX || h->file_id == SYSCTL_NR_OPEN)) {
 		thread_t *ct = thread_current();
 		if (!ct || ct->euid != 0) return -13; /* EACCES */
@@ -1351,7 +1409,14 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					}
 					const char *name = slash2 + 1;
 					int fid = -1;
-					if (strcmp(name, "hostname") == 0) fid = SYSCTL_HOSTNAME;
+					if (strcmp(name, "random") == 0) {
+						h->kind = 8; h->file_id = 3; f->type = FS_TYPE_DIR; f->size = 0;
+						f->driver_private = h;
+						*out_file = f;
+						return 0;
+					}
+					if (strcmp(name, "random/boot_id") == 0) fid = SYSCTL_BOOT_ID;
+					else if (strcmp(name, "hostname") == 0) fid = SYSCTL_HOSTNAME;
 					else if (strcmp(name, "domainname") == 0) fid = SYSCTL_DOMAINNAME;
 					else if (strcmp(name, "ostype") == 0) fid = SYSCTL_OSTYPE;
 					else if (strcmp(name, "osrelease") == 0) fid = SYSCTL_OSRELEASE;
@@ -1726,6 +1791,8 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 							full = procfs_show_status(h->cache, cap, (void *)(uintptr_t)h->pid);
 						else if (h->file_id == 3)
 							full = procfs_show_statm(h->cache, cap, (void *)(uintptr_t)h->pid);
+						else if (h->file_id == 6)
+							full = procfs_show_oom_score_adj(h->cache, cap, h->pid);
 						if (full > 0) {
 							f->size = (size_t)full;
 							h->cache_len = f->size;
@@ -1797,6 +1864,9 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				} else if (strncmp(rest, "cgroup", 6) == 0 && rest[6] == '\0') {
 					if (!procfs_thread_by_id(pid)) { kfree(h); kfree(pp); kfree(f); return -1; }
 					h->kind = 3; h->pid = pid; h->file_id = 5; f->type = FS_TYPE_REG;
+				} else if (strncmp(rest, "oom_score_adj", 13) == 0 && rest[13] == '\0') {
+					if (!procfs_thread_by_id(pid)) { kfree(h); kfree(pp); kfree(f); return -1; }
+					h->kind = 3; h->pid = pid; h->file_id = 6; f->type = FS_TYPE_REG;
 				} else if (strncmp(rest, "mounts", 6) == 0 && rest[6] == '\0') {
 					/* /proc/self/mounts == /proc/mounts (Linux) */
 					h->kind = 7; h->file_id = 16; f->type = FS_TYPE_REG; f->size = 0;
@@ -1880,10 +1950,11 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 
     if (h->kind == 2) {
         /* /proc/<pid> directory entries */
-        const char *names[10] = { "task", "cmdline", "stat", "status", "statm", "environ", "mounts", "mountinfo", "exe", "cgroup" };
-        const uint8_t types[10] = { EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
-                                   EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
-                                   EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK, EXT2_FT_REG_FILE };
+		const char *names[11] = { "task", "cmdline", "stat", "status", "statm", "environ", "mounts", "mountinfo", "exe", "cgroup", "oom_score_adj" };
+		const uint8_t types[11] = { EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
+								   EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
+								   EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK, EXT2_FT_REG_FILE,
+								   EXT2_FT_REG_FILE };
         size_t pos = 0;
         size_t written = 0;
         uint8_t *out = (uint8_t*)buf;
@@ -1923,7 +1994,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
                 pos += rec_len;
             }
         }
-        for (int idx = 0; idx < 10; idx++) {
+		for (int idx = 0; idx < 11; idx++) {
             size_t namelen = strlen(names[idx]);
             size_t rec_len = 8 + namelen;
             rec_len = (rec_len + 3) & ~3u;
@@ -1956,6 +2027,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 		const char *names_kernel[] = {
 			"hostname", "domainname", "ostype", "osrelease", "version", "pid_max"
 		};
+		const char *names_random[] = { "boot_id" };
 		const char *names_fs[] = { "file-max", "nr_open" };
 		const char *const *names;
 		int ncount;
@@ -1963,6 +2035,10 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 		if (h->file_id == 1) {
 			names = names_kernel;
 			ncount = (int)(sizeof(names_kernel) / sizeof(names_kernel[0]));
+			is_file_dir = 1;
+		} else if (h->file_id == 3) {
+			names = names_random;
+			ncount = (int)(sizeof(names_random) / sizeof(names_random[0]));
 			is_file_dir = 1;
 		} else if (h->file_id == 2) {
 			names = names_fs;

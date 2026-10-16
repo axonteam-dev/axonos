@@ -427,6 +427,10 @@ int fs_bind_mount_file(const char *source, const char *target) {
 
 int fs_mkdir(const char *path) {
         if (!path) return -1;
+        char normalized[512];
+        if (fs_resolve_parent_path(path, normalized, sizeof(normalized)) != 0)
+                return -1;
+        path = normalized;
         struct fs_driver *mount_drv = fs_match_mount(path);
         if (mount_drv && mount_drv->ops && mount_drv->ops->mkdir) {
                 int r = mount_drv->ops->mkdir(path);
@@ -723,9 +727,104 @@ static char *fs_resolve_symlinks(const char *path) {
         return NULL;
 }
 
+/* Resolve directory symlinks for dentry mutations, but leave the leaf alone.
+ * For example, unlink("/bin/sh") must operate on /usr/bin/sh when /bin is
+ * usr-merged, while unlinking a symlink itself must not follow that leaf. */
+int fs_resolve_parent_path(const char *path, char *out, size_t out_cap) {
+        size_t len, parent_len, base_len, resolved_len, joined_len, normalized_len;
+        const char *slash, *base;
+        char *parent, *resolved, *joined, *normalized;
+        int trailing_slash;
+
+        if (!path || !out || out_cap == 0)
+                return -1;
+        len = strlen(path);
+        if (len == 0 || len >= out_cap)
+                return -1;
+        if (path[0] != '/') {
+                memcpy(out, path, len + 1);
+                return 0;
+        }
+        if (strcmp(path, "/") == 0) {
+                memcpy(out, path, 2);
+                return 0;
+        }
+
+        trailing_slash = path[len - 1] == '/';
+        slash = strrchr(path, '/');
+        if (!slash)
+                return -1;
+        parent_len = (slash == path) ? 1u : (size_t)(slash - path);
+        base = slash + 1;
+        base_len = len - (size_t)(base - path);
+        parent = (char *)kmalloc(parent_len + 1);
+        if (!parent)
+                return -1;
+        memcpy(parent, path, parent_len);
+        parent[parent_len] = '\0';
+
+        resolved = fs_resolve_symlinks(parent);
+        kfree(parent);
+        if (!resolved) {
+                /* Let the underlying operation return the usual missing-parent
+                 * error; this helper only rewrites parents it can resolve. */
+                memcpy(out, path, len + 1);
+                return 0;
+        }
+        resolved_len = strlen(resolved);
+        if (resolved_len > (size_t)-1 - base_len - 2u) {
+                kfree(resolved);
+                return -1;
+        }
+        joined_len = resolved_len + base_len + 2u;
+        joined = (char *)kmalloc(joined_len);
+        if (!joined) {
+                kfree(resolved);
+                return -1;
+        }
+        memcpy(joined, resolved, resolved_len);
+        size_t used = resolved_len;
+        if (used == 0 || joined[used - 1] != '/')
+                joined[used++] = '/';
+        if (base_len) {
+                memcpy(joined + used, base, base_len);
+                used += base_len;
+        }
+        if (trailing_slash && used > 1 && joined[used - 1] != '/')
+                joined[used++] = '/';
+        joined[used] = '\0';
+        kfree(resolved);
+
+        normalized = fs_normalize_abs_path(joined);
+        kfree(joined);
+        if (!normalized)
+                return -1;
+        normalized_len = strlen(normalized);
+        if (trailing_slash && normalized_len > 1 &&
+            normalized[normalized_len - 1] != '/') {
+                if (normalized_len + 1 >= out_cap) {
+                        kfree(normalized);
+                        return -1;
+                }
+                normalized[normalized_len++] = '/';
+                normalized[normalized_len] = '\0';
+        }
+        if (normalized_len >= out_cap) {
+                kfree(normalized);
+                return -1;
+        }
+        memcpy(out, normalized, normalized_len + 1);
+        kfree(normalized);
+        return 0;
+}
+
 /* Try drivers in registration order. Drivers should return -1 if they do not handle the path. */
 struct fs_file *fs_create_file(const char *path) {
         if (!path) return NULL;
+        char normalized[512];
+        if (fs_resolve_parent_path(path, normalized, sizeof(normalized)) != 0)
+                return NULL;
+        path = normalized;
         struct fs_driver *mount_drv = fs_match_mount(path);
         if (mount_drv && mount_drv->ops && mount_drv->ops->create) {
                 struct fs_file *file = NULL;
@@ -989,6 +1088,12 @@ int fs_chmod(const char *path, mode_t mode) {
 
 int fs_link(const char *oldpath, const char *newpath) {
         if (!oldpath || !newpath) return -1;
+        char old_normalized[512], new_normalized[512];
+        if (fs_resolve_parent_path(oldpath, old_normalized, sizeof(old_normalized)) != 0 ||
+            fs_resolve_parent_path(newpath, new_normalized, sizeof(new_normalized)) != 0)
+                return -1;
+        oldpath = old_normalized;
+        newpath = new_normalized;
         struct fs_driver *mount_drv = fs_match_mount(oldpath);
         if (mount_drv && mount_drv->ops && mount_drv->ops->link) {
                 int r = mount_drv->ops->link(oldpath, newpath);
@@ -1007,6 +1112,12 @@ int fs_link(const char *oldpath, const char *newpath) {
 
 int fs_rename(const char *oldpath, const char *newpath) {
         if (!oldpath || !newpath) return -1;
+        char old_normalized[512], new_normalized[512];
+        if (fs_resolve_parent_path(oldpath, old_normalized, sizeof(old_normalized)) != 0 ||
+            fs_resolve_parent_path(newpath, new_normalized, sizeof(new_normalized)) != 0)
+                return -1;
+        oldpath = old_normalized;
+        newpath = new_normalized;
         if (strcmp(oldpath, newpath) == 0) return 0;
         struct fs_driver *mount_drv = fs_match_mount(oldpath);
         if (mount_drv && mount_drv->ops && mount_drv->ops->rename) {
@@ -1026,6 +1137,10 @@ int fs_rename(const char *oldpath, const char *newpath) {
 
 int fs_unlink(const char *path) {
         if (!path) return -1;
+        char normalized[512];
+        if (fs_resolve_parent_path(path, normalized, sizeof(normalized)) != 0)
+                return -1;
+        path = normalized;
         struct fs_driver *mount_drv = fs_match_mount(path);
         if (mount_drv && mount_drv->ops && mount_drv->ops->unlink) {
                 int r = mount_drv->ops->unlink(path);
@@ -1173,6 +1288,10 @@ int vfs_stat(const char *path, struct stat *st) {
 /* Like lstat(): do not follow the final symlink. */
 int vfs_lstat(const char *path, struct stat *st) {
         if (!path || !st) return -1;
+        char normalized[512];
+        if (fs_resolve_parent_path(path, normalized, sizeof(normalized)) != 0)
+                return -1;
+        path = normalized;
         struct fs_file *f = fs_open_nofollow(path);
         if (!f) return -1;
         int r = vfs_fstat(f, st);
@@ -1183,6 +1302,10 @@ int vfs_lstat(const char *path, struct stat *st) {
 /* Read symlink target into buf. Returns bytes copied (no NUL) or -1 on error. */
 ssize_t vfs_readlink(const char *path, char *buf, size_t bufsiz) {
         if (!path || !buf || bufsiz == 0) return -1;
+        char normalized[512];
+        if (fs_resolve_parent_path(path, normalized, sizeof(normalized)) != 0)
+                return -1;
+        path = normalized;
         struct fs_file *f = fs_open_nofollow(path);
         if (!f) return -1;
         struct stat st;

@@ -105,6 +105,8 @@ struct fs_file *fs_create_file(const char *path);
 struct fs_file *fs_open(const char *path);
 /* Like fs_open(), but do not follow a final symlink (lstat/lgetxattr semantics). */
 struct fs_file *fs_open_nofollow(const char *path);
+/* Resolve symlinks in parent components only, preserving the final dentry. */
+int fs_resolve_parent_path(const char *path, char *out, size_t out_cap);
 ssize_t fs_read(struct fs_file *file, void *buf, size_t size, size_t offset);
 ssize_t fs_write(struct fs_file *file, const void *buf, size_t size, size_t offset);
 uint64_t fs_file_max_get(void);

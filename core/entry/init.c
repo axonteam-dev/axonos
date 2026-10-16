@@ -260,6 +260,58 @@ static int boot_write_bytes(const char *path, const void *data, size_t len)
         return 0;
 }
 
+/* Preserve the distro's CA roots while adding AxonOS's built-in CA. */
+static int boot_install_system_ca_bundle(const char *pem, size_t pem_len)
+{
+        static const char bundle_path[] = "/etc/ssl/certs/ca-certificates.crt";
+        struct fs_file *f;
+        struct stat st;
+        uint8_t *bundle;
+        size_t base_len = 0, total_len;
+        int rc = 0;
+
+        if (!pem || pem_len == 0)
+                return -1;
+        f = fs_open(bundle_path);
+        if (f) {
+                if (vfs_fstat(f, &st) == 0 && st.st_size > 0 &&
+                    (uint64_t)st.st_size <= 4u * 1024u * 1024u)
+                        base_len = (size_t)st.st_size;
+        }
+        if (pem_len > (size_t)-1 - base_len - 2u) {
+                if (f) fs_file_free(f);
+                return -1;
+        }
+        bundle = (uint8_t *)kmalloc(base_len + pem_len + 2u);
+        if (!bundle) {
+                if (f) fs_file_free(f);
+                return -1;
+        }
+        if (base_len) {
+                ssize_t n = fs_read(f, bundle, base_len, 0);
+                if (n != (ssize_t)base_len) {
+                        fs_file_free(f);
+                        kfree(bundle);
+                        return -1;
+                }
+        }
+        if (f)
+                fs_file_free(f);
+        if (base_len && bundle[base_len - 1] != '\n')
+                bundle[base_len++] = '\n';
+        memcpy(bundle + base_len, pem, pem_len);
+        total_len = base_len + pem_len;
+
+        if (boot_write_bytes(bundle_path, bundle, total_len) != 0)
+                rc = -1;
+        /* libtls/OpenSSL commonly use this direct CA path. Make it a regular
+         * combined bundle instead of a symlink that could hide the distro CA. */
+        if (boot_write_bytes("/etc/ssl/cert.pem", bundle, total_len) != 0)
+                rc = -1;
+        kfree(bundle);
+        return rc;
+}
+
 /* Load /usr/share/fonts/console.psf (PSF1, e.g. from Debian consolefonts) into
  * the console font + unimap so UTF-8 output (tmux panes, cyrillic, …) renders
  * properly instead of byte-smeared garbage.  Missing file is fine. */
@@ -325,14 +377,10 @@ static void boot_load_system_certs(void)
                 klogprintf("certs: built-in CA PEM empty (host openssl missing at build)\n");
                 return;
         }
-        if (boot_write_bytes("/etc/ssl/certs/ca-certificates.crt", pem, pem_len) != 0)
-                klogprintf("certs: warning: cannot write ca-certificates.crt\n");
         if (boot_write_bytes("/etc/ssl/certs/axonos-system-ca.pem", pem, pem_len) != 0)
                 klogprintf("certs: warning: cannot write axonos-system-ca.pem\n");
-        (void)fs_unlink("/etc/ssl/cert.pem");
-        if (overlayfs_symlink("/etc/ssl/cert.pem",
-                              "/etc/ssl/certs/ca-certificates.crt") != 0)
-                (void)boot_write_bytes("/etc/ssl/cert.pem", pem, pem_len);
+        if (boot_install_system_ca_bundle(pem, pem_len) != 0)
+                klogprintf("certs: warning: cannot preserve distro CA bundle\n");
         klogprintf("certs: system CA ready (%zu bytes PEM) in .builtin_trusted_keys\n",
                 pem_len);
 }
@@ -1703,10 +1751,16 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
         /* Linux: load_system_certificate_list + integrity_load_keys before PID 1. */
         boot_load_system_certs();
 
-        /* Programs (mount, sh) open /etc/localtime; create so open doesn't fail. */
+        /* Programs (mount, sh) open /etc/localtime. Keep a packaged timezone
+         * from initfs; create an empty placeholder only when it is absent. */
         {
-                struct fs_file *lt = fs_create_file("/etc/localtime");
-                if (lt) fs_file_free(lt);
+                struct fs_file *lt = fs_open("/etc/localtime");
+                if (lt) {
+                        fs_file_free(lt);
+                } else {
+                        lt = fs_create_file("/etc/localtime");
+                        if (lt) fs_file_free(lt);
+                }
         }
         /* /etc/profile: login shells (getty→login→sh -l). ramfs_write_blob
          * ramfs_remove()s first so a leftover overlay whiteout cannot hide PS1. */

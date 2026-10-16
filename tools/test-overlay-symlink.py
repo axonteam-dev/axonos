@@ -16,6 +16,11 @@ struct fs_file { int type; };
 static struct fs_file inode;
 static int overlay_active = 1, exists, whiteout, created, released;
 #define kprintf(...) ((void)0)
+static int fs_resolve_parent_path(const char *p, char *out, size_t n) {
+    if (!p || !out || n <= __builtin_strlen(p)) return -1;
+    __builtin_memcpy(out, p, __builtin_strlen(p) + 1);
+    return 0;
+}
 static int ramfs_path_is_whiteout(const char *p) { (void)p; return whiteout; }
 static int overlay_open(const char *p, struct fs_file **out) {
     (void)p; *out = exists && !whiteout ? &inode : NULL;

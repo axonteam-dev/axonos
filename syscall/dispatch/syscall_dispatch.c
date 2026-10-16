@@ -6696,6 +6696,20 @@ static struct fs_file *socket_file_get(thread_t *cur, int fd, ksock_net_t **out_
     return f;
 }
 
+/* The TCP layer can finish a nonblocking handshake while servicing RX, before
+ * poll/select observes connect_pending. Keep the socket-level state in sync. */
+static int socket_sync_tcp_connected(ksock_net_t *s) {
+    if (!s || s->tcp_listening || s->unix_domain_stub || s->unix_conn ||
+        s->dns_tcp_udp_bridge || s->type_base != SOCK_STREAM_LOCAL ||
+        s->protocol != IPPROTO_TCP_LOCAL)
+        return 0;
+    if (s->tcp.established) {
+        s->connected = 1;
+        return 1;
+    }
+    return 0;
+}
+
 static void net_debug_log_tls443_tx(ksock_net_t *s, const uint8_t *buf, size_t len, const char *path) {
     if (!s || !buf || len == 0) return;
     if (s->type_base != SOCK_STREAM_LOCAL || s->protocol != IPPROTO_TCP_LOCAL || s->dns_tcp_udp_bridge)
@@ -8989,7 +9003,7 @@ static ssize_t net_sock_write_userspace(thread_t *cur, int fd, ksock_net_t *s, c
         if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return -EFAULT;
         if (s->tcp.peer_rst) return -ECONNRESET;
         if (s->tcp.peer_fin) return -EPIPE;
-        if (!s->connected || !s->tcp.established) return -ENOTCONN;
+        if (!socket_sync_tcp_connected(s) || !s->tcp.established) return -ENOTCONN;
         size_t total = 0;
         net_tcp_ops_t ops;
         net_make_tcp_ops(&ops, &s->tcp);
@@ -9053,7 +9067,7 @@ static ssize_t net_sock_write_kbuf(ksock_net_t *s, const void *buf, size_t cnt) 
     if (s->dns_tcp_udp_bridge) return -EINVAL;
     if (s->tcp.peer_rst) return -ECONNRESET;
     if (s->tcp.peer_fin) return -EPIPE;
-    if (!s->connected || !s->tcp.established) return -ENOTCONN;
+    if (!socket_sync_tcp_connected(s) || !s->tcp.established) return -ENOTCONN;
     net_tcp_ops_t ops;
     net_make_tcp_ops(&ops, &s->tcp);
     size_t total = 0;
@@ -9267,7 +9281,7 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
                 } else {
                     e1000_poll();
                     (void)net_tcp_service(&s->tcp, &ops, 64);
-                    if (s->tcp.established) revents |= POLLOUT_K;
+                    if (socket_sync_tcp_connected(s)) revents |= POLLOUT_K;
                     if (s->tcp.peer_rst) revents |= POLLERR_K | POLLHUP_K;
                 }
             } else {
@@ -9332,8 +9346,10 @@ static short fd_poll_revents(thread_t *thr, int fd, short events) {
             if (s->tcp.connect_pending) {
                 net_tcp_ops_t ops;
                 net_make_tcp_ops(&ops, &s->tcp);
-                (void)net_tcp_connect_poll(&s->tcp, &ops, 0);
+                if (net_tcp_connect_poll(&s->tcp, &ops, 0) == 0)
+                    s->connected = 1;
             }
+            (void)socket_sync_tcp_connected(s);
             if (s->tcp.connect_refused || s->tcp.connect_timed_out) {
                 revents |= POLLERR_K | POLLHUP_K;
                 if (events & POLLOUT_K)
@@ -9546,6 +9562,7 @@ static ssize_t net_sock_read_userspace(thread_t *cur, ksock_net_t *s, void *bufp
             if (net_tcp_connect_poll(&s->tcp, &cops, 0) == 0)
                 s->connected = 1;
         }
+        (void)socket_sync_tcp_connected(s);
         if (!s->connected || (!s->tcp.established && !s->tcp.peer_rst && !s->tcp.peer_fin)) {
             if (s->tcp.rx_len == 0) return -ENOTCONN;
         }
@@ -13234,7 +13251,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge) {
                     if (s->tcp.peer_rst) { kfree(flat); return ret_err(ECONNRESET); }
                     if (s->tcp.peer_fin) { kfree(flat); return ret_err(EPIPE); }
-                    if (!s->connected || !s->tcp.established) { kfree(flat); return ret_err(ENOTCONN); }
+                    if (!socket_sync_tcp_connected(s) || !s->tcp.established) { kfree(flat); return ret_err(ENOTCONN); }
                     size_t total = 0;
                     net_tcp_ops_t ops;
                     net_make_tcp_ops(&ops, &s->tcp);
@@ -13989,9 +14006,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             } else if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
                                 net_tcp_ops_t ops;
                                 net_make_tcp_ops(&ops, &s->tcp);
-                                if (s->tcp.connect_pending)
-                                    (void)net_tcp_connect_poll(&s->tcp, &ops, 0);
+                                if (s->tcp.connect_pending &&
+                                    net_tcp_connect_poll(&s->tcp, &ops, 0) == 0)
+                                    s->connected = 1;
                                 net_pump_tcp_sock(s, 1);
+                                (void)socket_sync_tcp_connected(s);
                                 if (s->tcp.rx_len > 0 || s->tcp.peer_fin || s->tcp.peer_rst || s->tcp.ooo_valid) can_r = 1;
                             }
                         } else if (f->type == FS_TYPE_PIPE && f->driver_private) {
@@ -14043,7 +14062,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                 } else {
                                     e1000_poll();
                                     (void)net_tcp_service(&s->tcp, &ops, 64);
-                                    if (s->tcp.established || s->tcp.peer_rst) can_w = 1;
+                                    if (socket_sync_tcp_connected(s) || s->tcp.peer_rst) can_w = 1;
                                 }
                             } else {
                                 can_w = 1;
@@ -15265,7 +15284,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 if (s->tcp.peer_rst) return ret_err(ECONNRESET);
                 if (s->tcp.peer_fin) return ret_err(EPIPE);
-                if (!s->connected || !s->tcp.established) return ret_err(ENOTCONN);
+                if (!socket_sync_tcp_connected(s) || !s->tcp.established) return ret_err(ENOTCONN);
                 ssize_t wr = net_sock_write_userspace(t, fd, s, buf_u, len);
                 if (wr < 0) return ret_err((int)-wr);
                 return (uint64_t)wr;
@@ -15444,6 +15463,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (rr < 0) return ret_read_err(rr);
                     return (uint64_t)rr;
                 }
+                (void)socket_sync_tcp_connected(s);
                 if ((!s->connected || (!s->tcp.established && !s->tcp.peer_rst && !s->tcp.peer_fin)) &&
                     s->tcp.rx_len == 0) return ret_err(ENOTCONN);
                 ssize_t rr = net_sock_read_userspace(t, s, buf_u, len);
@@ -15719,7 +15739,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 if (s->tcp.peer_rst) { kfree(flat); return ret_err(ECONNRESET); }
                 if (s->tcp.peer_fin) { kfree(flat); return ret_err(EPIPE); }
-                if (!s->connected || !s->tcp.established) { kfree(flat); return ret_err(ENOTCONN); }
+                if (!socket_sync_tcp_connected(s) || !s->tcp.established) { kfree(flat); return ret_err(ENOTCONN); }
                 size_t total = 0;
                 net_tcp_ops_t ops;
                 net_make_tcp_ops(&ops, &s->tcp);
@@ -16070,7 +16090,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge) {
                 if (s->tcp.rx_len == 0 && s->tcp.peer_fin) return 0;
-                if ((!s->connected || (!s->tcp.established && !s->tcp.peer_rst)) && s->tcp.rx_len == 0) return ret_err(ENOTCONN);
+                (void)socket_sync_tcp_connected(s);
+                if ((!s->connected || (!s->tcp.established && !s->tcp.peer_rst)) &&
+                    s->tcp.rx_len == 0)
+                    return ret_err(ENOTCONN);
                 for (uint64_t i = 0; i < m.msg_iovlen; i++) {
                     if (iov[i].len == 0) continue;
                     if (!iov[i].base || !user_range_ok(iov[i].base, (size_t)iov[i].len))

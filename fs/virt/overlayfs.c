@@ -938,8 +938,12 @@ static int overlay_unlink(const char *path)
 
 int overlayfs_symlink(const char *path, const char *target)
 {
+    char normalized[512];
     if (!overlay_active || !path || !target)
         return -1;
+    if (fs_resolve_parent_path(path, normalized, sizeof(normalized)) != 0)
+        return -2;
+    path = normalized;
     /* symlink(2) never replaces an existing dentry, including one that only
      * exists in the lower layer or is itself a dangling symlink. BusyBox's
      * --install -s relies on EEXIST to keep its own executable intact. */

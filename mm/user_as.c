@@ -44,6 +44,48 @@ static int user_as_ensure_range_for_exec(thread_t *tcur, uintptr_t lo, uintptr_t
     return 0;
 }
 
+/* Leave the unused image-to-brk gap non-present and account it as anonymous
+ * memory. The normal VMA fault path allocates a private zeroed page on first
+ * access; eagerly materializing this gap consumed several MiB on every exec. */
+static int user_as_lazy_anon_range_for_exec(thread_t *tcur,
+                                             uintptr_t lo, uintptr_t hi) {
+    mm_t *k = mm_kernel();
+    mm_t *share;
+    uint64_t tid;
+
+    if (hi <= lo)
+        return 0;
+    lo = user_mm_align_down(lo, 4096u);
+    if (hi > (uintptr_t)-1 - 4095u)
+        return -1;
+    hi = user_mm_align_up(hi, 4096u);
+    if (lo < 0x200000u || hi > (uintptr_t)MMIO_IDENTITY_LIMIT ||
+        !user_as_has_private_mm(tcur) || !k || !k->pml4)
+        return -1;
+
+    share = tcur->mm_ptemplate ? tcur->mm_ptemplate : k;
+    if (!share->pml4)
+        return -1;
+
+    /* Remove inherited identity leaves so the first access reaches the
+     * existing anonymous-VMA demand-zero fault handler. */
+    if (mm_unmap_user_range(tcur->mm, share->pml4,
+                            (uint64_t)lo, (uint64_t)hi) != 0) {
+        /* Preserve the old eager behavior if the range cannot be punched out. */
+        return mm_make_private_range(tcur->mm, (uint64_t)lo, (uint64_t)hi,
+                                     0, share);
+    }
+
+    tid = (uint64_t)(tcur->tid ? tcur->tid : 1);
+    if (user_vma_add(tid, lo, (size_t)(hi - lo), 3,
+                     USER_VMA_KIND_MMAP_LAZY) == 0)
+        return 0;
+
+    /* Metadata exhaustion must not leave an unhandled hole in userspace. */
+    return mm_make_private_range(tcur->mm, (uint64_t)lo, (uint64_t)hi,
+                                 0, share);
+}
+
 uintptr_t user_as_stack_top_for_tid(uint64_t tid) {
     const uintptr_t top = (uintptr_t)USER_STACK_TOP;
     const uintptr_t stride = (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + (uintptr_t)(64 * 1024);
@@ -293,9 +335,8 @@ void user_as_set_brk_after_load(thread_t *tcur, uintptr_t elf_brk, uintptr_t ima
     brk = user_mm_align_up(brk, 4096);
     /*
      * Legacy shared-CR3: zero image→brk gap.
-     * Private mm (Linux do_brk_flags): install anon zero pages for the initial
-     * brk/TLS window so identity leaves are never user backing for SET_FS.
-     * Do not prefault multi-MiB — further growth uses user_brk_ensure_range.
+     * Private mm: leave the image-to-brk gap lazy; keep only the small TLS
+     * bootstrap window eagerly private so SET_FS never sees identity backing.
      */
     if (!user_as_has_private_mm(tcur)) {
         uintptr_t zero_lo = 0;
@@ -317,7 +358,7 @@ void user_as_set_brk_after_load(thread_t *tcur, uintptr_t elf_brk, uintptr_t ima
             gap_lo = image_hi;
         gap_lo = user_mm_align_up(gap_lo, 4096);
         if (gap_lo < brk && gap_lo > 0x200000u &&
-            user_as_ensure_range_for_exec(tcur, gap_lo, brk) != 0)
+            user_as_lazy_anon_range_for_exec(tcur, gap_lo, brk) != 0)
             kprintf("exec-brk: anon gap failed lo=0x%llx brk=0x%llx\n",
                 (unsigned long long)gap_lo, (unsigned long long)brk);
         uintptr_t hi = brk + tls_window;

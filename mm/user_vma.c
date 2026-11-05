@@ -522,6 +522,13 @@ uintptr_t user_vma_max_mmap_like_end_for_mm_nolock(thread_t *runner) {
         uintptr_t e = g_user_vmas[i].addr + g_user_vmas[i].len;
         if (e > mx) mx = e;
     }
+    user_vma_t *mm_vmas = user_vma_mm_storage(runner->mm, 0);
+    for (int i = 0; mm_vmas && i < USER_VMA_MAX; i++) {
+        user_vma_t *v = &mm_vmas[i];
+        if (!v->used || !user_vma_kind_is_mmap_like(v->kind)) continue;
+        uintptr_t e = v->addr + v->len;
+        if (e > v->addr && e > mx) mx = e;
+    }
     return mx;
 }
 
@@ -597,6 +604,12 @@ int user_vma_overlaps_thread_range(thread_t *runner, uintptr_t addr, size_t len)
             break;
         }
     }
+    user_vma_t *mm_vmas = user_vma_mm_storage(runner->mm, 0);
+    for (int i = 0; !rc && mm_vmas && i < USER_VMA_MAX; i++) {
+        user_vma_t *v = &mm_vmas[i];
+        uint64_t b0 = (uint64_t)v->addr, b1 = b0 + (uint64_t)v->len;
+        if (v->used && b1 > b0 && !(a1 <= b0 || a0 >= b1)) rc = 1;
+    }
     release_irqrestore(&g_user_vma_lock, fl);
     return rc;
 }
@@ -615,6 +628,13 @@ int user_vma_mmap_range_overlaps_nolock(thread_t *runner, uintptr_t addr, size_t
         uint64_t b1 = b0 + (uint64_t)g_user_vmas[i].len;
         if (b1 < b0) continue;
         if (!(a1 <= b0 || a0 >= b1)) return 1;
+    }
+    user_vma_t *mm_vmas = user_vma_mm_storage(runner->mm, 0);
+    for (int i = 0; mm_vmas && i < USER_VMA_MAX; i++) {
+        user_vma_t *v = &mm_vmas[i];
+        uint64_t b0 = (uint64_t)v->addr, b1 = b0 + (uint64_t)v->len;
+        if (v->used && user_vma_kind_is_mmap_like(v->kind) && b1 > b0 &&
+            !(a1 <= b0 || a0 >= b1)) return 1;
     }
     return 0;
 }
@@ -643,6 +663,13 @@ static uintptr_t user_vma_overlap_end_nolock(thread_t *runner, uintptr_t addr, u
         if (b1 < b0) continue;
         if (a1 <= b0 || a0 >= b1) continue;
         if ((uintptr_t)b1 > end) end = (uintptr_t)b1;
+    }
+    user_vma_t *mm_vmas = runner ? user_vma_mm_storage(runner->mm, 0) : NULL;
+    for (int i = 0; mm_vmas && i < USER_VMA_MAX; i++) {
+        user_vma_t *v = &mm_vmas[i];
+        uint64_t b0 = (uint64_t)v->addr, b1 = b0 + (uint64_t)v->len;
+        if (v->used && b1 > b0 && !(a1 <= b0 || a0 >= b1) &&
+            (uintptr_t)b1 > end) end = (uintptr_t)b1;
     }
     return end;
 }
@@ -709,6 +736,16 @@ static uintptr_t user_vma_overlap_start_nolock(thread_t *runner, uintptr_t addr,
         uint64_t b1 = b0 + (uint64_t)g_user_vmas[i].len;
         if (b1 < b0) continue;
         if (a1 <= b0 || a0 >= b1) continue;
+        if (!hit || (uintptr_t)b0 < start) {
+            start = (uintptr_t)b0;
+            hit = 1;
+        }
+    }
+    user_vma_t *mm_vmas = runner ? user_vma_mm_storage(runner->mm, 0) : NULL;
+    for (int i = 0; mm_vmas && i < USER_VMA_MAX; i++) {
+        user_vma_t *v = &mm_vmas[i];
+        uint64_t b0 = (uint64_t)v->addr, b1 = b0 + (uint64_t)v->len;
+        if (!v->used || b1 <= b0 || a1 <= b0 || a0 >= b1) continue;
         if (!hit || (uintptr_t)b0 < start) {
             start = (uintptr_t)b0;
             hit = 1;

@@ -835,6 +835,17 @@ static thread_t *elf_bprm_thread(void) {
     return tc;
 }
 
+/* exec currently preserves credentials (it does not apply set-id bits or file
+ * capabilities). Still mark differing real/effective IDs secure so libc does
+ * not trust the environment of a process that already has raised IDs. */
+static uint64_t elf_auxv_secure(const thread_t *t) {
+    if (!t) return 0;
+    if (t->process)
+        return t->process->uid != t->process->euid ||
+               t->process->gid != t->process->egid;
+    return t->uid != t->euid || t->gid != t->egid;
+}
+
 /* Store one qword into the loaded image. Private mm must use leaf PA — a plain
  * user-VA store under the wrong CR3 fills identity phys and leaves GOT slots 0
  * (static IFUNC then `jmp *GOT` → RIP=0). */
@@ -2016,8 +2027,8 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
     for (int i = 0; i < envc; i++) env_strings_size += strlen(envp[i]) + 1;
 
     enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6, AT_BASE = 7, AT_ENTRY = 9,
-           AT_CLKTCK = 17, AT_RANDOM = 25 };
-    const size_t aux_pairs = 9;
+           AT_CLKTCK = 17, AT_SECURE = 23, AT_RANDOM = 25 };
+    const size_t aux_pairs = 10;
     const size_t aux_qwords = aux_pairs * 2;
     size_t ptrs = (size_t)(argc + 1 + envc + 1) + aux_qwords;
     size_t ptrs_bytes = ptrs * sizeof(uint64_t);
@@ -2091,7 +2102,8 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
             sp64[ax +12] = (uint64_t)AT_RANDOM; sp64[ax +13] = (uint64_t)random_addr;
             sp64[ax +14] = (uint64_t)AT_CLKTCK;
             sp64[ax +15] = (uint64_t)pit_get_frequency();
-            sp64[ax +16] = (uint64_t)AT_NULL;   sp64[ax +17] = 0;
+            sp64[ax +16] = (uint64_t)AT_SECURE; sp64[ax +17] = elf_auxv_secure(tc);
+            sp64[ax +18] = (uint64_t)AT_NULL;   sp64[ax +19] = 0;
             *(uint64_t *)base = (uint64_t)argc;
         }
         if (tip_mm) {
@@ -2506,8 +2518,8 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
               auxv pairs (a_type,a_val) ending with AT_NULL
        Many libc start routines expect auxv to exist; without AT_NULL they may parse garbage. */
     enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6, AT_BASE = 7, AT_ENTRY = 9,
-           AT_CLKTCK = 17, AT_RANDOM = 25 };
-    const size_t aux_pairs = 9; /* PHDR,PHENT,PHNUM,BASE,ENTRY,PAGESZ,RANDOM,CLKTCK,NULL */
+           AT_CLKTCK = 17, AT_SECURE = 23, AT_RANDOM = 25 };
+    const size_t aux_pairs = 10; /* PHDR,PHENT,PHNUM,BASE,ENTRY,PAGESZ,RANDOM,CLKTCK,SECURE,NULL */
     const size_t aux_qwords = aux_pairs * 2;
     /* pointer area: argv pointers + NULL + env pointers + NULL + auxv */
     size_t ptrs = (size_t)(argc + 1 + envc + 1) + aux_qwords;
@@ -2594,7 +2606,8 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         sp64[ax +12] = (uint64_t)AT_RANDOM; sp64[ax +13] = (uint64_t)random_addr;
         sp64[ax +14] = (uint64_t)AT_CLKTCK;
         sp64[ax +15] = (uint64_t)pit_get_frequency();
-        sp64[ax +16] = (uint64_t)AT_NULL;   sp64[ax +17] = 0;
+        sp64[ax +16] = (uint64_t)AT_SECURE; sp64[ax +17] = elf_auxv_secure(tip_tc);
+        sp64[ax +18] = (uint64_t)AT_NULL;   sp64[ax +19] = 0;
         *(uint64_t *)base = (uint64_t)argc;
     }
     if (tip_mm) {

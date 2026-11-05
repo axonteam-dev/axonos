@@ -20444,6 +20444,11 @@ kfree(path);
             kfree(kbuf);
             return 0;
         }
+        case SYS_creat:
+            /* Linux creat(path, mode) is open(path, O_WRONLY|O_CREAT|O_TRUNC, mode). */
+            a3 = a2;
+            a2 = 0x001u | 0x040u | 0x200u;
+            __attribute__((fallthrough));
         case SYS_open: {
             const char *path_u = (const char*)(uintptr_t)a1;
             int flags = (int)a2;

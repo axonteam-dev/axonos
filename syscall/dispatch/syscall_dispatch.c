@@ -1940,9 +1940,17 @@ static int clone_ensure_user_va(mm_t *mm, uint64_t va, int write) {
      * musl timer helper pthread_create failed with EFAULT → timer_create EAGAIN
      * → vim E1286 flood when opening kernel logs.
      */
-    (void)user_vma_fault_lazy_anon(va);
-    if (mm_user_leaf_pa(mm, va, write, &pa) == 0)
+    if (user_vma_fault_lazy_anon(va) &&
+        mm_user_leaf_pa(mm, va, write, &pa) == 0)
         return 0;
+    /* The return RIP may be in a lazy file-backed executable mapping. Fill
+     * it through filemap_fault rather than silently installing a blank page
+     * that would subsequently be executed as zero bytes. */
+    if (user_vma_fault_nonpresent(va, write ? 2u : 0u) &&
+        mm_user_leaf_pa(mm, va, write, &pa) == 0)
+        return 0;
+    if (!write)
+        return -1;
     /* Exclusive stack top: try the last byte of the page below. */
     if ((va & 0xfffu) == 0 && va >= 0x1000ull) {
         (void)user_vma_fault_lazy_anon(va - 1u);

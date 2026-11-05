@@ -433,8 +433,29 @@ int user_vma_set_prot(uint64_t tid, uintptr_t addr, size_t len, int prot) {
     unsigned long fl = 0;
     int rc = 0;
     uintptr_t end = addr + len;
+    if (end < addr) return -1;
+    thread_t *owner = thread_get((int)tid);
     acquire_irqsave(&g_user_vma_lock, &fl);
-    if (user_vma_split_at_nolock(tid, addr) != 0) rc = -1;
+    if (owner && owner->mm) {
+        user_vma_t *mm_vmas = user_vma_mm_storage(owner->mm, 0);
+        if (user_vma_unmap_capacity_nolock(owner, addr, end) != 0 ||
+            user_vma_split_runner_at_nolock(owner, addr) != 0 ||
+            user_vma_split_runner_at_nolock(owner, end) != 0 ||
+            user_vma_split_mm_at_nolock(mm_vmas, addr) != 0 ||
+            user_vma_split_mm_at_nolock(mm_vmas, end) != 0) {
+            rc = -1;
+        } else {
+            for (int i = 0; i < USER_VMA_MAX; i++) {
+                user_vma_t *v = &g_user_vmas[i];
+                if (v->used && user_vma_tid_matches_runner_mm_nolock(owner, v->tid) &&
+                    v->addr < end && v->addr + v->len > addr)
+                    v->prot = prot;
+                v = mm_vmas ? &mm_vmas[i] : NULL;
+                if (v && v->used && v->addr < end && v->addr + v->len > addr)
+                    v->prot = prot;
+            }
+        }
+    } else if (user_vma_split_at_nolock(tid, addr) != 0) rc = -1;
     else if (user_vma_split_at_nolock(tid, end) != 0) rc = -1;
     else {
         for (int i = 0; i < USER_VMA_MAX; i++) {
@@ -451,12 +472,16 @@ int user_vma_set_prot(uint64_t tid, uintptr_t addr, size_t len, int prot) {
 
 int user_vma_is_fully_mapped(uint64_t tid, uintptr_t addr, size_t len) {
     uintptr_t end = addr + len;
+    if (end < addr) return 0;
     uintptr_t cur = addr;
     unsigned long fl = 0;
     int ok = 1;
+    thread_t *owner = thread_get((int)tid);
     acquire_irqsave(&g_user_vma_lock, &fl);
     while (cur < end) {
-        user_vma_t *v = user_vma_find_containing_nolock(tid, cur);
+        user_vma_t *v = owner && owner->mm ?
+            user_vma_find_fault_nolock(owner, cur) :
+            user_vma_find_containing_nolock(tid, cur);
         if (!v) { ok = 0; break; }
         uintptr_t ve = v->addr + v->len;
         if (ve <= cur) { ok = 0; break; }

@@ -73,12 +73,27 @@
  * File-scope (not function-static) so the fatal-exit paths can reset it. */
 static int console_kbd_mode = 0x01; /* K_XLATE — Linux default */
 static int kd_mode = 0;             /* KD_TEXT */
+static process_t *console_graphics_owner;
+static uint64_t console_graphics_owner_tid;
+
+static int console_graphics_owned_by(thread_t *t) {
+    if (!t) return 0;
+    if (console_graphics_owner)
+        return t->process == console_graphics_owner;
+    return console_graphics_owner_tid && t->tid == console_graphics_owner_tid;
+}
+
 
 /* Reset the console after a holding process (e.g. Xorg fbdev) died: drop
  * KD_GRAPHICS back to KD_TEXT, K_OFF back to K_XLATE, and force the active
  * tty's backing store onto the screen so the shell text reappears. */
-static void console_kd_reset_for_dead_owner(int tty_idx) {
+static void console_kd_reset_for_dead_owner(thread_t *owner, int tty_idx) {
     int changed = 0;
+    if ((console_graphics_owner || console_graphics_owner_tid) &&
+        !console_graphics_owned_by(owner))
+        return;
+    console_graphics_owner = NULL;
+    console_graphics_owner_tid = 0;
     if (video_kd_graphics()) {
         video_set_kd_mode(0); /* KD_GRAPHICS -> KD_TEXT */
         changed = 1;
@@ -862,7 +877,7 @@ void syscall_user_fatal_exit(int signo) {
          * wedged the shell (no prompt after curl's DNS worker #PF).
          */
         if (leader->attached_tty >= 0) {
-            console_kd_reset_for_dead_owner(leader->attached_tty);
+            console_kd_reset_for_dead_owner(leader, leader->attached_tty);
         }
         {
             int nt = thread_get_count();
@@ -2473,7 +2488,7 @@ static int force_fatal_signal_thread_group(thread_t *any, int sig)
     }
 
     if (leader->attached_tty >= 0) {
-        console_kd_reset_for_dead_owner(leader->attached_tty);
+        console_kd_reset_for_dead_owner(leader, leader->attached_tty);
     }
     thread_close_all_fds(leader);
     if (leader->parent_tid >= 0) {
@@ -19224,6 +19239,13 @@ kfree(path);
                     if (mode < 0 || mode > 3)
                         return ret_err(EINVAL);
                     kd_mode = mode;
+                    if (mode == 1) {
+                        console_graphics_owner = cur ? cur->process : NULL;
+                        console_graphics_owner_tid = cur ? cur->tid : 0;
+                    } else if (console_graphics_owned_by(cur)) {
+                        console_graphics_owner = NULL;
+                        console_graphics_owner_tid = 0;
+                    }
                     video_set_kd_mode(mode == 1); /* KD_GRAPHICS */
                     return 0;
                 }
@@ -22930,7 +22952,7 @@ kfree(path);
                     cur->mm_ptemplate = NULL;
                 }
                 if (cur->attached_tty >= 0)
-                    console_kd_reset_for_dead_owner(cur->attached_tty);
+                    console_kd_reset_for_dead_owner(cur, cur->attached_tty);
                 if (cur->mm && cur->mm != mm_kernel()) {
                     mm_t *dead_mm = cur->mm;
                     cur->mm = NULL;
@@ -23036,7 +23058,7 @@ if (is_watch_proc(cur)) {
                     cur->mm_ptemplate = NULL;
                 }
                  if (cur->attached_tty >= 0)
-                    console_kd_reset_for_dead_owner(cur->attached_tty);
+                    console_kd_reset_for_dead_owner(cur, cur->attached_tty);
                  if (cur->mm && cur->mm != mm_kernel()) {
                      mm_t *dead_mm = cur->mm;
                      syscall_trace_init_spawn(cur, "exit-group-mm-enter", 0, 0);

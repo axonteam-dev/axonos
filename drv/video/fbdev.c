@@ -250,14 +250,22 @@ static int fbdev_sysfs_publish_now(uint8_t bus, uint8_t device, uint8_t function
 	if (sysfs_mkdir("/sys/class") != 0)
 		return -1;
 
-	/* Platform + class (non-PCI fbdev_open; target must NOT contain "devices/pci"). */
-	(void)sysfs_mkdir("/sys/devices");
-	(void)sysfs_mkdir("/sys/devices/platform");
-	(void)sysfs_mkdir("/sys/devices/platform/axonfb.0");
-	fbdev_sysfs_attr_devname("/sys/devices/platform/axonfb.0");
-	(void)sysfs_mkdir("/sys/class/graphics");
-	(void)sysfs_create_symlink("/sys/class/graphics/fb0",
-				   "../../devices/platform/axonfb.0");
+	/* fbdevhw's legacy probe reads fb0/device/subsystem and rejects a missing
+	 * link or a PCI bus target. Model a platform framebuffer with the Linux
+	 * class -> framebuffer -> device -> subsystem symlink layout. */
+	if (sysfs_mkdir("/sys/bus/platform/devices") != 0 ||
+	    sysfs_mkdir("/sys/devices/platform/axonfb.0/graphics/fb0") != 0 ||
+	    sysfs_mkdir("/sys/class/graphics") != 0 ||
+	    sysfs_create_symlink("/sys/devices/platform/axonfb.0/subsystem",
+	                         "../../../bus/platform") != 0 ||
+	    sysfs_create_symlink("/sys/devices/platform/axonfb.0/graphics/fb0/device",
+	                         "../..") != 0 ||
+	    sysfs_create_symlink("/sys/class/graphics/fb0",
+	                         "../../devices/platform/axonfb.0/graphics/fb0") != 0 ||
+	    sysfs_create_symlink("/sys/bus/platform/devices/axonfb.0",
+	                         "../../../devices/platform/axonfb.0") != 0)
+		return -1;
+	fbdev_sysfs_attr_devname("/sys/devices/platform/axonfb.0/graphics/fb0");
 
 	/* PCI graphics/fb0 — Xorg FBDevPciProbe / fbdev_open_pci. */
 	snprintf(path, sizeof(path),

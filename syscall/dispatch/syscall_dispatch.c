@@ -108,6 +108,30 @@ static void console_kd_reset_for_dead_owner(int tty_idx) {
 #define S_IFSOCK 0140000
 #endif
 
+/* Linux ignores O_TRUNC for character and block devices. Some virtual
+ * filesystems (notably devfs) represent device handles as FS_TYPE_REG, so the
+ * VFS handle type alone is not enough to decide whether to truncate. */
+static int syscall_apply_open_truncate(struct fs_file *file)
+{
+    if (!file) return 0;
+    file->pos = 0;
+
+    struct stat st;
+    if (vfs_fstat(file, &st) == 0) {
+        unsigned int type = st.st_mode & 0170000u;
+        if (type == S_IFCHR || type == S_IFBLK)
+            return 0;
+    }
+
+    if (file->type == FS_TYPE_REG) {
+        if (cgroupfs_open_truncate_noop(file)) return 0;
+        return vfs_ftruncate(file, 0);
+    }
+
+    file->size = 0;
+    return 0;
+}
+
 /* Linux x86_64 struct stat size; ensures st_mode at correct offset for S_ISREG etc. */
 #define STAT_COPY_SIZE 144
 #define NET_FRAME_BUF 2048
@@ -19501,8 +19525,7 @@ kfree(path);
                 } else
                     return ret_err(EFAULT);
                 if (vt >= 1 && vt <= DEVFS_TTY_COUNT) {
-                    devfs_switch_tty(vt - 1);
-                    return 0;
+                    return devfs_switch_tty(vt - 1) == 0 ? 0 : ret_err(EBUSY);
                 }
                 return ret_err(ENOTTY);
             }
@@ -20447,11 +20470,11 @@ kfree(path);
             const int O_TRUNC_MASK = 0x200;
             const int O_APPEND_MASK = 0x400;
             if (f && (flags & O_TRUNC_MASK)) {
-                f->pos = 0;
-                if (f->type == FS_TYPE_REG) {
-                    if (vfs_ftruncate(f, 0) != 0) f->size = 0;
-                } else {
-                    f->size = 0;
+                int tr = syscall_apply_open_truncate(f);
+                if (tr != 0) {
+                    fs_file_free(f);
+                    kfree(path);
+                    return ret_err(tr < 0 ? -tr : EIO);
                 }
             }
             if (f && (flags & O_APPEND_MASK)) { f->pos = (off_t)(size_t)f->size; }
@@ -20597,11 +20620,10 @@ kfree(path);
             const int O_TRUNC_MASK = 0x200;
             const int O_APPEND_MASK = 0x400;
             if (f && (flags & O_TRUNC_MASK)) {
-                f->pos = 0;
-                if (f->type == FS_TYPE_REG) {
-                    if (vfs_ftruncate(f, 0) != 0) f->size = 0;
-                } else {
-                    f->size = 0;
+                int tr = syscall_apply_open_truncate(f);
+                if (tr != 0) {
+                    fs_file_free(f);
+                    return ret_err(tr < 0 ? -tr : EIO);
                 }
             }
             if (f && (flags & O_APPEND_MASK)) { f->pos = (off_t)(size_t)f->size; }

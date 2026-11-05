@@ -119,8 +119,8 @@ int devfs_create_char_node(const char *path, void *driver_private);
 int devfs_find_block_by_path(const char *path);
 /* Return underlying disk device_id for block node path, or -1 if not found */
 int devfs_get_device_id(const char *path);
-/* Switch current active virtual terminal (0..N-1) */
-void devfs_switch_tty(int index);
+/* Switch current active virtual terminal (0..N-1); return -1 if busy. */
+int devfs_switch_tty(int index);
 
 /* Return number of virtual ttys available */
 int devfs_tty_count(void);

@@ -2863,19 +2863,19 @@ int devfs_mount(const char *path) {
     return fs_mount(path, &devfs_driver);
 }
 
-void devfs_switch_tty(int index) {
-    if (index < 0 || index >= DEVFS_TTY_COUNT) return;
-    if (index == devfs_active) return;
+int devfs_switch_tty(int index) {
+    if (index < 0 || index >= DEVFS_TTY_COUNT) return -1;
+    if (index == devfs_active) return 0;
 
     /* Serialize against the painter for the destination tty (write_stream /
      * echo hold out_lock). ISR-callable: never spin here, defer the switch
      * if the destination is being painted right now (T6). */
     struct devfs_tty *dst = &dev_ttys[index];
     if (!try_acquire(&dst->out_lock))
-        return;
+        return -1;
     if (index == devfs_active) {
         release(&dst->out_lock);
-        return;
+        return 0;
     }
 
     /* When cirrusfb is active, tty backing store matches its internal textbuf.
@@ -2885,7 +2885,7 @@ void devfs_switch_tty(int index) {
         devfs_active = index;
         devfs_tty_blit_to_console(dst);
         release(&dst->out_lock);
-        return;
+        return 0;
     }
 
     if (vbe_is_available()) {
@@ -2893,7 +2893,7 @@ void devfs_switch_tty(int index) {
         devfs_active = index;
         devfs_tty_blit_to_console(dst);
         release(&dst->out_lock);
-        return;
+        return 0;
     }
 
     /* Fallback: legacy VGA text mode only.
@@ -2908,6 +2908,7 @@ void devfs_switch_tty(int index) {
        current_user must track the *currently running* user thread (scheduler-owned),
        not "foreground tty process". Desync causes syscalls to be dispatched using the
        wrong thread struct and leads to user-mode GPF after vfork/exec. */
+    return 0;
 }
 
 int devfs_tty_count(void) { return DEVFS_TTY_COUNT; }

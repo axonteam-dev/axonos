@@ -1254,7 +1254,8 @@ int user_vma_add_file(uint64_t tid, uintptr_t addr, size_t len, int prot, int ki
                 unsigned long fl2 = 0;
                 acquire_irqsave(&g_user_vma_lock, &fl2);
                 for (int i = 0; i < USER_VMA_MAX; i++) {
-                    if (!vmas[i].used || vmas[i].addr != addr || vmas[i].len != len)
+                    if (!vmas[i].used || vmas[i].addr != addr || vmas[i].len != len ||
+                        vmas[i].kind != kind)
                         continue;
                     if (vmas[i].file)
                         user_vma_drop_file_nolock(&vmas[i]);

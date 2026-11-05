@@ -20,13 +20,12 @@
 
 extern void kprintf(const char *fmt, ...);
 
-/* Match syscall_fd_get(): process->fds is the shared descriptor table;
- * t->fds is only a per-thread mirror and may be stale after another thread
- * closes and reuses the same fd. */
+/* process->fds is authoritative when present, including empty slots;
+ * t->fds is only a mirror and may still point to a file closed by a sibling. */
 static struct fs_file *user_mmap_fd_get(thread_t *t, int fd) {
     if (!t || fd < 0 || fd >= THREAD_MAX_FD)
         return NULL;
-    if (t->process && t->process->fds[fd])
+    if (t->process)
         return t->process->fds[fd];
     return t->fds[fd];
 }
@@ -255,6 +254,10 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
 
     thread_t *tcur = thread_get_current_user();
     if (!tcur) tcur = thread_current();
+    /* Validate before MAP_FIXED can remove an existing mapping. */
+    if (!(flags & MAP_ANONYMOUS) &&
+        !user_mmap_fd_get(tcur ? tcur : cur, (int)(int64_t)a5))
+        return user_mm_ret_err(USER_MM_EBADF);
 
     uintptr_t top_limit = user_as_mmap_brk_top_limit(tcur);
     if (top_limit > (uintptr_t)USER_STACK_TOP)

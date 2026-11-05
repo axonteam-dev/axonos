@@ -7,7 +7,7 @@ import tempfile
 source = (Path(__file__).resolve().parents[1] / "mm/user_mmap.c").read_text()
 i = source.index("static struct fs_file *user_mmap_fd_get(")
 helper = source[i:source.index("\n}\n", i) + 3]
-assert source.count("user_mmap_fd_get(tcur ? tcur : cur,") == 4
+assert source.count("user_mmap_fd_get(tcur ? tcur : cur,") == 5
 program = r'''
 #include <assert.h>
 #include <stddef.h>
@@ -26,7 +26,7 @@ int main(void) {
     assert(user_mmap_fd_get(&a, 3) == &xfce);
     assert(user_mmap_fd_get(&b, 3) == &xfce);
     process.fds[3]=NULL;
-    assert(user_mmap_fd_get(&a, 3) == &dbus); /* existing syscall fallback */
+    assert(!user_mmap_fd_get(&a, 3)); /* shared slot closed despite stale mirror */
     a.process=NULL;
     assert(user_mmap_fd_get(&a, 3) == &dbus);
     assert(!user_mmap_fd_get(&a, -1));

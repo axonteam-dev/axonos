@@ -92,13 +92,15 @@ int user_map_mprotect_range(uint64_t va_begin, uint64_t va_end, int prot) {
         uint64_t l4i = (va >> 39) & 0x1FF;
         uint64_t l3i = (va >> 30) & 0x1FF;
         uint64_t l2i = (va >> 21) & 0x1FF;
-        if (!(l4[l4i] & PG_PRESENT)) return -1;
+        /* Lazy VMAs need not have page tables yet. Their future fault uses
+         * the VMA's updated prot; only existing leaves need changing here. */
+        if (!(l4[l4i] & PG_PRESENT)) continue;
         uint64_t *l3 = (uint64_t *)(uintptr_t)(l4[l4i] & ~0xFFFULL);
-        if (!(l3[l3i] & PG_PRESENT)) return -1;
+        if (!(l3[l3i] & PG_PRESENT)) continue;
         uint64_t l3e = l3[l3i];
         if (l3e & PG_PS_2M) return -1;
         uint64_t *l2 = (uint64_t *)(uintptr_t)(l3e & ~0xFFFULL);
-        if (!(l2[l2i] & PG_PRESENT)) return -1;
+        if (!(l2[l2i] & PG_PRESENT)) continue;
         uint64_t l2e = l2[l2i];
         if (l2e & PG_PS_2M) {
             if (prot_begin > va || prot_end < va + PAGE_SIZE_2M) {

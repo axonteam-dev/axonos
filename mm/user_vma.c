@@ -1130,9 +1130,20 @@ int user_vma_clone_for_tid(uint64_t from_tid, uint64_t to_tid) {
             rc = -1;
             break;
         }
-        user_vma_t *dst = user_vma_find_containing_nolock(to_tid, g_user_vmas[i].addr);
+        user_vma_t *dst = NULL;
+        for (int j = 0; j < USER_VMA_MAX; j++) {
+            if (g_user_vmas[j].used && g_user_vmas[j].tid == to_tid &&
+                g_user_vmas[j].addr == g_user_vmas[i].addr &&
+                g_user_vmas[j].len == g_user_vmas[i].len &&
+                g_user_vmas[j].kind == g_user_vmas[i].kind) {
+                dst = &g_user_vmas[j];
+                break;
+            }
+        }
         if (dst && g_user_vmas[i].file) {
             fs_file_get(g_user_vmas[i].file);
+            if (dst->file)
+                user_vma_drop_file_nolock(dst);
             dst->file = g_user_vmas[i].file;
             dst->file_off = g_user_vmas[i].file_off;
         }

@@ -989,6 +989,12 @@ static void thread_close_all_fds(thread_t *cur) {
             for (int k = 0; k < n; k++)
                 fs_file_free(f);
         }
+        /* Thread slots mirror the shared table and can contain dangling
+         * pointers after another thread closed/reused a descriptor. They do
+         * not own a second descriptor reference for the process leader. */
+        for (int i = 0; i < THREAD_MAX_FD; i++)
+            cur->fds[i] = NULL;
+        return;
     }
     for (int i = 0; i < THREAD_MAX_FD; i++) {
         struct fs_file *f = cur->fds[i];

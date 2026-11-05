@@ -8,6 +8,7 @@
 #include <exec.h>
 #include <fs.h>
 #include <thread.h>
+#include <process.h>
 #include <heap.h>
 #include <mmio.h>
 #include <paging.h>
@@ -18,6 +19,17 @@
 #include <axonos.h>
 
 extern void kprintf(const char *fmt, ...);
+
+/* Match syscall_fd_get(): process->fds is the shared descriptor table;
+ * t->fds is only a per-thread mirror and may be stale after another thread
+ * closes and reuses the same fd. */
+static struct fs_file *user_mmap_fd_get(thread_t *t, int fd) {
+    if (!t || fd < 0 || fd >= THREAD_MAX_FD)
+        return NULL;
+    if (t->process && t->process->fds[fd])
+        return t->process->fds[fd];
+    return t->fds[fd];
+}
 
 static int user_mmap_watch(thread_t *t) {
     if (!t || !t->name[0]) return 0;
@@ -549,8 +561,7 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         int fd = (int)(int64_t)a5;
         off_t file_off = (off_t)(int64_t)a6;
         if (fd >= 0 && fd < THREAD_MAX_FD && file_off >= 0) {
-            struct fs_file *f = tcur ? tcur->fds[fd] : cur->fds[fd];
-            if (!f) f = cur->fds[fd];
+            struct fs_file *f = user_mmap_fd_get(tcur ? tcur : cur, fd);
             if (f && f->type == FS_TYPE_REG && !fbdev_is_fb0_file(f)) {
                 if (shared_mapping) {
                     file_lazy = 1;
@@ -586,9 +597,7 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         int skip_file_pages = 0;
         int map_fd = (int)(int64_t)a5;
         if (map_fd >= 0 && map_fd < THREAD_MAX_FD) {
-            struct fs_file *mf = tcur ? tcur->fds[map_fd] : NULL;
-            if (!mf && cur)
-                mf = cur->fds[map_fd];
+            struct fs_file *mf = user_mmap_fd_get(tcur ? tcur : cur, map_fd);
             /* /dev/fb0 is VRAM, not a ramfs file — bulk-zero then map_page_2m
              * is a no-op on the 4K L1, so Doom drew into anonymous RAM. */
             if (fbdev_is_fb0_file(mf))
@@ -611,8 +620,7 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         int fd = (int)(int64_t)a5;
         off_t file_off = (off_t)(int64_t)a6;
         if (fd < 0 || fd >= THREAD_MAX_FD) return user_mm_ret_err(USER_MM_EBADF);
-        struct fs_file *f = tcur ? tcur->fds[fd] : cur->fds[fd];
-        if (!f) f = cur->fds[fd];
+        struct fs_file *f = user_mmap_fd_get(tcur ? tcur : cur, fd);
         if (!f) return user_mm_ret_err(USER_MM_EBADF);
         if (f->type != FS_TYPE_REG) return user_mm_ret_err(USER_MM_EBADF);
         if (file_off < 0) return user_mm_ret_err(USER_MM_EINVAL);
@@ -692,11 +700,10 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
             tpath = file_lazy_f->path;
         else if (eager_file && eager_file->path)
             tpath = eager_file->path;
-        else if (!file_lazy && !eager_file && !(flags & MAP_ANONYMOUS) &&
-                 (int)(int64_t)a5 >= 0 && (int)(int64_t)a5 < THREAD_MAX_FD &&
-                 tcur && tcur->fds[(int)(int64_t)a5] &&
-                 tcur->fds[(int)(int64_t)a5]->path)
-            tpath = tcur->fds[(int)(int64_t)a5]->path;
+        else if (!file_lazy && !eager_file && !(flags & MAP_ANONYMOUS)) {
+            struct fs_file *f = user_mmap_fd_get(tcur ? tcur : cur, (int)(int64_t)a5);
+            if (f) tpath = f->path;
+        }
         if (tpath && (strstr(tpath, "/dev/shm/") != NULL ||
                       strstr(tpath, "PostgreSQL.") != NULL ||
                       strstr(tpath, "dynshmem") != NULL)) {

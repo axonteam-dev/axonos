@@ -153,6 +153,19 @@ static int user_vma_is_filemap(const user_vma_t *v) {
            v->kind == USER_VMA_KIND_SHM;
 }
 
+/* MAP_FIXED file segments can be nested inside an earlier whole-ELF anonymous
+ * reservation. A first-match search incorrectly returns the reservation and
+ * demand-fills executable text with zeroes. The innermost mapping wins. */
+static int user_vma_is_better_containing(const user_vma_t *candidate,
+                                        const user_vma_t *best) {
+    if (!best) return 1;
+    if (candidate->addr != best->addr)
+        return candidate->addr > best->addr;
+    if (candidate->len != best->len)
+        return candidate->len < best->len;
+    return candidate->file && !best->file;
+}
+
 static user_vma_t *user_vma_find_containing_nolock(uint64_t tid, uintptr_t va) {
     for (int i = 0; i < USER_VMA_MAX; i++) {
         if (!g_user_vmas[i].used || g_user_vmas[i].tid != tid) continue;
@@ -225,24 +238,29 @@ static int user_vma_tid_matches_runner_mm_nolock(thread_t *runner, uint64_t reco
     return 0;
 }
 
-/* Faults must also find inherited mm-scoped VMAs. A fork child's unfaulted
- * shared-library pages need not have an entry in the tid-keyed mirror. */
+/* An address space owns its mappings. A tid mirror may outlive a task or be
+ * associated with a different mm after a thread slot is reused; it must not
+ * override the mm's mappings (or invent a mapping in an mm-scoped hole). */
 static user_vma_t *user_vma_find_fault_nolock(thread_t *runner, uintptr_t va) {
-    for (int i = 0; i < USER_VMA_MAX; i++) {
-        user_vma_t *v = &g_user_vmas[i];
-        if (v->used && user_vma_tid_matches_runner_mm_nolock(runner, v->tid) &&
-            va >= v->addr && va - v->addr < v->len)
-            return v;
-    }
+    user_vma_t *best = NULL;
     user_vma_t *vmas = runner ? user_vma_mm_storage(runner->mm, 0) : NULL;
     if (vmas) {
         for (int i = 0; i < USER_VMA_MAX; i++) {
             user_vma_t *v = &vmas[i];
-            if (v->used && va >= v->addr && va - v->addr < v->len)
-                return v;
+            if (v->used && va >= v->addr && va - v->addr < v->len &&
+                user_vma_is_better_containing(v, best))
+                best = v;
         }
+        return best;
     }
-    return NULL;
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        user_vma_t *v = &g_user_vmas[i];
+        if (v->used && user_vma_tid_matches_runner_mm_nolock(runner, v->tid) &&
+            va >= v->addr && va - v->addr < v->len &&
+            user_vma_is_better_containing(v, best))
+            best = v;
+    }
+    return best;
 }
 
 static int user_vma_split_runner_at_nolock(thread_t *runner,

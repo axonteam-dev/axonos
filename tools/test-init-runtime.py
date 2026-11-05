@@ -164,6 +164,14 @@ static user_vma_t *user_vma_mm_storage(mm_t *mm, int create) {
 static int user_vma_tid_matches_runner_mm_nolock(thread_t *runner, uint64_t tid) {
     return runner && runner->tid == tid;
 }
+static int user_vma_is_better_containing(const void *candidate, const void *best) {
+    const user_vma_t *c = candidate;
+    const user_vma_t *b = best;
+    if (!b) return 1;
+    if (c->addr != b->addr) return c->addr > b->addr;
+    if (c->len != b->len) return c->len < b->len;
+    return 0;
+}
 ''' + find_vma + r'''
 int main(void) {
     mm_t child = {0}, unrelated = {0};
@@ -173,7 +181,7 @@ int main(void) {
     assert(user_vma_find_fault_nolock(&runner, 0x8000fff) == &child.vmas[0]);
     assert(!user_vma_find_fault_nolock(&runner, 0x8001000));
     g_user_vmas[1] = (user_vma_t){1, 9, 0x8000000, 4096, 0};
-    assert(user_vma_find_fault_nolock(&runner, 0x8000000) == &g_user_vmas[1]);
+    assert(user_vma_find_fault_nolock(&runner, 0x8000000) == &child.vmas[0]);
     memset(g_user_vmas, 0, sizeof(g_user_vmas)); runner.mm = &unrelated;
     assert(!user_vma_find_fault_nolock(&runner, 0x8000000));
     puts("PASS: fault lookup finds inherited mm-only VMAs and isolates processes");

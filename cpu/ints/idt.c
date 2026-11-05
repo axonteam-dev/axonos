@@ -365,6 +365,12 @@ static int fault_try_user_stack_page(uint64_t cr2, uint64_t err) {
                 hi = (uintptr_t)MMIO_IDENTITY_LIMIT;
         if (a < lo || a >= hi)
                 return 0;
+        /* A clone3/posix_spawn stack is an ordinary mmap, often adjacent to
+         * shared libraries. The legacy two-megabyte TLS allowance below it
+         * can overlap a lazy file mapping. Such faults must reach filemap,
+         * not be satisfied with an anonymous zero page. */
+        if (user_vma_is_lazy_file_page_for(t, a))
+                return 0;
         /* Linux expand_stack: only !present holes. A present user/read fault
          * (err=0x5, typically U=0 leftover) used to allocate a fresh zero page
          * over live stack — wiping the return address so RET #GP(0)s on a

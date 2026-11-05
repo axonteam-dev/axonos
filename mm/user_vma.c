@@ -920,21 +920,18 @@ int user_vma_is_lazy_file_page_for(thread_t *runner, uintptr_t va) {
     unsigned long fl = 0;
     int hit = 0;
     acquire_irqsave(&g_user_vma_lock, &fl);
-    for (int i = 0; i < USER_VMA_MAX; i++) {
-        if (!g_user_vmas[i].used)
-            continue;
-        if (!user_vma_tid_matches_runner_mm_nolock(runner, g_user_vmas[i].tid))
-            continue;
-        if (!g_user_vmas[i].file)
-            continue;
-        if (!user_vma_is_filemap(&g_user_vmas[i]))
-            continue;
-        uintptr_t a = g_user_vmas[i].addr;
-        uintptr_t e = a + g_user_vmas[i].len;
-        if (va >= a && va < e) {
+    for (int i = 0; i < USER_VMA_MAX && !hit; i++) {
+        user_vma_t *v = &g_user_vmas[i];
+        if (v->used && user_vma_tid_matches_runner_mm_nolock(runner, v->tid) &&
+            user_vma_is_filemap(v) && va >= v->addr && va - v->addr < v->len)
             hit = 1;
-            break;
-        }
+    }
+    user_vma_t *mm_vmas = user_vma_mm_storage(runner->mm, 0);
+    for (int i = 0; mm_vmas && i < USER_VMA_MAX && !hit; i++) {
+        user_vma_t *v = &mm_vmas[i];
+        if (v->used && user_vma_is_filemap(v) &&
+            va >= v->addr && va - v->addr < v->len)
+            hit = 1;
     }
     release_irqrestore(&g_user_vma_lock, fl);
     return hit;

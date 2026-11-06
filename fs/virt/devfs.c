@@ -948,11 +948,14 @@ static void devfs_tty_echo_bytes(struct devfs_tty *tty, const uint8_t *bytes,
     if (!try_acquire(&tty->out_lock))
         return;
 
-    console_begin_tty_batch();
+    int visible = !video_kd_graphics();
+    if (visible) console_begin_tty_batch();
     for (size_t i = 0; i < count; i++)
-        devfs_tty_emit_byte(tty, 1, bytes[i]);
-    console_set_cursor(tty->cursor_x, tty->cursor_y);
-    console_end_tty_batch();
+        devfs_tty_emit_byte(tty, visible, bytes[i]);
+    if (visible) {
+        console_set_cursor(tty->cursor_x, tty->cursor_y);
+        console_end_tty_batch();
+    }
     release(&tty->out_lock);
 }
 
@@ -2943,10 +2946,13 @@ static int devfs_tty_try_erase(struct devfs_tty *t, int tty) {
             if (try_acquire(&t->out_lock)) {
                 uint32_t cx = (uint32_t)t->cursor_x;
                 uint32_t cy = (uint32_t)t->cursor_y;
-                uint8_t attr = console_get_cell_attr(cx - 1, cy);
-                console_putch_xy(cx - 1, cy, ' ', attr);
+                int visible = !video_kd_graphics();
+                uint8_t attr = visible ? console_get_cell_attr(cx - 1, cy) : t->current_attr;
+                if (t->screen)
+                    tty_cell_store(t->screen, cy * devfs_tty_cols() + cx - 1, ' ', attr);
+                if (visible) console_putch_xy(cx - 1, cy, ' ', attr);
                 t->cursor_x = cx - 1;
-                console_set_cursor(t->cursor_x, t->cursor_y);
+                if (visible) console_set_cursor(t->cursor_x, t->cursor_y);
                 release(&t->out_lock);
             }
         }

@@ -17366,8 +17366,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 /* Lost-wakeup guard: if SIGCHLD became pending between the
                  * check above and thread_block(), no one will unblock us — do
                  * not yield, loop back and take the pending signal. */
-                if (!(tcur->pending_signals & ~new_mask) &&
-                    tcur->state == THREAD_BLOCKED)
+                if (tcur->pending_signals & ~new_mask)
+                    thread_unblock(wait_tid);
+                else if (tcur->state == THREAD_BLOCKED)
                     thread_yield();
                 syscall_restore_live_frame_from_snapshot(tcur, "rt_sigsuspend");
             }

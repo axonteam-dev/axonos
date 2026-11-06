@@ -313,8 +313,9 @@ void evdev_ps2_mouse_packet(const uint8_t pkt[3])
 	if ((pkt[0] & 0xC0u) != 0)
 		return;
 
-	dx = (int8_t)pkt[1];
-	dy = (int8_t)pkt[2];
+	/* PS/2 movement is signed 9-bit; signs live in the status byte. */
+	dx = (int)pkt[1] - ((pkt[0] & 0x10u) ? 256 : 0);
+	dy = (int)pkt[2] - ((pkt[0] & 0x20u) ? 256 : 0);
 	dy = -dy; /* PS/2 Y is up; Linux REL_Y is down */
 	btn = pkt[0] & 0x07u;
 	old = d->btn;

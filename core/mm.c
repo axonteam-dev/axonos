@@ -1078,8 +1078,10 @@ void mm_release(mm_t *mm) {
             kfree(n);
             n = nx;
         }
-        if (mm->vma_storage)
+        if (mm->vma_storage) {
+            user_vma_release_mm(mm);
             kfree(mm->vma_storage);
+        }
         if (mm->pml4_alloc_raw) kfree(mm->pml4_alloc_raw);
         kfree(mm);
     }

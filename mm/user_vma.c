@@ -829,6 +829,19 @@ void user_vma_remove_all_for_tid(uint64_t tid) {
     release_irqrestore(&g_user_vma_lock, fl);
 }
 
+/* The mm-scoped copy owns one file reference per used entry, independently
+ * of the tid mirrors. Drop those references before freeing its storage. */
+void user_vma_release_mm(mm_t *mm) {
+    if (!mm || !mm->vma_storage) return;
+    unsigned long fl = 0;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    user_vma_t *vmas = (user_vma_t *)mm->vma_storage;
+    for (int i = 0; i < USER_VMA_MAX; i++)
+        if (vmas[i].used)
+            user_vma_clear_nolock(&vmas[i]);
+    release_irqrestore(&g_user_vma_lock, fl);
+}
+
 void user_vma_teardown_unmap_for_exec(thread_t *runner) {
     unsigned long fl = 0;
     acquire_irqsave(&g_user_vma_lock, &fl);

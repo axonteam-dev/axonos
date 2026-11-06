@@ -38,6 +38,7 @@ int user_vma_lookup_after(thread_t *runner, uintptr_t addr,
 int user_vma_grow(thread_t *runner, uintptr_t addr, size_t old_len, size_t new_len);
 
 void user_vma_remove_all_for_tid(uint64_t tid);
+void user_vma_release_mm(mm_t *mm);
 /* Unmap page tables for all VMAs in runner's address space and drop metadata. */
 void user_vma_teardown_unmap_for_exec(thread_t *runner);
 int user_vma_clone_for_tid(uint64_t from_tid, uint64_t to_tid);

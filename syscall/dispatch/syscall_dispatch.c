@@ -5619,14 +5619,12 @@ static int fork_socket_should_share_ksock(const ksock_net_t *s) {
 }
 
 static void fork_inherit_fd_table(thread_t *child, thread_t *parent) {
-    int new_proc = (!parent->process || child->process != parent->process);
     process_t *pp = parent->process;
     process_t *cp = child->process;
     for (int i = 0; i < THREAD_MAX_FD; i++) {
-        /* Fork must copy the process table (syscall_fd_get's source of truth).
-         * CLONE_THREAD keeps the old thread-slot mirror so we do not extra-ref
-         * sockets that already live in the shared process table. */
-        struct fs_file *pf = (new_proc && pp && pp->fds[i]) ? pp->fds[i] : parent->fds[i];
+        /* Empty shared slots are authoritative too: a sibling may have
+         * closed the fd while parent->fds still contains a stale pointer. */
+        struct fs_file *pf = pp ? pp->fds[i] : parent->fds[i];
         child->fds[i] = NULL;
         if (cp && i < PROCESS_MAX_FD)
             cp->fd_cloexec[i] = (pp && i < PROCESS_MAX_FD) ? pp->fd_cloexec[i] : 0;

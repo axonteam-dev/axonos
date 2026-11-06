@@ -731,48 +731,29 @@ static int vmwgfx_fifo_free_bytes(vmwgfx_ctx_t *ctx) {
 	return (int)freeb;
 }
 
-/* Byte-indexed ring; one dword at a time with wrap (VMware guest FIFO convention). */
-static int vmwgfx_fifo_append_u32(vmwgfx_ctx_t *ctx, uint32_t value) {
+/* Publish the entire UPDATE at once: the host must not see a partial command. */
+static int vmwgfx_fifo_emit_update(vmwgfx_ctx_t *ctx, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 	volatile uint32_t *hdr = (volatile uint32_t *)ctx->fifo_va;
 	uint8_t *base = (uint8_t *)ctx->fifo_va;
 	uint32_t sz = ctx->fifo_len;
-	if (!hdr || sz < 64u)
+	if (!hdr || sz < 64u || w == 0 || h == 0)
 		return -1;
-	if (vmwgfx_fifo_free_bytes(ctx) < 4)
+	if (vmwgfx_fifo_free_bytes(ctx) < 20)
 		return -1;
 	uint32_t mn = hdr[SVGA_FIFO_MIN];
 	uint32_t mx = hdr[SVGA_FIFO_MAX];
 	uint32_t nx = hdr[SVGA_FIFO_NEXT];
 	if (mx <= mn || mx > sz || mx > SVGA_FIFO_HOST_MAX_BYTES || mn + 20u > mx ||
-	    mn < 4u * sizeof(uint32_t))
+	    mn < 4u * sizeof(uint32_t) || nx < mn || nx >= mx || (nx & 3u))
 		return -1;
-	if (nx + 4u > mx)
-		nx = mn;
-	*(volatile uint32_t *)(base + nx) = value;
-	nx += 4u;
-	if (nx >= mx)
-		nx = mn;
-	hdr[SVGA_FIFO_NEXT] = nx;
+	const uint32_t words[5] = { SVGA_CMD_UPDATE, x, y, w, h };
+	for (unsigned i = 0; i < 5; i++) {
+		*(volatile uint32_t *)(base + nx) = words[i];
+		nx += 4u;
+		if (nx >= mx) nx = mn;
+	}
 	vmwgfx_io_barrier();
-	return 0;
-}
-
-static int vmwgfx_fifo_emit_update(vmwgfx_ctx_t *ctx, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
-	if (!ctx->fifo_va || w == 0 || h == 0)
-		return -1;
-	/* Full UPDATE is 5 dwords; require room up front so we never leave a partial cmd. */
-	if (vmwgfx_fifo_free_bytes(ctx) < 20)
-		return -1;
-	if (vmwgfx_fifo_append_u32(ctx, SVGA_CMD_UPDATE) != 0)
-		return -1;
-	if (vmwgfx_fifo_append_u32(ctx, x) != 0)
-		return -1;
-	if (vmwgfx_fifo_append_u32(ctx, y) != 0)
-		return -1;
-	if (vmwgfx_fifo_append_u32(ctx, w) != 0)
-		return -1;
-	if (vmwgfx_fifo_append_u32(ctx, h) != 0)
-		return -1;
+	hdr[SVGA_FIFO_NEXT] = nx;
 	return 0;
 }
 

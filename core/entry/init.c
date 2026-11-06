@@ -18,6 +18,7 @@
 #include <pit.h>
 #include <rtc.h>
 #include <heap.h>
+#include <user_vma.h>
 #include <pmm.h>
 #include <paging.h>
 #include <sysinfo.h>
@@ -1006,6 +1007,10 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         } else {
                                 heap_init(heap_start, heap_size);
                         }
+                }
+                if (user_vma_init() != 0) {
+                        kprintf("fatal: unable to allocate global VMA table\n");
+                        for (;;) asm volatile("cli; hlt");
                 }
                 kprintf("Kernel starting... heap_start: %p heap_size=%llu heap_total=%llu heap_base=%p ram_mb=%d kernel_end: %p initrd: %p..%p\n",
                                 (void*)heap_start,

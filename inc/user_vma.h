@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <thread.h>
 
-#define USER_VMA_MAX 4096
+#define USER_VMA_MAX 8192
 
 enum {
     USER_VMA_KIND_MMAP = 1,
@@ -14,6 +14,7 @@ enum {
 };
 
 struct fs_file;
+int user_vma_init(void);
 
 typedef struct {
     int used;

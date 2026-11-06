@@ -16,8 +16,16 @@
 #include <vga.h>
 #include <klog.h>
 
-static user_vma_t g_user_vmas[USER_VMA_MAX];
+static user_vma_t *g_user_vmas;
 static spinlock_t g_user_vma_lock;
+
+int user_vma_init(void) {
+    if (g_user_vmas) return 0;
+    g_user_vmas = (user_vma_t *)kmalloc(sizeof(user_vma_t) * USER_VMA_MAX);
+    if (!g_user_vmas) return -1;
+    memset(g_user_vmas, 0, sizeof(user_vma_t) * USER_VMA_MAX);
+    return 0;
+}
 
 static int g_uv_trace;
 #define UV_TRACE_MAX 260

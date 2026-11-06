@@ -1957,7 +1957,9 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
                                       size_t size, const char *path) {
     if (!t || !s) return -1;
     int idx = t->id;
-    const int tty_on_vga_batch = (idx == devfs_active);
+    /* Keep parsing into the tty's backing store, but never paint glyphs,
+     * cursor moves or scroll operations into a userspace-owned framebuffer. */
+    const int tty_on_vga_batch = (idx == devfs_active && !video_kd_graphics());
     unsigned long out_flags = 0;
     acquire_irqsave(&t->out_lock, &out_flags);
     if (tty_on_vga_batch)

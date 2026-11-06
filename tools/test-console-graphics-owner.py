@@ -24,6 +24,9 @@ static int devfs_tty_leave_alt_screen(int tty) { (void)tty; return 0; }
 static void devfs_tty_force_reblit(int tty) { (void)tty; repaint++; }
 ''' + source[start:end] + r'''
 int main(void) {
+    assert(console_graphics_wait_syscall(7) && console_graphics_wait_syscall(232));
+    assert(console_graphics_wait_syscall(270) && console_graphics_wait_syscall(281));
+    assert(console_graphics_wait_syscall(441) && !console_graphics_wait_syscall(1));
     process_t x={1}, child={2};
     thread_t xorg={&x,19}, worker={&x,20}, helper={&child,26}, no_process={NULL,30};
     console_graphics_owner=&x; console_graphics_owner_tid=19;

@@ -84,6 +84,14 @@ static int console_graphics_owned_by(thread_t *t) {
 }
 
 
+/* A memory-mapped framebuffer can require a device damage notification.
+ * Flush before the graphics owner sleeps, including epoll/pselect paths; a
+ * nonblocking poll-only flush misses the usual X server event loop. */
+static int console_graphics_wait_syscall(uint64_t nr) {
+    return nr == 7 || nr == 23 || nr == 232 || nr == 270 || nr == 271 ||
+           nr == 281 || nr == 441; /* poll/select/epoll and their variants */
+}
+
 /* Reset the console after a holding process (e.g. Xorg fbdev) died: drop
  * KD_GRAPHICS back to KD_TEXT, K_OFF back to K_XLATE, and force the active
  * tty's backing store onto the screen so the shell text reappears. */
@@ -23356,6 +23364,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
     thread_t *trace_t = syscall_resolve_thread();
     if (!trace_t)
         trace_t = thread_get_current_user();
+    if (video_kd_graphics() && console_graphics_owned_by(trace_t) &&
+        console_graphics_wait_syscall(num))
+        fbdev_sync_user_frontbuffer();
     /* If this task forked on its previous syscall, that iretq has completed:
      * publishing now cannot race the old live syscall frame. */
     syscall_publish_deferred_fork_child();

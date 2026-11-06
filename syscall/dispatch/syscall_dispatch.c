@@ -22854,10 +22854,9 @@ kfree(path);
                      * Drop this task's fd refs. process->fds is shared:
                      * - Inherit (leader still mirrors the slot): drop the
                      *   extra fork_inherit ref only.
-                     * - open/socket by this thread into process->fds: close
-                     *   and clear the process slot. Leaving bound UDP DNS
-                     *   sockets in ksock_registry stole replies from the
-                     *   leader / next curl (error 6 after a successful run).
+                     * - open/socket by this thread into process->fds: the
+                     *   shared table owns the descriptor; a thread exit must
+                     *   not close it while the process is still running.
                      */
                     for (int fd = 0; fd < THREAD_MAX_FD; ++fd) {
                         struct fs_file *f = cur->fds[fd];
@@ -22870,8 +22869,7 @@ kfree(path);
                                 fs_file_free(f);
                                 continue;
                             }
-                            cur->process->fds[fd] = NULL;
-                            cur->process->fd_cloexec[fd] = 0;
+                            continue;
                         }
                         fs_file_free(f);
                     }

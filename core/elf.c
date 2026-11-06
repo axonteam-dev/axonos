@@ -74,6 +74,11 @@ static void elf_fill_at_random(uint8_t *rp) {
 void exec_boot_ensure_stdio(thread_t *ut) {
     if (!ut)
         return;
+    /* A sibling may have closed/reused a descriptor since this thread last
+     * updated its mirror. Never inspect or republish stale stdio pointers. */
+    if (ut->process)
+        for (int fd = 0; fd <= 2; fd++)
+            ut->fds[fd] = ut->process->fds[fd];
 
     /*
      * Linux starts init with descriptors 0, 1 and 2 already open. Use one
@@ -180,7 +185,10 @@ void exec_boot_ensure_stdio(thread_t *ut) {
             tty, ut->sid, ut->pgid);
     }
 
-    process_sync_from_thread(ut->process, ut);
+    if (ut->process)
+        for (int fd = 0; fd <= 2; fd++)
+            ut->process->fds[fd] = ut->fds[fd];
+    process_sync_exec_from_thread(ut->process, ut);
 }
 
 uint64_t elf_et_dyn_base(void) {
@@ -2314,7 +2322,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[],
     }
 
     /* Unreachable on success (enter_user_mode). */
-    process_sync_from_thread(cur->process, cur);
+    process_sync_exec_from_thread(cur->process, cur);
     return 0;
 }
 
@@ -2715,7 +2723,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
                 cur_user->sid = cur_user->process->sid;
             if (cur_user->pgid <= 0)
                 cur_user->pgid = cur_user->process->pgid;
-            process_sync_from_thread(cur_user->process, cur_user);
+            process_sync_exec_from_thread(cur_user->process, cur_user);
         }
         /*
          * After setsid(), BusyBox init with empty console id leaves /dev/null
@@ -2724,7 +2732,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
          */
         exec_boot_ensure_stdio(cur_user);
         if (cur_user->process)
-            process_sync_from_thread(cur_user->process, cur_user);
+            process_sync_exec_from_thread(cur_user->process, cur_user);
         /* Set foreground so Ctrl+C terminates this process when waiting */
         if (cur_user->attached_tty >= 0) {
             devfs_set_tty_fg_pgrp(cur_user->attached_tty, cur_user->pgid);
@@ -2922,7 +2930,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
     {
         thread_t *tc = thread_current();
         if (tc) {
-            process_sync_from_thread(tc->process, tc);
+            process_sync_exec_from_thread(tc->process, tc);
             process_exec_reset(tc->process, tc);
             syscall_trace_init_spawn(tc, "exec-ready", entry, final_stack);
         }

@@ -212,7 +212,7 @@ void process_attach_thread(process_t *process, thread_t *thread) {
     release_irqrestore(&process_lock, flags);
 }
 
-void process_sync_from_thread(process_t *process, thread_t *thread) {
+static void process_sync_thread_state(process_t *process, thread_t *thread, int copy_fds) {
     if (!process || !thread)
         return;
     unsigned long flags;
@@ -239,9 +239,19 @@ void process_sync_from_thread(process_t *process, thread_t *thread) {
     process->umask = thread->umask;
     memcpy(process->cwd, thread->cwd, sizeof(process->cwd));
     memcpy(process->fs_root, thread->fs_root, sizeof(process->fs_root));
-    for (int i = 0; i < PROCESS_MAX_FD; ++i)
-        process->fds[i] = thread->fds[i];
+    if (copy_fds)
+        for (int i = 0; i < PROCESS_MAX_FD; ++i)
+            process->fds[i] = thread->fds[i];
     release_irqrestore(&process_lock, flags);
+}
+
+void process_sync_from_thread(process_t *process, thread_t *thread) {
+    process_sync_thread_state(process, thread, 1);
+}
+
+/* exec already has an authoritative shared descriptor table. */
+void process_sync_exec_from_thread(process_t *process, thread_t *thread) {
+    process_sync_thread_state(process, thread, 0);
 }
 
 process_t *process_find(uint64_t pid) {

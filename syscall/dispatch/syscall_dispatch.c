@@ -127,6 +127,20 @@ static void console_kd_reset_for_dead_owner(thread_t *owner, int tty_idx) {
 
 #define mark_user_identity_range_2m_sys user_map_mark_identity_2m
 
+/* VMware scanout needs explicit UPDATE notifications for userspace mmap
+ * stores. While the graphics owner is parked in a wait syscall, retry the
+ * presentation at a bounded rate rather than relying only on syscall entry. */
+static void console_graphics_wait_present(thread_t *owner) {
+    static uint64_t next_ms;
+    if (!video_kd_graphics() || !console_graphics_owned_by(owner)) return;
+    uint64_t now = time_monotonic_ms();
+    uint64_t next = __atomic_load_n(&next_ms, __ATOMIC_RELAXED);
+    if (now < next) return;
+    if (!__atomic_compare_exchange_n(&next_ms, &next, now + 50, 0,
+                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+    fbdev_sync_user_frontbuffer();
+}
+
 #ifndef S_IFSOCK
 #define S_IFSOCK 0140000
 #endif
@@ -14006,6 +14020,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
             auto_select_check:
             {
+                console_graphics_wait_present(curth);
                 if (thread_has_interrupt_signal(curth)) {
                     if (rin) kfree(rin); if (rout) kfree(rout);
                     if (win) kfree(win); if (wout) kfree(wout);
@@ -20291,6 +20306,7 @@ kfree(path);
 
             auto_check:
             {
+                console_graphics_wait_present(poll_thr);
                 /* htop refresh loops live inside one poll/getdents window on SMP
                  * (timer only sets need_resched in kernel). Yield so a woken tty
                  * reader on another VC can run. */
@@ -23300,6 +23316,7 @@ if (is_watch_proc(cur)) {
             epoll_event_k *outbuf = (epoll_event_k *)kmalloc((size_t)maxevents * sizeof(epoll_event_k));
             if (!outbuf) return ret_err(ENOMEM);
             for (;;) {
+                console_graphics_wait_present(wait_thr);
                 thread_cond_resched();
                 if (thread_has_interrupt_signal(wait_thr)) {
                     kfree(outbuf);

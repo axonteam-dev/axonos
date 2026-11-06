@@ -2459,6 +2459,7 @@ static void exit_group_reap_peer_threads(thread_t *cur) {
             fs_file_free(f);
         }
         t->exit_status = 9; /* WTERMSIG: SIGKILL */
+        user_vma_remove_all_for_tid((uint64_t)(t->tid ? t->tid : 1));
         t->state = THREAD_TERMINATED;
     }
 }
@@ -22858,6 +22859,7 @@ kfree(path);
                     cur->clear_child_tid = 0;
                     sysv_shm_detach_all_for_tid(
                         (uint64_t)(cur->tid ? cur->tid : 1));
+                    user_vma_remove_all_for_tid((uint64_t)(cur->tid ? cur->tid : 1));
                     /*
                      * Drop this task's fd refs. process->fds is shared:
                      * - Inherit (leader still mirrors the slot): drop the

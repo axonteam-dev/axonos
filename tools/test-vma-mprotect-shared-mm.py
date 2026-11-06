@@ -33,8 +33,6 @@ static void acquire_irqsave(spinlock_t *l, unsigned long *flags) {
 static void release_irqrestore(spinlock_t *l, unsigned long flags) {
     (void)flags; assert(l->locked); l->locked=0;
 }
-static int thread_get_count(void) { return 2; }
-static thread_t *thread_get_by_index(int i) { return &threads[i]; }
 static thread_t *thread_get(int tid) { return tid == 1 ? &threads[0] : tid == 2 ? &threads[1] : NULL; }
 static user_vma_t *user_vma_mm_storage(mm_t *mm, int create) {
     (void)create; return mm ? mm->vmas : NULL;

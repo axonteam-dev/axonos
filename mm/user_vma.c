@@ -227,15 +227,11 @@ static int user_vma_tid_matches_runner_mm_nolock(thread_t *runner, uint64_t reco
         return record_tid == 1u;
     if (!runner->mm)
         return (uint64_t)(runner->tid ? runner->tid : 1) == record_tid;
-    int n = thread_get_count();
-    for (int j = 0; j < n; j++) {
-        thread_t *u = thread_get_by_index(j);
-        if (!u || u->ring != 3) continue;
-        if (u->mm != runner->mm) continue;
-        if ((uint64_t)(u->tid ? u->tid : 1) == record_tid)
-            return 1;
-    }
-    return 0;
+    if (record_tid > 0x7fffffffULL)
+        return 0;
+    thread_t *u = thread_get((int)record_tid);
+    return u && u->ring == 3 && u->mm == runner->mm &&
+           (uint64_t)(u->tid ? u->tid : 1) == record_tid;
 }
 
 /* An address space owns its mappings. A tid mirror may outlive a task or be

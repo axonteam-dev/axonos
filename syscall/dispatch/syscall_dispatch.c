@@ -13341,6 +13341,20 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (r != 0) return ret_err(net_l3_send_errno());
                     return (uint64_t)sum;
                 }
+                if (s->unix_domain_stub && s->type_base == SOCK_STREAM_LOCAL) {
+                    size_t total = 0;
+                    kfree(flat);
+                    for (int i = 0; i < iovcnt; i++) {
+                        size_t len = (size_t)iov[i].len;
+                        if (!len) continue;
+                        ssize_t wr = net_sock_write_userspace(cur, fd, s,
+                            (const void *)(uintptr_t)iov[i].base, len);
+                        if (wr < 0) return total ? (uint64_t)total : ret_err((int)-wr);
+                        total += (size_t)wr;
+                        if ((size_t)wr < len) break;
+                    }
+                    return (uint64_t)total;
+                }
                 kfree(flat);
                 ssize_t wr = net_sock_write_userspace(cur, fd, s, (const void *)(uintptr_t)iov[0].base, (size_t)iov[0].len);
                 if (wr < 0) return ret_err((int)-wr);

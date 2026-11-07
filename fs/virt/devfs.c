@@ -179,7 +179,7 @@ static void tty_cells_pack_vga(const uint8_t *screen, uint32_t rows, uint32_t co
 
 /* Push tty backing store to the visible console (active VC only). */
 static void devfs_tty_blit_to_console(struct devfs_tty *tty) {
-    if (!tty || !tty->screen) return;
+    if (!tty || !tty->screen || video_kd_graphics()) return;
     if (cirrusfb_is_ready()) {
         cirrusfb_restore_screen(tty->screen, cirrusfb_cols(), cirrusfb_rows());
         cirrusfb_set_cursor(tty->cursor_x, tty->cursor_y);
@@ -2886,7 +2886,7 @@ int devfs_switch_tty(int index) {
     /* When cirrusfb is active, tty backing store matches its internal textbuf.
        Never memcpy fbcon-sized buffers into legacy VGA text memory; that corrupts memory. */
     if (cirrusfb_is_ready()) {
-        devfs_tty_snapshot_visible(&dev_ttys[devfs_active]);
+        if (!video_kd_graphics()) devfs_tty_snapshot_visible(&dev_ttys[devfs_active]);
         devfs_active = index;
         devfs_tty_blit_to_console(dst);
         release(&dst->out_lock);
@@ -2894,7 +2894,7 @@ int devfs_switch_tty(int index) {
     }
 
     if (vbe_is_available()) {
-        devfs_tty_snapshot_visible(&dev_ttys[devfs_active]);
+        if (!video_kd_graphics()) devfs_tty_snapshot_visible(&dev_ttys[devfs_active]);
         devfs_active = index;
         devfs_tty_blit_to_console(dst);
         release(&dst->out_lock);
@@ -2903,7 +2903,7 @@ int devfs_switch_tty(int index) {
 
     /* Fallback: legacy VGA text mode only.
        Clamp copy size so we never write beyond the actual VGA text buffer. */
-    devfs_tty_snapshot_visible(&dev_ttys[devfs_active]);
+    if (!video_kd_graphics()) devfs_tty_snapshot_visible(&dev_ttys[devfs_active]);
     devfs_active = index;
     devfs_tty_blit_to_console(dst);
     release(&dst->out_lock);

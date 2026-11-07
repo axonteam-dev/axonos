@@ -4,6 +4,7 @@
 #include <klog.h>
 #include <string.h>
 #include <stddef.h>
+#include <devfs.h>
 
 #define MAX_VIDEO_DRIVERS 8
 #define MAX_VIDEO_DEVICES 8
@@ -93,13 +94,23 @@ void video_display_sync(void) {
 	}
 }
 
-static int g_kd_graphics;
+static int g_kd_graphics[DEVFS_TTY_COUNT];
+
+int video_set_vt_graphics(int tty, int graphics) {
+	if (tty < 0 || tty >= DEVFS_TTY_COUNT) return -1;
+	__atomic_store_n(&g_kd_graphics[tty], graphics ? 1 : 0, __ATOMIC_RELEASE);
+	return 0;
+}
+
+int video_vt_graphics(int tty) {
+	if (tty < 0 || tty >= DEVFS_TTY_COUNT) return 0;
+	return __atomic_load_n(&g_kd_graphics[tty], __ATOMIC_ACQUIRE);
+}
 
 void video_set_kd_mode(int graphics) {
-	g_kd_graphics = graphics ? 1 : 0;
+	(void)video_set_vt_graphics(devfs_get_active(), graphics);
 }
 
 int video_kd_graphics(void) {
-	return g_kd_graphics;
+	return video_vt_graphics(devfs_get_active());
 }
-

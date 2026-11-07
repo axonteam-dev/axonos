@@ -75,6 +75,7 @@ static int console_kbd_mode = 0x01; /* K_XLATE — Linux default */
 static int kd_mode = 0;             /* KD_TEXT */
 static process_t *console_graphics_owner;
 static uint64_t console_graphics_owner_tid;
+static int console_graphics_owner_vt = -1;
 
 static int console_graphics_owned_by(thread_t *t) {
     if (!t) return 0;
@@ -102,8 +103,12 @@ static void console_kd_reset_for_dead_owner(thread_t *owner, int tty_idx) {
         return;
     console_graphics_owner = NULL;
     console_graphics_owner_tid = 0;
-    if (video_kd_graphics()) {
-        video_set_kd_mode(0); /* KD_GRAPHICS -> KD_TEXT */
+    if (kd_mode) {
+        if (console_graphics_owner_vt >= 0)
+            (void)video_set_vt_graphics(console_graphics_owner_vt, 0);
+        else
+            video_set_kd_mode(0);
+        console_graphics_owner_vt = -1;
         changed = 1;
     }
     if (kd_mode) {
@@ -19270,10 +19275,14 @@ kfree(path);
             if (req == 0x4B3A || req == 0x4B3B) {
                 if (!devfs_is_tty_file(f))
                     return ret_err(ENOTTY);
+                int mode_tty = devfs_get_tty_index_from_file(f);
+                if (mode_tty < 0 || mode_tty >= DEVFS_TTY_COUNT)
+                    return ret_err(ENOTTY);
                 if (req == 0x4B3B) {
+                    int tty_mode = video_vt_graphics(mode_tty) ? 1 : 0;
                     if (!argp || !user_range_ok(argp, sizeof(int)))
                         return ret_err(EFAULT);
-                    if (copy_to_user_safe(argp, &kd_mode, sizeof(kd_mode)) != 0)
+                    if (copy_to_user_safe(argp, &tty_mode, sizeof(tty_mode)) != 0)
                         return ret_err(EFAULT);
                     return 0;
                 }
@@ -19281,15 +19290,20 @@ kfree(path);
                     int mode = (int)(intptr_t)argp;
                     if (mode < 0 || mode > 3)
                         return ret_err(EINVAL);
-                    kd_mode = mode;
                     if (mode == 1) {
+                        kd_mode = mode;
                         console_graphics_owner = cur ? cur->process : NULL;
                         console_graphics_owner_tid = cur ? cur->tid : 0;
+                        console_graphics_owner_vt = mode_tty;
                     } else if (console_graphics_owned_by(cur)) {
+                        kd_mode = 0;
                         console_graphics_owner = NULL;
                         console_graphics_owner_tid = 0;
+                        console_graphics_owner_vt = -1;
                     }
-                    video_set_kd_mode(mode == 1); /* KD_GRAPHICS */
+                    (void)video_set_vt_graphics(mode_tty, mode == 1);
+                    if (mode != 1 && mode_tty == devfs_get_active())
+                        devfs_tty_force_reblit(mode_tty);
                     return 0;
                 }
             }

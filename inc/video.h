@@ -47,7 +47,8 @@ void video_display_sync(void);
 /* Linux KDSETMODE: KD_TEXT=0, KD_GRAPHICS=1. fbcon must not paint over X. */
 void video_set_kd_mode(int graphics);
 int video_kd_graphics(void);
+int video_set_vt_graphics(int tty, int graphics);
+int video_vt_graphics(int tty);
 
 #endif /* VIDEO_H */
-
 

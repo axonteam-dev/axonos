@@ -17,8 +17,8 @@ program = r'''
 typedef struct process { int id; } process_t;
 typedef struct thread { process_t *process; uint64_t tid; } thread_t;
 static int graphics, repaint, restore;
-static int video_kd_graphics(void) { return graphics; }
 static void video_set_kd_mode(int mode) { graphics=mode; }
+static int video_set_vt_graphics(int tty, int mode) { (void)tty; graphics=mode; return 0; }
 static void devfs_tty_restore_sane(int tty) { (void)tty; restore++; }
 static int devfs_tty_leave_alt_screen(int tty) { (void)tty; return 0; }
 static void devfs_tty_force_reblit(int tty) { (void)tty; repaint++; }

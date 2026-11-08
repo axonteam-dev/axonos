@@ -8,7 +8,9 @@ root = Path(__file__).resolve().parents[1]
 pty = (root / 'fs/virt/pty.c').read_text()
 syscall = (root / 'syscall/dispatch/syscall_dispatch.c').read_text()
 claim = pty[pty.index('int pty_try_acquire_ctty('):pty.index('int pty_get_controlling_sid(')]
-helper = syscall[syscall.index('static int thread_has_ctty('):syscall.index('/* Readiness for an open file')]
+helper_start = syscall.index('static int thread_has_ctty(')
+helper_end = syscall.index('\n}', syscall.index('static void syscall_pty_maybe_acquire_ctty(')) + 2
+helper = syscall[helper_start:helper_end]
 assert syscall.count('syscall_pty_maybe_acquire_ctty(cur, f, flags);') == 2
 program = r'''
 #include <assert.h>

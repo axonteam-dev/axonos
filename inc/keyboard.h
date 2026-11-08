@@ -2,6 +2,7 @@
 #define PS2_H
 
 #include <stdint.h>
+#include <idt.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,6 +38,7 @@ char* kgets(char* buffer, int max_length);
 
 /* Internal helper used by PS/2 routing code. */
 void keyboard_process_scancode(uint8_t scancode);
+void keyboard_handler(cpu_registers_t *regs);
 void keyboard_poll_drain(void);
 
 // ctrl+C handling helpers

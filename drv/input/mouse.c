@@ -1,6 +1,7 @@
 #include <mouse.h>
 
 #include <devfs.h>
+#include <debug.h>
 #include <idt.h>
 #include <pic.h>
 #include <stdio.h>
@@ -9,6 +10,7 @@
 #include <sysfs.h>
 #include <thread.h>
 #include <input_evdev.h>
+#include <keyboard.h>
 
 #define PS2_CMD_PORT 0x64
 #define PS2_DATA_PORT 0x60
@@ -26,6 +28,9 @@ static int g_pkt_idx = 0;
 
 static int g_mouse_sysfs_registered = 0;
 static int g_ps2_aux_live = 0;
+static unsigned int g_mouse_init_state = 0; /* 0 pending, 1 ready, 2 failed */
+static unsigned int g_mouse_irq_count = 0;
+static unsigned int g_mouse_aux_bytes = 0;
 
 int ps2_aux_is_live(void) {
     return g_ps2_aux_live;
@@ -58,18 +63,32 @@ static void ps2_flush_output(void) {
     }
 }
 
-static void ps2_mouse_write(uint8_t v) {
-    if (!ps2_wait_input_empty()) return;
+static int ps2_mouse_write(uint8_t v) {
+    if (!ps2_wait_input_empty()) return -1;
     outb(PS2_CMD_PORT, 0xD4);
-    if (!ps2_wait_input_empty()) return;
+    if (!ps2_wait_input_empty()) return -1;
     outb(PS2_DATA_PORT, v);
+    return 0;
 }
 
-static int ps2_mouse_read_ack(uint8_t *out) {
-    if (!out) return -1;
-    if (!ps2_wait_output_full()) return -1;
-    *out = inb(PS2_DATA_PORT);
-    return 0;
+static int ps2_mouse_send_ack(uint8_t byte) {
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (ps2_mouse_write(byte) != 0) return -1;
+        /* Keyboard data may precede the AUX response in the shared buffer. */
+        for (int i = 0; i < 64; i++) {
+            if (!ps2_wait_output_full()) return -1;
+            uint8_t status = inb(PS2_CMD_PORT);
+            uint8_t data = inb(PS2_DATA_PORT);
+            if (!(status & 0x20u)) {
+                keyboard_process_scancode(data);
+                continue;
+            }
+            if (data == 0xFA) return 0;
+            if (data == 0xFE) break;
+            return -1;
+        }
+    }
+    return -1;
 }
 
 static void mouse_stream_push(uint8_t b) {
@@ -84,6 +103,7 @@ static void mouse_stream_push(uint8_t b) {
 }
 
 void mouse_process_byte(uint8_t b) {
+    __atomic_fetch_add(&g_mouse_aux_bytes, 1, __ATOMIC_RELAXED);
     if (g_pkt_idx == 0 && (b & 0x08u) == 0) {
         /* Out-of-sync: first byte always has bit3=1 for PS/2 packet. */
         return;
@@ -99,16 +119,10 @@ void mouse_process_byte(uint8_t b) {
 }
 
 static void mouse_irq_handler(cpu_registers_t *regs) {
-    (void)regs;
-    /* Drain all pending bytes to avoid partial-packet stalls. */
-    for (int i = 0; i < 32; i++) {
-        uint8_t st = inb(PS2_CMD_PORT);
-        if ((st & 0x01u) == 0) break;
-        uint8_t b = inb(PS2_DATA_PORT);
-        /* IRQ12 is the mouse port. Never feed the keyboard parser: a 0xE0
-         * movement byte would swallow the next letter (set1 'p' is 0x19). */
-        mouse_process_byte(b);
-    }
+    /* Both IRQs share one controller output buffer, including its status.
+     * Use the same lock and status-based routing as IRQ1 and the paint poll. */
+    __atomic_fetch_add(&g_mouse_irq_count, 1, __ATOMIC_RELAXED);
+    keyboard_handler(regs);
 }
 
 int mouse_stream_available(void) {
@@ -158,6 +172,12 @@ static ssize_t mouse_sysfs_show_pending(char *buf, size_t size, void *priv) {
     return (ssize_t)snprintf(buf, size, "%d\n", mouse_stream_available());
 }
 
+static ssize_t mouse_sysfs_show_counter(char *buf, size_t size, void *priv) {
+    if (!buf || size == 0) return 0;
+    return (ssize_t)snprintf(buf, size, "%u\n",
+        __atomic_load_n((unsigned int *)priv, __ATOMIC_RELAXED));
+}
+
 static void mouse_register_sysfs(void) {
     if (g_mouse_sysfs_registered) return;
     if (sysfs_mkdir("/sys/class") != 0) return;
@@ -166,9 +186,15 @@ static void mouse_register_sysfs(void) {
     struct sysfs_attr attr_name = { mouse_sysfs_show_text, NULL, (void*)"PS/2 mouse" };
     struct sysfs_attr attr_driver = { mouse_sysfs_show_text, NULL, (void*)"ps2-mouse" };
     struct sysfs_attr attr_pending = { mouse_sysfs_show_pending, NULL, NULL };
+    struct sysfs_attr attr_init = { mouse_sysfs_show_counter, NULL, &g_mouse_init_state };
+    struct sysfs_attr attr_irq = { mouse_sysfs_show_counter, NULL, &g_mouse_irq_count };
+    struct sysfs_attr attr_aux = { mouse_sysfs_show_counter, NULL, &g_mouse_aux_bytes };
     if (sysfs_create_file("/sys/class/input/mouse0/name", &attr_name) != 0) return;
     if (sysfs_create_file("/sys/class/input/mouse0/driver", &attr_driver) != 0) return;
     if (sysfs_create_file("/sys/class/input/mouse0/pending_bytes", &attr_pending) != 0) return;
+    if (sysfs_create_file("/sys/class/input/mouse0/init_state", &attr_init) != 0) return;
+    if (sysfs_create_file("/sys/class/input/mouse0/irq12_count", &attr_irq) != 0) return;
+    if (sysfs_create_file("/sys/class/input/mouse0/aux_bytes", &attr_aux) != 0) return;
     g_mouse_sysfs_registered = 1;
 }
 
@@ -177,63 +203,61 @@ void mouse_publish_sysfs(void) {
 }
 
 void ps2_mouse_init(void) {
-    uint8_t ack = 0;
     uint8_t test = 0xFF;
 
     idt_set_handler(44, mouse_irq_handler); /* IRQ12 */
 
     /* Probe AUX with bounded waits. Blind 0xA8+0xD4 on a laptop without a
      * second port wedges i8042 (hang after "List of block devices"). */
+    pic_mask_irq(1);
     pic_mask_irq(12);
     ps2_flush_output();
     if (!ps2_wait_input_empty()) {
-        pic_unmask_irq(1);
-        (void)devfs_create_char_node("/dev/input/mice", NULL);
-        mouse_register_sysfs();
-        return;
+        goto failed;
     }
     outb(PS2_CMD_PORT, 0xA8); /* enable aux so 0xA9 is meaningful */
     if (!ps2_wait_input_empty()) {
-        pic_unmask_irq(1);
-        (void)devfs_create_char_node("/dev/input/mice", NULL);
-        mouse_register_sysfs();
-        return;
+        goto failed;
     }
     outb(PS2_CMD_PORT, 0xA9); /* test second port */
     if (!ps2_wait_output_full()) {
-        pic_unmask_irq(1);
-        (void)devfs_create_char_node("/dev/input/mice", NULL);
-        mouse_register_sysfs();
-        return;
+        goto failed;
     }
     test = inb(PS2_DATA_PORT);
-    if (test != 0x00 && test != 0xFA) {
-        pic_unmask_irq(1);
-        (void)devfs_create_char_node("/dev/input/mice", NULL);
-        mouse_register_sysfs();
-        return;
+    if (test != 0x00) {
+        goto failed;
     }
 
-    pic_mask_irq(1);
     ps2_flush_output();
-    if (ps2_wait_input_empty()) outb(PS2_CMD_PORT, 0xA8); /* enable aux port */
-    if (ps2_wait_input_empty()) outb(PS2_CMD_PORT, 0x20); /* read command byte */
-    uint8_t cmd = 0x47; /* sane default: IRQ1+IRQ12+translation */
-    if (ps2_wait_output_full()) cmd = inb(PS2_DATA_PORT);
+    if (!ps2_wait_input_empty()) goto failed;
+    outb(PS2_CMD_PORT, 0xA8); /* enable aux port */
+    if (!ps2_wait_input_empty()) goto failed;
+    outb(PS2_CMD_PORT, 0x20); /* read command byte */
+    if (!ps2_wait_output_full()) goto failed;
+    uint8_t cmd = inb(PS2_DATA_PORT);
     cmd |= 0x03u;              /* force IRQ1 + IRQ12 enabled */
     cmd &= (uint8_t)~0x30u;    /* clear disable keyboard/mouse clocks */
     cmd |= 0x40u;              /* keep translation on for set1 keyboard path */
-    if (ps2_wait_input_empty()) outb(PS2_CMD_PORT, 0x60);
-    if (ps2_wait_input_empty()) outb(PS2_DATA_PORT, cmd);
+    if (!ps2_wait_input_empty()) goto failed;
+    outb(PS2_CMD_PORT, 0x60);
+    if (!ps2_wait_input_empty()) goto failed;
+    outb(PS2_DATA_PORT, cmd);
     ps2_flush_output();
 
-    ps2_mouse_write(0xF6); (void)ps2_mouse_read_ack(&ack);
-    ps2_mouse_write(0xF4); (void)ps2_mouse_read_ack(&ack);
+    if (ps2_mouse_send_ack(0xF6) != 0 || ps2_mouse_send_ack(0xF4) != 0)
+        goto failed;
 
     g_ps2_aux_live = 1;
+    __atomic_store_n(&g_mouse_init_state, 1, __ATOMIC_RELAXED);
     pic_unmask_irq(1);
     pic_unmask_irq(12);
 
+    goto publish;
+failed:
+    __atomic_store_n(&g_mouse_init_state, 2, __ATOMIC_RELAXED);
+    qemu_debug_printf("ps2_mouse_init: AUX setup failed\n");
+    pic_unmask_irq(1);
+publish:
     (void)devfs_create_char_node("/dev/input/mice", NULL);
     mouse_register_sysfs();
 }

@@ -9302,6 +9302,20 @@ static int thread_has_ctty(const thread_t *t) {
     return t && (t->attached_tty >= 0 || t->attached_pty >= 0);
 }
 
+/* Linux assigns a free slave to a session leader on open, unless suppressed. */
+static void syscall_pty_maybe_acquire_ctty(thread_t *cur, struct fs_file *f, int flags) {
+    int pid, sid, pgid;
+    if (!cur || !f || (flags & (0x100 | 0x200000)) || thread_has_ctty(cur))
+        return; /* O_NOCTTY or O_PATH */
+    pid = cur->process ? (int)cur->process->pid : (int)cur->tid;
+    sid = cur->process ? cur->process->sid : cur->sid;
+    pgid = cur->process ? (int)cur->process->pgid : cur->pgid;
+    if (sid != pid || !pty_try_acquire_ctty(f, sid, pgid))
+        return;
+    cur->attached_pty = pty_get_index(f);
+    cur->attached_tty = -1;
+}
+
 /* Shared readiness used by poll and epoll (level-triggered). */
 static short fd_poll_revents(thread_t *thr, int fd, short events) {
     short revents = 0;
@@ -18273,7 +18287,7 @@ kfree(path);
             if (fd < 0 || fd >= THREAD_MAX_FD) {
                 return ret_err(EBADF);
             }
-            struct fs_file *f = cur->fds[fd];
+            struct fs_file *f = cur->process ? cur->process->fds[fd] : cur->fds[fd];
             if (!f) {
                 return ret_err(EBADF);
             }
@@ -18480,7 +18494,15 @@ kfree(path);
                     if (copy_to_user_safe(argp, &bits, sizeof(bits)) != 0) return ret_err(EFAULT);
                     return 0;
                 }
-                if (req == TIOCMBIS || req == TIOCMBIC || req == FIONBIO || req == FIOASYNC)
+                if (req == FIONBIO) {
+                    int enabled;
+                    if (!argp || copy_from_user_raw(&enabled, argp, sizeof(enabled)) != 0)
+                        return ret_err(EFAULT);
+                    if (enabled) f->flags |= 0x800; /* O_NONBLOCK */
+                    else f->flags &= ~0x800;
+                    return 0;
+                }
+                if (req == TIOCMBIS || req == TIOCMBIC || req == FIOASYNC)
                     return 0;
                 /* Font/kbd console ioctls are VC-only. */
                 return ret_err(ENOTTY);
@@ -20575,6 +20597,7 @@ kfree(path);
                 f->flags = flags;
             int fd = thread_fd_alloc(f);
             if (fd < 0) { fs_file_free(f); kfree(path); return ret_err(fd == -23 ? ENFILE : EMFILE); }
+            syscall_pty_maybe_acquire_ctty(cur, f, flags);
             (void)fs_file_set_user_path(f, path);
             openrc_trace_deptree_open(cur, path, flags, fd);
             if (pid1_dl_trace_thread(cur) && pid1_dl_trace_path(path)) {
@@ -20724,6 +20747,7 @@ kfree(path);
                 f->flags = flags;
             int fd = thread_fd_alloc(f);
             if (fd < 0) { fs_file_free(f); return ret_err(fd == -23 ? ENFILE : EMFILE); }
+            syscall_pty_maybe_acquire_ctty(cur, f, flags);
             if (cur->process)
                 cur->process->fd_cloexec[fd] =
                     (flags & 02000000) ? 1 : 0;

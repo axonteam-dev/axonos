@@ -143,39 +143,18 @@ static size_t pty_ring_write(struct pty_ring *r, const char *src, size_t n) {
 
 static ssize_t pty_ring_read(struct pty_ring *r, char *dst, size_t n, int *eof) {
 	size_t done = 0;
+	unsigned long flags = 0;
 	*eof = 0;
-	for (;;) {
-		unsigned long flags = 0;
-		acquire_irqsave(&r->lock, &flags);
-		while (done < n && r->count > 0) {
-			dst[done++] = r->buf[r->head];
-			r->head = (r->head + 1) % PTY_BUF_CAP;
-			r->count--;
-		}
-		if (done > 0) {
-			release_irqrestore(&r->lock, flags);
-			return (ssize_t)done;
-		}
-		/* empty — block */
-		{
-			thread_t *cur = thread_current();
-			if (!cur)
-				cur = thread_get_current_user();
-			if (!cur) {
-				release_irqrestore(&r->lock, flags);
-				return 0;
-			}
-			if (r->waiters_count < (int)(sizeof(r->waiters) / sizeof(r->waiters[0])))
-				r->waiters[r->waiters_count++] = (int)cur->tid;
-			release_irqrestore(&r->lock, flags);
-			thread_block((int)cur->tid);
-			thread_yield();
-			if (cur->pending_signals & ~cur->saved_sig_mask)
-				return -4; /* EINTR */
-			/* caller may set *eof if peer closed */
-			(void)eof;
-		}
+	/* Never wait here: another reader may drain the ring after the caller's
+	 * availability check. The caller must recheck peer-close and nonblocking. */
+	acquire_irqsave(&r->lock, &flags);
+	while (done < n && r->count > 0) {
+		dst[done++] = r->buf[r->head];
+		r->head = (r->head + 1) % PTY_BUF_CAP;
+		r->count--;
 	}
+	release_irqrestore(&r->lock, flags);
+	return (ssize_t)done;
 }
 
 static size_t pty_ring_avail(struct pty_ring *r) {
@@ -449,8 +428,10 @@ ssize_t pty_read(struct fs_file *f, void *buf, size_t n) {
 	r = h->is_master ? &h->pair->s2m : &h->pair->m2s;
 
 	for (;;) {
-		if (pty_ring_avail(r) > 0)
-			return pty_ring_read(r, (char *)buf, n, &eof);
+		if (pty_ring_avail(r) > 0) {
+			ssize_t got = pty_ring_read(r, (char *)buf, n, &eof);
+			if (got > 0) return got;
+		}
 		if (h->is_master && h->pair->slave_opens == 0)
 			return 0;
 		if (!h->is_master && h->pair->master_opens == 0)
@@ -467,15 +448,33 @@ ssize_t pty_read(struct fs_file *f, void *buf, size_t n) {
 			if (!cur)
 				return 0;
 			acquire_irqsave(&r->lock, &flags);
-			if (r->count > 0) {
+			if (r->count > 0 ||
+			    (h->is_master ? h->pair->slave_opens == 0 :
+			                    h->pair->master_opens == 0)) {
 				release_irqrestore(&r->lock, flags);
 				continue;
 			}
-			if (r->waiters_count < (int)(sizeof(r->waiters) / sizeof(r->waiters[0])))
-				r->waiters[r->waiters_count++] = (int)cur->tid;
-			release_irqrestore(&r->lock, flags);
+			if (r->waiters_count >= (int)(sizeof(r->waiters) / sizeof(r->waiters[0]))) {
+				/* Never block without being registered for a wakeup. */
+				release_irqrestore(&r->lock, flags);
+				thread_sleep(1);
+				if (cur->pending_signals & ~cur->saved_sig_mask)
+					return -4;
+				continue;
+			}
+			r->waiters[r->waiters_count++] = (int)cur->tid;
 			thread_block((int)cur->tid);
+			release_irqrestore(&r->lock, flags);
 			thread_yield();
+			/* Signals may wake us without a ring wake clearing the entry. */
+			acquire_irqsave(&r->lock, &flags);
+			for (int i = 0; i < r->waiters_count; i++) {
+				if (r->waiters[i] == (int)cur->tid) {
+					r->waiters[i] = r->waiters[--r->waiters_count];
+					break;
+				}
+			}
+			release_irqrestore(&r->lock, flags);
 			if (cur->pending_signals & ~cur->saved_sig_mask)
 				return -4;
 		}
@@ -524,13 +523,19 @@ void pty_release_handle(struct fs_file *f) {
 	if (h->is_master) {
 		if (p->master_opens > 0)
 			p->master_opens--;
-		pty_ring_wake(&p->m2s);
-		pty_ring_wake(&p->s2m);
 	} else {
 		if (p->slave_opens > 0)
 			p->slave_opens--;
+	}
+	/* Serialize peer-close wakeups with waiter registration and blocking. */
+	{
+		unsigned long ring_flags = 0;
+		acquire_irqsave(&p->m2s.lock, &ring_flags);
 		pty_ring_wake(&p->m2s);
+		release_irqrestore(&p->m2s.lock, ring_flags);
+		acquire_irqsave(&p->s2m.lock, &ring_flags);
 		pty_ring_wake(&p->s2m);
+		release_irqrestore(&p->s2m.lock, ring_flags);
 	}
 	if (p->master_opens == 0 && p->slave_opens == 0)
 		p->in_use = 0;
@@ -686,6 +691,22 @@ int pty_set_fg_pgrp(struct fs_file *f, int pgid) {
 		return -1;
 	h->pair->fg_pgrp = pgid;
 	return 0;
+}
+
+int pty_try_acquire_ctty(struct fs_file *f, int sid, int pgid) {
+	struct pty_handle *h = pty_handle_of(f);
+	unsigned long flags = 0;
+	int acquired = 0;
+	if (!h || h->is_master || sid <= 0)
+		return 0;
+	acquire_irqsave(&g_pty_table_lock, &flags);
+	if (h->pair->controlling_sid < 0) {
+		h->pair->controlling_sid = sid;
+		h->pair->fg_pgrp = pgid;
+		acquired = 1;
+	}
+	release_irqrestore(&g_pty_table_lock, flags);
+	return acquired;
 }
 
 int pty_get_controlling_sid(struct fs_file *f) {

@@ -35,6 +35,7 @@ void pty_set_winsize(struct fs_file *f, uint16_t row, uint16_t col);
 int pty_get_fg_pgrp(struct fs_file *f);
 int pty_set_fg_pgrp(struct fs_file *f, int pgid);
 int pty_get_controlling_sid(struct fs_file *f);
+int pty_try_acquire_ctty(struct fs_file *f, int sid, int pgid);
 void pty_set_controlling_sid(struct fs_file *f, int sid);
 void pty_flush_input(struct fs_file *f);
 

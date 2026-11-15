@@ -33,6 +33,7 @@ struct fs_file {
     int truncate_error;
     int truncate_calls;
     int cgroup_noop;
+    int pseudo_noop;
 };
 
 static int vfs_fstat(struct fs_file *file, struct stat *st) {
@@ -49,6 +50,9 @@ static int vfs_ftruncate(struct fs_file *file, long length) {
 }
 static int cgroupfs_open_truncate_noop(const struct fs_file *file) {
     return file->cgroup_noop;
+}
+static int fs_open_truncate_is_noop(const struct fs_file *file) {
+    return file->pseudo_noop;
 }
 ''' + helper + r'''
 
@@ -76,10 +80,15 @@ int main(void) {
     assert(file.pos == 0 && file.size == 123 && file.truncate_calls == 1);
 
     file.cgroup_noop = 0;
+    file.pseudo_noop = 1;
+    assert(syscall_apply_open_truncate(&file) == 0);
+    assert(file.pos == 0 && file.size == 123 && file.truncate_calls == 1);
+
+    file.pseudo_noop = 0;
     file.truncate_error = -95;
     assert(syscall_apply_open_truncate(&file) == -95);
     assert(file.truncate_calls == 2);
-    puts("PASS: O_TRUNC ignores char/block devices and preserves regular-file behavior");
+    puts("PASS: O_TRUNC ignores char/block devices, pseudo-fs attributes and preserves regular-file behavior");
 }
 '''
 

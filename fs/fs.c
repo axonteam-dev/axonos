@@ -304,6 +304,20 @@ static int fs_file_matches_driver(const struct fs_driver *drv, const struct fs_f
         return 0;
 }
 
+int fs_open_truncate_is_noop(const struct fs_file *file) {
+        if (!file) return 0;
+        for (int i = 0; i < g_drivers_count; i++) {
+                struct fs_driver *drv = g_drivers[i];
+                if (!fs_file_matches_driver(drv, file)) continue;
+                const char *name = (drv->ops) ? drv->ops->name : NULL;
+                if (!name) return 0;
+                return strcmp(name, "procfs") == 0 ||
+                       strcmp(name, "sysfs") == 0 ||
+                       strcmp(name, "devfs") == 0;
+        }
+        return 0;
+}
+
 int fs_get_mount_path(const struct fs_driver *drv, char *out, size_t outlen) {
         if (!drv || !out || outlen == 0) return -1;
         for (int i = 0; i < g_mount_count; i++) {

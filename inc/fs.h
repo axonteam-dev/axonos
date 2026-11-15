@@ -129,6 +129,10 @@ ssize_t fs_readdir_next(struct fs_file *file, void *buf, size_t size);
 int vfs_fstat(struct fs_file *file, struct stat *st);
 /* Truncate/grow open file where driver supports it. Returns 0 or negative -errno (Linux). */
 int vfs_ftruncate(struct fs_file *file, off_t length);
+/* Pseudo filesystems (procfs/sysfs/devfs) expose attribute files without an
+ * inode truncate operation. Linux still accepts open(O_TRUNC) on them and
+ * ignores the truncation, which is what "echo 1 > /proc/..." relies on. */
+int fs_open_truncate_is_noop(const struct fs_file *file);
 int vfs_stat(const char *path, struct stat *st);
 int vfs_lstat(const char *path, struct stat *st);
 ssize_t vfs_readlink(const char *path, char *buf, size_t bufsiz);

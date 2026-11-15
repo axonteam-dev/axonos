@@ -167,6 +167,9 @@ static int syscall_apply_open_truncate(struct fs_file *file)
 
     if (file->type == FS_TYPE_REG) {
         if (cgroupfs_open_truncate_noop(file)) return 0;
+        /* procfs/sysfs/devfs attribute files: open(O_TRUNC) must not fail with
+         * EOPNOTSUPP, or "echo 1 > /proc/net/dhcp" never reaches ->write. */
+        if (fs_open_truncate_is_noop(file)) return 0;
         return vfs_ftruncate(file, 0);
     }
 

@@ -2463,6 +2463,14 @@ int procfs_fill_stat(struct fs_file *file, struct stat *st) {
         st->st_mode = S_IFREG | (rw ? 0644 : 0444);
         st->st_nlink = 1;
         st->st_size = (off_t)file->size;
+    } else if (h->kind == 7 && h->file_id == 60) {
+        /* /proc/net/dhcp is a control file: root may open it for writing so
+         * "echo 1 > /proc/net/dhcp" reaches procfs_write(); store rechecks
+         * CAP_NET_ADMIN. Linux exposes similar proc controls as 0644. */
+        st->st_ino = 0;
+        st->st_mode = S_IFREG | 0644;
+        st->st_nlink = 1;
+        st->st_size = (off_t)file->size;
     } else {
         st->st_ino = 0;
         st->st_mode = S_IFREG | 0444;

@@ -178,10 +178,10 @@ static void pci_log_bridge_windows(const pci_device_t *d, const char *slot)
         uint64_t start = pci_resource_start_val(bar);
         uint64_t end = start;
         if (bar & 1u)
-            kprintf("pci %s:   bridge window [io  0x%llx-0x%llx]\n",
+            klogprintf("pci %s:   bridge window [io  0x%llx-0x%llx]\n",
                        slot, (unsigned long long)start, (unsigned long long)end);
         else
-            kprintf("pci %s:   bridge window [mem 0x%llx-0x%llx]\n",
+            klogprintf("pci %s:   bridge window [mem 0x%llx-0x%llx]\n",
                        slot, (unsigned long long)start, (unsigned long long)end);
     }
 }
@@ -192,7 +192,7 @@ static void pci_log_bridge(const pci_device_t *d)
     pci_format_slot(d, slot, sizeof(slot));
     uint32_t buses = pci_config_read_dword(d->bus, d->device, d->function, 0x18);
     uint8_t secondary = (uint8_t)((buses >> 8) & 0xFF);
-    kprintf("pci %s: PCI bridge to [bus %02x]\n", slot, secondary);
+    klogprintf("pci %s: PCI bridge to [bus %02x]\n", slot, secondary);
     pci_log_bridge_windows(d, slot);
 }
 
@@ -207,8 +207,8 @@ static void pci_log_irq_routing(const pci_device_t *d)
     char slot[20];
     pci_format_slot(d, slot, sizeof(slot));
     char intc = (char)('A' + (pin - 1));
-    kprintf("pci %s: can't derive routing for PCI INT %c\n", slot, intc);
-    kprintf("pci %s: PCI INT %c: no GSI\n", slot, intc);
+    klogprintf("pci %s: can't derive routing for PCI INT %c\n", slot, intc);
+    klogprintf("pci %s: PCI INT %c: no GSI\n", slot, intc);
 }
 
 static void pci_log_device(const pci_device_t *d)
@@ -222,13 +222,13 @@ static void pci_log_device(const pci_device_t *d)
     }
 
     if (d->class_code == 0x03 && d->subclass == 0x00) {
-        kprintf("pci %s: Video device with shadowed ROM at [mem 0x000c0000-0x000dffff]\n",
+        klogprintf("pci %s: Video device with shadowed ROM at [mem 0x000c0000-0x000dffff]\n",
                    slot);
         pci_log_irq_routing(d);
         return;
     }
 
-    kprintf("pci %s: [%04x:%04x] %s (rev %02x)\n",
+    klogprintf("pci %s: [%04x:%04x] %s (rev %02x)\n",
                slot, d->vendor_id, d->device_id,
                pci_class_desc(d), d->revision);
     pci_log_irq_routing(d);

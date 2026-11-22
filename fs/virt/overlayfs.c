@@ -853,8 +853,12 @@ static int overlay_chmod(const char *path, mode_t mode)
 
 int overlayfs_chown(const char *path, uid_t uid, gid_t gid)
 {
+    char normalized[512];
     if (!overlay_active || !path)
         return -1;
+    if (fs_resolve_parent_path(path, normalized, sizeof(normalized)) != 0)
+        return -1;
+    path = normalized;
     if (ov_copy_up(path) != 0) {
         if (ov_ensure_parent_upper(path) != 0)
             return -1;
@@ -864,8 +868,12 @@ int overlayfs_chown(const char *path, uid_t uid, gid_t gid)
 
 int overlayfs_lchown(const char *path, uid_t uid, gid_t gid)
 {
+    char normalized[512];
     if (!overlay_active || !path)
         return -1;
+    if (fs_resolve_parent_path(path, normalized, sizeof(normalized)) != 0)
+        return -1;
+    path = normalized;
     /* Upper symlinks must be handled without following their target. */
     if (ramfs_lchown(path, uid, gid) == 0)
         return 0;
@@ -1164,9 +1172,13 @@ int overlayfs_link_open_file(struct fs_file *file, const char *newpath)
     struct overlay_file_handle *fh;
     struct fs_file *inner;
     char mapped[512];
+    char normalized[512];
 
     if (!file || !newpath || newpath[0] != '/')
         return -1;
+    if (fs_resolve_parent_path(newpath, normalized, sizeof(normalized)) != 0)
+        return -1;
+    newpath = normalized;
     if (file->fs_private != (void *)&overlay_driver)
         return -1;
     fh = (struct overlay_file_handle *)file->driver_private;

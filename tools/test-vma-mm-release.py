@@ -15,7 +15,8 @@ program = r'''
 #include <assert.h>
 #include <stddef.h>
 #include <stdio.h>
-#define USER_VMA_MAX 4
+#define USER_VMA_MAX 8
+#define USER_VMA_MM_MAX 4
 typedef struct { int used; int *refs; } user_vma_t;
 typedef struct { void *vma_storage; } mm_t;
 typedef struct { int locked; } spinlock_t;
@@ -26,7 +27,7 @@ static void user_vma_clear_nolock(user_vma_t *v) { if (v->refs) --*v->refs; v->u
 ''' + source[start:end] + r'''
 int main(void) {
     int refs=3;
-    user_vma_t entries[USER_VMA_MAX]={{1,&refs},{1,&refs},{0,&refs},{0,0}};
+    user_vma_t entries[USER_VMA_MM_MAX]={{1,&refs},{1,&refs},{0,&refs},{0,0}};
     mm_t mm={entries};
     user_vma_release_mm(&mm);
     assert(refs==1 && !entries[0].used && !entries[1].used);
@@ -38,5 +39,5 @@ int main(void) {
 with tempfile.TemporaryDirectory(prefix="axon-vma-release-", dir="/tmp/opencode") as tmp:
     c, binary = Path(tmp) / "test.c", Path(tmp) / "test"
     c.write_text(program)
-    subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", str(c), "-o", str(binary)], check=True)
+    subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=undefined", str(c), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

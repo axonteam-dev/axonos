@@ -34,6 +34,11 @@ static process_t *process_find(uint64_t pid) { return pid==target.pid ? &process
 static void acquire_irqsave(spinlock_t *l,unsigned long *f) { assert(!l->held);l->held=1;*f=0; }
 static void release_irqrestore(spinlock_t *l,unsigned long f) { (void)f;assert(l->held);l->held=0; }
 static void thread_set_pending_signal(thread_t *t,int sig) { t->pending_signals|=1ULL<<(sig-1); }
+static int syscall_task_capable(const void *task, unsigned capability) {
+    const thread_t *t = task;
+    (void)capability;
+    return t && t->euid == 0;
+}
 '''+function("static int kbrequest_register(")+function("void syscall_kbrequest_event(")+r'''
 int main(void) {
     syscall_kbrequest_event(); assert(!target.pending_signals);

@@ -18,6 +18,7 @@
 
 #define SQUASHFS_METADATA_SIZE 8192
 #define SQUASHFS_NAME_LEN 256
+#define SQUASHFS_PATH_MAX 4096
 #define SQUASHFS_INVALID_FRAG 0xffffffffu
 
 #define SQUASHFS_COMPRESSED_BIT 0x8000u
@@ -128,6 +129,7 @@ struct squashfs_sb {
     struct meta_cache_ent meta_cache[META_CACHE_SLOTS];
     int meta_cache_next;
     struct data_cache_ent data_cache[DATA_CACHE_SLOTS];
+    spinlock_t data_cache_lock;
     int data_cache_next;
     struct dir_cache_ent dir_cache[DIR_CACHE_SLOTS];
     char mount_prefix[64]; /* "" for overlay lower, or "/squash" etc. */
@@ -200,16 +202,21 @@ static int sq_read_data_block_direct(struct squashfs_sb *s, uint64_t abs_pos, ui
     }
 
     /* data cache */
+    acquire(&s->data_cache_lock);
     for (i = 0; i < DATA_CACHE_SLOTS; i++) {
         if (s->data_cache[i].valid && s->data_cache[i].abs_pos == abs_pos &&
             s->data_cache[i].comp_size == csize) {
-            if (s->data_cache[i].len > out_cap)
+            if (s->data_cache[i].len > out_cap) {
+                release(&s->data_cache_lock);
                 return -1;
+            }
             memcpy(out, s->data_cache[i].data, s->data_cache[i].len);
             *out_len = s->data_cache[i].len;
+            release(&s->data_cache_lock);
             return 0;
         }
     }
+    release(&s->data_cache_lock);
 
     src = s->image + abs_pos;
     if (!compressed) {
@@ -232,22 +239,51 @@ static int sq_read_data_block_direct(struct squashfs_sb *s, uint64_t abs_pos, ui
 
     /* store in cache */
     {
-        struct data_cache_ent *e = &s->data_cache[s->data_cache_next];
-        s->data_cache_next = (s->data_cache_next + 1) % DATA_CACHE_SLOTS;
-        if (e->data)
-            kfree(e->data);
-        e->data = (uint8_t *)kmalloc(got);
-        if (e->data) {
-            memcpy(e->data, out, got);
+        uint8_t *new_data = (uint8_t *)kmalloc(got);
+        if (new_data) {
+            memcpy(new_data, out, got);
+            acquire(&s->data_cache_lock);
+            struct data_cache_ent *e = &s->data_cache[s->data_cache_next];
+            uint8_t *old_data = e->data;
+            s->data_cache_next = (s->data_cache_next + 1) % DATA_CACHE_SLOTS;
+            e->data = new_data;
             e->len = got;
             e->abs_pos = abs_pos;
             e->comp_size = csize;
             e->valid = 1;
-        } else {
-            e->valid = 0;
+            release(&s->data_cache_lock);
+            if (old_data) kfree(old_data);
         }
     }
     return 0;
+}
+
+/* Copy a cached slice into a kernel bounce buffer while eviction is excluded.
+ * Return 1 on hit, 0 on miss; len is the full decoded block length. */
+static int sq_cached_slice(struct squashfs_sb *s, uint64_t pos, uint32_t field,
+                           size_t off, void *out, size_t want, size_t *len,
+                           size_t *copied)
+{
+    uint32_t csize = field & ~SQUASHFS_COMPRESSED_BIT_BLOCK;
+    mm_dm_ctx_t dm = mm_enter_direct_map();
+    int hit = 0;
+    acquire(&s->data_cache_lock);
+    if (csize && sq_in_range(s, pos, csize)) {
+        for (int i = 0; i < DATA_CACHE_SLOTS; i++) {
+            struct data_cache_ent *e = &s->data_cache[i];
+            if (!e->valid || e->abs_pos != pos || e->comp_size != csize)
+                continue;
+            *len = e->len;
+            *copied = off < e->len ? e->len - off : 0;
+            if (*copied > want) *copied = want;
+            if (*copied) memcpy(out, e->data + off, *copied);
+            hit = 1;
+            break;
+        }
+    }
+    release(&s->data_cache_lock);
+    mm_leave_direct_map(dm);
+    return hit;
 }
 
 /* The image and caches are kernel/physical identity pointers. Their numeric
@@ -783,6 +819,40 @@ static int sq_is_symlink_type(uint16_t type)
     return type == SQUASHFS_SYMLINK_TYPE || type == SQUASHFS_LSYMLINK_TYPE;
 }
 
+static int sq_normalize_abs_path(const char *in, char *out, size_t cap)
+{
+    const char *p;
+    size_t w = 1;
+
+    if (!in || !out || cap < 2 || in[0] != '/')
+        return -1;
+    out[0] = '/';
+    p = in + 1;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && *p != '/') p++;
+        size_t n = (size_t)(p - start);
+        if (n == 1 && start[0] == '.')
+            continue;
+        if (n == 2 && start[0] == '.' && start[1] == '.') {
+            while (w > 1 && out[w - 1] != '/') w--;
+            if (w > 1) w--;
+            continue;
+        }
+        if (w > 1) {
+            if (w + 1 >= cap) return -1;
+            out[w++] = '/';
+        }
+        if (n >= cap - w) return -1;
+        memcpy(out + w, start, n);
+        w += n;
+    }
+    out[w] = '\0';
+    return 0;
+}
+
 static int sq_path_to_inode_n(struct squashfs_sb *s, const char *path,
                               struct squashfs_inode_info *out, int depth)
 {
@@ -790,7 +860,7 @@ static int sq_path_to_inode_n(struct squashfs_sb *s, const char *path,
     char comp[SQUASHFS_NAME_LEN + 1];
     const char *p;
 
-    if (!s || !path || !out)
+    if (!s || !path || !out || strlen(path) >= SQUASHFS_PATH_MAX)
         return -1;
     if (path[0] != '/')
         return -1;
@@ -810,6 +880,7 @@ static int sq_path_to_inode_n(struct squashfs_sb *s, const char *path,
 
     while (*p) {
         size_t n = 0;
+        const char *comp_start = p;
         uint64_t next_ref = 0;
         struct squashfs_inode_info next;
 
@@ -832,35 +903,62 @@ static int sq_path_to_inode_n(struct squashfs_sb *s, const char *path,
             sq_inode_info_free(&cur);
             return -1;
         }
-        /*
-         * Linux: follow intermediate directory symlinks. Last component stays
-         * a symlink so open_nofollow/readlink work. Relative one-name targets
-         * (C.UTF-8 → C.utf8) are looked up in the parent directory.
-         */
+        /* Linux: follow intermediate symlinks, including relative targets
+         * containing multiple components (e.g. Debian usr-merge /bin->usr/bin).
+         * Keep a final symlink intact for open_nofollow/readlink. */
         if (*p && sq_is_symlink_type(next.type) && next.symlink && next.symlink[0]) {
             const char *tgt = next.symlink;
+            char joined[SQUASHFS_PATH_MAX];
+            char normalized[SQUASHFS_PATH_MAX];
+            size_t w = 0;
+
             if (tgt[0] == '/') {
-                sq_inode_info_free(&next);
-                sq_inode_info_free(&cur);
-                if (sq_path_to_inode_n(s, tgt, &next, depth + 1) != 0)
-                    return -1;
-                cur = next;
-                continue;
-            }
-            if (!strchr(tgt, '/')) {
-                uint64_t rel_ref = 0;
-                if (sq_lookup_dir(s, &cur, tgt, &rel_ref, NULL) != 0) {
-                    sq_inode_info_free(&next);
-                    sq_inode_info_free(&cur);
-                    return -1;
+                size_t tl = strlen(tgt);
+                if (tl >= sizeof(joined)) goto symlink_path_error;
+                memcpy(joined, tgt, tl);
+                w = tl;
+            } else {
+                size_t parent_len = (size_t)(comp_start - path);
+                if (parent_len == 0) {
+                    joined[w++] = '/';
+                } else {
+                    if (parent_len >= sizeof(joined)) goto symlink_path_error;
+                    memcpy(joined, path, parent_len);
+                    w = parent_len;
+                    while (w > 1 && joined[w - 1] == '/') w--;
                 }
-                sq_inode_info_free(&next);
-                memset(&next, 0, sizeof(next));
-                if (sq_read_inode(s, rel_ref, &next) != 0) {
-                    sq_inode_info_free(&cur);
-                    return -1;
+                if (w == 0) joined[w++] = '/';
+                if (joined[w - 1] != '/') {
+                    if (w + 1 >= sizeof(joined)) goto symlink_path_error;
+                    joined[w++] = '/';
                 }
+                size_t tl = strlen(tgt);
+                if (tl >= sizeof(joined) - w) goto symlink_path_error;
+                memcpy(joined + w, tgt, tl);
+                w += tl;
             }
+            if (*p) {
+                while (w > 1 && joined[w - 1] == '/') w--;
+                if (w && joined[w - 1] != '/') {
+                    if (w + 1 >= sizeof(joined)) goto symlink_path_error;
+                    joined[w++] = '/';
+                }
+                size_t rest_len = strlen(p);
+                if (rest_len >= sizeof(joined) - w) goto symlink_path_error;
+                memcpy(joined + w, p, rest_len);
+                w += rest_len;
+            }
+            joined[w] = '\0';
+            if (sq_normalize_abs_path(joined, normalized, sizeof(normalized)) != 0)
+                goto symlink_path_error;
+            sq_inode_info_free(&next);
+            sq_inode_info_free(&cur);
+            return sq_path_to_inode_n(s, normalized, out, depth + 1);
+
+symlink_path_error:
+            sq_inode_info_free(&next);
+            sq_inode_info_free(&cur);
+            return -1;
         }
         sq_inode_info_free(&cur);
         cur = next;
@@ -906,16 +1004,10 @@ static int sq_file_read(struct squashfs_sb *s, const struct squashfs_inode_info 
     *out_n = 0;
     if (offset >= ino->file_size)
         return 0;
-    if (offset + size > ino->file_size)
+    if (size > ino->file_size - offset)
         size = (size_t)(ino->file_size - offset);
 
     block_buf_cap = s->block_size;
-    block_buf = (uint8_t *)kmalloc(block_buf_cap);
-    if (!block_buf) {
-        klogprintf("squashfs: read buffer allocation failed size=%zu inode=%u\n",
-            block_buf_cap, ino->inode_number);
-        return -1;
-    }
 
     while (done < size) {
         size_t file_off = offset + done;
@@ -959,6 +1051,18 @@ static int sq_file_read(struct squashfs_sb *s, const struct squashfs_inode_info 
             }
             {
                 size_t expected = s->block_size;
+                uint8_t slice[4096];
+                size_t copied = 0;
+                if (sq_cached_slice(s, data_pos, bsize, block_off, slice,
+                                    want < sizeof(slice) ? want : sizeof(slice),
+                                    &unc_len, &copied)) {
+                    if (!copied) { kfree(block_buf); return -1; }
+                    memcpy(dst + done, slice, copied);
+                    done += copied;
+                    continue;
+                }
+                if (!block_buf) block_buf = (uint8_t *)kmalloc(block_buf_cap);
+                if (!block_buf) return -1;
                 /* last non-fragment block may be short when no fragment */
                 if (ino->fragment == SQUASHFS_INVALID_FRAG &&
                     (uint64_t)(block_index + 1) * s->block_size > ino->file_size)
@@ -996,6 +1100,23 @@ static int sq_file_read(struct squashfs_sb *s, const struct squashfs_inode_info 
                 kfree(block_buf);
                 return -1;
             }
+            frag_file_off = (size_t)(ino->block_count) * (size_t)s->block_size;
+            if (file_off < frag_file_off) { kfree(block_buf); return -1; }
+            local_off = (file_off - frag_file_off) + ino->frag_offset;
+            {
+                uint8_t slice[4096];
+                size_t copied = 0;
+                if (sq_cached_slice(s, fe.start_block, fe.size, local_off, slice,
+                                    want < sizeof(slice) ? want : sizeof(slice),
+                                    &frag_unc, &copied)) {
+                    if (!copied) break;
+                    memcpy(dst + done, slice, copied);
+                    done += copied;
+                    continue;
+                }
+            }
+            if (!block_buf) block_buf = (uint8_t *)kmalloc(block_buf_cap);
+            if (!block_buf) return -1;
             if (sq_read_data_block(s, fe.start_block, fe.size, block_buf, block_buf_cap, &frag_unc, 0) != 0) {
                 kfree(block_buf);
                 return -1;

@@ -33,7 +33,7 @@ struct ns_common;
 	AXON_CLONE_NEWIPC | AXON_CLONE_NEWUSER | AXON_CLONE_NEWPID | \
 	AXON_CLONE_NEWNET | AXON_CLONE_NEWCGROUP | AXON_CLONE_NEWTIME)
 
-#define NS_MNT_MAX 32
+#define NS_MNT_MAX 64
 
 enum ns_type {
 	NS_TYPE_MNT = 0,
@@ -48,9 +48,14 @@ enum ns_type {
 };
 
 struct ns_mount {
-	char path[64];
+	char path[256];
 	size_t path_len;
 	struct fs_driver *driver;
+	unsigned int refs;
+	uint64_t flags;
+	uint8_t bind_directory;
+	char bind_source[512];
+	char source[128];
 };
 
 struct uid_gid_map {
@@ -80,6 +85,7 @@ int ns_readlink_proc(const char *path, char *buf, size_t bufsz);
 /* nsfs fd: bind an open /proc/<pid>/ns/<type> handle for setns(2). */
 int ns_bind_proc_file(struct fs_file *f, struct process *target, enum ns_type type);
 int ns_file_type(const struct fs_file *f, enum ns_type *type_out, uint32_t *inum_out);
+void ns_release_file(struct fs_file *f);
 
 /* UTS */
 const char *ns_uts_nodename(void);

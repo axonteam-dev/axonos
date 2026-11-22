@@ -95,6 +95,32 @@ void fbdev_sync_user_frontbuffer(void)
 {
 	if (!g_fbdev.active || !g_fbdev_user_mapped)
 		return;
+	/* Temporary X11 diagnostic: sample scanout while a graphics client runs.
+	 * This distinguishes unchanged framebuffer bytes from host presentation. */
+	if (video_kd_graphics() && g_fbdev.bpp == 32 && g_fbdev.kva &&
+	    g_fbdev.width && g_fbdev.height &&
+	    (uint64_t)g_fbdev.width * 4 <= g_fbdev.pitch &&
+	    (uint64_t)g_fbdev.pitch * g_fbdev.height <= g_fbdev.len) {
+		static uint64_t next_sample;
+		static unsigned samples;
+		uint64_t now = time_monotonic_ms();
+		uint64_t next = __atomic_load_n(&next_sample, __ATOMIC_RELAXED);
+		if (samples < 30 && now >= next &&
+		    __atomic_compare_exchange_n(&next_sample, &next, now + 1000, 0,
+		                                __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+			uint32_t hash = 2166136261u;
+			for (uint32_t y = 0; y < g_fbdev.height; y += 2) {
+				volatile uint32_t *row = (volatile uint32_t *)
+					((uint8_t *)g_fbdev.kva + (size_t)y * g_fbdev.pitch);
+				for (uint32_t x = 0; x < g_fbdev.width; x += 4)
+					hash = (hash ^ row[x]) * 16777619u;
+			}
+			samples++;
+			klogprintf_logonly("xdiag-fbscan: sample=%u hash=%x size=%ux%u pitch=%u pa=%llx\n",
+				samples, hash, g_fbdev.width, g_fbdev.height, g_fbdev.pitch,
+				(unsigned long long)g_fbdev.pa);
+		}
+	}
 	fbdev_flush_display();
 }
 
@@ -117,8 +143,27 @@ void fbdev_flush_display(void) {
 void fbdev_copy_from(size_t offset, const void *src, size_t n) {
 	if (!g_fbdev.active || n == 0 || !src)
 		return;
+	if (offset >= g_fbdev.len)
+		return;
+	if (n > g_fbdev.len - offset)
+		n = g_fbdev.len - offset;
 	memcpy((uint8_t *)g_fbdev.kva + offset, src, n);
-	fbdev_flush_display();
+	/* A write has a known byte range, unlike stores through a userspace mmap.
+	 * Notify only its visible rows; off-screen memory needs no UPDATE. */
+	if (!g_fbdev.pitch || !g_fbdev.width || !g_fbdev.height)
+		return;
+	size_t first = offset / g_fbdev.pitch;
+	size_t last = (offset + n - 1) / g_fbdev.pitch;
+	if (first >= g_fbdev.height)
+		return;
+	if (last >= g_fbdev.height)
+		last = g_fbdev.height - 1;
+#if defined(__GNUC__) || defined(__clang__)
+	__asm__ volatile("mfence" ::: "memory");
+#endif
+	video_flush_region_pixels(0, (uint32_t)first, g_fbdev.width,
+	                          (uint32_t)(last - first + 1));
+	video_display_sync();
 }
 
 int fbdev_mmap_user(uintptr_t addr, size_t len, size_t file_off) {

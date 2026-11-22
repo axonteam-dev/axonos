@@ -38,6 +38,7 @@ static struct cgroup g_cgroup_root;
 static char g_cg_mount[64] = "/sys/fs/cgroup";
 static spinlock_t g_cg_lock;
 static int freed;
+static int cgroup_caller_has_admin(void) { return 1; }
 static void acquire_irqsave(spinlock_t *lock, unsigned long *flags) {
     assert(!lock->locked); lock->locked = 1; *flags = 0;
 }

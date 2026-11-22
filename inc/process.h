@@ -9,6 +9,23 @@
 /* Match THREAD_MAX_FD; docker/containerd expect ≥1024 NOFILE soft. */
 #define PROCESS_MAX_FD 2048
 #define PROCESS_SIGNAL_MAX 64
+#define PROCESS_CAP_LAST 40
+#define PROCESS_CAP_MASK ((1ULL << (PROCESS_CAP_LAST + 1)) - 1ULL)
+#define AXON_CAP_CHOWN 0
+#define AXON_CAP_DAC_OVERRIDE 1
+#define AXON_CAP_DAC_READ_SEARCH 2
+#define AXON_CAP_FOWNER 3
+#define AXON_CAP_SETGID 6
+#define AXON_CAP_SETUID 7
+#define AXON_CAP_SETPCAP 8
+#define AXON_CAP_NET_ADMIN 12
+#define AXON_CAP_NET_RAW 13
+#define AXON_CAP_IPC_OWNER 15
+#define AXON_CAP_SYS_CHROOT 18
+#define AXON_CAP_SYS_ADMIN 21
+#define AXON_CAP_SYS_RESOURCE 24
+#define AXON_CAP_SYS_TIME 25
+#define AXON_CAP_SYS_TTY_CONFIG 26
 /* Linux-ish defaults for RLIMIT_NOFILE (getrlimit/setrlimit/prlimit64). */
 #define PROCESS_RLIMIT_NOFILE_SOFT 1024ULL
 #define PROCESS_RLIMIT_NOFILE_HARD ((uint64_t)PROCESS_MAX_FD)
@@ -18,6 +35,7 @@
 
 typedef struct mm_struct mm_t;
 typedef struct thread thread_t;
+struct seccomp_filter;
 
 typedef enum process_state {
     PROCESS_ALIVE = 0,
@@ -69,6 +87,20 @@ typedef struct process {
     int dumpable;
     /* Linux PR_GET/SET_SECUREBITS, inherited at fork. */
     unsigned int secure_bits;
+    /* prctl(PR_SET_KEEPCAPS), cleared on exec. */
+    unsigned int keep_caps;
+    /* Linux capability quintet. Bits are numbered through CAP_LAST_CAP=40. */
+    uint64_t cap_effective;
+    uint64_t cap_permitted;
+    uint64_t cap_inheritable;
+    uint64_t cap_ambient;
+    uint64_t capability_bounding;
+    uint8_t no_new_privs;
+    uint8_t seccomp_mode;
+    uint32_t seccomp_lock;
+    struct seccomp_filter *seccomp_filters;
+    /* Linux personality(2); AxonOS currently implements PER_LINUX only. */
+    uint32_t personality;
     /* Resource limits (Linux rlimit64). Only NOFILE is enforced on open. */
     uint64_t rlim_nofile_cur;
     uint64_t rlim_nofile_max;
@@ -114,10 +146,12 @@ void process_set_vfork_parent(process_t *child, process_t *parent);
 void process_release_vfork_parent(process_t *child,
                                   process_vfork_release_reason_t reason);
 void process_exec_reset(process_t *process, thread_t *thread);
+int process_has_cap(const process_t *process, unsigned capability);
 void process_posix_timers_flush_pid(uint64_t pid);
 uint64_t process_pid(const thread_t *thread);
 uint64_t process_ppid(const thread_t *thread);
 int process_signal_targets(process_t *caller, int pid, int sig);
+int process_signal_has_unblocked_thread(process_t *process, int sig);
 /* Fill out[] with live PROCESS_ALIVE targets matching kill(2) pid rules.
  * Returns number of entries written (capped at out_max). */
 int process_collect_signal_targets(process_t *caller, int pid,

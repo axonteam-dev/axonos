@@ -194,19 +194,18 @@ static int user_mmap_copyin_file(thread_t *t, struct fs_file *f,
         if (chunk > sizeof(page))
             chunk = sizeof(page);
         ssize_t nr = fs_read(f, page, chunk, file_off + done);
-        if (nr < 0)
+        /* n is bounded by the file size by the caller. A short read is not
+         * EOF: continue at the next offset, or fail rather than silently
+         * replacing the rest of a shared object with zeroes. */
+        if (nr <= 0 || (size_t)nr > chunk)
             return -1;
-        if ((size_t)nr < chunk)
-            memset(page + (size_t)nr, 0, chunk - (size_t)nr);
         if (mm) {
-            if (mm_copy_to_user(mm, share, (uint64_t)dest + done, page, chunk) != 0)
+            if (mm_copy_to_user(mm, share, (uint64_t)dest + done, page, (size_t)nr) != 0)
                 return -1;
         } else {
-            memcpy((void *)(dest + done), page, chunk);
+            memcpy((void *)(dest + done), page, (size_t)nr);
         }
-        if ((size_t)nr < chunk)
-            break;
-        done += chunk;
+        done += (size_t)nr;
     }
     return 0;
 }
@@ -566,6 +565,13 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         if (fd >= 0 && fd < THREAD_MAX_FD && file_off >= 0) {
             struct fs_file *f = user_mmap_fd_get(tcur ? tcur : cur, fd);
             if (f && f->type == FS_TYPE_REG && !fbdev_is_fb0_file(f)) {
+                if ((prot & 4) && f->path && (fs_mount_flags(f->path) & 8u))
+                    return user_mm_ret_err(USER_MM_EACCES);
+                if (shared_mapping && (prot & 2) && f->path &&
+                    fs_mount_is_readonly(f->path))
+                    return user_mm_ret_err(USER_MM_EROFS);
+                if (shared_mapping && (prot & 2) && (f->flags & 3) == 0)
+                    return user_mm_ret_err(USER_MM_EACCES);
                 if (shared_mapping) {
                     file_lazy = 1;
                     file_lazy_f = f;
@@ -667,21 +673,6 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
                 if (map_end > zlo)
                     user_as_mmap_memset_zero_chunked(zlo, (size_t)(map_end - zlo));
             }
-            if (fixed_mapping && pg_off == 0 && to_read >= 4) {
-                unsigned char eh[4];
-                int got = 0;
-                if (tcur && tcur->mm)
-                    got = mm_copy_from_user(tcur->mm, eh, (uint64_t)map_lo, 4) == 0;
-                else {
-                    memcpy(eh, (const void *)(uintptr_t)map_lo, 4);
-                    got = 1;
-                }
-                if (!got || eh[0] != 0x7f || eh[1] != 'E' || eh[2] != 'L' || eh[3] != 'F') {
-                    klogprintf("mmap: missing ELF magic map=0x%llx path=%s\n",
-                        (unsigned long long)map_lo, f->path ? f->path : "(null)");
-                    return user_mm_ret_err(USER_MM_EFAULT);
-                }
-            }
             if (user_mmap_watch(tcur) && fixed_mapping) {
                 unsigned char p[4] = {0, 0, 0, 0};
                 if (to_read >= 4 && tcur && tcur->mm)
@@ -722,6 +713,18 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         if (user_vma_add_file(vtid, addr, len, prot & 7, mmap_vma_kind,
                               file_lazy_f, file_lazy_off) != 0)
             return user_mm_ret_err(USER_MM_ENOSPC);
+        if (file_lazy_f && file_lazy_f->path &&
+            strstr(file_lazy_f->path, "libcom_err.so") != NULL) {
+            uint64_t pa = 0;
+            int mapped = tcur && tcur->mm &&
+                mm_va_leaf_pa(tcur->mm, addr, &pa) == 0;
+            klogprintf("filemap-trace: mmap va=0x%llx len=0x%zx off=0x%llx prot=%d lazy=1 file=%s mapped=%d pa=0x%llx mm=0x%llx\n",
+                (unsigned long long)addr, len,
+                (unsigned long long)file_lazy_off, prot & 7,
+                file_lazy_f->path, mapped,
+                (unsigned long long)(mapped ? pa : 0),
+                (unsigned long long)(tcur && tcur->mm ? tcur->mm->cr3 : 0));
+        }
     } else if (eager_file) {
         if (user_vma_add_file(vtid, addr, len, prot & 7, mmap_vma_kind,
                               eager_file, eager_file_off) != 0)
@@ -1077,11 +1080,16 @@ uint64_t user_syscall_mprotect(uint64_t a1, uint64_t a2, uint64_t a3) {
     if (!user_vma_is_fully_mapped(tid, addr, len)) {
         if (user_map_ensure_present_us_2m((uint64_t)addr, (uint64_t)addr + len) != 0)
             return user_mm_ret_err(USER_MM_EFAULT);
-        if (user_vma_unmap_range(tid, addr, len) != 0)
+        if (user_vma_unmap_range(tid, addr, len) != 0) {
+            user_vma_debug_capacity(tcur, "mprotect-unmap");
             return user_mm_ret_err(USER_MM_ENOSPC);
-        if (user_vma_add(tid, addr, len, prot & 7, USER_VMA_KIND_MMAP) != 0)
+        }
+        if (user_vma_add(tid, addr, len, prot & 7, USER_VMA_KIND_MMAP) != 0) {
+            user_vma_debug_capacity(tcur, "mprotect-add");
             return user_mm_ret_err(USER_MM_ENOSPC);
+        }
     } else if (user_vma_set_prot(tid, addr, len, prot & 7) != 0) {
+        user_vma_debug_capacity(tcur, "mprotect-split");
         return user_mm_ret_err(USER_MM_ENOSPC);
     }
     if (user_map_mprotect_range((uint64_t)addr, (uint64_t)addr + len, prot & 7) != 0)

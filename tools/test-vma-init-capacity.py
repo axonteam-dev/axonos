@@ -8,7 +8,8 @@ root = Path(__file__).resolve().parents[1]
 source = (root / "mm/user_vma.c").read_text()
 init = (root / "core/entry/init.c").read_text()
 header = (root / "inc/user_vma.h").read_text()
-assert "#define USER_VMA_MAX 8192" in header
+assert "#define USER_VMA_MAX 32768" in header
+assert "#define USER_VMA_MM_MAX 8192" in header
 assert init.index("if (user_vma_init() != 0)") > init.index("heap_init(heap_start, heap_size)")
 start = source.index("int user_vma_init(void) {")
 end = source.index("\n}\n", start) + 3

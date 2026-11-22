@@ -15,6 +15,7 @@ program = r'''
 #include <stddef.h>
 #include <stdio.h>
 #define USER_VMA_MAX 8
+#define USER_VMA_MM_MAX USER_VMA_MAX
 struct fs_file { int id; };
 typedef struct { int used; uint64_t tid; uintptr_t addr; size_t len;
                  struct fs_file *file; } user_vma_t;

@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <serial.h>
 #include <vga.h>
+#include <video.h>
 #include <string.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -197,6 +198,7 @@ static int vga_text_ansi_feed_nolock(uint8_t ch, uint8_t attr) {
 
 /* Fast direct VGA helpers */
 void vga_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
+        if (video_kd_graphics()) return;
         if (x >= MAX_COLS || y >= MAX_ROWS) return;
         uint16_t off = (uint16_t)((y * MAX_COLS + x) * 2);
         unsigned long fl;
@@ -217,6 +219,7 @@ uint8_t vga_get_cell_attr(uint32_t x, uint32_t y) {
 }
 
 void vga_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr) {
+        if (video_kd_graphics()) return;
         if (y >= MAX_ROWS) return;
         if (x0 > x1) return;
         if (x1 >= MAX_COLS) x1 = MAX_COLS - 1;
@@ -232,6 +235,7 @@ void vga_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr) 
 }
 
 void vga_clear_screen_attr(uint8_t attr) {
+        if (video_kd_graphics()) return;
         if (cirrusfb_is_ready()) {
                 cirrusfb_clear(attr);
                 return;
@@ -250,6 +254,7 @@ void vga_clear_screen_attr(uint8_t attr) {
 
 
 void vga_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t ch, uint8_t attr) {
+        if (video_kd_graphics()) return;
         if (x >= MAX_COLS || y >= MAX_ROWS || w == 0 || h == 0)
                 return;
         if (w > MAX_COLS - x) w = MAX_COLS - x;
@@ -266,6 +271,7 @@ void vga_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t ch, u
 }
 
 void vga_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
+        if (video_kd_graphics()) return;
         if (!s || x >= MAX_COLS || y >= MAX_ROWS) return;
         uint32_t cx = x, cy = y;
         uint8_t cur_attr = attr;
@@ -454,6 +460,7 @@ static void kputchar_vga_text_nolock(uint8_t character, uint8_t attribute_byte)
 /* One character worth of output without taking vga_lock_spin (caller must hold lock). */
 static void console_putc_nolock(uint8_t character, uint8_t attribute_byte)
 {
+	if (video_kd_graphics()) return;
         if (cirrusfb_is_ready()) { cirrusfb_putchar(character, attribute_byte); return; }
         if (vbe_is_available()) { vbefb_putchar(character, attribute_byte); return; }
         if (vga_text_ansi_feed_nolock(character, attribute_byte))
@@ -479,6 +486,7 @@ void kputchar(uint8_t character, uint8_t attribute_byte)
 
 void vga_putchar_literal(uint8_t character, uint8_t attribute_byte)
 {
+        if (video_kd_graphics()) return;
         unsigned long fl;
         acquire_irqsave(&vga_lock_spin, &fl);
         kputchar_vga_text_nolock(character, attribute_byte);
@@ -523,6 +531,7 @@ void        scroll_line()
 
 void vga_scroll_region(uint32_t top, uint32_t bottom, uint8_t attr)
 {
+        if (video_kd_graphics()) return;
 	if (top >= MAX_ROWS)
 		top = MAX_ROWS - 1;
 	if (bottom >= MAX_ROWS)
@@ -545,6 +554,7 @@ void vga_scroll_region(uint32_t top, uint32_t bottom, uint8_t attr)
 
 void vga_blit_cells(const uint8_t *cells, uint32_t top, uint32_t bottom)
 {
+        if (video_kd_graphics()) return;
 	if (!cells || top >= MAX_ROWS)
 		return;
 	if (bottom >= MAX_ROWS)
@@ -727,7 +737,7 @@ static int utoa_rev(unsigned long long v, unsigned base, int upper, char *out)
  * the next write(1) / ECHO lands at a stale position (often 0,0). */
 static inline void kprintf_putc_locked(struct devfs_tty *tty, uint8_t ch, uint8_t color) {
         if (tty)
-                devfs_tty_console_write_locked((const char *)&ch, 1);
+                devfs_tty_console_write_locked(tty, (const char *)&ch, 1);
         else
                 console_putc_nolock(ch, color);
 }
@@ -752,9 +762,12 @@ void kprintf(const char* fmt, ...)
         /* Re-entrancy guard: a kprintf fired from a fault while another paint is
          * already under way would re-enter out_lock with IF=0 and self-deadlock.
          * Drop the nested output instead (see devfs_tty_console_enter). */
-        if (tty && !devfs_tty_console_enter())
+        if (tty && !devfs_tty_console_enter()) {
+                va_end(ap);
                 return;
+        }
         unsigned long output_fl;
+        int visible;
         if (tty) {
                 /*
                  * Same lock order as userspace: tty output lock, then backend lock.
@@ -762,11 +775,14 @@ void kprintf(const char* fmt, ...)
                  * ANSI state without out_lock, allowing printk to eat child byte 0.
                  */
                 acquire_irqsave(&tty->out_lock, &output_fl);
-                console_set_cursor(tty->cursor_x, tty->cursor_y);
+                /* A switch before the lock leaves this tty in the background. */
+                visible = tty->id == devfs_get_active() && !video_vt_graphics(tty->id);
+                if (visible) console_set_cursor(tty->cursor_x, tty->cursor_y);
                 /* Keep nested one-byte printk writes in one VGA cursor batch. */
-                console_begin_tty_batch();
+                if (visible) console_begin_tty_batch();
         } else {
                 acquire_irqsave(&vga_lock_spin, &output_fl);
+                visible = !video_kd_graphics();
         }
         for (const char *p = fmt; *p; ) {
                 // Color tags are no longer supported; treat them as normal characters.
@@ -928,11 +944,11 @@ PRINT_NUMBER_BASE10:
          }
 
         if (tty) {
-                console_end_tty_batch();
+                if (visible) console_end_tty_batch();
                 release_irqrestore(&tty->out_lock, output_fl);
                 devfs_tty_console_leave();
         } else {
-                if (!cirrusfb_is_ready() && !vbe_is_available())
+                if (visible && !cirrusfb_is_ready() && !vbe_is_available())
                         flush_cursor_nolock();
                 release_irqrestore(&vga_lock_spin, output_fl);
         }
@@ -940,6 +956,7 @@ PRINT_NUMBER_BASE10:
 }
 
 void vga_set_cursor(uint32_t x, uint32_t y) {
+        if (video_kd_graphics()) return;
         if (cirrusfb_is_ready()) { cirrusfb_set_cursor(x, y); return; }
         if (vbe_is_available()) { vbefb_set_cursor(x, y); return; }
         if (x >= MAX_COLS) x = MAX_COLS - 1;
@@ -952,6 +969,7 @@ void vga_set_cursor(uint32_t x, uint32_t y) {
 }
 
 void vga_update_cursor(void) {
+        if (video_kd_graphics()) return;
         uint32_t hz = timer_frequency ? timer_frequency : 250u;
         uint32_t quarter_period = (hz + 3u) / 4u;
         if (quarter_period < 1u) quarter_period = 1u;

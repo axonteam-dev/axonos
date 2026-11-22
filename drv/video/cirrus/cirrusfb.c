@@ -179,6 +179,7 @@ static inline void cirrusfb_vram_write_barrier(void) {
  * timer path (cirrusfb_update_cursor) perform the push.
  */
 static void cirrusfb_flush_dirty(void) {
+	if (video_kd_graphics()) { g_fb_dirty = 0; return; }
 	if (!g_fb_dirty || !g_ready) return;
 	/* Nested tty write batches: keep dirty until outermost end_batch. */
 	if (g_batch_depth > 0) return;
@@ -227,7 +228,8 @@ void cirrusfb_begin_batch(void) {
 		 * of each write; clear() appeared to fix it only by resynchronizing
 		 * cursor pixels and text backing.
 		 */
-		if (g_swcursor_visible)
+		/* Erasing redraws a glyph; without a shadow this writes scanout. */
+		if (g_swcursor_visible && !video_kd_graphics())
 			swcursor_erase_at(g_cursor_x, g_cursor_y);
 		g_swcursor_frozen = 1;
 	}
@@ -241,6 +243,12 @@ void cirrusfb_end_batch(void) {
 	g_batch_depth--;
 	if (g_batch_depth > 0)
 		return;
+	if (video_kd_graphics()) {
+		g_fb_dirty = 0;
+		g_hwcursor_deferred = 0;
+		g_swcursor_frozen = 0;
+		return;
+	}
 	if (g_hwcursor_deferred && g_ready && g_hwcursor_ok) {
 		hwcursor_set_pos(g_hwcursor_def_x, g_hwcursor_def_y);
 		g_hwcursor_deferred = 0;
@@ -381,6 +389,7 @@ static void put_pixel_noflush(uint32_t px, uint32_t py, uint32_t pix) {
 }
 
 void cirrusfb_dismiss_boot_logo(void) {
+	if (video_kd_graphics()) return;
 	if (!g_ready || !g_logo_visible)
 		return;
 	uint32_t rows = g_margin_rows;
@@ -648,6 +657,7 @@ uint32_t cirrusfb_cols(void) { return g_cols; }
 uint32_t cirrusfb_rows(void) { return g_rows; }
 
 void cirrusfb_putch_xy(uint32_t x, uint32_t y, uint16_t ch, uint8_t attr) {
+	if (video_kd_graphics()) return;
 	if (!g_ready || !g_textbuf || x >= g_cols || y >= g_rows) return;
 	/*
 	 * Unbatched echo/klog: freeze the SW cursor around the paint so a timer
@@ -672,6 +682,7 @@ void cirrusfb_putch_xy(uint32_t x, uint32_t y, uint16_t ch, uint8_t attr) {
 }
 
 void cirrusfb_putch_run(uint32_t x, uint32_t y, const uint16_t *chars, uint32_t n, uint8_t attr) {
+	if (video_kd_graphics()) return;
 	if (!g_ready || !g_textbuf || !chars || n == 0 || y >= g_rows || x >= g_cols)
 		return;
 	if (x + n > g_cols)
@@ -694,6 +705,7 @@ void cirrusfb_putch_run(uint32_t x, uint32_t y, const uint16_t *chars, uint32_t 
 }
 
 int cirrusfb_recompute_geometry(void) {
+	if (video_kd_graphics()) return -1;
 	if (!g_ready || !g_fb)
 		return -1;
 	uint32_t fw = FONT_W();
@@ -805,11 +817,13 @@ static void cirrusfb_putchar_inner(uint16_t ch, uint8_t attr) {
 }
 
 void cirrusfb_putchar_literal(uint16_t ch, uint8_t attr) {
+	if (video_kd_graphics()) return;
 	if (!g_ready || !g_textbuf) return;
 	cirrusfb_putchar_inner(ch, attr);
 }
 
 void cirrusfb_set_cursor(uint32_t x, uint32_t y) {
+	if (video_kd_graphics()) return;
 	if (!g_ready) return;
 	if (x >= g_cols) x = g_cols - 1;
 	if (y >= g_rows) y = g_rows - 1;
@@ -864,6 +878,7 @@ void cirrusfb_snapshot_screen(uint8_t *out, size_t max_bytes) {
 }
 
 void cirrusfb_restore_screen(const uint8_t *src, uint32_t cols, uint32_t rows) {
+	if (video_kd_graphics()) return;
 	if (!g_ready || !g_textbuf || !src) return;
 	if (cols != g_cols || rows != g_rows) return;
 	for (uint32_t y = 0; y < rows; y++) {
@@ -876,11 +891,14 @@ void cirrusfb_restore_screen(const uint8_t *src, uint32_t cols, uint32_t rows) {
 			draw_glyph_noflush(x, y, ch, attr);
 		}
 	}
+	devfs_tty_switch_debug_mark("VT repaint: cells complete; flush begin");
 	fb_dirty_mark(0, 0, g_width, g_height);
 	cirrusfb_flush_dirty();
+	devfs_tty_switch_debug_mark("VT repaint: flush complete");
 }
 
 void cirrusfb_clear(uint8_t attr) {
+	if (video_kd_graphics()) return;
 	if (!g_ready || !g_textbuf) return;
 	g_current_attr = attr;
 	for (uint32_t i = 0; i < g_cols * g_rows; i++) {
@@ -925,6 +943,7 @@ void cirrusfb_clear(uint8_t attr) {
 }
 
 void cirrusfb_blit_mono8(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t *pixels) {
+	if (video_kd_graphics()) return;
 	if (!g_ready || !g_fb || !pixels || w == 0 || h == 0)
 		return;
 	for (uint32_t row = 0; row < h; row++) {
@@ -945,6 +964,7 @@ void cirrusfb_blit_mono8(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const u
 }
 
 void cirrusfb_scroll_region(uint32_t top, uint32_t bottom) {
+	if (video_kd_graphics()) return;
 	if (!g_ready || !g_textbuf || g_cols == 0 || g_rows == 0)
 		return;
 	if (top >= g_rows)
@@ -1171,6 +1191,7 @@ static void cirrusfb_csi_dispatch(uint8_t fb) {
 }
 
 void cirrusfb_putchar(uint16_t ch, uint8_t attr) {
+	if (video_kd_graphics()) return;
 	if (!g_ready || !g_textbuf) return;
 
 	if (g_esc_state == CIR_ESC_NONE) {

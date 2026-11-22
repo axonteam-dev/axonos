@@ -32,6 +32,8 @@
 uint64_t dbg_saved_rbx_in;
 uint64_t dbg_saved_rbx_out;
 extern int syscall_pipe_watch_active;
+extern void syscall_xfce_map_dump(thread_t *t);
+extern void user_vma_debug_xfce_overlaps(thread_t *runner, uintptr_t va);
 
 // локальные таблицы обработчиков (неиспользуемые предупреждения устраним использованием ниже)
 static void (*irq_handlers[16])() = {NULL};
@@ -105,6 +107,79 @@ static void dump(const char* what, const char* who, cpu_registers_t* regs, uint6
                           (unsigned long long)regs->rdx,
                           (unsigned long long)regs->rcx,
                           (unsigned long long)regs->rax);
+
+        /* A recent guest Oops reported RIP inside (not at the start of) a
+         * kernel instruction, so symbolize the live mapping and unwind the
+         * interrupted kernel frame rather than trusting the ELF alone. */
+        if (!user_mode) {
+                extern uint64_t g_last_syscall_nr;
+                mm_t *kernel_mm = mm_kernel();
+                uint64_t code_pa = 0;
+                klogprintf_logonly("kpf-frame: vector=%llu last-syscall=%llu",
+                                   (unsigned long long)regs->interrupt_number,
+                                   (unsigned long long)g_last_syscall_nr);
+                qemu_debug_printf(" kpf-frame: vector=%llu last-syscall=%llu\n",
+                                  (unsigned long long)regs->interrupt_number,
+                                  (unsigned long long)g_last_syscall_nr);
+                if (kernel_mm &&
+                    mm_va_leaf_pa(kernel_mm, regs->rip, &code_pa) == 0 &&
+                    code_pa + (regs->rip & 0xFFFu) < 0x100000000ULL - 16u) {
+                        code_pa += regs->rip & 0xFFFu;
+                        const volatile uint8_t *code =
+                                (const volatile uint8_t *)(uintptr_t)code_pa;
+                        static const char hex[] = "0123456789abcdef";
+                        char bytes[48];
+                        size_t at = 0;
+                        for (unsigned i = 0; i < 16; i++) {
+                                uint8_t byte = code[i];
+                                bytes[at++] = hex[byte >> 4];
+                                bytes[at++] = hex[byte & 0x0Fu];
+                                if (i != 15)
+                                        bytes[at++] = ' ';
+                        }
+                        bytes[at] = '\0';
+                        klogprintf_logonly("kpf-code: va=0x%llx pa=0x%llx bytes=%s",
+                                           (unsigned long long)regs->rip,
+                                           (unsigned long long)code_pa, bytes);
+                        qemu_debug_printf(" kpf-code: va=0x%llx pa=0x%llx bytes=",
+                                          (unsigned long long)regs->rip,
+                                          (unsigned long long)code_pa);
+                        for (unsigned i = 0; i < 16; i++)
+                                qemu_debug_printf("%02x%s", (unsigned)code[i],
+                                                  i == 15 ? "\n" : " ");
+                } else {
+                        klogprintf_logonly("kpf-code: translation failed va=0x%llx",
+                                           (unsigned long long)regs->rip);
+                        qemu_debug_printf(" kpf-code: translation failed va=0x%llx\n",
+                                          (unsigned long long)regs->rip);
+                }
+                uintptr_t frame = (uintptr_t)regs->rbp;
+                for (unsigned depth = 0; depth < 5; depth++) {
+                        uint64_t frame_pa = 0;
+                        if (!kernel_mm || frame < 0x10000u || (frame & 7u) ||
+                            frame > 0x100000000ULL - 16u ||
+                            (frame & 0xFFFu) > 0xFF0u ||
+                            mm_va_leaf_pa(kernel_mm, frame, &frame_pa) != 0 ||
+                            frame_pa > 0x100000000ULL - 16u)
+                                break;
+                        frame_pa += frame & 0xFFFu;
+                        const volatile uint64_t *words =
+                                (const volatile uint64_t *)(uintptr_t)frame_pa;
+                        uint64_t next = words[0];
+                        uint64_t ret = words[1];
+                        klogprintf_logonly("kpf-bt[%u]: rbp=0x%llx ret=0x%llx next=0x%llx",
+                                           depth, (unsigned long long)frame,
+                                           (unsigned long long)ret,
+                                           (unsigned long long)next);
+                        qemu_debug_printf(" kpf-bt[%u]: rbp=0x%llx ret=0x%llx next=0x%llx\n",
+                                          depth, (unsigned long long)frame,
+                                          (unsigned long long)ret,
+                                          (unsigned long long)next);
+                        if (next <= frame)
+                                break;
+                        frame = (uintptr_t)next;
+                }
+        }
 
         logfn("Oops! %s in %s at RIP=0x%llx err=0x%llx\n", what, who, (unsigned long long)regs->rip, (unsigned long long)regs->error_code);
         logfn("RIP: 0x%llx\n", (unsigned long long)regs->rip);
@@ -791,31 +866,74 @@ static void page_fault_handler(cpu_registers_t* regs) {
                           user ? 1 : 0);
         /* Additional diagnostics to help pinpoint cause in user mode */
         if (user) {
-            /* dump instruction bytes at RIP */
+            thread_t *pf_thread = thread_current();
+            if (!pf_thread || pf_thread->ring != 3)
+                pf_thread = thread_get_current_user();
+            klogprintf("user-pf-regs: rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx "
+                       "rsi=0x%llx rdi=0x%llx rbp=0x%llx r8=0x%llx r9=0x%llx "
+                       "r10=0x%llx r11=0x%llx r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx\n",
+                       (unsigned long long)regs->rax, (unsigned long long)regs->rbx,
+                       (unsigned long long)regs->rcx, (unsigned long long)regs->rdx,
+                       (unsigned long long)regs->rsi, (unsigned long long)regs->rdi,
+                       (unsigned long long)regs->rbp, (unsigned long long)regs->r8,
+                       (unsigned long long)regs->r9, (unsigned long long)regs->r10,
+                       (unsigned long long)regs->r11, (unsigned long long)regs->r12,
+                       (unsigned long long)regs->r13, (unsigned long long)regs->r14,
+                       (unsigned long long)regs->r15);
+            /* RIP is a userspace VA; translate it through the faulting process's
+             * page tables before reading instruction bytes. The kernel's
+             * identity map at the same numeric VA can contain unrelated zeroes. */
             if ((regs->error_code & 0x11u) == 0x10u &&
                 ((regs->rip ^ cr2) & ~0xFFFULL) == 0) {
                 /* Instruction fetch from an unmapped page: dereferencing RIP
                  * here faults again in the exception handler (VMware #DF). */
                 klogprintf("code @ RIP: (instruction page not present)\n");
-            } else if ((uintptr_t)regs->rip < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                const unsigned char *code = (const unsigned char*)(uintptr_t)regs->rip;
-                klogprintf("code @ RIP: ");
-                for (int i = 0; i < 32; i++) kprintf("%02x ", (unsigned)code[i]);
-                kprintf("\n");
-                qemu_debug_printf("code @ RIP:");
-                for (int i = 0; i < 16; i++) qemu_debug_printf(" %02x", (unsigned)code[i]);
-                qemu_debug_printf("\n");
             } else {
-                klogprintf("code @ RIP: (outside identity map)\n");
-                qemu_debug_printf("code @ RIP: (outside identity map)\n");
+                uint64_t code_pa = 0;
+                if (pf_thread && pf_thread->mm &&
+                    mm_va_leaf_pa(pf_thread->mm, regs->rip, &code_pa) == 0 &&
+                    code_pa < (uint64_t)MMIO_IDENTITY_LIMIT &&
+                    (regs->rip & 0xFFFULL) <= 0xFF8u &&
+                    code_pa + (regs->rip & 0xFFFULL) + 8u <=
+                        (uint64_t)MMIO_IDENTITY_LIMIT) {
+                        const volatile unsigned char *code =
+                            (const volatile unsigned char *)(uintptr_t)
+                                (code_pa + (regs->rip & 0xFFFULL));
+                        klogprintf("user-pf-code: va=0x%llx pa=0x%llx bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                            (unsigned long long)regs->rip,
+                            (unsigned long long)(code_pa + (regs->rip & 0xFFFULL)),
+                            (unsigned)code[0], (unsigned)code[1],
+                            (unsigned)code[2], (unsigned)code[3],
+                            (unsigned)code[4], (unsigned)code[5],
+                            (unsigned)code[6], (unsigned)code[7]);
+                } else {
+                    klogprintf("code @ RIP: no user mapping for va=0x%llx\n",
+                               (unsigned long long)regs->rip);
+                }
             }
-            /* dump stack words */
-            if ((uintptr_t)regs->rsp < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                const uint64_t *stk = (const uint64_t*)(uintptr_t)regs->rsp;
-                klogprintf("stack @ RSP: ");
-                for (int i = 0; i < 8; i++) kprintf("0x%016llx ", (unsigned long long)stk[i]);
-                kprintf("\n");
-            } else {
+            /* Read stack through this process's translation and put the words
+             * in klog (kprintf-only bytes disappear from `dmesg`). */
+            {
+                uint64_t stack_pa = 0;
+                if (pf_thread && pf_thread->mm &&
+                    mm_va_leaf_pa(pf_thread->mm, regs->rsp, &stack_pa) == 0 &&
+                    (regs->rsp & 0xFFFULL) <= 0xFC0u) {
+                    uint64_t stack_addr = stack_pa + (regs->rsp & 0xFFFULL);
+                    if (stack_addr + 64u <= (uint64_t)MMIO_IDENTITY_LIMIT) {
+                        const volatile uint64_t *stk =
+                            (const volatile uint64_t *)(uintptr_t)stack_addr;
+                        klogprintf("user-pf-stack: %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                            (unsigned long long)stk[0], (unsigned long long)stk[1],
+                            (unsigned long long)stk[2], (unsigned long long)stk[3],
+                            (unsigned long long)stk[4], (unsigned long long)stk[5],
+                            (unsigned long long)stk[6], (unsigned long long)stk[7]);
+                    }
+                } else {
+                    klogprintf("user-pf-stack: no translation for rsp=0x%llx\n",
+                        (unsigned long long)regs->rsp);
+                }
+            }
+            if ((uintptr_t)regs->rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
                 klogprintf("stack @ RSP: (outside identity map)\n");
             }
             if (regs->rip >= 0x02007000ULL && regs->rip < 0x02007800ULL) {
@@ -839,18 +957,6 @@ static void page_fault_handler(cpu_registers_t* regs) {
                 } else {
                     klogprintf("ldso-linkmap: r13 outside readable identity range\n");
                 }
-            }
-            /* dump memory near CR2 if available; skip when page is non-present
-               (err bit 0 = 0) to avoid a second page fault when reading CR2 */
-            if ((regs->error_code & 1) != 0 && (uintptr_t)cr2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                klogprintf("bytes @ CR2: ");
-                const unsigned char *p = (const unsigned char*)(uintptr_t)cr2;
-                for (int i = 0; i < 32; i++) kprintf("%02x ", (unsigned)p[i]);
-                kprintf("\n");
-            } else if ((regs->error_code & 1) == 0) {
-                klogprintf("bytes @ CR2: (page not present, skipping read)\n");
-            } else {
-                klogprintf("bytes @ CR2: (outside identity map)\n");
             }
             if (user && regs->rip >= 0x2200000ULL && regs->rip < 0x2300000ULL &&
                 (uintptr_t)regs->rip < (uintptr_t)MMIO_IDENTITY_LIMIT) {
@@ -878,14 +984,14 @@ static void page_fault_handler(cpu_registers_t* regs) {
                 int l1i = (v >> 12) & 0x1FF;
                 klogprintf("ptes: l4[%d]=0x%016llx\n", l4i, (unsigned long long)l4[l4i]);
                 if (l4[l4i] & PG_PRESENT) {
-                    uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
+                    uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & PG_ADDR_MASK);
                     klogprintf("ptes: l3[%d]=0x%016llx\n", l3i, (unsigned long long)l3[l3i]);
                     if (l3[l3i] & PG_PRESENT) {
                         uint64_t l3e = l3[l3i];
                         if (l3e & PG_PS_2M) {
                             klogprintf("ptes: 1GiB/2MiB large at L3\n");
                         } else {
-                            uint64_t l2_phys = l3e & ~0xFFFULL;
+                            uint64_t l2_phys = l3e & PG_ADDR_MASK;
                             uint64_t *l2 = (uint64_t*)(uintptr_t)l2_phys;
                             uint64_t l2e = l2[l2i];
                             klogprintf("ptes: l2_phys=0x%llx l2[%d]=0x%016llx P=%d U=%d\n",
@@ -895,7 +1001,7 @@ static void page_fault_handler(cpu_registers_t* regs) {
                                 if (l2e & PG_PS_2M) {
                                     klogprintf("ptes: 2MiB large at L2\n");
                                 } else {
-                                    uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
+                                    uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & PG_ADDR_MASK);
                                     klogprintf("ptes: l1[%d]=0x%016llx\n", l1i, (unsigned long long)l1[l1i]);
                                 }
                             }
@@ -940,17 +1046,137 @@ extern uint64_t syscall_kernel_rsp0;
                     }
                     if (file)
                         fs_file_free(file);
+
+                    /* Temporary diagnosis for xfce4-session's call through
+                     * xfce_screensaver_new@plt (Debian trixie PIE at 0x400000).
+                     * Read the GOT via this task's leaf, never kernel VA. */
+                    if (regs->rip == 0xf816) {
+                        syscall_xfce_map_dump(ft);
+                        const uint64_t got_va = 0x441ff8ULL;
+                        uint64_t got_pa = 0;
+                        klogprintf("xfce-plt-diag: name=%s mm=%p cr3=0x%llx\n",
+                            ft->name[0] ? ft->name : "?", (void *)ft->mm,
+                            (unsigned long long)paging_read_cr3());
+                        if (ft->mm && mm_va_leaf_pa(ft->mm, got_va, &got_pa) == 0 &&
+                            got_pa + (got_va & 0xfffULL) + sizeof(uint64_t) <=
+                                (uint64_t)MMIO_IDENTITY_LIMIT) {
+                            uint64_t got = *(const volatile uint64_t *)(uintptr_t)
+                                (got_pa + (got_va & 0xfffULL));
+                            klogprintf("xfce-plt: got_va=0x%llx value=0x%llx page_pa=0x%llx\n",
+                                (unsigned long long)got_va,
+                                (unsigned long long)got,
+                                (unsigned long long)got_pa);
+                            uint64_t target_pa = 0;
+                            if (got >= 0x10000 && (got & 0xfffULL) <= 0xff8 &&
+                                mm_va_leaf_pa(ft->mm, got, &target_pa) == 0 &&
+                                target_pa + (got & 0xfffULL) + 8 <= (uint64_t)MMIO_IDENTITY_LIMIT) {
+                                const volatile uint8_t *p = (const volatile uint8_t *)(uintptr_t)
+                                    (target_pa + (got & 0xfffULL));
+                                klogprintf("xfce-plt-target: va=0x%llx pa=0x%llx bytes=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                                    (unsigned long long)got,
+                                    (unsigned long long)(target_pa + (got & 0xfffULL)),
+                                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+                                if (p[0] == 0xff && p[1] == 0x25) {
+                                    int32_t disp = (int32_t)((uint32_t)p[2] |
+                                        ((uint32_t)p[3] << 8) | ((uint32_t)p[4] << 16) |
+                                        ((uint32_t)p[5] << 24));
+                                    uint64_t slot = got + 6 + (int64_t)disp;
+                                    uint64_t slot_pa = 0;
+                                    if ((slot & 0xfffULL) <= 0xff8 &&
+                                        mm_va_leaf_pa(ft->mm, slot, &slot_pa) == 0 &&
+                                        slot_pa + (slot & 0xfffULL) + 8 <= (uint64_t)MMIO_IDENTITY_LIMIT) {
+                                        uint64_t dest = *(const volatile uint64_t *)(uintptr_t)
+                                            (slot_pa + (slot & 0xfffULL));
+                                        klogprintf("xfce-plt-chain: slot=0x%llx value=0x%llx\n",
+                                            (unsigned long long)slot, (unsigned long long)dest);
+                                    }
+                                }
+                            } else {
+                                klogprintf("xfce-plt-target: va=0x%llx not mapped\n",
+                                    (unsigned long long)got);
+                            }
+                            {
+                                uintptr_t gs = 0, ge = 0;
+                                uint64_t goff = 0;
+                                int gkind = 0, gprot = 0;
+                                struct fs_file *gf = NULL;
+                                int grc = user_vma_lookup_after(ft, (uintptr_t)got,
+                                    &gs, &ge, &gkind, &gprot, &gf, &goff);
+                                user_vma_debug_xfce_overlaps(ft, (uintptr_t)got);
+                                if (grc == 0 && got >= gs && got < ge)
+                                    klogprintf("xfce-target-vma: start=0x%llx end=0x%llx file=%s off=0x%llx prot=%d kind=%d f=%p refs=%d\n",
+                                        (unsigned long long)gs, (unsigned long long)ge,
+                                        gf && gf->path ? gf->path : "(anonymous)",
+                                        (unsigned long long)(goff + got - gs), gprot, gkind,
+                                        (void *)gf, gf ? gf->refcount : 0);
+                                else
+                                    klogprintf("xfce-target-vma: no mapping for 0x%llx\n",
+                                        (unsigned long long)got);
+                                if (gf) fs_file_free(gf);
+                            }
+                        } else {
+                            klogprintf("xfce-plt: got_va=0x%llx not mapped\n",
+                                (unsigned long long)got_va);
+                        }
+                    }
+
+                    /* A null-data fault can follow execution of a zero-filled
+                     * executable mapping. Report the VMA at RIP as well as
+                     * the faulting data address above, including the backing
+                     * file and its expected offset. */
+                    {
+                        uintptr_t rip_start = 0, rip_end = 0;
+                        uint64_t rip_offset = 0;
+                        int rip_kind = 0, rip_prot = 0;
+                        struct fs_file *rip_file = NULL;
+                        int rip_rc = user_vma_lookup_after(ft, (uintptr_t)regs->rip,
+                            &rip_start, &rip_end, &rip_kind, &rip_prot,
+                            &rip_file, &rip_offset);
+                        if (rip_rc == 0 && regs->rip >= rip_start &&
+                            regs->rip < rip_end) {
+                            uint64_t rip_pa = 0;
+                            int have_pa = ft->mm &&
+                                mm_va_leaf_pa(ft->mm, regs->rip, &rip_pa) == 0;
+                            klogprintf("fault-rip-vma: [0x%llx,0x%llx) prot=%d kind=%d "
+                                       "file=%s off=0x%llx size=0x%llx page_pa=0x%llx mm_cr3=0x%llx live_cr3=0x%llx\n",
+                                (unsigned long long)rip_start,
+                                (unsigned long long)rip_end,
+                                rip_prot, rip_kind,
+                                (rip_file && rip_file->path) ? rip_file->path : "(anonymous)",
+                                (unsigned long long)(rip_offset + (regs->rip - rip_start)),
+                                (unsigned long long)(rip_file ? rip_file->size : 0),
+                                (unsigned long long)(have_pa ? rip_pa : 0),
+                                (unsigned long long)(ft->mm ? ft->mm->cr3 : 0),
+                                (unsigned long long)paging_read_cr3());
+                        } else {
+                            klogprintf("fault-rip-vma: no mapping for 0x%llx\n",
+                                (unsigned long long)regs->rip);
+                        }
+                        if (rip_file)
+                            fs_file_free(rip_file);
+                    }
                 }
-                klogprintf("user-pf-fatal: tid=%llu name=%s sc=%llu rip=0x%llx rax=0x%llx cr2=0x%llx err=0x%llx fs=0x%llx rsp=0x%llx\n",
+                uint64_t frame14 = ft && ft->syscall_frame_kbuf
+                    ? ft->syscall_frame_kbuf[14] : 0;
+                uint64_t frame13 = ft && ft->syscall_frame_kbuf
+                    ? ft->syscall_frame_kbuf[13] : 0;
+                klogprintf("user-pf-fatal: tid=%llu name=%s parent=%d frame14=0x%llx global_sc=%llu rip=0x%llx rax=0x%llx cr2=0x%llx err=0x%llx fs=0x%llx rsp=0x%llx saved_rip=0x%llx saved_rsp=0x%llx frame13=0x%llx fork_trap=0x%llx fork_rip=0x%llx\n",
                         (unsigned long long)(ft && ft->tid ? ft->tid : 0),
                         (ft && ft->name[0]) ? ft->name : "?",
+                        ft ? ft->parent_tid : -1,
+                        (unsigned long long)frame14,
                         (unsigned long long)g_last_syscall_nr,
                         (unsigned long long)regs->rip,
                         (unsigned long long)regs->rax,
                         (unsigned long long)cr2,
                         (unsigned long long)regs->error_code,
                         (unsigned long long)(ft ? ft->user_fs_base : 0),
-                        (unsigned long long)regs->rsp);
+                        (unsigned long long)regs->rsp,
+                        (unsigned long long)(ft ? ft->saved_user_rip : 0),
+                        (unsigned long long)(ft ? ft->saved_user_rsp : 0),
+                        (unsigned long long)frame13,
+                        (unsigned long long)(ft ? ft->fork_child_trap_rip : 0),
+                        (unsigned long long)(ft ? ft->fork_child_user_rip : 0));
             }
             if (regs->rip == 0 && regs->rsp >= 0x200000ULL &&
                 regs->rsp + 16ULL < (uint64_t)MMIO_IDENTITY_LIMIT) {
@@ -993,6 +1219,48 @@ static void gp_fault_handler(cpu_registers_t* regs){
         vga_raw_hex("KGP err=", regs->error_code);
     }
     if ((regs->cs & 3) == 3) {
+        /* #GP previously killed user tasks without recording fault context. */
+        static unsigned user_gp_trace_left = 16;
+        if (user_gp_trace_left) {
+            user_gp_trace_left--;
+            thread_t *gt = thread_current();
+            if (!gt || gt->ring != 3)
+                gt = thread_get_current_user();
+            extern uint64_t g_last_syscall_nr;
+            uint64_t task_sc = gt && gt->syscall_frame_kbuf
+                ? gt->syscall_frame_kbuf[14] : g_last_syscall_nr;
+            klogprintf_logonly(
+                "user-gp-fatal: tid=%llu name=%s sc=%llu rip=0x%llx err=0x%llx "
+                "cs=0x%llx ss=0x%llx rsp=0x%llx rax=0x%llx rbx=0x%llx "
+                "rcx=0x%llx rdx=0x%llx rsi=0x%llx rdi=0x%llx\n",
+                (unsigned long long)(gt && gt->tid ? gt->tid : 0),
+                gt && gt->name[0] ? gt->name : "?",
+                (unsigned long long)task_sc,
+                (unsigned long long)regs->rip,
+                (unsigned long long)regs->error_code,
+                (unsigned long long)regs->cs,
+                (unsigned long long)regs->ss,
+                (unsigned long long)regs->rsp,
+                (unsigned long long)regs->rax,
+                (unsigned long long)regs->rbx,
+                (unsigned long long)regs->rcx,
+                (unsigned long long)regs->rdx,
+                (unsigned long long)regs->rsi,
+                (unsigned long long)regs->rdi);
+            uint64_t code_pa = 0;
+            if (gt && gt->mm &&
+                mm_va_leaf_pa(gt->mm, regs->rip, &code_pa) == 0) {
+                uint64_t code_addr = code_pa + (regs->rip & 0xFFFULL);
+                if (code_addr + 8u <= (uint64_t)MMIO_IDENTITY_LIMIT &&
+                    (regs->rip & 0xFFFULL) <= 0xFF8u) {
+                    const volatile uint8_t *code =
+                        (const volatile uint8_t *)(uintptr_t)code_addr;
+                    klogprintf_logonly("user-gp-code: va=0x%llx bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                        (unsigned long long)regs->rip, code[0], code[1],
+                        code[2], code[3], code[4], code[5], code[6], code[7]);
+                }
+            }
+        }
         // ash GPF @ 0x801738 ("ls"): dump leaf state for the watch VA.
         if (regs->rip >= MM_ASH_WATCH_LO && regs->rip < MM_ASH_WATCH_HI) {
             thread_t *gt = thread_current();
@@ -1077,6 +1345,10 @@ void idt_set_handler(uint8_t num, void (*handler)(cpu_registers_t*)) {
         isr_handlers[num] = handler;
 }
 
+void idt_load_cpu(void) {
+        asm volatile("lidt %0" : : "m"(idt_ptr) : "memory");
+}
+
 void idt_init() {
         idt_ptr.limit = sizeof(idt) - 1;
         idt_ptr.base = (uint64_t)&idt;
@@ -1105,5 +1377,5 @@ void idt_init() {
         idt_set_handler(APIC_TIMER_VECTOR, apic_timer_handler);
         idt_set_handler(APIC_IPI_RESCHED_VECTOR, apic_ipi_resched_handler);
 
-        asm volatile("lidt %0" : : "m"(idt_ptr));
+        idt_load_cpu();
 }

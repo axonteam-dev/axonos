@@ -29,7 +29,8 @@ program = r'''
 typedef long ssize_t;
 #define PROCESS_MAX_FD 2048
 #define THREAD_MAX_FD 2048
-struct fs_file { int limit_accounted, refcount; void *driver_private; };
+struct fs_file { int limit_accounted, refcount, fd_refcount; void *driver_private; };
+static void fs_file_fd_open(struct fs_file *f) { f->fd_refcount++; }
 typedef struct { struct fs_file *fds[2048]; uint64_t rlim_nofile_cur; int state, oom_score_adj; } process_t;
 #define PROCESS_ALIVE 0
 typedef struct { int ring, euid; process_t *process; struct fs_file *fds[2048]; } thread_t;
@@ -80,6 +81,7 @@ int main(void) {
     struct fs_file a={0}, b={0}, c={0};
     process_t p={.rlim_nofile_cur=2}; caller.process=&p;
     assert(thread_fd_alloc(&a)==0 && thread_fd_alloc(&b)==1);
+    assert(a.fd_refcount == 1 && b.fd_refcount == 1);
     assert(file_limit_count==2 && thread_fd_alloc(&c)==-24); /* EMFILE */
     p.rlim_nofile_cur=3;
     assert(thread_fd_alloc(&c)==-23 && !p.fds[2]); /* ENFILE */

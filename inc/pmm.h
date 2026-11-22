@@ -5,9 +5,11 @@
 
 /*
  * Physical page allocator for Soft_OWNED user frames (Linux-like buddy role).
- * Contiguous identity-mapped arena carved from RAM outside the kmalloc heap.
+ * One or more disjoint identity-mapped RAM ranges outside the kmalloc heap.
+ * Ranges may only be added during boot, before any pages are allocated.
  */
 void pmm_init(uintptr_t lo, uintptr_t hi);
+int pmm_add_range(uintptr_t lo, uintptr_t hi);
 int pmm_ready(void);
 void *pmm_alloc_page(void);
 void pmm_free_page(void *page);

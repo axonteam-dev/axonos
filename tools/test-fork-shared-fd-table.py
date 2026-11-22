@@ -35,7 +35,7 @@ int main(void) {
     assert(current.refcount==2);
     fork_inherit_fd_table(&worker,&parent);
     assert(worker.fds[1]==&current && !worker.fds[2]);
-    assert(current.refcount==3);
+    assert(current.refcount==2); /* CLONE_THREAD mirror owns no reference */
     no_proc.fds[0]=&local;
     fork_inherit_fd_table(&independent,&no_proc);
     assert(independent.fds[0]==&local && local.refcount==2);

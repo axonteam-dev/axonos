@@ -4,7 +4,11 @@
 #include <stddef.h>
 #include <thread.h>
 
-#define USER_VMA_MAX 8192
+/* The legacy tid-indexed table is shared by all processes. Keep its capacity
+ * independent of the per-address-space table to avoid multiplying the latter's
+ * memory cost by the number of processes. */
+#define USER_VMA_MAX 32768
+#define USER_VMA_MM_MAX 8192
 
 enum {
     USER_VMA_KIND_MMAP = 1,
@@ -40,6 +44,7 @@ int user_vma_grow(thread_t *runner, uintptr_t addr, size_t old_len, size_t new_l
 
 void user_vma_remove_all_for_tid(uint64_t tid);
 void user_vma_release_mm(mm_t *mm);
+void user_vma_debug_capacity(thread_t *runner, const char *where);
 /* Unmap page tables for all VMAs in runner's address space and drop metadata. */
 void user_vma_teardown_unmap_for_exec(thread_t *runner);
 int user_vma_clone_for_tid(uint64_t from_tid, uint64_t to_tid);

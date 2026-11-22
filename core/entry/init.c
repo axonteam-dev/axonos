@@ -20,6 +20,9 @@
 #include <heap.h>
 #include <user_vma.h>
 #include <pmm.h>
+#include <bootmem.h>
+#include <direct_map.h>
+#include <ram_page_pool.h>
 #include <paging.h>
 #include <sysinfo.h>
 #include <thread.h>
@@ -134,6 +137,66 @@ static int ramfs_mkdir_p(const char *path)
                         return -1;
         }
         return 0;
+}
+
+static int boot_parse_decimal(const char *begin, const char *end, uint32_t *out)
+{
+        uint32_t value = 0;
+        if (!begin || !end || begin >= end || !out)
+                return -1;
+        for (const char *p = begin; p < end; p++) {
+                if (*p < '0' || *p > '9' || value > (UINT32_MAX - (uint32_t)(*p - '0')) / 10)
+                        return -1;
+                value = value * 10 + (uint32_t)(*p - '0');
+        }
+        *out = value;
+        return 0;
+}
+
+/* Resolve the packaged service account rather than baking distro UIDs into
+ * the kernel. Used for tmpfs runtime directories that PID 1 seeds before
+ * systemd starts systemd-networkd as its unprivileged service user. */
+static int boot_lookup_passwd_ids(const char *name, uid_t *uid, gid_t *gid)
+{
+        char buf[8192];
+        struct fs_file *file;
+        ssize_t n;
+        size_t name_len;
+        if (!name || !uid || !gid)
+                return -1;
+        file = fs_open("/etc/passwd");
+        if (!file)
+                return -1;
+        n = fs_read(file, buf, sizeof(buf) - 1, 0);
+        fs_file_free(file);
+        if (n <= 0 || (size_t)n >= sizeof(buf))
+                return -1;
+        buf[n] = '\0';
+        name_len = strlen(name);
+        for (size_t off = 0; off < (size_t)n;) {
+                size_t end = off;
+                while (end < (size_t)n && buf[end] != '\n') end++;
+                size_t c1 = off;
+                while (c1 < end && buf[c1] != ':') c1++;
+                if (c1 - off == name_len && memcmp(buf + off, name, name_len) == 0) {
+                        size_t c2 = c1 + 1;
+                        while (c2 < end && buf[c2] != ':') c2++;
+                        size_t c3 = c2 + 1;
+                        while (c3 < end && buf[c3] != ':') c3++;
+                        size_t c4 = c3 + 1;
+                        while (c4 < end && buf[c4] != ':') c4++;
+                        uint32_t u, g;
+                        if (c2 >= end || c3 >= end || c4 >= end ||
+                            boot_parse_decimal(buf + c2 + 1, buf + c3, &u) != 0 ||
+                            boot_parse_decimal(buf + c3 + 1, buf + c4, &g) != 0)
+                                return -1;
+                        *uid = (uid_t)u;
+                        *gid = (gid_t)g;
+                        return 0;
+                }
+                off = end + (end < (size_t)n);
+        }
+        return -1;
 }
 
 /* Packaged configuration belongs to userspace. Seed only an absent inode,
@@ -511,6 +574,239 @@ static ssize_t sysfs_show_cpu_range_list(char *buf, size_t size, void *priv) {
         return (ssize_t)w;
 }
 
+typedef struct {
+        char name[64];
+        char parent[64];
+        uint32_t sectors;
+        uint32_t start_lba;
+        unsigned major;
+        unsigned minor;
+        unsigned partition;
+        unsigned logical_block_size;
+        unsigned removable;
+        unsigned read_only;
+} sysfs_block_info_t;
+
+static sysfs_block_info_t g_sysfs_block_info[64];
+
+static unsigned sysfs_parse_partition_name(const char *name, char *parent, size_t cap)
+{
+        size_t prefix = 0, len;
+        const char *digits = NULL;
+        unsigned part = 0;
+
+        if (!name || !parent || cap == 0)
+                return 0;
+        len = strlen(name);
+        if (strncmp(name, "sd", 2) == 0) {
+                prefix = 2;
+                while (name[prefix] >= 'a' && name[prefix] <= 'z')
+                        prefix++;
+                if (prefix < 3 || prefix >= len)
+                        prefix = 0;
+                else
+                        digits = name + prefix;
+        } else if (strncmp(name, "nvme", 4) == 0 || strncmp(name, "mmcblk", 6) == 0) {
+                const char *p = strrchr(name, 'p');
+                if (p && p > name && p[1] >= '0' && p[1] <= '9') {
+                        prefix = (size_t)(p - name);
+                        digits = p + 1;
+                }
+        }
+        if (!digits) {
+                strncpy(parent, name, cap - 1);
+                parent[cap - 1] = '\0';
+                return 0;
+        }
+        for (const char *p = digits; *p; p++) {
+                if (*p < '0' || *p > '9') {
+                        strncpy(parent, name, cap - 1);
+                        parent[cap - 1] = '\0';
+                        return 0;
+                }
+                if (part <= (0xffffffffu - (unsigned)(*p - '0')) / 10u)
+                        part = part * 10u + (unsigned)(*p - '0');
+        }
+        if (part == 0 || prefix == 0 || prefix >= cap) {
+                strncpy(parent, name, cap - 1);
+                parent[cap - 1] = '\0';
+                return 0;
+        }
+        memcpy(parent, name, prefix);
+        parent[prefix] = '\0';
+        return part;
+}
+
+static ssize_t sysfs_block_show_dev(char *buf, size_t size, void *priv)
+{
+        sysfs_block_info_t *b = (sysfs_block_info_t *)priv;
+        int n;
+        if (!b || !buf || size == 0)
+                return 0;
+        n = snprintf(buf, size, "%u:%u\n", b->major, b->minor);
+        return n < 0 ? 0 : (ssize_t)((size_t)n < size ? (size_t)n : size);
+}
+
+static ssize_t sysfs_block_show_size(char *buf, size_t size, void *priv)
+{
+        sysfs_block_info_t *b = (sysfs_block_info_t *)priv;
+        int n;
+        if (!b || !buf || size == 0)
+                return 0;
+        n = snprintf(buf, size, "%u\n", b->sectors);
+        return n < 0 ? 0 : (ssize_t)((size_t)n < size ? (size_t)n : size);
+}
+
+static ssize_t sysfs_block_show_start(char *buf, size_t size, void *priv)
+{
+        sysfs_block_info_t *b = (sysfs_block_info_t *)priv;
+        int n;
+        if (!b || !buf || size == 0)
+                return 0;
+        n = snprintf(buf, size, "%u\n", b->start_lba);
+        return n < 0 ? 0 : (ssize_t)((size_t)n < size ? (size_t)n : size);
+}
+
+static ssize_t sysfs_block_show_partition(char *buf, size_t size, void *priv)
+{
+        sysfs_block_info_t *b = (sysfs_block_info_t *)priv;
+        int n;
+        if (!b || !buf || size == 0)
+                return 0;
+        n = snprintf(buf, size, "%u\n", b->partition);
+        return n < 0 ? 0 : (ssize_t)((size_t)n < size ? (size_t)n : size);
+}
+
+static ssize_t sysfs_block_show_ro(char *buf, size_t size, void *priv)
+{
+        sysfs_block_info_t *b = (sysfs_block_info_t *)priv;
+        int n;
+        if (!b || !buf || size == 0)
+                return 0;
+        n = snprintf(buf, size, "%u\n", b->read_only);
+        return n < 0 ? 0 : (ssize_t)((size_t)n < size ? (size_t)n : size);
+}
+
+static ssize_t sysfs_block_show_removable(char *buf, size_t size, void *priv)
+{
+        sysfs_block_info_t *b = (sysfs_block_info_t *)priv;
+        int n;
+        if (!b || !buf || size == 0)
+                return 0;
+        n = snprintf(buf, size, "%u\n", b->removable);
+        return n < 0 ? 0 : (ssize_t)((size_t)n < size ? (size_t)n : size);
+}
+
+static ssize_t sysfs_block_show_logical_block_size(char *buf, size_t size, void *priv)
+{
+        sysfs_block_info_t *b = (sysfs_block_info_t *)priv;
+        int n;
+        if (!b || !buf || size == 0)
+                return 0;
+        n = snprintf(buf, size, "%u\n", b->logical_block_size);
+        return n < 0 ? 0 : (ssize_t)((size_t)n < size ? (size_t)n : size);
+}
+
+static void sysfs_block_create_attr(const char *path, sysfs_show_t show,
+                                   sysfs_block_info_t *info)
+{
+        struct sysfs_attr attr = { show, NULL, info };
+        (void)sysfs_create_file(path, &attr);
+}
+
+static void kernel_sysfs_populate_block_devices(void)
+{
+        int count = devfs_block_count();
+        if (count > (int)(sizeof(g_sysfs_block_info) / sizeof(g_sysfs_block_info[0])))
+                count = (int)(sizeof(g_sysfs_block_info) / sizeof(g_sysfs_block_info[0]));
+        (void)sysfs_mkdir("/sys/block");
+        (void)sysfs_mkdir("/sys/class");
+        (void)sysfs_mkdir("/sys/class/block");
+        (void)sysfs_mkdir("/sys/dev");
+        (void)sysfs_mkdir("/sys/dev/block");
+
+        for (int i = 0; i < count; i++) {
+                sysfs_block_info_t *b = &g_sysfs_block_info[i];
+                char name[64], devpath[80], parentpath[128], blockpath[160];
+                char path[224], target[160], devnum[32];
+                int device_id = -1;
+                uint32_t sectors = 0, start_lba = 0;
+                struct stat st;
+
+                memset(b, 0, sizeof(*b));
+                if (devfs_block_get(i, name, sizeof(name), &device_id, &sectors) != 0 ||
+                    name[0] == '\0' || strcmp(name, "cdrom") == 0)
+                        continue;
+                strncpy(b->name, name, sizeof(b->name) - 1);
+                b->name[sizeof(b->name) - 1] = '\0';
+                b->sectors = sectors;
+                snprintf(devpath, sizeof(devpath), "/dev/%s", name);
+                if (devfs_get_block_geom(devpath, NULL, &start_lba, NULL) == 0)
+                        b->start_lba = start_lba;
+                b->partition = sysfs_parse_partition_name(name, b->parent,
+                                                          sizeof(b->parent));
+                b->logical_block_size = (unsigned)devfs_get_logical_block_size(devpath);
+                b->removable = (strncmp(name, "sr", 2) == 0) ? 1u : 0u;
+                b->read_only = b->removable;
+                if (vfs_lstat(devpath, &st) == 0) {
+                        uint32_t rdev = (uint32_t)st.st_rdev;
+                        b->major = (rdev >> 8) & 0xfffu;
+                        b->minor = rdev & 0xffu;
+                } else {
+                        /* Match the simplified major/minor scheme in devfs. */
+                        if (name[0] == 's' && name[1] == 'd' &&
+                            name[2] >= 'a' && name[2] <= 'z') {
+                                b->major = 8;
+                                b->minor = (unsigned)(name[2] - 'a') * 16u + b->partition;
+                        } else if (name[0] == 's' && name[1] == 'r') {
+                                b->major = 11;
+                                for (const char *p = name + 2; *p >= '0' && *p <= '9'; p++)
+                                        b->minor = b->minor * 10u + (unsigned)(*p - '0');
+                        } else if (strncmp(name, "nvme", 4) == 0) {
+                                b->major = 259;
+                                b->minor = (unsigned)device_id;
+                        }
+                }
+
+                if (b->partition) {
+                        snprintf(parentpath, sizeof(parentpath), "/sys/block/%s", b->parent);
+                        (void)sysfs_mkdir(parentpath);
+                        snprintf(blockpath, sizeof(blockpath), "%s/%s", parentpath, name);
+                } else {
+                        snprintf(blockpath, sizeof(blockpath), "/sys/block/%s", name);
+                }
+                (void)sysfs_mkdir(blockpath);
+                snprintf(path, sizeof(path), "%s/dev", blockpath);
+                sysfs_block_create_attr(path, sysfs_block_show_dev, b);
+                snprintf(path, sizeof(path), "%s/size", blockpath);
+                sysfs_block_create_attr(path, sysfs_block_show_size, b);
+                snprintf(path, sizeof(path), "%s/ro", blockpath);
+                sysfs_block_create_attr(path, sysfs_block_show_ro, b);
+                snprintf(path, sizeof(path), "%s/removable", blockpath);
+                sysfs_block_create_attr(path, sysfs_block_show_removable, b);
+                snprintf(path, sizeof(path), "%s/queue", blockpath);
+                (void)sysfs_mkdir(path);
+                snprintf(path, sizeof(path), "%s/queue/logical_block_size", blockpath);
+                sysfs_block_create_attr(path, sysfs_block_show_logical_block_size, b);
+                if (b->partition) {
+                        snprintf(path, sizeof(path), "%s/partition", blockpath);
+                        sysfs_block_create_attr(path, sysfs_block_show_partition, b);
+                        snprintf(path, sizeof(path), "%s/start", blockpath);
+                        sysfs_block_create_attr(path, sysfs_block_show_start, b);
+                }
+
+                if (b->partition)
+                        snprintf(target, sizeof(target), "../../block/%s/%s", b->parent, name);
+                else
+                        snprintf(target, sizeof(target), "../../block/%s", name);
+                snprintf(path, sizeof(path), "/sys/class/block/%s", name);
+                (void)sysfs_create_symlink(path, target);
+                snprintf(devnum, sizeof(devnum), "%u:%u", b->major, b->minor);
+                snprintf(path, sizeof(path), "/sys/dev/block/%s", devnum);
+                (void)sysfs_create_symlink(path, target);
+        }
+}
+
 /* Populate default sysfs tree when userspace mounts sysfs via SYS_mount. */
 void kernel_sysfs_populate_default(void) {
         sysfs_mkdir("/sys/kernel");
@@ -547,12 +843,14 @@ void kernel_sysfs_populate_default(void) {
                         sysfs_mkdir(path);
                 }
         }
+        kernel_sysfs_populate_block_devices();
         usb_sysfs_populate_default();
         pci_sysfs_init();  /* /sys/bus/pci/devices для lspci */
         /* Video registers /dev/fb0 before /sys exists — publish graphics sysfs now. */
         fbdev_sysfs_publish_late();
         keyboard_publish_sysfs();
         mouse_publish_sysfs();
+        syscall_net_sysfs_publish();
 }
 
 static int boot_try_run_init(void) {
@@ -569,8 +867,9 @@ static int boot_try_run_init(void) {
         };
         static const char *systemd_candidates[] = {
                 "/usr/lib/systemd/systemd",
-                "/sbin/init",
-                "/linuxrc",
+                /* Do not retry Debian's /sbin/init symlink to systemd, or
+                 * run the BusyBox /linuxrc entry after PID 1 exits.
+                 * Go straight to a usable emergency shell instead. */
                 "/bin/sh",
                 NULL
         };
@@ -598,9 +897,26 @@ static int boot_try_run_init(void) {
                         "LOCPATH=/usr/lib/locale",
                         "TERMINFO_DIRS=/usr/share/terminfo",
                         "USER=root",
-                        "PS1=\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[0;37m\\w\\033[0m\\$ ",
+                        "PS1=[\\u@\\h \\W]\\$ ",
                         NULL
                 };
+                static const char *systemd_env[] = {
+                        "HOME=/root",
+                        "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+                        "SHELL=/bin/sh",
+                        "TERM=linux",
+                        "LC_ALL=C.UTF-8",
+                        "LANG=C.UTF-8",
+                        "LOCPATH=/usr/lib/locale",
+                        "TERMINFO_DIRS=/usr/share/terminfo",
+                        "USER=root",
+                        "SYSTEMD_LOG_TARGET=null",
+                        "SYSTEMD_LOG_LEVEL=emerg",
+                        "SYSTEMD_LOG_COLOR=1",
+                        "SYSTEMD_COLORS=1",
+                        NULL
+                };
+                const char *const *init_environment = boot_wants_systemd ? systemd_env : init_env;
                 if (strcmp(p, "/bin/sh") == 0) {
                         thread_t *t = thread_current();
                         if (t) {
@@ -608,12 +924,22 @@ static int boot_try_run_init(void) {
                                 if (!t->fds[0] || !devfs_is_tty_file(t->fds[0])) {
                                         struct fs_file *console = devfs_open_direct("/dev/console");
                                         if (console) {
-                                                if (t->fds[0]) fs_file_free(t->fds[0]);
-                                                t->fds[0] = console;
+                                                if (fs_file_account(console) == 0) {
+                                                        if (t->fds[0]) {
+                                                                struct fs_file *old = t->fds[0];
+                                                                t->fds[0] = NULL;
+                                                                fs_file_fd_close(old);
+                                                                fs_file_free(old);
+                                                        }
+                                                        t->fds[0] = console;
+                                                        fs_file_fd_open(console);
+                                                } else {
+                                                        fs_file_free(console);
+                                                }
                                         }
                                 }
-                                if (!t->fds[1] && t->fds[0]) { t->fds[1] = t->fds[0]; t->fds[1]->refcount++; }
-                                if (!t->fds[2] && t->fds[0]) { t->fds[2] = t->fds[0]; t->fds[2]->refcount++; }
+                                if (!t->fds[1] && t->fds[0]) { t->fds[1] = t->fds[0]; t->fds[1]->refcount++; fs_file_fd_open(t->fds[1]); }
+                                if (!t->fds[2] && t->fds[0]) { t->fds[2] = t->fds[0]; t->fds[2]->refcount++; fs_file_fd_open(t->fds[2]); }
                                 t->attached_tty = tty;
                                 t->sid = (int)(t->tid ? t->tid : 1);
                                 t->pgid = (int)(t->tid ? t->tid : 1);
@@ -632,13 +958,19 @@ static int boot_try_run_init(void) {
                         if (bt)
                                 exec_boot_ensure_stdio(bt);
                 }
-                int rc = kernel_execve_init_from_path(p, argv0, init_env);
+                int rc = kernel_execve_init_from_path(p, argv0, init_environment);
                 if (rc == -3) {
                         /* Transient exec layout race: one bounded retry for early boot init path. */
-                        rc = kernel_execve_init_from_path(p, argv0, init_env);
+                        rc = kernel_execve_init_from_path(p, argv0, init_environment);
                 }
                 if (rc == 0) {
-                        klogprintf("boot: init %s exited, trying fallback\n", p);
+                        int init_tid = thread_get_init_user_tid();
+                        thread_t *exited = init_tid >= 0 ? thread_get(init_tid) : NULL;
+                        if (exited && exited->state == THREAD_TERMINATED)
+                                klogprintf("boot: init %s exited status=0x%x tid=%d; trying fallback\n",
+                                        p, (unsigned)exited->exit_status, init_tid);
+                        else
+                                klogprintf("boot: init %s exited; trying fallback\n", p);
                         if (strcmp(p, "/bin/sh") == 0) {
                                 i--;
                                 klogprintf("boot: emergency shell exited; respawning /bin/sh -i\n");
@@ -687,9 +1019,9 @@ static void boot_select_init(uint32_t magic, uint64_t info)
  * start_kernel() — the AxonOS analog of Linux init/main.c start_kernel().
  * The decompressor (boot/kzip_stub.c decompress_kernel) has already imaged
  * this ELF at its link-time address with BSS cleared and jumps here with
- * (multiboot_magic, multiboot_info) in RDI/RSI — Linux's rsi=boot_params.
+ * (multiboot_magic, multiboot_info, stub_end) in RDI/RSI/RDX.
  */
-void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
+void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info, uint64_t stub_end) {
         boot_select_init(multiboot_magic, multiboot_info);
         enable_cursor();
         sysinfo_init(multiboot_magic, multiboot_info);
@@ -702,6 +1034,44 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 if (mb2_linux_shim_fill_bootparams(multiboot_magic, multiboot_info, axon_synth_bootparams,
                                                                                    sizeof axon_synth_bootparams, "initfs") == 0)
                         axon_boot_params_phys = (uint64_t)(uintptr_t)axon_synth_bootparams;
+        }
+
+        /* Treat the firmware map as a set, not a single high-water mark.
+         * The compressed stub's stack, tables and saved MB2 block remain live. */
+        static struct bootmem bootmem;
+        if (bootmem_from_multiboot(&bootmem, multiboot_magic,
+                                   (const void *)(uintptr_t)multiboot_info,
+                                   MMIO_IDENTITY_LIMIT) != 0 ||
+            bootmem_reserve(&bootmem, 0, (uintptr_t)_end) != 0 ||
+            stub_end < 0x08000000ULL ||
+            bootmem_reserve(&bootmem, 0x08000000ULL, stub_end) != 0) {
+                kprintf("fatal: invalid or unavailable boot memory map\n");
+                for (;;) asm volatile("cli; hlt");
+        }
+        /* Report RAM beyond the identity map separately; it cannot be fed to
+         * the PMM until physical addresses have a stable kernel-only mapping. */
+        {
+                static struct bootmem all_bootmem;
+                if (bootmem_from_multiboot(&all_bootmem, multiboot_magic,
+                                           (const void *)(uintptr_t)multiboot_info,
+                                           1ULL << 52) == 0)
+                        kprintf("bootmem: usable above 4 GiB after boot reservations: %llu MiB (unmanaged)\n",
+                                (unsigned long long)(bootmem_free_bytes(&all_bootmem,
+                                        MMIO_IDENTITY_LIMIT, 1ULL << 52) >> 20));
+                else
+                        kprintf("bootmem: unable to count RAM above identity limit\n");
+        }
+        if (axon_boot_params_phys) {
+                uintptr_t rd_start = 0;
+                size_t rd_size = 0;
+                if (linux_bootparams_ramdisk((const void *)(uintptr_t)axon_boot_params_phys,
+                                             &rd_start, &rd_size) == 0 && rd_size) {
+                        if (rd_size > ~(uintptr_t)0 - rd_start ||
+                            bootmem_reserve(&bootmem, rd_start, rd_start + rd_size) != 0) {
+                                kprintf("fatal: invalid ramdisk reservation\n");
+                                for (;;) asm volatile("cli; hlt");
+                        }
+                }
         }
 
         /*
@@ -815,6 +1185,10 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
                                         break;
                                 }
                         }
+                        if (safe_start && (uintptr_t)rd_start != safe_start &&
+                            (!bootmem_is_free(&bootmem, safe_start, safe_start + rd_size) ||
+                             bootmem_reserve(&bootmem, safe_start, safe_start + rd_size) != 0))
+                                safe_start = 0;
                         if (safe_start && (uintptr_t)rd_start != safe_start) {
                                 memmove((void *)safe_start, (const void *)rd_start, rd_size);
                                 uint8_t *bp = (uint8_t *)(uintptr_t)axon_boot_params_phys;
@@ -914,37 +1288,55 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         }
                 }
 
-                /* Size the arena: never enter the initrd or past RAM/MMIO. */
+                /* Select a real contiguous usable range for the object heap;
+                 * the highest end in an E820 map does not imply no holes. */
                 {
-                        uint64_t hs = (uint64_t)heap_start;
-                        const uint64_t guard = 4ULL * 1024ULL * 1024ULL;
-                        uint64_t max_heap_end = identity_end;
-                        if (max_heap_end > (uint64_t)MMIO_IDENTITY_LIMIT)
-                                max_heap_end = (uint64_t)MMIO_IDENTITY_LIMIT;
-                        if (max_heap_end > guard)
-                                max_heap_end -= guard;
-                        if (initrd_high && rd_st > 0 && (uint64_t)rd_st < max_heap_end)
-                                max_heap_end = (uint64_t)rd_st;
-                        if (hs < (uint64_t)USER_STACK_TOP) {
-                                if (max_heap_end > 0x80000000ULL)
-                                        max_heap_end = 0x80000000ULL;
+                        uint64_t chosen_start, chosen_end;
+                        uint64_t floor = HEAP_MIN_START;
+                        const uint64_t tls_cap = (uint64_t)USER_TLS_BASE - (1ULL << 20);
+                        const size_t OBJECT_HEAP_MAX = ram_mb >= 6144
+                                ? (2ULL * 1024ULL * 1024ULL * 1024ULL)
+                                : ram_mb >= 4096
+                                    ? (1536ULL * 1024ULL * 1024ULL)
+                                    : (1024ULL * 1024ULL * 1024ULL);
+                        if (floor < (uintptr_t)_end)
+                                floor = align_up_uintptr((uintptr_t)_end, 0x1000);
+                        if (bootmem_find_heap(&bootmem, heap_start, floor, tls_cap,
+                                              HEAP_ABOVE_USER, &chosen_start,
+                                              &chosen_end) != 0) {
+                                kprintf("fatal: no usable RAM range for kernel heap\n");
+                                for (;;) asm volatile("cli; hlt");
                         }
-                        if (hs < (uint64_t)USER_STACK_TOP) {
-                                uint64_t tls = (uint64_t)USER_TLS_BASE;
-                                const uint64_t tls_guard = 1ULL << 20;
-                                uint64_t tls_cap = tls > tls_guard ? tls - tls_guard : tls;
-                                if (tls_cap < max_heap_end)
-                                        max_heap_end = tls_cap;
+                        heap_start = (uintptr_t)chosen_start;
+                        heap_size = (size_t)(chosen_end - chosen_start);
+                        /* Keep a reasonable object heap, but let the frame pool
+                         * grow with RAM rather than fixing it at 256 MiB. Low
+                         * ranges cannot safely back frames: user mappings can
+                         * replace those identity aliases in a task's CR3. */
+                        heap_size = bootmem_heap_size(heap_start, heap_size,
+                                                      HEAP_ABOVE_USER, OBJECT_HEAP_MAX);
+                        if (bootmem_reserve(&bootmem, heap_start, heap_start + heap_size) != 0) {
+                                kprintf("fatal: cannot reserve kernel heap\n");
+                                for (;;) asm volatile("cli; hlt");
                         }
-                        if (max_heap_end > hs + (16ULL * 1024ULL * 1024ULL))
-                                heap_size = (size_t)(max_heap_end - hs);
-                        else if (max_heap_end > hs)
-                                heap_size = (size_t)(max_heap_end - hs);
-                        else
-                                heap_size = 0;
+                        heap_init(heap_start, heap_size);
+                        pmm_init(0, 0);
+                        for (size_t i = 0; i < bootmem.count; i++) {
+                                uintptr_t lo = (uintptr_t)bootmem.ranges[i].start;
+                                uintptr_t hi = (uintptr_t)bootmem.ranges[i].end;
+                                if (lo < HEAP_ABOVE_USER) lo = HEAP_ABOVE_USER;
+                                if (lo < hi && pmm_add_range(lo, hi) != 0) {
+                                        kprintf("fatal: cannot add usable PMM range\n");
+                                        for (;;) asm volatile("cli; hlt");
+                                }
+                        }
+                        kprintf("pmm: total %llu pages (%llu MiB), identity limit 4 GiB\n",
+                                 (unsigned long long)pmm_total_pages(),
+                                 (unsigned long long)(pmm_total_pages() / 256u));
+                        kprintf("bootmem: unused below frame pool: %llu MiB (user identity overlap)\n",
+                                (unsigned long long)(bootmem_free_bytes(&bootmem, 0,
+                                                                        HEAP_ABOVE_USER) >> 20));
                 }
-                if (heap_size == 0)
-                        heap_size = 64ULL * 1024ULL * 1024ULL;
                 if (initrd_sz > 0 && (uint64_t)heap_size < (128ULL * 1024ULL * 1024ULL))
                         kprintf("warning: heap %llu MiB may be tight with initfs %llu MiB — increase VM RAM\n",
                                         (unsigned long long)(heap_size / (1024ULL * 1024ULL)),
@@ -952,62 +1344,6 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 if (heap_size < (128ULL * 1024ULL * 1024ULL))
                         kprintf("warning: kernel heap only %llu MiB after user-VA split — increase VM RAM (docker needs ≥2GiB)\n",
                                         (unsigned long long)(heap_size / (1024ULL * 1024ULL)));
-                /*
-                 * Linux: buddy owns pages; kmalloc is a small-object layer.
-                 * Carve Soft_OWNED frames out of the high end of this arena so
-                 * fork/exec cannot exhaust the object heap (was ~392MiB OOM).
-                 */
-                {
-                        uintptr_t arena_hi = heap_start + heap_size;
-                        /*
-                         * ramfs/tmpfs file payloads currently use kmalloc, so
-                         * the object arena is also the writable-root backing
-                         * store. Keep a substantial PMM reserve for user pages,
-                         * but do not arbitrarily cap the overlay at 128 MiB.
-                         */
-                        const size_t OBJECT_HEAP_MAX = 1024ULL * 1024ULL * 1024ULL;
-                        /*
-                         * Dynamic toolchains map many DSOs concurrently.
-                         * Reserving only 64 MiB let opkg unpack GCC but left ld
-                         * unable to map libstdc++. Keep Linux-like separation
-                         * between filesystem cache/object memory and user pages.
-                         */
-                        /*
-                         * 64MiB was enough for BusyBox but not apt: trixie
-                         * Packages mmap (~32–128MiB) plus liblzma's dictionary
-                         * in dpkg-deb. A 2GiB VM parks this arena above the
-                         * user stack (~500MiB total) — the old 1GiB threshold
-                         * left PMM at 64MiB and xz printed LZMA_MEM_ERROR on
-                         * a 140KiB .deb.
-                         */
-                        const size_t PMM_MIN = (heap_size >= (512ULL * 1024ULL * 1024ULL))
-                                ? (256ULL * 1024ULL * 1024ULL)
-                                : (heap_size >= (256ULL * 1024ULL * 1024ULL))
-                                    ? (128ULL * 1024ULL * 1024ULL)
-                                    : (64ULL * 1024ULL * 1024ULL);
-                        if (heap_size > PMM_MIN + (128ULL * 1024ULL * 1024ULL)) {
-                                size_t object_heap = heap_size - PMM_MIN;
-                                if (object_heap > OBJECT_HEAP_MAX)
-                                        object_heap = OBJECT_HEAP_MAX;
-                                /* ramfs/overlay is the writable root. Keep most of the
-                                 * identity arena as objects so unpack is not starved
-                                 * on machines whose usable RAM ends at the 3–4GiB hole. */
-                                if (object_heap * 2u < heap_size) {
-                                        size_t pmm = heap_size / 5u;
-                                        if (pmm < (64ULL * 1024ULL * 1024ULL))
-                                                pmm = (64ULL * 1024ULL * 1024ULL);
-                                        if (heap_size > pmm + (128ULL * 1024ULL * 1024ULL))
-                                                object_heap = heap_size - pmm;
-                                        if (object_heap > OBJECT_HEAP_MAX)
-                                                object_heap = OBJECT_HEAP_MAX;
-                                }
-                                heap_size = object_heap;
-                                heap_init(heap_start, heap_size);
-                                pmm_init(heap_start + heap_size, arena_hi);
-                        } else {
-                                heap_init(heap_start, heap_size);
-                        }
-                }
                 if (user_vma_init() != 0) {
                         kprintf("fatal: unable to allocate global VMA table\n");
                         for (;;) asm volatile("cli; hlt");
@@ -1118,6 +1454,16 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
         boot_brk(0x65);
         
         paging_init();
+#if defined(AXON_EXPERIMENTAL_DIRECT_MAP) && AXON_EXPERIMENTAL_DIRECT_MAP
+        /* BSP only: paging_init enabled NXE; no task CR3 or AP exists yet.
+         * mm_kernel() may already have captured this same bootstrap root. */
+        if (direct_map_boot_install(multiboot_magic,
+                                    (const void *)(uintptr_t)multiboot_info) != 0)
+                kprintf("direct-map: experimental install failed; disabled\n");
+        else
+                kprintf("direct-map: experimental supervisor map installed; high RAMFS pool %llu pages; PMM unchanged\n",
+                        (unsigned long long)ramfs_high_page_free_pages());
+#endif
         boot_brk(0x66);
 
         // Enabling interrupts
@@ -1282,15 +1628,20 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         int fd0 = thread_fd_alloc(console);
                         if (fd0 >= 0) {
                                 /* ensure we have fd 0..2 set; if not, duplicate */
-                                thread_t* t = thread_current();
-                                if (t) {
+                                        thread_t* t = thread_current();
+                                        if (t) {
                                         if (fd0 != 0) { /* move to 0 */
-                                                if (t->fds[0]) fs_file_free(t->fds[0]);
+                                                if (t->fds[0]) {
+                                                        struct fs_file *old = t->fds[0];
+                                                        t->fds[0] = NULL;
+                                                        fs_file_fd_close(old);
+                                                        fs_file_free(old);
+                                                }
                                                 t->fds[0] = t->fds[fd0];
                                                 t->fds[fd0] = NULL;
                                         }
-                                        if (!t->fds[1]) { t->fds[1] = t->fds[0]; if (t->fds[1]) t->fds[1]->refcount++; }
-                                        if (!t->fds[2]) { t->fds[2] = t->fds[0]; if (t->fds[2]) t->fds[2]->refcount++; }
+                                        if (!t->fds[1]) { t->fds[1] = t->fds[0]; if (t->fds[1]) { t->fds[1]->refcount++; fs_file_fd_open(t->fds[1]); } }
+                                        if (!t->fds[2]) { t->fds[2] = t->fds[0]; if (t->fds[2]) { t->fds[2]->refcount++; fs_file_fd_open(t->fds[2]); } }
                                 }
                         } else {
                                 fs_file_free(console);
@@ -1471,6 +1822,25 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
          * services can connect their stdout/stderr to the journal socket. */
         (void)ramfs_mkdir("/run/systemd");
         (void)ramfs_mkdir("/run/systemd/journal");
+        (void)ramfs_mkdir("/run/systemd/netif");
+        (void)ramfs_mkdir("/run/systemd/netif/links");
+        (void)ramfs_mkdir("/run/systemd/netif/leases");
+        {
+                uid_t uid;
+                gid_t gid;
+                if (boot_lookup_passwd_ids("systemd-network", &uid, &gid) == 0) {
+                        (void)ramfs_chown("/run/systemd/netif", uid, gid);
+                        (void)ramfs_chown("/run/systemd/netif/links", uid, gid);
+                        (void)ramfs_chown("/run/systemd/netif/leases", uid, gid);
+                        (void)ramfs_chmod("/run/systemd/netif", 0755);
+                        (void)ramfs_chmod("/run/systemd/netif/links", 0755);
+                        (void)ramfs_chmod("/run/systemd/netif/leases", 0755);
+                } else {
+                        klogprintf("boot: systemd-network passwd entry unavailable; keeping netif dirs root-owned\n");
+                }
+        }
+        /* dbus.socket starts before tmpfiles and requires this parent. */
+        (void)ramfs_mkdir("/run/dbus");
         (void)ramfs_mkdir("/run/lock");
         (void)ramfs_chmod("/run/lock", 01777);
         (void)ramfs_mkdir("/run/openrc");
@@ -1649,26 +2019,15 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         "netgroup: files\n";
                 (void)boot_seed_file_if_missing("/etc/nsswitch.conf", nsswitch, sizeof(nsswitch) - 1, 0644);
         }
-        /*
-         * Resolver files must exist before the first opkg/wget invocation.
-         * 10.0.2.3 is QEMU user-net's DNS proxy; a later DHCP bound/renew
-         * atomically replaces this fallback with lease-provided servers.
-         */
+        /* Preserve an image-provided resolver, including a dangling symlink to
+         * a runtime file that systemd-resolved will create after boot. */
         {
-                struct stat st;
-                if (vfs_stat("/etc/resolv.conf", &st) != 0) {
-                        static const char resolv_fallback[] =
-                                "options timeout:2 attempts:5 single-request-reopen\n"
-                                "nameserver 10.0.2.3\n"
-                                "nameserver 1.1.1.1\n";
-                        struct fs_file *rf = fs_create_file("/etc/resolv.conf");
-                        if (!rf) rf = fs_open("/etc/resolv.conf");
-                        if (rf) {
-                                (void)vfs_ftruncate(rf, 0);
-                                fs_write(rf, resolv_fallback, sizeof(resolv_fallback) - 1, 0);
-                                fs_file_free(rf);
-                        }
-                }
+                static const char resolv_fallback[] =
+                        "options timeout:2 attempts:5 single-request-reopen\n"
+                        "nameserver 10.0.2.3\n"
+                        "nameserver 1.1.1.1\n";
+                (void)boot_seed_file_if_missing("/etc/resolv.conf", resolv_fallback,
+                                               sizeof(resolv_fallback) - 1, 0644);
         }
         /*
          * Entware glibc is configured with /opt/etc as sysconfdir, while
@@ -1800,7 +2159,7 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
                         "export LC_ALL=C.UTF-8\n"
                         "export LOCPATH=/usr/lib/locale\n"
                         "export TERMINFO_DIRS=/usr/share/terminfo\n"
-                        "export PS1='\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[1;37m\\w\\033[0m \\$ '\n";
+                        "export PS1='[\\u@\\h \\W]\\$ '\n";
                 static const char locsh[] = "export LANG=C.UTF-8\nexport LC_ALL=C.UTF-8\nexport LOCPATH=/usr/lib/locale\nexport TERMINFO_DIRS=/usr/share/terminfo\n";
                 (void)ramfs_mkdir("/etc/default");
                 (void)ramfs_mkdir("/root");
@@ -1844,7 +2203,7 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info) {
         }
         /* /etc/securetty: TTY devices from which root can log in */
         {
-                static const char securetty[] = "console\ntty1\ntty2\ntty3\ntty4\ntty5\ntty6\nttyS0\nttyS1\n";
+                static const char securetty[] = "console\ntty1\ntty2\ntty3\ntty4\ntty5\ntty6\ntty7\ntty8\ntty9\ntty10\ntty11\ntty12\nttyS0\nttyS1\n";
                 struct fs_file *sf = fs_create_file("/etc/securetty");
                 if (!sf) sf = fs_open("/etc/securetty");
                 if (sf) {

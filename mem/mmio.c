@@ -34,12 +34,12 @@ static void mmio_pat_apply_pde(uint64_t *l4, uint64_t va) {
 	uint64_t l4i = (va >> 39) & 0x1FF, l3i = (va >> 30) & 0x1FF, l2i = (va >> 21) & 0x1FF;
 	if (!l4 || !(l4[l4i] & PG_PRESENT) || (l4[l4i] & PG_PS_2M))
 		return;
-	uint64_t *l3 = (uint64_t *)(l4[l4i] & ~0xFFFULL);
+	uint64_t *l3 = (uint64_t *)(l4[l4i] & PG_ADDR_MASK);
 	if (!l3 || !(l3[l3i] & PG_PRESENT))
 		return;
 	if (l3[l3i] & PG_PS_2M)
 		return; /* 1GiB leaf: skip (map_page_2m would have split it) */
-	uint64_t *l2 = (uint64_t *)(l3[l3i] & ~0xFFFULL);
+	uint64_t *l2 = (uint64_t *)(l3[l3i] & PG_ADDR_MASK);
 	if (!l2 || !(l2[l2i] & PG_PRESENT))
 		return;
 	l2[l2i] |= PG_PAT;

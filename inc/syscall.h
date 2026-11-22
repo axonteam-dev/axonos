@@ -38,6 +38,7 @@ typedef struct syscall_frame {
 #define SYS_writev  20
 #define SYS_dup2    33
 #define SYS_getrandom 318
+#define SYS_memfd_create 319
 #define SYS_clock_gettime 228
 #define SYS_uname   63
 #define SYS_getcwd  79
@@ -48,6 +49,10 @@ typedef struct syscall_frame {
 #define SYS_readlinkat 267
 #define SYS_set_tid_address 218
 #define SYS_prlimit64 302
+#define SYS_seccomp 317
+#define SYS_unshare 272
+#define SYS_setns 308
+#define SYS_mount_setattr 442
 #define SYS_set_robust_list 273
 #define SYS_get_robust_list 274
 #define SYS_rseq 334
@@ -170,8 +175,11 @@ typedef struct syscall_frame {
 #define SYS_sysinfo  99
 #define SYS_sched_getaffinity 204
 #define SYS_sched_setaffinity 203
+#define SYS_ioprio_set 251
+#define SYS_ioprio_get 252
 #define SYS_sched_setscheduler 144
 #define SYS_sched_getscheduler 145
+#define SYS_sched_setattr 314
 #define SYS_getpriority       140
 #define SYS_setpriority       141
 #define SYS_nanosleep 35
@@ -211,6 +219,8 @@ typedef struct syscall_frame {
 void syscall_init(void);
 /* Optional in-kernel DHCP helper (prefer userspace udhcpc). */
 int syscall_net_preinit(void);
+/* Publish eth0/lo sysfs class devices after sysfs is mounted. */
+void syscall_net_sysfs_publish(void);
 /* Timer/IRQ: answer ARP while a syscall holds the CPU (kernel is not preempted). */
 void syscall_net_l2_irq_poll(void);
 
@@ -229,6 +239,8 @@ int syscall_publish_deferred_fork_child(void);
 void syscall_restore_user_fs_before_iretq(void);
 /* Linux wait_for_vfork_done — after syscall_do, before iretq. */
 uint64_t syscall_maybe_vfork_wait(uint64_t parent_ret);
+/* Program per-CPU x86-64 syscall MSRs without repeating global initialization. */
+void syscall_init_cpu(void);
 /* Point this CPU's syscall_entry64 stack at t's private kstack (or global default). */
 void syscall_bind_kstack_for_thread(thread_t *t);
 /* Linux fork child: iretq from cloned syscall GPR frame with rax=0. */

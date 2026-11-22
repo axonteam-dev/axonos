@@ -3,6 +3,7 @@
 
 extern const unsigned char _binary_build_payload_lz4_start[];
 extern const unsigned char _binary_build_payload_lz4_end[];
+extern const uint8_t _end[]; /* end of the live compressed stub, including BSS */
 
 typedef struct __attribute__((packed)) {
         unsigned char e_ident[16];
@@ -654,6 +655,7 @@ void decompress_kernel(uint64_t multiboot_magic, uint64_t multiboot_info) {
         if (entry == 0) panic_msg("KZIP: bad entry!");
 
         boot_line("Jumping to kernel entry... ok\n");
-        ((void (*)(uint64_t, uint64_t))(uintptr_t)entry)(multiboot_magic, preserved_multiboot_info);
+        ((void (*)(uint64_t, uint64_t, uint64_t))(uintptr_t)entry)(
+                multiboot_magic, preserved_multiboot_info, (uint64_t)(uintptr_t)_end);
         panic_msg("KZIP: payload returned.");
 }

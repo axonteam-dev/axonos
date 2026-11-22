@@ -17,6 +17,7 @@ struct fs_file {
     off_t pos;
     int type;                 /* FS_TYPE_* (set by driver) */
     int refcount;             /* VFS reference count for this handle */
+    int fd_refcount;          /* installed descriptors; excludes VMAs/kernel refs */
     /* Linux open(2) flags. O_NONBLOCK is 0x800 on x86_64; apt fcntl()s this
      * on method pipes and then treats EAGAIN as "wait for select". */
     int flags;
@@ -26,6 +27,7 @@ struct fs_file {
     int limit_accounted;      /* counted once per open file description */
     uint8_t inode_kind_known; /* driver already supplied the no-follow inode type */
     uint8_t is_symlink;       /* unresolved symlink; fs_open must resolve it */
+    uint8_t is_memfd;         /* anonymous memfd; seals are initially locked */
 };
 
 /* Filesystem driver operations (minimal set) */
@@ -76,15 +78,25 @@ struct fs_driver {
 /* Note: keep single definition above; chmod added here for drivers that support it */
 
 /* Public VFS API */
+/* Directory-entry notifications for inotify consumers. */
+void inotify_notify_entry(const char *path, uint32_t mask, uint32_t cookie);
+void inotify_notify_move(const char *oldpath, const char *newpath, int is_dir);
 int fs_register_driver(struct fs_driver *drv);
 int fs_unregister_driver(struct fs_driver *drv);
 int fs_mount(const char *path, struct fs_driver *drv);
 /* Bind an existing regular file at another existing regular-file path. */
 int fs_bind_mount_file(const char *source, const char *target);
+int fs_bind_mount_dir(const char *source, const char *target, uint64_t flags);
+int fs_mount_move(const char *source, const char *target);
+int fs_mount_private_tmpfs(const char *target, uint32_t mnt_ns, uint32_t serial,
+                           mode_t mode);
+int fs_path_is_private_mount_backing(const char *path);
 /* Unmount previously mounted path. Returns 0 on success, -1 on error */
 int fs_unmount(const char *path);
 /* Return driver mounted for path (NULL if none) — longest prefix match. */
 struct fs_driver *fs_get_mount_driver(const char *path);
+/* Return the registered driver owning an open file handle. */
+struct fs_driver *fs_get_file_driver(const struct fs_file *file);
 /* Exact mountpoint only (Linux: path is a mount point, not merely under one). */
 struct fs_driver *fs_get_mount_driver_exact(const char *path);
 /* Mount table index for longest-prefix match, or -1. Used for st_dev. */
@@ -99,6 +111,15 @@ int fs_get_mount_children(const char *dir_path, char names[][64], int max_count)
 int fs_mount_count(void);
 /* Get mount entry by index: path and fs short name (ops->name). Returns 0 on success. */
 int fs_mount_get(int index, char *out_path, size_t out_path_len, char *out_fs_name, size_t out_fs_name_len);
+/* Get the mount source shown in /proc/mounts (device path for block mounts). */
+int fs_mount_get_source(int index, char *out_source, size_t out_source_len);
+/* Set the source after mounting a block-backed filesystem. */
+int fs_mount_set_source(const char *path, const char *source);
+uint64_t fs_mount_flags(const char *path);
+int fs_mount_is_readonly(const char *path);
+int fs_mount_set_flags(const char *path, uint64_t flags);
+int fs_mount_update_flags(const char *path, uint64_t set, uint64_t clear,
+                          int recursive);
 
 /* High-level helpers which dispatch to registered drivers in registration order */
 struct fs_file *fs_create_file(const char *path);
@@ -107,6 +128,7 @@ struct fs_file *fs_open(const char *path);
 struct fs_file *fs_open_nofollow(const char *path);
 /* Resolve symlinks in parent components only, preserving the final dentry. */
 int fs_resolve_parent_path(const char *path, char *out, size_t out_cap);
+int fs_resolve_symlink_path(const char *path, char *out, size_t out_cap);
 ssize_t fs_read(struct fs_file *file, void *buf, size_t size, size_t offset);
 ssize_t fs_write(struct fs_file *file, const void *buf, size_t size, size_t offset);
 uint64_t fs_file_max_get(void);
@@ -120,6 +142,10 @@ uint64_t fs_current_generation(struct fs_file *file);
 void fs_file_free(struct fs_file *file);
 /* Bump refcount (mmap VMA / dup). Pair with fs_file_free. */
 void fs_file_get(struct fs_file *file);
+/* Track descriptor-table references separately from general VFS references. */
+void fs_file_fd_open(struct fs_file *file);
+int fs_file_fd_close(struct fs_file *file);
+int fs_file_fd_count(const struct fs_file *file);
 /* Retain user-facing path spelling on an open handle (openat). */
 int fs_file_set_user_path(struct fs_file *file, const char *user_path);
 /* Read next chunk from directory/file using and advancing file->pos */
@@ -167,9 +193,11 @@ void eventfd_fs_file_destroy(struct fs_file *f);
 void signalfd_fs_file_destroy(struct fs_file *f);
 void inotify_fs_file_destroy(struct fs_file *f);
 void timerfd_fs_file_destroy(struct fs_file *f);
-/* Linux: closing fd removes it from every epoll set in that process. */
-struct thread;
-void epoll_notify_fd_closed(struct thread *thr, int fd);
+/* Full-file OFD locks (fcntl F_OFD_*); keyed by inode, owned by open file
+ * description, automatically released on final fs_file_free(). */
+int fs_ofd_lock_try(struct fs_file *file, short type, short *conflict, int query);
+/* Linux: remove epoll watches after the last descriptor for a file closes. */
+void epoll_notify_file_closed(struct fs_file *file);
 
 /* Called by thread_fd_close when closing a pipe end; f->type == FS_TYPE_PIPE. */
 void pipe_release_end(struct fs_file *f);

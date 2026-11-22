@@ -14,7 +14,8 @@ program = r'''
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
-#define USER_VMA_MAX 16
+#define USER_VMA_MAX 9000
+#define USER_VMA_MM_MAX 16
 struct fs_file { int refs; };
 typedef struct { int used, prot, kind; uint64_t tid, file_off; uintptr_t addr;
                  size_t len; struct fs_file *file; } user_vma_t;
@@ -39,6 +40,19 @@ int main(void) {
         if (g_user_vmas[i].len==0x4000) { assert(g_user_vmas[i].file==&large && g_user_vmas[i].file_off==0x9000); found_large++; }
     }
     assert(found_small==1 && found_large==1 && small.refs==2 && large.refs==2);
+    /* Fork still succeeds after other processes exceed the old 8192-slot
+     * global limit; per-mm capacity remains independent. */
+    for (int i=0; i<USER_VMA_MAX; ++i) g_user_vmas[i]=(user_vma_t){0};
+    for (int i=0; i<8192; ++i) g_user_vmas[i]=(user_vma_t){.used=1,.tid=3};
+    g_user_vmas[8192]=(user_vma_t){.used=1,.tid=1,.addr=0x1000,.len=0x1000,.kind=3,.file=&small,.file_off=0x5000};
+    assert(user_vma_clone_for_tid(1, 2)==0);
+    assert(g_user_vmas[8193].used && g_user_vmas[8193].tid==2);
+    assert(g_user_vmas[8193].file==&small && g_user_vmas[8193].file_off==0x5000);
+    for (int i=0; i<USER_VMA_MAX; ++i) g_user_vmas[i]=(user_vma_t){.used=1,.tid=3};
+    g_user_vmas[8999]=(user_vma_t){.used=1,.tid=1,.addr=0x2000,.len=0x1000,.kind=3,.file=&small};
+    int refs_before=small.refs;
+    assert(user_vma_clone_for_tid(1, 2)!=0 && small.refs==refs_before);
+    assert(g_user_vmas[8999].used && g_user_vmas[8999].tid==1);
     puts("PASS: fork clones overlapping VMA backing by exact identity");
 }
 '''

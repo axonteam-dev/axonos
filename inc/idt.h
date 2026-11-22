@@ -35,6 +35,8 @@ extern void isr_dispatch(cpu_registers_t* regs);
 extern const char* exception_messages[];
 
 void idt_init();
+/* Load the already initialized shared IDT into the current CPU's IDTR. */
+void idt_load_cpu(void);
 void idt_set_gate(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flags);
 void idt_set_handler(uint8_t num, void (*handler)(cpu_registers_t*));
 // Debug helper

@@ -20,13 +20,38 @@
 #include <spinlock.h>
 #include <process.h>
 #include <thread.h>
+#include <ns.h>
 
 #ifndef EIO
 #define EIO 5
 #endif
 
 #define MAX_FS_DRIVERS 16
-#define MAX_FS_MOUNTS 16
+#define MAX_FS_MOUNTS NS_MNT_MAX
+
+/* Mount topology belongs to the caller's mount namespace. Namespace clones
+ * copy this table; subsequent mount/unmount operations update only that copy. */
+#define mount_entry ns_mount
+static struct mount_entry *fs_current_mounts(void)
+{
+	return ns_mnt_vec(NULL);
+}
+
+int fs_path_is_private_mount_backing(const char *path)
+{
+        static const char prefix[] = "/run/.axon-private-tmpfs-";
+        return path && strncmp(path, prefix, sizeof(prefix) - 1) == 0;
+}
+
+static int *fs_current_mount_count(void)
+{
+	int *count = NULL;
+	(void)ns_mnt_vec(&count);
+	return count;
+}
+#define g_mounts (fs_current_mounts())
+#define g_mount_count (*fs_current_mount_count())
+#define FS_MOUNT_RDONLY 1ULL
 
 static struct fs_driver *g_drivers[MAX_FS_DRIVERS];
 static int g_drivers_count = 0;
@@ -34,6 +59,72 @@ static spinlock_t file_limit_lock;
 static uint64_t file_limit_max = 65536;
 static uint64_t file_limit_count;
 static uint32_t nr_open_limit = PROCESS_MAX_FD;
+
+/* OFD locks belong to an open file description, not a PID. They protect
+ * sysusers' /etc/.pwd.lock against concurrent writers, including when one fd
+ * is dup'd/forked. Support the whole-file locks it uses (start=0,len=0). */
+#define OFD_LOCK_MAX 128
+struct ofd_lock_entry {
+        struct fs_file *owner;
+        dev_t dev;
+        ino_t ino;
+        short type; /* Linux F_RDLCK=0, F_WRLCK=1 */
+};
+static struct ofd_lock_entry ofd_locks[OFD_LOCK_MAX];
+static spinlock_t ofd_lock_guard;
+
+int fs_ofd_lock_try(struct fs_file *file, short type, short *conflict, int query) {
+        if (!file || (type != 0 && type != 1 && type != 2)) return -22;
+        struct stat st;
+        if (vfs_fstat(file, &st) != 0 || !st.st_ino ||
+            (st.st_mode & 0170000u) != S_IFREG) return -22;
+
+        unsigned long flags;
+        acquire_irqsave(&ofd_lock_guard, &flags);
+        int owned = -1, free_slot = -1;
+        short blocked = 2; /* F_UNLCK */
+        for (int i = 0; i < OFD_LOCK_MAX; ++i) {
+                struct ofd_lock_entry *e = &ofd_locks[i];
+                if (!e->owner) {
+                        if (free_slot < 0) free_slot = i;
+                        continue;
+                }
+                if (e->owner == file) {
+                        owned = i;
+                        continue;
+                }
+                if (e->dev == st.st_dev && e->ino == st.st_ino &&
+                    type != 2 && (type == 1 || e->type == 1))
+                        blocked = e->type;
+        }
+        if (conflict) *conflict = blocked;
+        int result = 0;
+        if (query)
+                result = 0;
+        else if (type != 2 && blocked != 2)
+                result = -11; /* EAGAIN: wait outside spinlock */
+        else if (type == 2 && owned >= 0)
+                ofd_locks[owned].owner = NULL;
+        else if (type != 2 && owned >= 0)
+                ofd_locks[owned].type = type;
+        else if (type != 2 && free_slot >= 0)
+                ofd_locks[free_slot] = (struct ofd_lock_entry) {
+                        .owner = file, .dev = st.st_dev, .ino = st.st_ino, .type = type,
+                };
+        else if (type != 2)
+                result = -37; /* ENOLCK */
+        release_irqrestore(&ofd_lock_guard, flags);
+        return result;
+}
+
+static void fs_ofd_lock_release(struct fs_file *file) {
+        unsigned long flags;
+        acquire_irqsave(&ofd_lock_guard, &flags);
+        for (int i = 0; i < OFD_LOCK_MAX; ++i)
+                if (ofd_locks[i].owner == file)
+                        ofd_locks[i].owner = NULL;
+        release_irqrestore(&ofd_lock_guard, flags);
+}
 
 uint64_t fs_file_max_get(void) { return __atomic_load_n(&file_limit_max, __ATOMIC_ACQUIRE); }
 uint32_t fs_nr_open_get(void) { return __atomic_load_n(&nr_open_limit, __ATOMIC_ACQUIRE); }
@@ -71,6 +162,7 @@ int fs_file_account(struct fs_file *file) {
                         return -23; /* ENFILE */
                 }
                 file_limit_count++;
+                __atomic_store_n(&file->fd_refcount, 0, __ATOMIC_RELEASE);
                 file->limit_accounted = 1;
         }
         release_irqrestore(&file_limit_lock, flags);
@@ -86,17 +178,6 @@ static void fs_file_unaccount(struct fs_file *file) {
         }
         release_irqrestore(&file_limit_lock, flags);
 }
-struct mount_entry {
-        char path[64];
-        size_t path_len;
-        struct fs_driver *driver;
-        unsigned int refs;
-        char bind_source[64]; /* nonempty for a regular-file bind mount */
-};
-
-static struct mount_entry g_mounts[MAX_FS_MOUNTS];
-static int g_mount_count = 0;
-
 int fs_mount_count(void) {
         return g_mount_count;
 }
@@ -121,11 +202,192 @@ int fs_mount_get(int index, char *out_path, size_t out_path_len, char *out_fs_na
         return 0;
 }
 
+int fs_mount_get_source(int index, char *out_source, size_t out_source_len) {
+        if (index < 0 || index >= g_mount_count || !out_source || out_source_len == 0)
+                return -1;
+        struct mount_entry *m = &g_mounts[index];
+        if (!m->driver)
+                return -1;
+        const char *source = m->source;
+        size_t len = strlen(source);
+        if (len >= out_source_len)
+                len = out_source_len - 1;
+        memcpy(out_source, source, len);
+        out_source[len] = '\0';
+        return 0;
+}
+
+int fs_mount_set_source(const char *path, const char *source) {
+        if (!path || !source || !source[0] ||
+            strlen(source) >= sizeof(g_mounts[0].source))
+                return -1;
+        for (int i = 0; i < g_mount_count; i++) {
+                struct mount_entry *m = &g_mounts[i];
+                if (!m->driver || strcmp(m->path, path) != 0)
+                        continue;
+                strncpy(m->source, source, sizeof(m->source) - 1);
+                m->source[sizeof(m->source) - 1] = '\0';
+                return 0;
+        }
+        return -1;
+}
+
+uint64_t fs_mount_flags(const char *path) {
+        if (!path || path[0] != '/') return 0;
+        size_t path_len = strlen(path);
+        int best = -1;
+        size_t best_len = 0;
+        for (int i = 0; i < g_mount_count; i++) {
+                const struct mount_entry *m = &g_mounts[i];
+                size_t len = m->path_len;
+                if (!m->driver || len == 0 || len > path_len ||
+                    strncmp(path, m->path, len) != 0)
+                        continue;
+                if (len > 1 && path[len] != '\0' && path[len] != '/')
+                        continue;
+                if (best < 0 || len > best_len) {
+                        best = i;
+                        best_len = len;
+                }
+        }
+        return best < 0 ? 0 : g_mounts[best].flags;
+}
+
+int fs_mount_set_flags(const char *path, uint64_t flags) {
+        if (!path || path[0] != '/') return -1;
+        size_t len = strlen(path);
+        while (len > 1 && path[len - 1] == '/') len--;
+        for (int i = 0; i < g_mount_count; i++) {
+                struct mount_entry *m = &g_mounts[i];
+                if (!m->driver || m->path_len != len || memcmp(path, m->path, len) != 0)
+                        continue;
+                const uint64_t attr_mask = 1u /* MS_RDONLY */ | 2u /* MS_NOSUID */ |
+                                           4u /* MS_NODEV */ | 8u /* MS_NOEXEC */;
+                if (flags & 32u /* MS_REMOUNT */) {
+                        m->flags |= flags & attr_mask;
+                        if (!(flags & 1u /* MS_RDONLY */))
+                                m->flags &= ~1ULL; /* remount,rw */
+                        return 0;
+                }
+                if (flags & 4096u /* MS_BIND */) {
+                        /* A bind mount inherits source mount attributes. The
+                         * operation bits MS_BIND/MS_REC are not attributes. */
+                        m->flags |= flags & attr_mask;
+                        return 0;
+                }
+                m->flags = flags;
+                return 0;
+        }
+        return -1;
+}
+
+int fs_mount_update_flags(const char *path, uint64_t set, uint64_t clear,
+                          int recursive) {
+        if (!path || path[0] != '/' || (set & clear)) return -1;
+        size_t len = strlen(path);
+        while (len > 1 && path[len - 1] == '/') len--;
+        int changed = 0;
+        int exact = 0;
+        for (int i = 0; i < g_mount_count; i++) {
+                struct mount_entry *m = &g_mounts[i];
+                if (!m->driver) continue;
+                int match = m->path_len == len && memcmp(path, m->path, len) == 0;
+                if (match) exact = 1;
+                if (!match && recursive && len > 0 &&
+                    (len == 1 || (m->path_len > len &&
+                     memcmp(path, m->path, len) == 0 && m->path[len] == '/')))
+                        match = 1;
+                if (!match) continue;
+                m->flags = (m->flags | set) & ~clear;
+                changed++;
+        }
+        /* mount_setattr operates on the mount containing pathname even when
+         * pathname itself is not a mountpoint. Apply the local attributes to
+         * the deepest mounted ancestor; recursive callers also updated child
+         * mounts above. */
+        if (!exact) {
+                int best = -1;
+                size_t best_len = 0;
+                for (int i = 0; i < g_mount_count; i++) {
+                        struct mount_entry *m = &g_mounts[i];
+                        size_t ml = m->path_len;
+                        if (!m->driver || ml > len ||
+                            strncmp(path, m->path, ml) != 0 ||
+                            (ml > 1 && len > ml && path[ml] != '/'))
+                                continue;
+                        if (best < 0 || ml > best_len) {
+                                best = i;
+                                best_len = ml;
+                        }
+                }
+                if (best >= 0) {
+                        g_mounts[best].flags = (g_mounts[best].flags | set) & ~clear;
+                        changed++;
+                }
+        }
+        return changed ? 0 : -1;
+}
+
+int fs_mount_is_readonly(const char *path)
+{
+        return !!(fs_mount_flags(path) & FS_MOUNT_RDONLY);
+}
+
+/* Translate a directory/file bind mount to its source path. Keep the logical
+ * target separately in fs_file->path so /proc and unmount semantics stay
+ * namespace-local. */
+static int fs_translate_mount_path(const char *path, char *out, size_t out_cap)
+{
+        if (!path || !out || out_cap == 0)
+                return -1;
+        size_t len = strlen(path);
+        if (len >= out_cap)
+                return -1;
+        int best = -1;
+        size_t best_len = 0;
+        for (int i = 0; i < g_mount_count; i++) {
+                struct mount_entry *m = &g_mounts[i];
+                size_t ml = m->path_len;
+                if (!m->driver || !m->bind_source[0] || ml > len ||
+                    strncmp(path, m->path, ml) != 0)
+                        continue;
+                if (!m->bind_directory && len != ml)
+                        continue;
+                if (m->bind_directory && ml > 1 && path[ml] != '\0' && path[ml] != '/')
+                        continue;
+                if (best < 0 || ml > best_len) {
+                        best = i;
+                        best_len = ml;
+                }
+        }
+        if (best < 0) {
+                memcpy(out, path, len + 1);
+                return 0;
+        }
+        struct mount_entry *m = &g_mounts[best];
+        size_t src_len = strlen(m->bind_source);
+        const char *suffix = path + best_len;
+        const char *separator = (*suffix && src_len > 0 &&
+            m->bind_source[src_len - 1] != '/' && *suffix != '/') ? "/" : "";
+        int n = snprintf(out, out_cap, "%.*s%s%s", (int)src_len,
+                         m->bind_source, separator, suffix);
+        if (n < 0 || (size_t)n >= out_cap)
+                return -1;
+        return 0;
+}
+
+static int fs_private_source_denied(const char *path)
+{
+        /* Service tempfs backing paths are never an ABI. The mount translator
+         * reaches them internally only after this check on the visible path. */
+        return fs_path_is_private_mount_backing(path);
+}
+
 int fs_get_mount_children(const char *dir_path, char names[][64], int max_count) {
         if (!dir_path || !names || max_count <= 0) return 0;
 
         /* normalize dir_path into a small fixed buffer */
-        char dir[64];
+        char dir[256];
         size_t dlen = strlen(dir_path);
         if (dlen == 0) return 0;
         if (dlen >= sizeof(dir)) dlen = sizeof(dir) - 1;
@@ -144,7 +406,7 @@ int fs_get_mount_children(const char *dir_path, char names[][64], int max_count)
                 if (g_mounts[i].path[0] != '/') continue;
 
                 /* normalize mount path (strip trailing slashes) */
-                char mp[64];
+                char mp[256];
                 size_t mlen = g_mounts[i].path_len;
                 if (mlen == 0) continue;
                 if (mlen >= sizeof(mp)) mlen = sizeof(mp) - 1;
@@ -304,6 +566,16 @@ static int fs_file_matches_driver(const struct fs_driver *drv, const struct fs_f
         return 0;
 }
 
+struct fs_driver *fs_get_file_driver(const struct fs_file *file) {
+        if (!file) return NULL;
+        for (int i = 0; i < g_drivers_count; i++) {
+                struct fs_driver *drv = g_drivers[i];
+                if (fs_file_matches_driver(drv, file))
+                        return drv;
+        }
+        return NULL;
+}
+
 int fs_open_truncate_is_noop(const struct fs_file *file) {
         if (!file) return 0;
         for (int i = 0; i < g_drivers_count; i++) {
@@ -402,23 +674,42 @@ int fs_mount(const char *path, struct fs_driver *drv) {
         g_mounts[g_mount_count].path_len = len;
         g_mounts[g_mount_count].driver = drv;
         g_mounts[g_mount_count].refs = 1;
+        g_mounts[g_mount_count].flags = 0;
+        g_mounts[g_mount_count].bind_directory = 0;
         g_mounts[g_mount_count].bind_source[0] = '\0';
+        g_mounts[g_mount_count].source[0] = '\0';
         g_mount_count++;
         return 0;
 }
 
 int fs_bind_mount_file(const char *source, const char *target) {
-        if (!source || !target || strcmp(source, target) == 0 ||
+        if (!source || !target ||
             strlen(source) >= sizeof(g_mounts[0].bind_source) ||
-            strlen(target) >= sizeof(g_mounts[0].path) ||
-            g_mount_count >= MAX_FS_MOUNTS || fs_get_mount_driver_exact(target))
+            strlen(target) >= sizeof(g_mounts[0].path))
                 return -1;
 
-        struct stat src_stat, dst_stat;
-        if (vfs_stat(source, &src_stat) != 0 || vfs_stat(target, &dst_stat) != 0 ||
-            (src_stat.st_mode & 0170000u) != S_IFREG ||
-            (dst_stat.st_mode & 0170000u) != S_IFREG)
+        int same_path = strcmp(source, target) == 0;
+        struct fs_driver *existing = fs_get_mount_driver_exact(target);
+        if (same_path && existing)
+                return 0; /* bind/remount an already-mounted path, e.g. / */
+        if (g_mount_count >= MAX_FS_MOUNTS || existing)
                 return -1;
+        if (fs_private_source_denied(source)) return -1;
+
+        struct stat src_stat, dst_stat;
+        if (vfs_stat(source, &src_stat) != 0 || vfs_stat(target, &dst_stat) != 0)
+                return -1;
+        mode_t src_type = src_stat.st_mode & 0170000u;
+        mode_t dst_type = dst_stat.st_mode & 0170000u;
+        if ((src_type != S_IFREG && src_type != S_IFDIR &&
+             src_type != S_IFCHR && src_type != S_IFBLK) || src_type != dst_type)
+                return -1;
+        uint64_t source_flags = fs_mount_flags(source);
+        char resolved_source[512];
+        if (fs_translate_mount_path(source, resolved_source, sizeof(resolved_source)) != 0 ||
+            strlen(resolved_source) >= sizeof(g_mounts[0].bind_source))
+                return -1;
+        source = resolved_source;
 
         /* Keep the source backing file, not a snapshot: writes via either path
          * must reach the same inode (notably /run/machine-id -> /etc/machine-id). */
@@ -435,20 +726,191 @@ int fs_bind_mount_file(const char *source, const char *target) {
         m->path_len = strlen(target);
         m->driver = drv;
         m->refs = 1;
+        m->flags = source_flags;
+        m->bind_directory = src_type == S_IFDIR;
         strcpy(m->bind_source, source);
+        strncpy(m->source, source, sizeof(m->source) - 1);
+        m->source[sizeof(m->source) - 1] = '\0';
+        return 0;
+}
+
+int fs_bind_mount_dir(const char *source, const char *target, uint64_t flags)
+{
+        struct stat src, dst;
+        if (!source || !target || strlen(source) >= sizeof(g_mounts[0].bind_source) ||
+            strlen(target) >= sizeof(g_mounts[0].path) ||
+            g_mount_count >= MAX_FS_MOUNTS || fs_get_mount_driver_exact(target))
+                return -1;
+        if (fs_private_source_denied(source)) return -1;
+        if (vfs_stat(source, &src) != 0 || vfs_stat(target, &dst) != 0 ||
+            (src.st_mode & 0170000u) != S_IFDIR ||
+            (dst.st_mode & 0170000u) != S_IFDIR)
+                return -1;
+        uint64_t source_flags = fs_mount_flags(source);
+        char resolved_source[512];
+        if (fs_translate_mount_path(source, resolved_source, sizeof(resolved_source)) != 0 ||
+            strlen(resolved_source) >= sizeof(g_mounts[0].bind_source))
+                return -1;
+        source = resolved_source;
+        struct fs_driver *drv = fs_get_mount_driver(source);
+        if (!drv) return -1;
+        if (strncmp(source, target, strlen(target)) == 0 &&
+            (source[strlen(target)] == '/' || source[strlen(target)] == '\0'))
+                return -1; /* prohibit direct recursive bind trees */
+        fs_ensure_ramfs_mountpoint_dir(target);
+        struct mount_entry *m = &g_mounts[g_mount_count++];
+        memset(m, 0, sizeof(*m));
+        strcpy(m->path, target);
+        m->path_len = strlen(target);
+        m->driver = drv;
+        m->refs = 1;
+        m->flags = source_flags | flags;
+        m->bind_directory = 1;
+        strcpy(m->bind_source, source);
+        strncpy(m->source, source, sizeof(m->source) - 1);
+        m->source[sizeof(m->source) - 1] = '\0';
+        return 0;
+}
+
+static int fs_mount_path_contains(const char *parent, size_t parent_len,
+                                  const char *path, size_t path_len)
+{
+        return path_len >= parent_len &&
+               memcmp(parent, path, parent_len) == 0 &&
+               (path_len == parent_len || parent_len == 1 || path[parent_len] == '/');
+}
+
+int fs_mount_move(const char *source, const char *target)
+{
+        struct stat src, dst;
+        size_t src_len, dst_len;
+        int source_found = 0;
+
+        if (!source || !target || source[0] != '/' || target[0] != '/' ||
+            strcmp(source, target) == 0 || strcmp(source, "/") == 0 ||
+            strcmp(target, "/") == 0)
+                return -1;
+        src_len = strlen(source);
+        dst_len = strlen(target);
+        if (src_len >= sizeof(g_mounts[0].path) ||
+            dst_len >= sizeof(g_mounts[0].path))
+                return -1;
+        if (fs_mount_path_contains(source, src_len, target, dst_len) ||
+            fs_mount_path_contains(target, dst_len, source, src_len))
+                return -1; /* do not create a recursive mount tree */
+        if (vfs_stat(source, &src) != 0 || vfs_stat(target, &dst) != 0 ||
+            (src.st_mode & 0170000u) != S_IFDIR ||
+            (dst.st_mode & 0170000u) != S_IFDIR)
+                return -1;
+
+        for (int i = 0; i < g_mount_count; i++) {
+                struct mount_entry *m = &g_mounts[i];
+                if (!m->driver) continue;
+                size_t ml = m->path_len;
+                if (!fs_mount_path_contains(source, src_len, m->path, ml))
+                        continue;
+                size_t suffix_len = ml - src_len;
+                if (dst_len + suffix_len >= sizeof(m->path))
+                        return -1;
+                if (ml == src_len) source_found = 1;
+        }
+        if (!source_found)
+                return -1; /* MS_MOVE source must be a mountpoint */
+
+        /* Moving over a mounted target hides that target tree. The destination
+         * tree is removed from this namespace table before source descendants
+         * are renamed; sibling namespaces have independent tables. */
+        for (int i = 0; i < g_mount_count; ) {
+                struct mount_entry *m = &g_mounts[i];
+                if (m->driver && fs_mount_path_contains(target, dst_len,
+                                                        m->path, m->path_len)) {
+                        for (int j = i + 1; j < g_mount_count; j++)
+                                g_mounts[j - 1] = g_mounts[j];
+                        g_mount_count--;
+                        memset(&g_mounts[g_mount_count], 0, sizeof(g_mounts[g_mount_count]));
+                        continue;
+                }
+                i++;
+        }
+        for (int i = 0; i < g_mount_count; i++) {
+                struct mount_entry *m = &g_mounts[i];
+                if (!m->driver || !fs_mount_path_contains(source, src_len,
+                                                           m->path, m->path_len))
+                        continue;
+                char moved[sizeof(m->path)];
+                size_t suffix_len = m->path_len - src_len;
+                memcpy(moved, target, dst_len);
+                memcpy(moved + dst_len, m->path + src_len, suffix_len);
+                moved[dst_len + suffix_len] = '\0';
+                memcpy(m->path, moved, dst_len + suffix_len + 1);
+                m->path_len = dst_len + suffix_len;
+        }
+        return 0;
+}
+
+int fs_mount_private_tmpfs(const char *target, uint32_t mnt_ns, uint32_t serial,
+                           mode_t mode)
+{
+        char run_backing[512], source[512];
+        struct stat target_stat;
+        if (!target || !mnt_ns || !serial)
+                return -1;
+        if (vfs_stat(target, &target_stat) != 0 ||
+            (target_stat.st_mode & 0170000u) != S_IFDIR)
+                return -1;
+        if (fs_translate_mount_path("/run", run_backing, sizeof(run_backing)) != 0)
+                return -1;
+        size_t run_len = strlen(run_backing);
+        int n = snprintf(source, sizeof(source), "%s%s.axon-private-tmpfs-%08x-%08x",
+                         run_backing,
+                         run_len && run_backing[run_len - 1] == '/' ? "" : "/",
+                         mnt_ns, serial);
+        if (n < 0 || (size_t)n >= sizeof(source)) return -1;
+        if (ramfs_mkdir(source) != 0 || ramfs_chmod(source, mode & 07777u) != 0) {
+                (void)ramfs_remove(source);
+                return -1;
+        }
+        struct fs_driver *driver = fs_get_mount_driver(source);
+        if (!driver || g_mount_count >= MAX_FS_MOUNTS || fs_get_mount_driver_exact(target)) {
+                (void)ramfs_remove(source);
+                return -1;
+        }
+        fs_ensure_ramfs_mountpoint_dir(target);
+        struct mount_entry *m = &g_mounts[g_mount_count++];
+        memset(m, 0, sizeof(*m));
+        strcpy(m->path, target);
+        m->path_len = strlen(target);
+        m->driver = driver;
+        m->refs = 1;
+        m->bind_directory = 1;
+        if (strlen(source) >= sizeof(m->bind_source)) {
+                g_mount_count--;
+                (void)ramfs_remove(source);
+                return -1;
+        }
+        strcpy(m->bind_source, source);
+        strcpy(m->source, "tmpfs");
         return 0;
 }
 
 int fs_mkdir(const char *path) {
         if (!path) return -1;
+        if (fs_private_source_denied(path)) return -1;
         char normalized[512];
         if (fs_resolve_parent_path(path, normalized, sizeof(normalized)) != 0)
                 return -1;
         path = normalized;
+        if (fs_mount_is_readonly(path)) return -30; /* EROFS */
+        char backing[512];
+        if (fs_translate_mount_path(path, backing, sizeof(backing)) != 0) return -1;
+        path = backing;
         struct fs_driver *mount_drv = fs_match_mount(path);
         if (mount_drv && mount_drv->ops && mount_drv->ops->mkdir) {
                 int r = mount_drv->ops->mkdir(path);
-                if (r == 0) return 0;
+                if (r == 0) {
+                        inotify_notify_entry(normalized, 0x40000100u, 0); /* IN_CREATE | IN_ISDIR */
+                        return 0;
+                }
                 if (r < 0) return r;
         }
 
@@ -456,7 +918,10 @@ int fs_mkdir(const char *path) {
                 struct fs_driver *drv = g_drivers[i];
                 if (!drv || !drv->ops || !drv->ops->mkdir) continue;
                 int r = drv->ops->mkdir(path);
-                if (r == 0) return 0;
+                if (r == 0) {
+                        inotify_notify_entry(normalized, 0x40000100u, 0);
+                        return 0;
+                }
                 if (r < 0 && r != -1) return r;
         }
         return -1;
@@ -478,6 +943,7 @@ int fs_unmount(const char *path) {
                         g_mounts[g_mount_count].path_len = 0;
                         g_mounts[g_mount_count].refs = 0;
                         g_mounts[g_mount_count].bind_source[0] = '\0';
+                        g_mounts[g_mount_count].source[0] = '\0';
                         return 0;
                 }
         }
@@ -497,10 +963,15 @@ struct fs_file *fs_open_nofollow(const char *path) {
         thread_t *caller = thread_current();
         if (caller) caller->fs_open_error = 0;
         if (!path) return NULL;
-        for (int i = 0; i < g_mount_count; i++) {
-                if (g_mounts[i].bind_source[0] && strcmp(g_mounts[i].path, path) == 0)
-                        return fs_open_nofollow(g_mounts[i].bind_source);
-        }
+        if (fs_private_source_denied(path)) return NULL;
+        char logical[4096];
+        char backing[4096];
+        size_t logical_len = strlen(path);
+        if (logical_len >= sizeof(logical)) return NULL;
+        memcpy(logical, path, logical_len + 1);
+        if (fs_translate_mount_path(logical, backing, sizeof(backing)) != 0)
+                return NULL;
+        path = backing;
         struct fs_driver *mount_drv = fs_match_mount(path);
         if (mount_drv && mount_drv->ops && mount_drv->ops->open) {
                 struct fs_file *file = NULL;
@@ -508,6 +979,10 @@ struct fs_file *fs_open_nofollow(const char *path) {
 
                 if (rr == 0 && file) {
                         if (!file->fs_private) file->fs_private = (void*)mount_drv;
+                        if (fs_file_set_user_path(file, logical) != 0) {
+                                fs_file_free(file);
+                                return NULL;
+                        }
                         if (fs_file_mark_opened(file) != 0) { fs_file_free(file); return NULL; }
                         return file;
                 }
@@ -526,8 +1001,13 @@ struct fs_file *fs_open_nofollow(const char *path) {
 
                         if (m && m->ops && m->ops->open) {
                                 struct fs_file *mount_file = NULL;
-                                if (m->ops->open(path, &mount_file) == 0 && mount_file) {
-                                        if (!mount_file->fs_private) mount_file->fs_private = (void*)m;
+                                        if (m->ops->open(path, &mount_file) == 0 && mount_file) {
+                                                if (!mount_file->fs_private) mount_file->fs_private = (void*)m;
+                                                if (fs_file_set_user_path(mount_file, logical) != 0) {
+                                                        fs_file_free(file);
+                                                        fs_file_free(mount_file);
+                                                        return NULL;
+                                                }
 
                                         if (fs_file_mark_opened(file) != 0) {
                                                 if (mount_file->refcount < 1) mount_file->refcount = 1;
@@ -539,6 +1019,10 @@ struct fs_file *fs_open_nofollow(const char *path) {
                                 }
                         }
                         if (!file->fs_private) file->fs_private = (void*)drv;
+                        if (fs_file_set_user_path(file, logical) != 0) {
+                                fs_file_free(file);
+                                return NULL;
+                        }
                         if (fs_file_mark_opened(file) != 0) { fs_file_free(file); return NULL; }
                         return file;
                 }
@@ -741,6 +1225,23 @@ static char *fs_resolve_symlinks(const char *path) {
         return NULL;
 }
 
+int fs_resolve_symlink_path(const char *path, char *out, size_t out_cap)
+{
+        if (!path || !out || out_cap == 0)
+                return -1;
+        char *resolved = fs_resolve_symlinks(path);
+        if (!resolved)
+                return -1;
+        size_t len = strlen(resolved);
+        if (len >= out_cap) {
+                kfree(resolved);
+                return -1;
+        }
+        memcpy(out, resolved, len + 1);
+        kfree(resolved);
+        return 0;
+}
+
 /* Resolve directory symlinks for dentry mutations, but leave the leaf alone.
  * For example, unlink("/bin/sh") must operate on /usr/bin/sh when /bin is
  * usr-merged, while unlinking a symlink itself must not follow that leaf. */
@@ -835,15 +1336,31 @@ int fs_resolve_parent_path(const char *path, char *out, size_t out_cap) {
 /* Try drivers in registration order. Drivers should return -1 if they do not handle the path. */
 struct fs_file *fs_create_file(const char *path) {
         if (!path) return NULL;
+        if (fs_private_source_denied(path)) return NULL;
         char normalized[512];
         if (fs_resolve_parent_path(path, normalized, sizeof(normalized)) != 0)
                 return NULL;
-        path = normalized;
+        if (fs_mount_is_readonly(normalized)) {
+                thread_t *caller = thread_current();
+                if (caller) caller->fs_open_error = 30; /* EROFS */
+                return NULL;
+        }
+        char backing[512];
+        if (fs_translate_mount_path(normalized, backing, sizeof(backing)) != 0)
+                return NULL;
+        const char *logical = normalized;
+        path = backing;
         struct fs_driver *mount_drv = fs_match_mount(path);
         if (mount_drv && mount_drv->ops && mount_drv->ops->create) {
                 struct fs_file *file = NULL;
                 if (mount_drv->ops->create(path, &file) == 0) {
-                        if (file) file->refcount = 1;
+                        if (file) {
+                                file->refcount = 1;
+                                if (fs_file_set_user_path(file, logical) != 0) {
+                                        fs_file_free(file);
+                                        return NULL;
+                                }
+                        }
                         return file;
                 }
                 /* This mount owns the path. Do not fall through to ramfs_create:
@@ -859,6 +1376,10 @@ struct fs_file *fs_create_file(const char *path) {
                 if (r == 0 && file) {
                         /* driver should set file->fs_private to drv->driver_data if needed */
                         file->refcount = 1;
+                        if (fs_file_set_user_path(file, logical) != 0) {
+                                fs_file_free(file);
+                                return NULL;
+                        }
                         return file;
                 }
                 if (r < 0 && r != -1) {
@@ -965,21 +1486,15 @@ ssize_t fs_read(struct fs_file *file, void *buf, size_t size, size_t offset) {
                 /* debug logging removed */
                 if (!drv->ops->read) return -EIO;
                 ssize_t rr = drv->ops->read(file, buf, size, offset);
-                if (rr < 0 && read_error_budget-- > 0)
-                        klogprintf("fs-read: driver=%s path=%s off=0x%zx size=%zu rc=%lld\n",
-                                drv->ops->name ? drv->ops->name : "?",
-                                file->path, offset, size, (long long)rr);
                 if (rr < 0 && rr == -1) return -EIO;
                 return rr;
         }
-        if (read_error_budget-- > 0)
-                klogprintf("fs-read: no driver path=%s owner=%p handle=%p\n",
-                        file->path, file->fs_private, file->driver_private);
         return -EIO;
 }
 
 ssize_t fs_write(struct fs_file *file, const void *buf, size_t size, size_t offset) {
         if (!file || !file->path) return -1;
+        if (!file->is_memfd && fs_mount_is_readonly(file->path)) return -30; /* EROFS */
         for (int i = 0; i < g_drivers_count; i++) {
                 struct fs_driver *drv = g_drivers[i];
                 if (!drv || !drv->ops || !fs_file_matches_driver(drv, file)) continue;
@@ -1001,10 +1516,43 @@ uint64_t fs_current_generation(struct fs_file *file) {
         return file->backing_gen;
 }
 
+static void fs_file_bad_ref_debug(struct fs_file *file, int prev, void *caller) {
+        thread_t *t = thread_current();
+        kprintf("fs_file_free: refcount=%d f=%p path=%p caller=%p tid=%llu name=%s (skip)\n",
+                prev, (void *)file, (void *)file->path, caller,
+                (unsigned long long)(t ? t->tid : 0),
+                t && t->name[0] ? t->name : "-");
+}
+
 void fs_file_get(struct fs_file *file) {
         if (!file) return;
         /* atomic: the same fs_file may be shared (dup / dev/fd/N) across CPUs */
         __atomic_add_fetch(&file->refcount, 1, __ATOMIC_ACQ_REL);
+}
+
+void fs_file_fd_open(struct fs_file *file) {
+        if (!file) return;
+        __atomic_add_fetch(&file->fd_refcount, 1, __ATOMIC_ACQ_REL);
+}
+
+int fs_file_fd_close(struct fs_file *file) {
+        if (!file) return 0;
+        int prev = __atomic_fetch_sub(&file->fd_refcount, 1, __ATOMIC_ACQ_REL);
+        if (prev <= 0) {
+                /* Keep a bookkeeping bug from wrapping into a live reference. */
+                __atomic_store_n(&file->fd_refcount, 0, __ATOMIC_RELEASE);
+                epoll_notify_file_closed(file);
+                return 0;
+        }
+        int refs = prev - 1;
+        if (refs == 0)
+                epoll_notify_file_closed(file);
+        return refs;
+}
+
+int fs_file_fd_count(const struct fs_file *file) {
+        if (!file) return 0;
+        return __atomic_load_n(&file->fd_refcount, __ATOMIC_ACQUIRE);
 }
 
 void fs_file_free(struct fs_file *file) {
@@ -1016,13 +1564,14 @@ void fs_file_free(struct fs_file *file) {
 #if !AXON_PRODUCTION
                 static int warn_left = 8;
                 if (warn_left-- > 0)
-                        kprintf("fs_file_free: refcount=%d path=%s (skip)\n",
-                                prev, file->path ? file->path : "(null)");
+                        fs_file_bad_ref_debug(file, prev, __builtin_return_address(0));
 #endif
                 return;
         }
         /* prev == 1: last reference — we own the object from here on. */
         __atomic_store_n(&file->refcount, 0, __ATOMIC_RELAXED);
+        fs_ofd_lock_release(file);
+        ns_release_file(file);
         fs_file_unaccount(file);
         if (file->type == FS_TYPE_PIPE) {
                 pipe_release_end(file);
@@ -1065,6 +1614,17 @@ void fs_file_free(struct fs_file *file) {
                 }
         }
 
+        {
+                static int fallback_trace_left = 20;
+                if (!heap_ptr_is_kmalloc(file) && fallback_trace_left-- > 0) {
+                        thread_t *t = thread_current();
+                        klogprintf("filefree-fallback: f=%p path=%p type=%d caller=%p tid=%llu name=%s\n",
+                                   (void *)file, (void *)file->path, file->type,
+                                   __builtin_return_address(0),
+                                   (unsigned long long)(t ? t->tid : 0),
+                                   t && t->name[0] ? t->name : "-");
+                }
+        }
         kfree((void*)file->path);
         kfree(file);
 }
@@ -1085,6 +1645,15 @@ int fs_file_set_user_path(struct fs_file *file, const char *user_path) {
 
 int fs_chmod(const char *path, mode_t mode) {
         if (!path) return -1;
+        if (fs_private_source_denied(path)) return -1;
+        char normalized[512];
+        if (fs_resolve_parent_path(path, normalized, sizeof(normalized)) != 0)
+                return -1;
+        path = normalized;
+        if (fs_mount_is_readonly(path)) return -30;
+        char backing[512];
+        if (fs_translate_mount_path(path, backing, sizeof(backing)) != 0) return -1;
+        path = backing;
         struct fs_driver *mount_drv = fs_match_mount(path);
         if (mount_drv && mount_drv->ops && mount_drv->ops->chmod) {
                 int r = mount_drv->ops->chmod(path, mode);
@@ -1102,12 +1671,20 @@ int fs_chmod(const char *path, mode_t mode) {
 
 int fs_link(const char *oldpath, const char *newpath) {
         if (!oldpath || !newpath) return -1;
+        if (fs_private_source_denied(oldpath) || fs_private_source_denied(newpath)) return -1;
         char old_normalized[512], new_normalized[512];
         if (fs_resolve_parent_path(oldpath, old_normalized, sizeof(old_normalized)) != 0 ||
             fs_resolve_parent_path(newpath, new_normalized, sizeof(new_normalized)) != 0)
                 return -1;
         oldpath = old_normalized;
         newpath = new_normalized;
+        if (fs_mount_is_readonly(newpath)) return -30;
+        char old_backing[512], new_backing[512];
+        if (fs_translate_mount_path(oldpath, old_backing, sizeof(old_backing)) != 0 ||
+            fs_translate_mount_path(newpath, new_backing, sizeof(new_backing)) != 0)
+                return -1;
+        oldpath = old_backing;
+        newpath = new_backing;
         struct fs_driver *mount_drv = fs_match_mount(oldpath);
         if (mount_drv && mount_drv->ops && mount_drv->ops->link) {
                 int r = mount_drv->ops->link(oldpath, newpath);
@@ -1126,24 +1703,41 @@ int fs_link(const char *oldpath, const char *newpath) {
 
 int fs_rename(const char *oldpath, const char *newpath) {
         if (!oldpath || !newpath) return -1;
+        if (fs_private_source_denied(oldpath) || fs_private_source_denied(newpath)) return -1;
         char old_normalized[512], new_normalized[512];
         if (fs_resolve_parent_path(oldpath, old_normalized, sizeof(old_normalized)) != 0 ||
             fs_resolve_parent_path(newpath, new_normalized, sizeof(new_normalized)) != 0)
                 return -1;
         oldpath = old_normalized;
         newpath = new_normalized;
+        if (fs_mount_is_readonly(oldpath) || fs_mount_is_readonly(newpath)) return -30;
+        char old_backing[512], new_backing[512];
+        if (fs_translate_mount_path(oldpath, old_backing, sizeof(old_backing)) != 0 ||
+            fs_translate_mount_path(newpath, new_backing, sizeof(new_backing)) != 0)
+                return -1;
+        oldpath = old_backing;
+        newpath = new_backing;
         if (strcmp(oldpath, newpath) == 0) return 0;
+        struct stat moved_stat;
+        int is_dir = vfs_lstat(old_normalized, &moved_stat) == 0 &&
+                     (moved_stat.st_mode & 0170000u) == S_IFDIR;
         struct fs_driver *mount_drv = fs_match_mount(oldpath);
         if (mount_drv && mount_drv->ops && mount_drv->ops->rename) {
                 int r = mount_drv->ops->rename(oldpath, newpath);
-                if (r == 0) return 0;
+                if (r == 0) {
+                        inotify_notify_move(old_normalized, new_normalized, is_dir);
+                        return 0;
+                }
                 if (r < 0) return r;
         }
         for (int i = 0; i < g_drivers_count; i++) {
                 struct fs_driver *drv = g_drivers[i];
                 if (!drv || !drv->ops || !drv->ops->rename) continue;
                 int r = drv->ops->rename(oldpath, newpath);
-                if (r == 0) return 0;
+                if (r == 0) {
+                        inotify_notify_move(old_normalized, new_normalized, is_dir);
+                        return 0;
+                }
                 if (r < 0 && r != -1) return r;
         }
         return -1;
@@ -1151,21 +1745,35 @@ int fs_rename(const char *oldpath, const char *newpath) {
 
 int fs_unlink(const char *path) {
         if (!path) return -1;
+        if (fs_private_source_denied(path)) return -1;
         char normalized[512];
         if (fs_resolve_parent_path(path, normalized, sizeof(normalized)) != 0)
                 return -1;
         path = normalized;
+        if (fs_mount_is_readonly(path)) return -30;
+        char backing[512];
+        if (fs_translate_mount_path(path, backing, sizeof(backing)) != 0) return -1;
+        path = backing;
+        struct stat removed_stat;
+        int is_dir = vfs_lstat(normalized, &removed_stat) == 0 &&
+                     (removed_stat.st_mode & 0170000u) == S_IFDIR;
         struct fs_driver *mount_drv = fs_match_mount(path);
         if (mount_drv && mount_drv->ops && mount_drv->ops->unlink) {
                 int r = mount_drv->ops->unlink(path);
-                if (r == 0) return 0;
+                if (r == 0) {
+                        inotify_notify_entry(normalized, 0x00000200u | (is_dir ? 0x40000000u : 0), 0);
+                        return 0;
+                }
                 if (r < 0) return r;
         }
         for (int i = 0; i < g_drivers_count; i++) {
                 struct fs_driver *drv = g_drivers[i];
                 if (!drv || !drv->ops || !drv->ops->unlink) continue;
                 int r = drv->ops->unlink(path);
-                if (r == 0) return 0;
+                if (r == 0) {
+                        inotify_notify_entry(normalized, 0x00000200u | (is_dir ? 0x40000000u : 0), 0);
+                        return 0;
+                }
                 if (r < 0 && r != -1) return r;
         }
         return -1;
@@ -1273,6 +1881,7 @@ done:
 
 int vfs_ftruncate(struct fs_file *file, off_t length) {
         if (!file) return -9; /* EBADF */
+        if (!file->is_memfd && file->path && fs_mount_is_readonly(file->path)) return -30; /* EROFS */
         for (int i = 0; i < g_drivers_count; i++) {
                 struct fs_driver *drv = g_drivers[i];
                 if (!drv) continue;
@@ -1292,6 +1901,18 @@ int vfs_ftruncate(struct fs_file *file, off_t length) {
 
 int vfs_stat(const char *path, struct stat *st) {
         if (!path || !st) return -1;
+        int ns_pid;
+        enum ns_type ns_type;
+        if (ns_parse_proc_ns_path(path, &ns_pid, &ns_type) == 0) {
+                process_t *process = process_find((uint64_t)(unsigned)ns_pid);
+                if (!process) return -1;
+                memset(st, 0, sizeof(*st));
+                st->st_dev = 0x6e736673u; /* nsfs */
+                st->st_ino = ns_inum(process, ns_type);
+                st->st_mode = S_IFREG | 0444;
+                st->st_nlink = 1;
+                return 0;
+        }
         struct fs_file *f = fs_open(path);
         if (!f) return -1;
         int r = vfs_fstat(f, st);
@@ -1302,6 +1923,10 @@ int vfs_stat(const char *path, struct stat *st) {
 /* Like lstat(): do not follow the final symlink. */
 int vfs_lstat(const char *path, struct stat *st) {
         if (!path || !st) return -1;
+        int ns_pid;
+        enum ns_type ns_type;
+        if (ns_parse_proc_ns_path(path, &ns_pid, &ns_type) == 0)
+                return vfs_stat(path, st);
         char normalized[512];
         if (fs_resolve_parent_path(path, normalized, sizeof(normalized)) != 0)
                 return -1;
@@ -1316,6 +1941,13 @@ int vfs_lstat(const char *path, struct stat *st) {
 /* Read symlink target into buf. Returns bytes copied (no NUL) or -1 on error. */
 ssize_t vfs_readlink(const char *path, char *buf, size_t bufsiz) {
         if (!path || !buf || bufsiz == 0) return -1;
+        char ns_target[64];
+        int ns_len = ns_readlink_proc(path, ns_target, sizeof(ns_target));
+        if (ns_len >= 0) {
+                size_t copy = (size_t)ns_len < bufsiz ? (size_t)ns_len : bufsiz;
+                memcpy(buf, ns_target, copy);
+                return (ssize_t)copy;
+        }
         char normalized[512];
         if (fs_resolve_parent_path(path, normalized, sizeof(normalized)) != 0)
                 return -1;

@@ -322,7 +322,9 @@ void ns_init(void)
 	acquire_irqsave(&g_ns_lock, &fl);
 	memset(&g_init_uts, 0, sizeof(g_init_uts));
 	memset(&g_init_ipc, 0, sizeof(g_init_ipc));
-	memset(&g_init_mnt, 0, sizeof(g_init_mnt));
+	/* Filesystem mounts may have been installed before the first process is
+	 * created. Preserve that boot mount table while initializing its ns inode. */
+	memset(&g_init_mnt.ns, 0, sizeof(g_init_mnt.ns));
 	memset(&g_init_pid, 0, sizeof(g_init_pid));
 	memset(&g_init_net, 0, sizeof(g_init_net));
 	memset(&g_init_user, 0, sizeof(g_init_user));
@@ -581,12 +583,11 @@ int ns_unshare(process_t *p, uint64_t flags)
 
 int ns_setns_file(process_t *p, struct fs_file *f, int nstype)
 {
-	enum ns_type type;
-	uint32_t inum = 0;
-	struct nsproxy *fresh;
-	process_t *cur;
-	unsigned long fl = 0;
-	int i;
+    enum ns_type type;
+    uint32_t inum = 0;
+    struct nsproxy *fresh;
+    struct ns_common *want;
+    unsigned long fl = 0;
 
 	if (!p || !f)
 		return -1;
@@ -594,93 +595,74 @@ int ns_setns_file(process_t *p, struct fs_file *f, int nstype)
 		return -1;
 	if (nstype != 0 && (uint64_t)nstype != ns_clone_flag_for_type(type))
 		return -22; /* EINVAL */
-	cur = ns_current_proc();
-	if (!cur)
-		return -1;
-	acquire_irqsave(&g_ns_lock, &fl);
-	fresh = nsproxy_dup(ns_of(p));
+    if (!f->driver_private) return -1;
+    acquire_irqsave(&g_ns_lock, &fl);
+    fresh = nsproxy_dup(ns_of(p));
 	if (!fresh) {
 		release_irqrestore(&g_ns_lock, fl);
 		return -12;
 	}
-	/* Steal the matching ns object from the process that owns this inum. */
-	for (i = 0; i < 1024; i++) {
-		process_t *o = process_find((uint64_t)(unsigned)(i + 1));
-		struct nsproxy *ons;
-		struct ns_common *want = NULL;
-
-		if (!o || !o->nsproxy)
-			continue;
-		ons = o->nsproxy;
-		switch (type) {
-		case NS_TYPE_MNT: want = &ons->mnt_ns->ns; break;
-		case NS_TYPE_UTS: want = &ons->uts_ns->ns; break;
-		case NS_TYPE_IPC: want = &ons->ipc_ns->ns; break;
-		case NS_TYPE_PID: want = &ons->pid_ns->ns; break;
-		case NS_TYPE_USER: want = &ons->user_ns->ns; break;
-		case NS_TYPE_NET: want = &ons->net_ns->ns; break;
-		case NS_TYPE_CGROUP: want = &ons->cgroup_ns->ns; break;
-		case NS_TYPE_TIME: want = &ons->time_ns->ns; break;
-		default: break;
-		}
-		if (!want || want->inum != inum)
-			continue;
-		switch (type) {
-		case NS_TYPE_MNT:
-			mnt_get(ons->mnt_ns);
-			mnt_put(fresh->mnt_ns);
-			fresh->mnt_ns = ons->mnt_ns;
-			break;
-		case NS_TYPE_UTS:
-			uts_get(ons->uts_ns);
-			uts_put(fresh->uts_ns);
-			fresh->uts_ns = ons->uts_ns;
-			break;
-		case NS_TYPE_IPC:
-			ipc_get(ons->ipc_ns);
-			ipc_put(fresh->ipc_ns);
-			fresh->ipc_ns = ons->ipc_ns;
-			break;
-		case NS_TYPE_PID:
-			/* Linux setns(pid_ns): only children are born in the target ns. */
-			if (fresh->pid_ns_for_children &&
-			    fresh->pid_ns_for_children != fresh->pid_ns)
-				pid_put(fresh->pid_ns_for_children);
-			fresh->pid_ns_for_children = ons->pid_ns;
-			if (fresh->pid_ns_for_children != fresh->pid_ns)
-				pid_get(fresh->pid_ns_for_children);
-			break;
-		case NS_TYPE_USER:
-			user_get(ons->user_ns);
-			user_put(fresh->user_ns);
-			fresh->user_ns = ons->user_ns;
-			break;
-		case NS_TYPE_NET:
-			net_get(ons->net_ns);
-			net_put(fresh->net_ns);
-			fresh->net_ns = ons->net_ns;
-			break;
-		case NS_TYPE_CGROUP:
-			cgroup_ns_get(ons->cgroup_ns);
-			cgroup_ns_put(fresh->cgroup_ns);
-			fresh->cgroup_ns = ons->cgroup_ns;
-			break;
-		case NS_TYPE_TIME:
-			time_get(ons->time_ns);
-			time_put(fresh->time_ns);
-			fresh->time_ns = ons->time_ns;
-			break;
-		default:
-			break;
-		}
-		nsproxy_put(p->nsproxy);
-		p->nsproxy = fresh;
-		release_irqrestore(&g_ns_lock, fl);
-		return 0;
-	}
-	nsproxy_put(fresh);
-	release_irqrestore(&g_ns_lock, fl);
-	return -2; /* ENOENT */
+    /* Namespace fd pins the namespace object, even if its owner exited. */
+    want = (struct ns_common *)f->driver_private;
+    if (want->inum != inum || want->type != type) {
+        nsproxy_put(fresh);
+        release_irqrestore(&g_ns_lock, fl);
+        return -1;
+    }
+    switch (type) {
+        case NS_TYPE_MNT:
+            mnt_get((struct mnt_namespace *)((char *)want - offsetof(struct mnt_namespace, ns)));
+            mnt_put(fresh->mnt_ns);
+            fresh->mnt_ns = (struct mnt_namespace *)((char *)want - offsetof(struct mnt_namespace, ns));
+            break;
+        case NS_TYPE_UTS:
+            uts_get((struct uts_namespace *)((char *)want - offsetof(struct uts_namespace, ns)));
+            uts_put(fresh->uts_ns);
+            fresh->uts_ns = (struct uts_namespace *)((char *)want - offsetof(struct uts_namespace, ns));
+            break;
+        case NS_TYPE_IPC:
+            ipc_get((struct ipc_namespace *)((char *)want - offsetof(struct ipc_namespace, ns)));
+            ipc_put(fresh->ipc_ns);
+            fresh->ipc_ns = (struct ipc_namespace *)((char *)want - offsetof(struct ipc_namespace, ns));
+            break;
+        case NS_TYPE_PID:
+            /* Linux setns(pid_ns): only children are born in the target ns. */
+            if (want != &fresh->pid_ns->ns)
+                pid_get((struct pid_namespace *)((char *)want - offsetof(struct pid_namespace, ns)));
+            if (fresh->pid_ns_for_children &&
+                fresh->pid_ns_for_children != fresh->pid_ns)
+                pid_put(fresh->pid_ns_for_children);
+            fresh->pid_ns_for_children = (struct pid_namespace *)((char *)want - offsetof(struct pid_namespace, ns));
+            break;
+        case NS_TYPE_USER:
+            user_get((struct user_namespace *)((char *)want - offsetof(struct user_namespace, ns)));
+            user_put(fresh->user_ns);
+            fresh->user_ns = (struct user_namespace *)((char *)want - offsetof(struct user_namespace, ns));
+            break;
+        case NS_TYPE_NET:
+            net_get((struct net_namespace *)((char *)want - offsetof(struct net_namespace, ns)));
+            net_put(fresh->net_ns);
+            fresh->net_ns = (struct net_namespace *)((char *)want - offsetof(struct net_namespace, ns));
+            break;
+        case NS_TYPE_CGROUP:
+            cgroup_ns_get((struct cgroup_namespace *)((char *)want - offsetof(struct cgroup_namespace, ns)));
+            cgroup_ns_put(fresh->cgroup_ns);
+            fresh->cgroup_ns = (struct cgroup_namespace *)((char *)want - offsetof(struct cgroup_namespace, ns));
+            break;
+        case NS_TYPE_TIME:
+            time_get((struct time_namespace *)((char *)want - offsetof(struct time_namespace, ns)));
+            time_put(fresh->time_ns);
+            fresh->time_ns = (struct time_namespace *)((char *)want - offsetof(struct time_namespace, ns));
+            break;
+        default:
+            nsproxy_put(fresh);
+            release_irqrestore(&g_ns_lock, fl);
+            return -1;
+    }
+    nsproxy_put(p->nsproxy);
+    p->nsproxy = fresh;
+    release_irqrestore(&g_ns_lock, fl);
+    return 0;
 }
 
 void ns_process_exit(process_t *p)
@@ -828,13 +810,26 @@ int ns_readlink_proc(const char *path, char *buf, size_t bufsz)
 
 int ns_bind_proc_file(struct fs_file *f, process_t *target, enum ns_type type)
 {
-	if (!f || !target)
-		return -1;
+    if (!f || !target)
+        return -1;
 	/* Pin the ns identity at open(2) time. Path re-parse after unshare
 	 * would see the new ns; Linux nsfs fds stay bound to the old one. */
-	f->backing_id = ((uint64_t)ns_inum(target, type) << 8) | (unsigned)type;
-	f->backing_gen = 0x4E535346ULL; /* 'NSFS' */
-	return 0;
+    f->backing_id = ((uint64_t)ns_inum(target, type) << 8) | (unsigned)type;
+    f->backing_gen = 0x4E535346ULL; /* 'NSFS' */
+    struct nsproxy *ns = ns_of(target);
+    if (!ns) return -1;
+    switch (type) {
+    case NS_TYPE_MNT: f->driver_private = ns->mnt_ns; mnt_get(ns->mnt_ns); break;
+    case NS_TYPE_UTS: f->driver_private = ns->uts_ns; uts_get(ns->uts_ns); break;
+    case NS_TYPE_IPC: f->driver_private = ns->ipc_ns; ipc_get(ns->ipc_ns); break;
+    case NS_TYPE_PID: f->driver_private = ns->pid_ns; pid_get(ns->pid_ns); break;
+    case NS_TYPE_USER: f->driver_private = ns->user_ns; user_get(ns->user_ns); break;
+    case NS_TYPE_NET: f->driver_private = ns->net_ns; net_get(ns->net_ns); break;
+    case NS_TYPE_CGROUP: f->driver_private = ns->cgroup_ns; cgroup_ns_get(ns->cgroup_ns); break;
+    case NS_TYPE_TIME: f->driver_private = ns->time_ns; time_get(ns->time_ns); break;
+    default: return -1;
+    }
+    return 0;
 }
 
 int ns_file_type(const struct fs_file *f, enum ns_type *type_out, uint32_t *inum_out)
@@ -845,8 +840,8 @@ int ns_file_type(const struct fs_file *f, enum ns_type *type_out, uint32_t *inum
 
 	if (!f)
 		return -1;
-	if (f->backing_gen == 0x4E535346ULL) {
-		type = (enum ns_type)(f->backing_id & 0xffu);
+    if (f->backing_gen == 0x4E535346ULL) {
+        type = (enum ns_type)(f->backing_id & 0xffu);
 		if (type_out)
 			*type_out = type;
 		if (inum_out)
@@ -863,6 +858,24 @@ int ns_file_type(const struct fs_file *f, enum ns_type *type_out, uint32_t *inum
 	if (inum_out)
 		*inum_out = ns_inum(p, type);
 	return 0;
+}
+
+void ns_release_file(struct fs_file *f)
+{
+    if (!f || f->backing_gen != 0x4E535346ULL || !f->driver_private)
+        return;
+    switch ((enum ns_type)(f->backing_id & 0xffu)) {
+    case NS_TYPE_MNT: mnt_put((struct mnt_namespace *)f->driver_private); break;
+    case NS_TYPE_UTS: uts_put((struct uts_namespace *)f->driver_private); break;
+    case NS_TYPE_IPC: ipc_put((struct ipc_namespace *)f->driver_private); break;
+    case NS_TYPE_PID: pid_put((struct pid_namespace *)f->driver_private); break;
+    case NS_TYPE_USER: user_put((struct user_namespace *)f->driver_private); break;
+    case NS_TYPE_NET: net_put((struct net_namespace *)f->driver_private); break;
+    case NS_TYPE_CGROUP: cgroup_ns_put((struct cgroup_namespace *)f->driver_private); break;
+    case NS_TYPE_TIME: time_put((struct time_namespace *)f->driver_private); break;
+    default: break;
+    }
+    f->driver_private = NULL;
 }
 
 const char *ns_uts_nodename(void)

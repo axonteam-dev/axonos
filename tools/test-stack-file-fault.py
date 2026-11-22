@@ -24,6 +24,7 @@ typedef struct thread {
     int ring; uintptr_t user_stack_base, user_stack_limit; mm_t *mm, *mm_ptemplate;
 } thread_t;
 #define USER_VMA_MAX 4
+#define USER_VMA_MM_MAX USER_VMA_MAX
 typedef struct { int used, file; uint64_t tid; uintptr_t addr; size_t len; } user_vma_t;
 static user_vma_t g_user_vmas[USER_VMA_MAX], mm_vmas[USER_VMA_MAX];
 static spinlock_t g_user_vma_lock;

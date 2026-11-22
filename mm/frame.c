@@ -4,10 +4,10 @@
 #include <pmm.h>
 #include <spinlock.h>
 #include <string.h>
+#include <vga.h>
 
-/* 256K slots × 4KiB = 1GiB of Soft_OWNED user pages. 64K (256MiB) was
- * smaller than the PMM arena; apt's cache plus lists exhausted it
- * while fork memcpy'd lazy-anon identity leftovers into dpkg-deb/xz. */
+/* Default capacity for the legacy heap-backed allocator. A PMM arena may be
+ * larger than this, and needs one metadata slot for every physical page. */
 #define FRAME_META_MAX 262144
 #define FRAME_HASH_SIZE 8192
 
@@ -33,12 +33,25 @@ static unsigned frame_hash_pa(uint64_t pa) {
 
 void frame_init(void) {
     unsigned long flags;
-    frames_cap = FRAME_META_MAX;
-    frames = (frame_meta_t *)kmalloc(sizeof(frame_meta_t) * (size_t)frames_cap);
-    if (!frames) {
-        frames_cap = 4096;
+    size_t capacity = FRAME_META_MAX;
+    size_t pmm_pages = pmm_total_pages();
+    if (pmm_pages > capacity)
+        capacity = pmm_pages;
+    /* Slot links are int indices; also avoid overflowing the allocation size. */
+    if (capacity > (size_t)0x7fffffff)
+        capacity = (size_t)0x7fffffff;
+    if (capacity > ~(size_t)0 / sizeof(frame_meta_t))
+        capacity = ~(size_t)0 / sizeof(frame_meta_t);
+    frames = NULL;
+    while (capacity >= 4096) {
+        frames_cap = (int)capacity;
         frames = (frame_meta_t *)kmalloc(sizeof(frame_meta_t) * (size_t)frames_cap);
+        if (frames)
+            break;
+        capacity /= 2;
     }
+    if (!frames)
+        frames_cap = 0;
     acquire_irqsave(&frame_lock, &flags);
     if (frames)
         memset(frames, 0, sizeof(frame_meta_t) * (size_t)frames_cap);
@@ -55,6 +68,10 @@ void frame_init(void) {
         }
     }
     release_irqrestore(&frame_lock, flags);
+    if ((size_t)frames_cap < pmm_pages)
+        kprintf("frame: metadata capacity %llu pages below PMM %llu pages\n",
+                (unsigned long long)frames_cap,
+                (unsigned long long)pmm_pages);
 }
 
 static int frame_slot_locked(uint64_t pa) {
@@ -151,10 +168,16 @@ void *frame_alloc(void) {
     }
     release_irqrestore(&frame_lock, flags);
     if (slot < 0) {
+        static int metadata_oom_once;
         if (raw)
             kfree(raw);
         else
             pmm_free_page(page);
+        if (!metadata_oom_once) {
+            metadata_oom_once = 1;
+            kprintf("frame: metadata exhausted (%d slots; PMM free=%llu)\n",
+                    frames_cap, (unsigned long long)pmm_free_pages());
+        }
         return NULL;
     }
     return page;

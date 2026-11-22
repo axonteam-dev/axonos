@@ -238,7 +238,7 @@ static int mm_map_4k_sharedaware_body(mm_t *mm, uint64_t *share_l4, uint64_t va,
     int l1i = (int)((va >> 12) & 0x1FF);
 
     uint64_t se4 = share_l4[l4i];
-    if (!(se4 & PG_PRESENT) || !pt_page_pa_ok(se4)) return -1;
+    if ((se4 & PG_PRESENT) && ((se4 & PG_PS_2M) || !pt_page_pa_ok(se4))) return -1;
     uint64_t *swapper_l4 = g_mm_ready ? g_kernel_mm.pml4 : NULL;
     uint64_t ke4 = (swapper_l4 && (swapper_l4[l4i] & PG_PRESENT)) ? swapper_l4[l4i] : 0;
 
@@ -247,13 +247,13 @@ static int mm_map_4k_sharedaware_body(mm_t *mm, uint64_t *share_l4, uint64_t va,
     if (ent4 & PG_PRESENT) {
         if (!pt_page_pa_ok(ent4)) return -1;
         if (mm_pte_same_pt_page(ent4, se4) || mm_pte_same_pt_page(ent4, ke4)) {
-            l3 = (uint64_t*)(uintptr_t)(ent4 & ~0xFFFULL);
+            l3 = (uint64_t*)(uintptr_t)(ent4 & PG_ADDR_MASK);
             uint64_t *n3 = dup_pt_page(mm, l3);
             if (!n3) return -1;
             l3 = n3;
             mm->pml4[l4i] = ((uint64_t)(uintptr_t)l3) | (ent4 & 0xFFFULL);
         } else {
-            l3 = (uint64_t*)(uintptr_t)(ent4 & ~0xFFFULL);
+            l3 = (uint64_t*)(uintptr_t)(ent4 & PG_ADDR_MASK);
         }
     } else {
         l3 = alloc_pt_page(mm);
@@ -261,11 +261,12 @@ static int mm_map_4k_sharedaware_body(mm_t *mm, uint64_t *share_l4, uint64_t va,
         mm->pml4[l4i] = ((uint64_t)(uintptr_t)l3) | PG_PRESENT | PG_RW | PG_US;
     }
 
-    uint64_t *share_l3 = (uint64_t*)(uintptr_t)(se4 & ~0xFFFULL);
-    uint64_t se3 = share_l3[l3i];
+    uint64_t *share_l3 = (se4 & PG_PRESENT) ?
+        (uint64_t*)(uintptr_t)(se4 & PG_ADDR_MASK) : NULL;
+    uint64_t se3 = share_l3 ? share_l3[l3i] : 0;
     uint64_t ke3 = 0;
     if ((ke4 & PG_PRESENT) && !(ke4 & PG_PS_2M) && pt_page_pa_ok(ke4)) {
-        uint64_t *kl3 = (uint64_t *)(uintptr_t)(ke4 & ~0xFFFULL);
+        uint64_t *kl3 = (uint64_t *)(uintptr_t)(ke4 & PG_ADDR_MASK);
         ke3 = kl3[l3i];
     }
 
@@ -278,7 +279,7 @@ static int mm_map_4k_sharedaware_body(mm_t *mm, uint64_t *share_l4, uint64_t va,
     uint64_t *l2 = NULL;
     if (ent3 & PG_PRESENT) {
         if (!pt_page_pa_ok(ent3)) return -1;
-        l2 = (uint64_t*)(uintptr_t)(ent3 & ~0xFFFULL);
+        l2 = (uint64_t*)(uintptr_t)(ent3 & PG_ADDR_MASK);
         /* Dup L2 if still shared with oldmm or swapper. */
         if (mm_pte_same_pt_page(ent3, se3) || mm_pte_same_pt_page(ent3, ke3)) {
             uint64_t *n2 = dup_pt_page(mm, l2);
@@ -296,15 +297,15 @@ static int mm_map_4k_sharedaware_body(mm_t *mm, uint64_t *share_l4, uint64_t va,
 
     uint64_t *share_l2 = NULL;
     uint64_t se2 = 0;
-    if (!(se3 & PG_PRESENT)) return -1;
-    if (!(se3 & PG_PS_2M)) {
-        share_l2 = (uint64_t *)(uintptr_t)(se3 & ~0xFFFULL);
+    if ((se3 & PG_PRESENT) && !(se3 & PG_PS_2M)) {
+        if (!pt_page_pa_ok(se3)) return -1;
+        share_l2 = (uint64_t *)(uintptr_t)(se3 & PG_ADDR_MASK);
         se2 = share_l2[l2i];
     }
     uint64_t *swapper_l2 = NULL;
     uint64_t ke2 = 0;
     if ((ke3 & PG_PRESENT) && !(ke3 & PG_PS_2M) && pt_page_pa_ok(ke3)) {
-        swapper_l2 = (uint64_t *)(uintptr_t)(ke3 & ~0xFFFULL);
+        swapper_l2 = (uint64_t *)(uintptr_t)(ke3 & PG_ADDR_MASK);
         ke2 = swapper_l2[l2i];
     }
 
@@ -338,7 +339,7 @@ static int mm_map_4k_sharedaware_body(mm_t *mm, uint64_t *share_l4, uint64_t va,
     } else {
         if (!pt_page_pa_ok(ce2)) return -1;
         if (ce2 & PG_PS_2M) return -1;
-        l1 = (uint64_t *)(uintptr_t)(ce2 & ~0xFFFULL);
+        l1 = (uint64_t *)(uintptr_t)(ce2 & PG_ADDR_MASK);
         /*
          * Dup L1 unless this mm already owns it. Pointer inequality vs
          * share_l1 alone missed aliases after partial splits — child
@@ -349,9 +350,9 @@ static int mm_map_4k_sharedaware_body(mm_t *mm, uint64_t *share_l4, uint64_t va,
             uint64_t *share_l1 = NULL;
             uint64_t *swapper_l1 = NULL;
             if (share_l2 && (se2 & PG_PRESENT) && !(se2 & PG_PS_2M) && pt_page_pa_ok(se2))
-                share_l1 = (uint64_t *)(uintptr_t)(se2 & ~0xFFFULL);
+                share_l1 = (uint64_t *)(uintptr_t)(se2 & PG_ADDR_MASK);
             if (swapper_l2 && (ke2 & PG_PRESENT) && !(ke2 & PG_PS_2M) && pt_page_pa_ok(ke2))
-                swapper_l1 = (uint64_t *)(uintptr_t)(ke2 & ~0xFFFULL);
+                swapper_l1 = (uint64_t *)(uintptr_t)(ke2 & PG_ADDR_MASK);
             int need_dup = !mm_owns_pt_page(mm, l1);
             if (share_l1 && (uintptr_t)l1 == (uintptr_t)share_l1)
                 need_dup = 1;
@@ -585,8 +586,8 @@ static int mm_fork_private_pt_path(mm_t *mm, uint64_t *share_l4, uint64_t va,
     uint64_t *l3 = NULL;
     if (ent4 & PG_PRESENT) {
         if (!pt_page_pa_ok(ent4)) return -1;
-        l3 = (uint64_t *)(uintptr_t)(ent4 & ~0xFFFULL);
-        if ((ent4 & ~0xFFFULL) == (se4 & ~0xFFFULL)) {
+        l3 = (uint64_t *)(uintptr_t)(ent4 & PG_ADDR_MASK);
+        if ((ent4 & PG_ADDR_MASK) == (se4 & PG_ADDR_MASK)) {
             uint64_t *n3 = dup_pt_page(mm, l3);
             if (!n3) return -1;
             l3 = n3;
@@ -596,7 +597,7 @@ static int mm_fork_private_pt_path(mm_t *mm, uint64_t *share_l4, uint64_t va,
         return -1;
     }
 
-    uint64_t *share_l3 = (uint64_t *)(uintptr_t)(se4 & ~0xFFFULL);
+    uint64_t *share_l3 = (uint64_t *)(uintptr_t)(se4 & PG_ADDR_MASK);
     uint64_t se3 = share_l3[l3i];
     uint64_t ent3 = l3[l3i];
     if (!(ent3 & PG_PRESENT)) return -1;
@@ -609,9 +610,9 @@ static int mm_fork_private_pt_path(mm_t *mm, uint64_t *share_l4, uint64_t va,
     uint64_t *l2 = NULL;
     if (ent3 & PG_PRESENT) {
         if (!pt_page_pa_ok(ent3)) return -1;
-        l2 = (uint64_t *)(uintptr_t)(ent3 & ~0xFFFULL);
+        l2 = (uint64_t *)(uintptr_t)(ent3 & PG_ADDR_MASK);
         if ((se3 & PG_PRESENT) && !(se3 & PG_PS_2M) && pt_page_pa_ok(se3) &&
-            (ent3 & ~0xFFFULL) == (se3 & ~0xFFFULL)) {
+            (ent3 & PG_ADDR_MASK) == (se3 & PG_ADDR_MASK)) {
             uint64_t *n2 = dup_pt_page(mm, l2);
             if (!n2) return -1;
             l2 = n2;
@@ -623,7 +624,7 @@ static int mm_fork_private_pt_path(mm_t *mm, uint64_t *share_l4, uint64_t va,
 
     uint64_t se2 = 0;
     if ((se3 & PG_PRESENT) && !(se3 & PG_PS_2M) && pt_page_pa_ok(se3)) {
-        uint64_t *share_l2 = (uint64_t *)(uintptr_t)(se3 & ~0xFFFULL);
+        uint64_t *share_l2 = (uint64_t *)(uintptr_t)(se3 & PG_ADDR_MASK);
         se2 = share_l2[l2i];
     }
 
@@ -636,10 +637,10 @@ static int mm_fork_private_pt_path(mm_t *mm, uint64_t *share_l4, uint64_t va,
         return 0;
     }
 
-    uint64_t *l1 = (uint64_t *)(uintptr_t)(ent2 & ~0xFFFULL);
+    uint64_t *l1 = (uint64_t *)(uintptr_t)(ent2 & PG_ADDR_MASK);
     if (!pt_page_pa_ok(ent2)) return -1;
     if ((se2 & PG_PRESENT) && !(se2 & PG_PS_2M) && pt_page_pa_ok(se2) &&
-        (ent2 & ~0xFFFULL) == (se2 & ~0xFFFULL)) {
+        (ent2 & PG_ADDR_MASK) == (se2 & PG_ADDR_MASK)) {
         uint64_t *n1 = dup_pt_page(mm, l1);
         if (!n1) return -1;
         l1 = n1;
@@ -704,6 +705,26 @@ int mm_clear_range_private(mm_t *mm, uint64_t *share_l4, uint64_t va_begin, uint
     return 0;
 }
 
+/* Locate a 4K PTE even when its leaf is non-present. Upper levels must still
+ * be present tables; huge mappings and genuinely absent paths have no PTE. */
+static uint64_t *mm_leaf_pte_direct(uint64_t *l4, uint64_t va) {
+    if (!l4 || va >= (uint64_t)MMIO_IDENTITY_LIMIT)
+        return NULL;
+    uint64_t e4 = l4[(va >> 39) & 0x1FF];
+    if (!(e4 & PG_PRESENT) || (e4 & PG_PS_2M) || !pt_page_pa_ok(e4))
+        return NULL;
+    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
+    uint64_t e3 = l3[(va >> 30) & 0x1FF];
+    if (!(e3 & PG_PRESENT) || (e3 & PG_PS_2M) || !pt_page_pa_ok(e3))
+        return NULL;
+    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
+    uint64_t e2 = l2[(va >> 21) & 0x1FF];
+    if (!(e2 & PG_PRESENT) || (e2 & PG_PS_2M) || !pt_page_pa_ok(e2))
+        return NULL;
+    uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
+    return &l1[(va >> 12) & 0x1FF];
+}
+
 /*
  * Remove user mappings from one mm without modifying page tables shared with
  * the fork parent or swapper.  Linux munmap drops one mapping reference for
@@ -741,16 +762,17 @@ int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
      * VMA.
      */
     /*
-     * Use mm_va_leaf_pa (not mm_user_leaf_pa): mm_demote_user_identity clears
-     * PG_US on the mmap window. Requiring US made unmap a no-op success while
-     * leaving demoted identity leaves mapped — pthread stacks then saw RAM
-     * garbage (musl cancelbuf → #GP on non-canonical rax).
+     * Include both present leaves (including demoted identity mappings) and
+     * non-present owned leaves retained by mprotect(PROT_NONE).
      */
     for (uint64_t va = begin; va < end; ) {
         uint64_t mapped_pa = 0;
         if (mm_va_leaf_pa(mm, va, &mapped_pa) != 0) {
-            va += PAGE_SIZE_4K;
-            continue;
+            uint64_t *pte = mm_leaf_pte_direct(mm->pml4, va);
+            if (!pte || !(*pte & PG_SOFT_OWNED)) {
+                va += PAGE_SIZE_4K;
+                continue;
+            }
         }
         uint64_t *l2 = NULL;
         int l2i = 0;
@@ -779,8 +801,11 @@ int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
     for (uint64_t va = begin; va < end; ) {
         uint64_t mapped_pa = 0;
         if (mm_va_leaf_pa(mm, va, &mapped_pa) != 0) {
-            va += PAGE_SIZE_4K;
-            continue;
+            uint64_t *pte = mm_leaf_pte_direct(mm->pml4, va);
+            if (!pte || !(*pte & PG_SOFT_OWNED)) {
+                va += PAGE_SIZE_4K;
+                continue;
+            }
         }
         uint64_t *l2 = NULL;
         int l2i = 0;
@@ -822,7 +847,7 @@ int mm_unmap_user_range(mm_t *mm, uint64_t *share_l4,
         if (l1) {
             int l1i = (int)((va >> 12) & 0x1FF);
             uint64_t old = l1[l1i];
-            if (old & PG_PRESENT) {
+            if (old & (PG_PRESENT | PG_SOFT_OWNED)) {
                 uint64_t old_pa = old & PG_ADDR_MASK;
                 l1[l1i] = 0;
                 if ((caller_cr3 & ~0xFFFULL) == mm_cr3) {
@@ -889,16 +914,16 @@ static int mm_privatize_identity_range_ex(mm_t *mm, uint64_t va_begin, uint64_t 
             int l1i = (int)((va >> 12) & 0x1FF);
             uint64_t e4 = mm->pml4[l4i];
             if ((e4 & PG_PRESENT) && !(e4 & PG_PS_2M) && pt_page_pa_ok(e4)) {
-                uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
+                uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
                 uint64_t e3 = l3[l3i];
                 if ((e3 & PG_PRESENT) && !(e3 & PG_PS_2M) && pt_page_pa_ok(e3)) {
-                    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
+                    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
                     uint64_t e2 = l2[l2i];
                     if ((e2 & (PG_PRESENT | PG_PS_2M | PG_SOFT_COW)) ==
                         (PG_PRESENT | PG_PS_2M | PG_SOFT_COW))
                         continue;
                     if ((e2 & PG_PRESENT) && !(e2 & PG_PS_2M) && pt_page_pa_ok(e2)) {
-                        uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
+                        uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
                         if (l1[l1i] & PG_SOFT_COW)
                             continue;
                     }
@@ -1015,12 +1040,12 @@ static void mm_release_user_frames(mm_t *mm) {
         uint64_t e4 = l4[l4i];
         if (!(e4 & PG_PRESENT) || !pt_page_pa_ok(e4))
             continue;
-        uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
+        uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
         for (int l3i = 0; l3i < 512; ++l3i) {
             uint64_t e3 = l3[l3i];
             if (!(e3 & PG_PRESENT) || (e3 & PG_PS_2M) || !pt_page_pa_ok(e3))
                 continue;
-            uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
+            uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
             for (int l2i = 0; l2i < 512; ++l2i) {
                 uint64_t e2 = l2[l2i];
                 if (!(e2 & PG_PRESENT))
@@ -1035,11 +1060,13 @@ static void mm_release_user_frames(mm_t *mm) {
                 }
                 if (!pt_page_pa_ok(e2))
                     continue;
-                uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
+                uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
                 for (int l1i = 0; l1i < 512; ++l1i) {
                     uint64_t e1 = l1[l1i];
-                    if ((e1 & (PG_PRESENT | PG_US | PG_SOFT_OWNED)) !=
-                        (PG_PRESENT | PG_US | PG_SOFT_OWNED)) {
+                    /* Ownership survives protection changes: PROT_NONE can
+                     * clear PRESENT and US while retaining the frame address
+                     * and its reference in the software-owned PTE. */
+                    if (!(e1 & PG_SOFT_OWNED)) {
                         if (++progress >= 512u) {
                             progress = 0;
                             mm_leave_direct_map(dm);
@@ -1207,7 +1234,7 @@ int mm_demote_user_identity(mm_t *mm) {
         if (!(e4 & PG_PRESENT) || !pt_page_pa_ok(e4))
             continue;
         if (mm_pte_same_pt_page(e4, ke4)) {
-            uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
+            uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
             uint64_t *n3 = dup_pt_page(mm, l3);
             if (!n3)
                 return -1;
@@ -1215,7 +1242,7 @@ int mm_demote_user_identity(mm_t *mm) {
             e4 = mm->pml4[l4i];
         }
 
-        uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
+        uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
         uint64_t e3 = l3[l3i];
         if (!(e3 & PG_PRESENT) || !pt_page_pa_ok(e3))
             continue;
@@ -1224,11 +1251,11 @@ int mm_demote_user_identity(mm_t *mm) {
 
         uint64_t ke3 = 0;
         if ((ke4 & PG_PRESENT) && !(ke4 & PG_PS_2M) && pt_page_pa_ok(ke4)) {
-            uint64_t *kl3 = (uint64_t *)(uintptr_t)(ke4 & ~0xFFFULL);
+            uint64_t *kl3 = (uint64_t *)(uintptr_t)(ke4 & PG_ADDR_MASK);
             ke3 = kl3[l3i];
         }
         if (mm_pte_same_pt_page(e3, ke3)) {
-            uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
+            uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
             uint64_t *n2 = dup_pt_page(mm, l2);
             if (!n2)
                 return -1;
@@ -1236,7 +1263,7 @@ int mm_demote_user_identity(mm_t *mm) {
             e3 = l3[l3i];
         }
 
-        uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
+        uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
         int l2i_begin = (int)((range_lo >> 21) & 0x1FF);
         int l2i_end = (int)(((range_hi - 1ULL) >> 21) & 0x1FF);
         for (int l2i = l2i_begin; l2i <= l2i_end; l2i++) {
@@ -1263,24 +1290,24 @@ int mm_demote_user_identity(mm_t *mm) {
                 continue;
             uint64_t ke2 = 0;
             if ((ke3 & PG_PRESENT) && !(ke3 & PG_PS_2M) && pt_page_pa_ok(ke3)) {
-                uint64_t *kl2 = (uint64_t *)(uintptr_t)(ke3 & ~0xFFFULL);
+                uint64_t *kl2 = (uint64_t *)(uintptr_t)(ke3 & PG_ADDR_MASK);
                 ke2 = kl2[l2i];
             }
             if (mm_pte_same_pt_page(e2, ke2) ||
-                !mm_owns_pt_page(mm, (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL))) {
-                uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
+                !mm_owns_pt_page(mm, (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK))) {
+                uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
                 uint64_t *n1 = dup_pt_page(mm, l1);
                 if (!n1)
                     return -1;
                 l2[l2i] = ((uint64_t)(uintptr_t)n1) | (e2 & 0xFFFULL);
                 e2 = l2[l2i];
             }
-            uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
+            uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
             for (int i = 0; i < 512; i++) {
                 uint64_t e1 = l1[i];
                 if (!(e1 & PG_PRESENT))
                     continue;
-                uint64_t p1 = e1 & ~0xFFFULL;
+                uint64_t p1 = e1 & PG_ADDR_MASK;
                 uint64_t page_va = va + ((uint64_t)i << 12);
                 if (unmap_identity && p1 == page_va &&
                     page_va >= brk_unmap_lo && page_va < brk_unmap_hi)
@@ -1352,7 +1379,7 @@ static int mm_share_pte_class(uint64_t *share_l4, uint64_t va) {
     int l1i = (int)((va >> 12) & 0x1FF);
     uint64_t se4 = share_l4[l4i];
     if (!(se4 & PG_PRESENT) || !pt_page_pa_ok(se4)) return 0;
-    uint64_t *share_l3 = (uint64_t *)(uintptr_t)(se4 & ~0xFFFULL);
+    uint64_t *share_l3 = (uint64_t *)(uintptr_t)(se4 & PG_ADDR_MASK);
     uint64_t se3 = share_l3[l3i];
     if (!(se3 & PG_PRESENT)) return 0;
     if (se3 & PG_PS_2M) {
@@ -1362,7 +1389,7 @@ static int mm_share_pte_class(uint64_t *share_l4, uint64_t va) {
         }
         return (se3 & PG_RW) ? 2 : 1;
     }
-    uint64_t *share_l2 = (uint64_t *)(uintptr_t)(se3 & ~0xFFFULL);
+    uint64_t *share_l2 = (uint64_t *)(uintptr_t)(se3 & PG_ADDR_MASK);
     uint64_t se2 = share_l2[l2i];
     if (!(se2 & PG_PRESENT)) return 0;
     if (se2 & PG_PS_2M) {
@@ -1372,7 +1399,7 @@ static int mm_share_pte_class(uint64_t *share_l4, uint64_t va) {
         }
         return (se2 & PG_RW) ? 2 : 1;
     }
-    uint64_t *share_l1 = (uint64_t *)(uintptr_t)(se2 & ~0xFFFULL);
+    uint64_t *share_l1 = (uint64_t *)(uintptr_t)(se2 & PG_ADDR_MASK);
     uint64_t se1 = share_l1[l1i];
     if (!(se1 & PG_PRESENT)) return 0;
     if (!(se1 & PG_US)) {
@@ -1390,17 +1417,17 @@ static int mm_share_pte_user_writable(uint64_t *share_l4, uint64_t va) {
     int l1i = (int)((va >> 12) & 0x1FF);
     uint64_t se4 = share_l4[l4i];
     if (!(se4 & PG_PRESENT) || !pt_page_pa_ok(se4)) return 0;
-    uint64_t *share_l3 = (uint64_t *)(uintptr_t)(se4 & ~0xFFFULL);
+    uint64_t *share_l3 = (uint64_t *)(uintptr_t)(se4 & PG_ADDR_MASK);
     uint64_t se3 = share_l3[l3i];
     if (!(se3 & PG_PRESENT)) return 0;
     if (se3 & PG_PS_2M)
         return ((se3 & (PG_US | PG_RW)) == (PG_US | PG_RW));
-    uint64_t *share_l2 = (uint64_t *)(uintptr_t)(se3 & ~0xFFFULL);
+    uint64_t *share_l2 = (uint64_t *)(uintptr_t)(se3 & PG_ADDR_MASK);
     uint64_t se2 = share_l2[l2i];
     if (!(se2 & PG_PRESENT)) return 0;
     if (se2 & PG_PS_2M)
         return ((se2 & (PG_US | PG_RW)) == (PG_US | PG_RW));
-    uint64_t *share_l1 = (uint64_t *)(uintptr_t)(se2 & ~0xFFFULL);
+    uint64_t *share_l1 = (uint64_t *)(uintptr_t)(se2 & PG_ADDR_MASK);
     uint64_t se1 = share_l1[l1i];
     if (!(se1 & PG_PRESENT)) return 0;
     return ((se1 & (PG_US | PG_RW)) == (PG_US | PG_RW));
@@ -1415,7 +1442,7 @@ static int mm_share_pte_user_writable_pa(uint64_t *share_l4, uint64_t va, uint64
     uint64_t off4k = va & 0xFFFULL;
     uint64_t se4 = share_l4[l4i];
     if (!(se4 & PG_PRESENT) || !pt_page_pa_ok(se4)) return 0;
-    uint64_t *share_l3 = (uint64_t *)(uintptr_t)(se4 & ~0xFFFULL);
+    uint64_t *share_l3 = (uint64_t *)(uintptr_t)(se4 & PG_ADDR_MASK);
     uint64_t se3 = share_l3[l3i];
     if (!(se3 & PG_PRESENT)) return 0;
     if (se3 & PG_PS_2M) {
@@ -1426,7 +1453,7 @@ static int mm_share_pte_user_writable_pa(uint64_t *share_l4, uint64_t va, uint64
         if (out_flags) *out_flags = se3;
         return 1;
     }
-    uint64_t *share_l2 = (uint64_t *)(uintptr_t)(se3 & ~0xFFFULL);
+    uint64_t *share_l2 = (uint64_t *)(uintptr_t)(se3 & PG_ADDR_MASK);
     uint64_t se2 = share_l2[l2i];
     if (!(se2 & PG_PRESENT)) return 0;
     if (se2 & PG_PS_2M) {
@@ -1436,7 +1463,7 @@ static int mm_share_pte_user_writable_pa(uint64_t *share_l4, uint64_t va, uint64
         if (out_flags) *out_flags = se2;
         return 1;
     }
-    uint64_t *share_l1 = (uint64_t *)(uintptr_t)(se2 & ~0xFFFULL);
+    uint64_t *share_l1 = (uint64_t *)(uintptr_t)(se2 & PG_ADDR_MASK);
     uint64_t se1 = share_l1[l1i];
     if (!(se1 & PG_PRESENT)) return 0;
     if ((se1 & (PG_US | PG_RW)) != (PG_US | PG_RW)) return 0;
@@ -1457,13 +1484,13 @@ static int mm_share_pte_user_cowable_pa(uint64_t *share_l4, uint64_t va,
     int l1i = (int)((va >> 12) & 0x1FF);
     uint64_t se4 = share_l4[l4i];
     if (!(se4 & PG_PRESENT) || !pt_page_pa_ok(se4)) return 0;
-    uint64_t *share_l3 = (uint64_t *)(uintptr_t)(se4 & ~0xFFFULL);
+    uint64_t *share_l3 = (uint64_t *)(uintptr_t)(se4 & PG_ADDR_MASK);
     uint64_t se3 = share_l3[l3i];
     if (!(se3 & PG_PRESENT) || (se3 & PG_PS_2M) || !pt_page_pa_ok(se3)) return 0;
-    uint64_t *share_l2 = (uint64_t *)(uintptr_t)(se3 & ~0xFFFULL);
+    uint64_t *share_l2 = (uint64_t *)(uintptr_t)(se3 & PG_ADDR_MASK);
     uint64_t se2 = share_l2[l2i];
     if (!(se2 & PG_PRESENT) || (se2 & PG_PS_2M) || !pt_page_pa_ok(se2)) return 0;
-    uint64_t *share_l1 = (uint64_t *)(uintptr_t)(se2 & ~0xFFFULL);
+    uint64_t *share_l1 = (uint64_t *)(uintptr_t)(se2 & PG_ADDR_MASK);
     uint64_t se1 = share_l1[l1i];
     if ((se1 & (PG_PRESENT | PG_US | PG_SOFT_COW | PG_RW)) !=
         (PG_PRESENT | PG_US | PG_SOFT_COW))
@@ -1505,7 +1532,7 @@ static int mm_mark_share_user_readonly_page(mm_t *owner, uint64_t *share_l4,
 
     uint64_t se4 = share_l4[l4i];
     if (!(se4 & PG_PRESENT) || !pt_page_pa_ok(se4)) return 0;
-    uint64_t *share_l3 = (uint64_t *)(uintptr_t)(se4 & ~0xFFFULL);
+    uint64_t *share_l3 = (uint64_t *)(uintptr_t)(se4 & PG_ADDR_MASK);
     uint64_t se3 = share_l3[l3i];
     if (!(se3 & PG_PRESENT)) return 0;
     if (se3 & PG_PS_2M) {
@@ -1515,7 +1542,7 @@ static int mm_mark_share_user_readonly_page(mm_t *owner, uint64_t *share_l4,
     }
     if (!pt_page_pa_ok(se3) || (se3 & PG_PS_2M)) return -1;
 
-    uint64_t *share_l2 = (uint64_t *)(uintptr_t)(se3 & ~0xFFFULL);
+    uint64_t *share_l2 = (uint64_t *)(uintptr_t)(se3 & PG_ADDR_MASK);
     uint64_t se2 = share_l2[l2i];
     if (!(se2 & PG_PRESENT)) return 0;
     if (se2 & PG_PS_2M) {
@@ -1525,7 +1552,7 @@ static int mm_mark_share_user_readonly_page(mm_t *owner, uint64_t *share_l4,
     }
     if (!pt_page_pa_ok(se2) || (se2 & PG_PS_2M)) return -1;
 
-    uint64_t *share_l1 = (uint64_t *)(uintptr_t)(se2 & ~0xFFFULL);
+    uint64_t *share_l1 = (uint64_t *)(uintptr_t)(se2 & PG_ADDR_MASK);
     uint64_t se1 = share_l1[l1i];
     if (allow_identity_cow &&
         (se1 & (PG_PRESENT | PG_US | PG_RW | PG_SOFT_OWNED)) ==
@@ -1611,10 +1638,10 @@ int mm_cow_restore_user_writable(mm_t *mm, uint64_t va_begin, uint64_t va_end) {
         int l1i = (int)((va >> 12) & 0x1FF);
         uint64_t e4 = l4[l4i];
         if (!(e4 & PG_PRESENT) || !pt_page_pa_ok(e4)) continue;
-        uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
+        uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
         uint64_t e3 = l3[l3i];
         if (!(e3 & PG_PRESENT) || (e3 & PG_PS_2M) || !pt_page_pa_ok(e3)) continue;
-        uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
+        uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
         uint64_t e2 = l2[l2i];
         if (!(e2 & PG_PRESENT)) continue;
         if (e2 & PG_PS_2M) {
@@ -1625,7 +1652,7 @@ int mm_cow_restore_user_writable(mm_t *mm, uint64_t va_begin, uint64_t va_end) {
             continue;
         }
         if (!pt_page_pa_ok(e2)) continue;
-        uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
+        uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
         uint64_t e1 = l1[l1i];
         if ((e1 & (PG_PRESENT | PG_US | PG_SOFT_COW)) !=
             (PG_PRESENT | PG_US | PG_SOFT_COW))
@@ -1727,6 +1754,33 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
                                   uint64_t va, uint64_t parent_pa,
                                   uint64_t parent_pte, int protect_parent,
                                   int shared_hint, int private_vma_hint) {
+    if (!(parent_pte & PG_PRESENT) && (parent_pte & PG_SOFT_OWNED)) {
+        /* PROT_NONE still owns its frame. Duplicate that reference without
+         * making either PTE accessible. Private peers must COW even if the
+         * protection is only made writable after the fork. */
+        int shared = parent && shared_hint;
+        uint64_t pa = parent_pa & PG_ADDR_MASK;
+        uint64_t *parent_slot = mm_leaf_pte_direct(parent_l4, va);
+        uint64_t *child_slot;
+        uint64_t protected_pte = parent_pte & ~(PG_PRESENT | PG_US | PG_RW);
+        if (!parent_slot || *parent_slot != parent_pte || frame_retain(pa) != 0)
+            return -1;
+        if (shared)
+            protected_pte &= ~PG_SOFT_COW;
+        else
+            protected_pte |= PG_SOFT_COW;
+        if (mm_map_user_page(child, va, pa, protected_pte & ~PG_ADDR_MASK) != 0) {
+            frame_release(pa);
+            return -1;
+        }
+        child_slot = mm_leaf_pte_direct(child->pml4, va);
+        if (!child_slot)
+            return -1; /* mapped reference is reclaimed with the child mm */
+        *child_slot = protected_pte;
+        if (!shared && protect_parent)
+            *parent_slot = protected_pte;
+        return 0;
+    }
     /*
      * shared_hint comes from the fork snapshot probe (MV_SNAP_SHARED) computed
      * once per page BESIDE the walk, not from a fresh O(USER_VMA_MAX=4096) scan
@@ -1998,7 +2052,7 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
         uint64_t e4 = parent_l4[l4i];
         if (!(e4 & PG_PRESENT) || !pt_page_pa_ok(e4))
             continue;
-        uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
+        uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
         for (int l3i = 0; l3i < 512; ++l3i) {
             uint64_t va_l3 = ((uint64_t)l4i << 39) | ((uint64_t)l3i << 30);
             if (va_l3 >= limit) {
@@ -2008,7 +2062,7 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
             uint64_t e3 = l3[l3i];
             if (!(e3 & PG_PRESENT) || (e3 & PG_PS_2M) || !pt_page_pa_ok(e3))
                 continue;
-            uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
+            uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
             for (int l2i = 0; l2i < 512; ++l2i) {
                 uint64_t va_l2 = va_l3 | ((uint64_t)l2i << 21);
                 if (va_l2 < 0x200000ULL || va_l2 >= limit)
@@ -2106,14 +2160,15 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                             continue;
                     }
                 }
-                uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
+                uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
                 for (int l1i = 0; l1i < 512; ++l1i) {
                     uint64_t va = va_l2 | ((uint64_t)l1i << 12);
                     if (va < 0x200000ULL || va >= limit)
                         continue;
                     uint64_t e1 = l1[l1i];
                     if ((e1 & (PG_PRESENT | PG_US)) !=
-                        (PG_PRESENT | PG_US))
+                        (PG_PRESENT | PG_US) &&
+                        ((e1 & (PG_PRESENT | PG_SOFT_OWNED)) != PG_SOFT_OWNED))
                         continue;
                     uint64_t pa = e1 & PG_ADDR_MASK;
                     if (pa >= (uint64_t)MMIO_IDENTITY_LIMIT || !pt_page_pa_ok(e1))
@@ -2367,14 +2422,14 @@ static int mm_cow_private_writable_impl(mm_t *mm, uint64_t *share_l4, uint64_t v
             int l2i = (int)((va >> 21) & 0x1FF);
             uint64_t se4 = share_l4[l4i];
             if (se4 & PG_PRESENT) {
-                uint64_t *l3 = (uint64_t *)(uintptr_t)(se4 & ~0xFFFULL);
+                uint64_t *l3 = (uint64_t *)(uintptr_t)(se4 & PG_ADDR_MASK);
                 uint64_t se3 = l3[l3i];
                 if ((se3 & PG_PRESENT) && (se3 & PG_PS_2M)) {
                     va = (va & ~((uint64_t)PAGE_SIZE_2M - 1)) + PAGE_SIZE_2M;
                     continue;
                 }
                 if (se3 & PG_PRESENT && !(se3 & PG_PS_2M)) {
-                    uint64_t *l2 = (uint64_t *)(uintptr_t)(se3 & ~0xFFFULL);
+                    uint64_t *l2 = (uint64_t *)(uintptr_t)(se3 & PG_ADDR_MASK);
                     uint64_t se2 = l2[l2i];
                     if ((se2 & PG_PRESENT) && (se2 & PG_PS_2M)) {
                         va = (va & ~((uint64_t)PAGE_SIZE_2M - 1)) + PAGE_SIZE_2M;
@@ -2519,7 +2574,7 @@ static int mm_active_pte_flags(uint64_t va, uint64_t *flags_out) {
     int l1i = (int)((va >> 12) & 0x1FF);
     uint64_t e4 = l4[l4i];
     if (!(e4 & PG_PRESENT) || !pt_page_pa_ok(e4)) return -1;
-    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
+    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
     uint64_t e3 = l3[l3i];
     if (!(e3 & PG_PRESENT)) return -1;
     if (e3 & PG_PS_2M) {
@@ -2527,7 +2582,7 @@ static int mm_active_pte_flags(uint64_t va, uint64_t *flags_out) {
         return 0;
     }
     if (!pt_page_pa_ok(e3)) return -1;
-    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
+    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
     uint64_t e2 = l2[l2i];
     if (!(e2 & PG_PRESENT)) return -1;
     if (e2 & PG_PS_2M) {
@@ -2535,7 +2590,7 @@ static int mm_active_pte_flags(uint64_t va, uint64_t *flags_out) {
         return 0;
     }
     if (!pt_page_pa_ok(e2)) return -1;
-    uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
+    uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
     *flags_out = l1[l1i];
     return (*flags_out & PG_PRESENT) ? 0 : -1;
 }
@@ -2551,7 +2606,7 @@ static int mm_split_huge_leaf_for_va(mm_t *mm, uint64_t va) {
     uint64_t e4 = mm->pml4[l4i];
     if (!(e4 & PG_PRESENT) || (e4 & PG_PS_2M) || !pt_page_pa_ok(e4))
         return -1;
-    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
+    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
     uint64_t e3 = l3[l3i];
     if (!(e3 & PG_PRESENT))
         return -1;
@@ -2562,7 +2617,7 @@ static int mm_split_huge_leaf_for_va(mm_t *mm, uint64_t va) {
     }
     if (!pt_page_pa_ok(e3) || (e3 & PG_PS_2M))
         return -1;
-    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
+    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
     uint64_t e2 = l2[l2i];
     if (!(e2 & PG_PRESENT))
         return -1;
@@ -2843,22 +2898,22 @@ static int mm_va_has_private_4k(mm_t *mm, uint64_t *share_l4, uint64_t va) {
     int l1i = (int)((va >> 12) & 0x1FF);
     uint64_t e4 = mm->pml4[l4i];
     if (!(e4 & PG_PRESENT) || (e4 & PG_PS_2M) || !pt_page_pa_ok(e4)) return 0;
-    if ((e4 & ~0xFFFULL) == (share_l4[l4i] & ~0xFFFULL)) return 0;
-    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
+    if ((e4 & PG_ADDR_MASK) == (share_l4[l4i] & PG_ADDR_MASK)) return 0;
+    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
     uint64_t e3 = l3[l3i];
     if (!(e3 & PG_PRESENT) || (e3 & PG_PS_2M) || !pt_page_pa_ok(e3)) return 0;
     uint64_t se4 = share_l4[l4i];
     if ((se4 & PG_PRESENT) && pt_page_pa_ok(se4) && !(se4 & PG_PS_2M)) {
-        uint64_t *sl3 = (uint64_t *)(uintptr_t)(se4 & ~0xFFFULL);
+        uint64_t *sl3 = (uint64_t *)(uintptr_t)(se4 & PG_ADDR_MASK);
         uint64_t se3 = sl3[l3i];
         if ((se3 & PG_PRESENT) && !(se3 & PG_PS_2M) &&
-            (e3 & ~0xFFFULL) == (se3 & ~0xFFFULL))
+            (e3 & PG_ADDR_MASK) == (se3 & PG_ADDR_MASK))
             return 0;
     }
-    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
+    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
     uint64_t e2 = l2[l2i];
     if (!(e2 & PG_PRESENT) || (e2 & PG_PS_2M) || !pt_page_pa_ok(e2)) return 0;
-    uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
+    uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
     uint64_t e1 = l1[l1i];
     if (!(e1 & PG_PRESENT) || !pt_page_pa_ok(e1)) return 0;
     /* Identity leaf still has pa == va; real private backing does not. */
@@ -2871,13 +2926,13 @@ static int mm_va_has_private_4k(mm_t *mm, uint64_t *share_l4, uint64_t va) {
     {
         uint64_t se4b = share_l4[l4i];
         if ((se4b & PG_PRESENT) && pt_page_pa_ok(se4b) && !(se4b & PG_PS_2M)) {
-            uint64_t *sl3 = (uint64_t *)(uintptr_t)(se4b & ~0xFFFULL);
+            uint64_t *sl3 = (uint64_t *)(uintptr_t)(se4b & PG_ADDR_MASK);
             uint64_t se3 = sl3[l3i];
             if ((se3 & PG_PRESENT) && !(se3 & PG_PS_2M) && pt_page_pa_ok(se3)) {
-                uint64_t *sl2 = (uint64_t *)(uintptr_t)(se3 & ~0xFFFULL);
+                uint64_t *sl2 = (uint64_t *)(uintptr_t)(se3 & PG_ADDR_MASK);
                 uint64_t se2 = sl2[l2i];
                 if ((se2 & PG_PRESENT) && !(se2 & PG_PS_2M) && pt_page_pa_ok(se2)) {
-                    uint64_t *sl1 = (uint64_t *)(uintptr_t)(se2 & ~0xFFFULL);
+                    uint64_t *sl1 = (uint64_t *)(uintptr_t)(se2 & PG_ADDR_MASK);
                     uint64_t se1 = sl1[l1i];
                     if ((se1 & PG_PRESENT) && pt_page_pa_ok(se1) &&
                         (se1 & PG_ADDR_MASK) == (e1 & PG_ADDR_MASK))
@@ -2905,7 +2960,7 @@ int mm_va_leaf_pa(mm_t *mm, uint64_t va, uint64_t *pa_out) {
     int l1i = (int)((va >> 12) & 0x1FF);
     uint64_t e4 = mm->pml4[l4i];
     if (!(e4 & PG_PRESENT) || (e4 & PG_PS_2M) || !pt_page_pa_ok(e4)) return -1;
-    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
+    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
     uint64_t e3 = l3[l3i];
     if (!(e3 & PG_PRESENT) || (e3 & PG_PS_2M) || !pt_page_pa_ok(e3)) {
         /* 2MiB/1GiB leaf: PA == aligned VA for identity. */
@@ -2915,7 +2970,7 @@ int mm_va_leaf_pa(mm_t *mm, uint64_t va, uint64_t *pa_out) {
         }
         return -1;
     }
-    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
+    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
     uint64_t e2 = l2[l2i];
     if (!(e2 & PG_PRESENT) || !pt_page_pa_ok(e2)) return -1;
     if (e2 & PG_PS_2M) {
@@ -2924,7 +2979,7 @@ int mm_va_leaf_pa(mm_t *mm, uint64_t va, uint64_t *pa_out) {
         *pa_out &= ~0xFFFULL;
         return 0;
     }
-    uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
+    uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
     uint64_t e1 = l1[l1i];
     if (!(e1 & PG_PRESENT) || !pt_page_pa_ok(e1)) return -1;
     *pa_out = e1 & PG_ADDR_MASK;
@@ -2939,7 +2994,7 @@ static int mm_va_leaf_entry_direct(mm_t *mm, uint64_t va,
     uint64_t e4 = mm->pml4[(va >> 39) & 0x1FF];
     if (!(e4 & PG_PRESENT) || (e4 & PG_PS_2M) || !pt_page_pa_ok(e4))
         return -1;
-    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
+    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
     uint64_t e3 = l3[(va >> 30) & 0x1FF];
     if (!(e3 & PG_PRESENT))
         return -1;
@@ -2949,7 +3004,7 @@ static int mm_va_leaf_entry_direct(mm_t *mm, uint64_t va,
     }
     if (!pt_page_pa_ok(e3))
         return -1;
-    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
+    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
     uint64_t e2 = l2[(va >> 21) & 0x1FF];
     if (!(e2 & PG_PRESENT))
         return -1;
@@ -2959,7 +3014,7 @@ static int mm_va_leaf_entry_direct(mm_t *mm, uint64_t va,
     }
     if (!pt_page_pa_ok(e2))
         return -1;
-    uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
+    uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
     uint64_t e1 = l1[(va >> 12) & 0x1FF];
     if (!(e1 & PG_PRESENT))
         return -1;
@@ -2982,7 +3037,7 @@ static int mm_user_leaf_pa_direct(mm_t *mm, uint64_t va, int write,
     if ((e4 & (PG_PRESENT | PG_US)) != (PG_PRESENT | PG_US) ||
         (write && !(e4 & PG_RW)) || !pt_page_pa_ok(e4))
         return -1;
-    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
+    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
     uint64_t e3 = l3[(va >> 30) & 0x1FF];
     if ((e3 & (PG_PRESENT | PG_US)) != (PG_PRESENT | PG_US) ||
         (write && !(e3 & PG_RW)))
@@ -2993,7 +3048,7 @@ static int mm_user_leaf_pa_direct(mm_t *mm, uint64_t va, int write,
     }
     if (!pt_page_pa_ok(e3))
         return -1;
-    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
+    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
     uint64_t e2 = l2[(va >> 21) & 0x1FF];
     if ((e2 & (PG_PRESENT | PG_US)) != (PG_PRESENT | PG_US) ||
         (write && !(e2 & PG_RW)))
@@ -3005,7 +3060,7 @@ static int mm_user_leaf_pa_direct(mm_t *mm, uint64_t va, int write,
     }
     if (!pt_page_pa_ok(e2))
         return -1;
-    uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
+    uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
     uint64_t e1 = l1[(va >> 12) & 0x1FF];
     if ((e1 & (PG_PRESENT | PG_US)) != (PG_PRESENT | PG_US) ||
         (write && !(e1 & PG_RW)))
@@ -3240,6 +3295,10 @@ int mm_copy_from_user(mm_t *mm, void *dst, uint64_t src, size_t len) {
     return 0;
 }
 
+static int mm_pte_is_present_cow(uint64_t pte) {
+    return (pte & (PG_PRESENT | PG_SOFT_COW)) == (PG_PRESENT | PG_SOFT_COW);
+}
+
 static int mm_make_private_range_impl(mm_t *mm, uint64_t va_begin, uint64_t va_end, int copy_old,
                           mm_t *share_cmp_mm, int no_yield, int no_zero) {
     if (!mm || !mm->pml4) return -1;
@@ -3309,17 +3368,17 @@ static int mm_make_private_range_impl(mm_t *mm, uint64_t va_begin, uint64_t va_e
             int l1i = (int)((va >> 12) & 0x1FF);
             uint64_t e4 = mm->pml4[l4i];
             if ((e4 & PG_PRESENT) && !(e4 & PG_PS_2M) && pt_page_pa_ok(e4)) {
-                uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
+                uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
                 uint64_t e3 = l3[l3i];
                 if ((e3 & PG_PRESENT) && !(e3 & PG_PS_2M) && pt_page_pa_ok(e3)) {
-                    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
+                    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
                     uint64_t e2 = l2[l2i];
                     if ((e2 & (PG_PRESENT | PG_PS_2M | PG_SOFT_COW)) ==
                         (PG_PRESENT | PG_PS_2M | PG_SOFT_COW))
                         continue;
                     if ((e2 & PG_PRESENT) && !(e2 & PG_PS_2M) && pt_page_pa_ok(e2)) {
-                        uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
-                        if (l1[l1i] & PG_SOFT_COW)
+                        uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
+                        if (mm_pte_is_present_cow(l1[l1i]))
                             continue;
                     }
                 }
@@ -3522,7 +3581,7 @@ static int mm_dbg_ash_leaf_flags(mm_t *mm, uint64_t va, uint64_t *pa_out,
     uint64_t e4 = mm->pml4[l4i];
     if (!(e4 & PG_PRESENT) || (e4 & PG_PS_2M) || !pt_page_pa_ok(e4))
         return -1;
-    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xFFFULL);
+    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
     uint64_t e3 = l3[l3i];
     if (!(e3 & PG_PRESENT) || !pt_page_pa_ok(e3))
         return -1;
@@ -3534,7 +3593,7 @@ static int mm_dbg_ash_leaf_flags(mm_t *mm, uint64_t va, uint64_t *pa_out,
         if (is_2m_out) *is_2m_out = 1;
         return 0;
     }
-    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xFFFULL);
+    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
     uint64_t e2 = l2[l2i];
     if (!(e2 & PG_PRESENT) || !pt_page_pa_ok(e2))
         return -1;
@@ -3546,7 +3605,7 @@ static int mm_dbg_ash_leaf_flags(mm_t *mm, uint64_t va, uint64_t *pa_out,
         if (is_2m_out) *is_2m_out = 1;
         return 0;
     }
-    uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xFFFULL);
+    uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
     uint64_t e1 = l1[l1i];
     if (!(e1 & PG_PRESENT) || !pt_page_pa_ok(e1))
         return -1;

@@ -16,6 +16,7 @@
 #include <string.h>
 #include <stddef.h>
 #include <vga.h>
+#include <spinlock.h>
 
 #if defined(__GNUC__) || defined(__clang__)
 #define vmwgfx_io_barrier() __asm__ volatile("" ::: "memory")
@@ -80,6 +81,8 @@ enum svga_fifo {
 
 static int g_upd_pending;
 static uint32_t g_upd_x0, g_upd_y0, g_upd_x1, g_upd_y1;
+/* Protect damage, FIFO producer state and indexed register accesses at runtime. */
+static spinlock_t g_vmwgfx_lock = { 0 };
 
 typedef struct {
 	uint8_t bus;
@@ -903,37 +906,48 @@ static void vmwgfx_shutdown(video_device_t *dev) {
 
 static void vmwgfx_flush_region(video_device_t *dev, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 	(void)dev;
+	unsigned long flags;
+	acquire_irqsave(&g_vmwgfx_lock, &flags);
 	if (!g_vmwgfx.present || !g_vmwgfx.fifo_va || !g_vmwgfx.scanout_on)
-		return;
+		goto out;
 	if (w == 0 || h == 0)
-		return;
+		goto out;
 	uint32_t fw = g_vmwgfx.width;
 	uint32_t fh = g_vmwgfx.height;
 	if (fw == 0 || fh == 0)
-		return;
+		goto out;
 	if (x >= fw || y >= fh)
-		return;
-	if (x + w > fw)
+		goto out;
+	if (w > fw - x)
 		w = fw - x;
-	if (y + h > fh)
+	if (h > fh - y)
 		h = fh - y;
 	vmwgfx_fifo_submit_update(&g_vmwgfx, x, y, w, h);
+out:
+	release_irqrestore(&g_vmwgfx_lock, flags);
 }
 
 static void vmwgfx_display_sync(video_device_t *dev) {
 	(void)dev;
-	if (!g_vmwgfx.present || !g_vmwgfx.scanout_on)
-		return;
-	(void)vmwgfx_fifo_flush_pending_update(&g_vmwgfx);
-	svga_reg_write32(&g_vmwgfx, SVGA_REG_SYNC, 1);
-	vmwgfx_io_barrier();
+	unsigned long flags;
+	acquire_irqsave(&g_vmwgfx_lock, &flags);
+	if (g_vmwgfx.present && g_vmwgfx.scanout_on) {
+		(void)vmwgfx_fifo_flush_pending_update(&g_vmwgfx);
+		svga_reg_write32(&g_vmwgfx, SVGA_REG_SYNC, 1);
+		vmwgfx_io_barrier();
+	}
+	release_irqrestore(&g_vmwgfx_lock, flags);
 }
 
 static int vmwgfx_set_mode(video_device_t *dev, uint32_t width, uint32_t height, uint32_t bpp) {
 	(void)dev;
 	if (bpp != 32)
 		return -1;
-	if (svga_try_mode(&g_vmwgfx, width, height, 1) != 0)
+	unsigned long flags;
+	acquire_irqsave(&g_vmwgfx_lock, &flags);
+	int result = svga_try_mode(&g_vmwgfx, width, height, 1);
+	release_irqrestore(&g_vmwgfx_lock, flags);
+	if (result != 0)
 		return -1;
 	return 0;
 }

@@ -185,6 +185,10 @@ typedef struct thread {
         mm_t *mm_ptemplate;
         /* Unix-like static scheduling weight: -20 (high) .. 19 (low). Default 0. */
         int nice;
+        /* Linux sched_getscheduler/sched_setattr policy (SCHED_OTHER by default). */
+        int sched_policy;
+        /* Linux I/O priority (ioprio_get/set), default IOPRIO_CLASS_NONE. */
+        uint16_t ioprio;
         /* Monotonic ticket when entering THREAD_READY; lower runs earlier at same priority. */
         uint32_t sched_fifo_seq;
         /* CFS-like weighted runtime. Scheduler picks the smallest value;

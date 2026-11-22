@@ -8,11 +8,15 @@
 #include <heap.h>
 #include <stat.h>
 #include <thread.h>
+#include <process.h>
 #include <vga.h>
 #include <spinlock.h>
 #include <klog.h>
 #include <timekeeping.h>
 #include <xattr.h>
+#include <ns.h>
+#include <pmm.h>
+#include <ram_page_pool.h>
 
 #ifndef ENODATA
 #define ENODATA 61
@@ -41,6 +45,25 @@
 #ifndef EACCES
 #define EACCES 13
 #endif
+#ifndef EFAULT
+#define EFAULT 14
+#endif
+#ifndef EXDEV
+#define EXDEV 18
+#endif
+
+#define RAMFS_DATA_CHUNK_SIZE 4096u
+#define RAMFS_CHUNKIFY_THRESHOLD (1u * 1024u * 1024u)
+
+struct ramfs_data_chunk {
+    size_t index;
+    char *data;
+    int from_pmm;
+#if defined(AXON_EXPERIMENTAL_DIRECT_MAP) && AXON_EXPERIMENTAL_DIRECT_MAP
+    struct ram_page high_page;
+#endif
+    struct ramfs_data_chunk *next;
+};
 
 struct ramfs_xattr {
     char *name;
@@ -52,10 +75,15 @@ struct ramfs_xattr {
 struct ramfs_node {
     char *name;
     int is_dir;
+    int is_memfd;
     char *data;
     int data_borrowed;
     size_t size;
     size_t capacity;
+    int chunked;
+    struct ramfs_data_chunk *chunks;
+    struct ramfs_data_chunk *chunks_tail;
+    struct ramfs_data_chunk *chunks_cursor;
     /* Serialize read/write/size for this file (SMP + kernel klog vs userspace write). */
     spinlock_t io_lock;
     unsigned long ino;
@@ -127,6 +155,14 @@ static thread_t *ramfs_cred(void)
     return thread_current();
 }
 
+static int ramfs_capable(thread_t *task, unsigned capability)
+{
+    if (!task) return 1; /* kernel-originated maintenance */
+    if (task->process)
+        return process_has_cap(task->process, capability);
+    return task->euid == 0;
+}
+
 static void ramfs_set_create_owner(struct ramfs_node *n)
 {
     thread_t *ct = ramfs_cred();
@@ -171,7 +207,7 @@ static int ramfs_dir_writable(struct ramfs_node *dir, thread_t *ct)
     mode_t m;
     if (!dir)
         return 0;
-    if (!ct || ct->euid == 0)
+    if (!ct || ramfs_capable(ct, AXON_CAP_DAC_OVERRIDE))
         return 1;
     m = dir->mode;
     if (ct->euid == dir->uid && (m & 0200))
@@ -188,7 +224,7 @@ static int ramfs_may_unlink_node(struct ramfs_node *parent, struct ramfs_node *n
     if (!n || !ramfs_dir_writable(parent, ct))
         return 0;
     /* Sticky bit: only file owner, directory owner, or root. */
-    if ((parent->mode & 01000) && ct && ct->euid != 0 &&
+    if ((parent->mode & 01000) && ct && !ramfs_capable(ct, AXON_CAP_FOWNER) &&
         ct->euid != n->uid && ct->euid != parent->uid)
         return 0;
     return 1;
@@ -370,9 +406,13 @@ int ramfs_link_open_file(struct fs_file *file, const char *newpath)
 {
     struct ramfs_file_handle *fh;
     struct ramfs_node *target;
+    char normalized[512];
 
     if (!file || !newpath || newpath[0] != '/')
         return -1;
+    if (fs_resolve_parent_path(newpath, normalized, sizeof(normalized)) != 0)
+        return -1;
+    newpath = normalized;
     /* ramfs/tmpfs only — overlay wraps a different driver_private. */
     if (file->fs_private != ramfs_root || !file->driver_private)
         return -1;
@@ -382,6 +422,8 @@ int ramfs_link_open_file(struct fs_file *file, const char *newpath)
     target = fh->node;
     if (!target)
         return -2;
+    if (target->is_memfd)
+        return -EXDEV;
     return ramfs_link_inode(target, newpath);
 }
 
@@ -395,6 +437,50 @@ static void ramfs_file_set_backing(struct fs_file *f, struct ramfs_node *n)
         return;
     f->backing_id = PAGECACHE_ID_RAMFS(n->ino);
     f->backing_gen = n->generation;
+}
+
+struct fs_file *ramfs_create_memfd(const char *name)
+{
+    struct ramfs_node *n;
+    struct ramfs_file_handle *fh;
+    struct fs_file *f;
+    char *path;
+    size_t len;
+
+    if (!name || !ramfs_root)
+        return NULL;
+    len = strlen(name);
+    n = ramfs_alloc_node(name, 0);
+    if (!n)
+        return NULL;
+    f = (struct fs_file *)kmalloc(sizeof(*f));
+    fh = (struct ramfs_file_handle *)kmalloc(sizeof(*fh));
+    path = (char *)kmalloc(len + sizeof("/memfd: (deleted)"));
+    if (!f || !fh || !path) {
+        if (path) kfree(path);
+        if (fh) kfree(fh);
+        if (f) kfree(f);
+        ramfs_free_node_shallow(n);
+        return NULL;
+    }
+    snprintf(path, len + sizeof("/memfd: (deleted)"), "/memfd:%s (deleted)", name);
+    memset(f, 0, sizeof(*f));
+    ramfs_set_create_owner(n);
+    n->mode = S_IFREG | 0777;
+    n->nlink = 0;
+    n->open_count = 1;
+    n->is_memfd = 1;
+    fh->node = n;
+    f->path = path;
+    f->fs_private = ramfs_driver.driver_data;
+    f->driver_private = fh;
+    f->type = FS_TYPE_REG;
+    f->inode_kind_known = 1;
+    f->refcount = 1;
+    f->flags = 2; /* O_RDWR */
+    f->is_memfd = 1;
+    ramfs_file_set_backing(f, n);
+    return f;
 }
 
 /*
@@ -436,10 +522,228 @@ static void ramfs_inode_changed(struct ramfs_node *n)
     pagecache_invalidate(PAGECACHE_ID_RAMFS(n->ino), n->generation);
 }
 
+static int ramfs_chunk_alloc_data(struct ramfs_data_chunk *chunk)
+{
+#if defined(AXON_EXPERIMENTAL_DIRECT_MAP) && AXON_EXPERIMENTAL_DIRECT_MAP
+    /* Experimental only: preserve the PA/VA/generation handle so freeing
+     * never passes a high direct-map pointer to the identity-mapped PMM. */
+    if (ramfs_high_page_alloc(&chunk->high_page) == 0) {
+        chunk->data = chunk->high_page.va;
+        chunk->from_pmm = 2;
+    }
+#endif
+    if (!chunk->data && pmm_ready()) {
+        chunk->data = (char *)pmm_alloc_page();
+        if (chunk->data)
+            chunk->from_pmm = 1;
+    }
+    /* The object heap is reserved separately from PMM. If the page pool is
+     * exhausted, its remaining space is still usable, and vice versa. */
+    if (!chunk->data) {
+        chunk->data = (char *)kmalloc(RAMFS_DATA_CHUNK_SIZE);
+        chunk->from_pmm = 0;
+    }
+    if (!chunk->data)
+        return -ENOMEM;
+    memset(chunk->data, 0, RAMFS_DATA_CHUNK_SIZE);
+    return 0;
+}
+
+static void ramfs_chunk_list_free(struct ramfs_data_chunk *chunk)
+{
+    while (chunk) {
+        struct ramfs_data_chunk *next = chunk->next;
+        if (chunk->data) {
+#if defined(AXON_EXPERIMENTAL_DIRECT_MAP) && AXON_EXPERIMENTAL_DIRECT_MAP
+            if (chunk->from_pmm == 2)
+                (void)ramfs_high_page_free(chunk->high_page);
+            else
+#endif
+            if (chunk->from_pmm)
+                pmm_free_page(chunk->data);
+            else
+                kfree(chunk->data);
+        }
+        kfree(chunk);
+        chunk = next;
+    }
+}
+
+static struct ramfs_data_chunk *ramfs_chunk_find(struct ramfs_node *n, size_t index)
+{
+    struct ramfs_data_chunk *chunk;
+    if (!n)
+        return NULL;
+    chunk = (n->chunks_cursor && n->chunks_cursor->index <= index)
+            ? n->chunks_cursor : n->chunks;
+    for (; chunk; chunk = chunk->next) {
+        if (chunk->index == index) {
+            n->chunks_cursor = chunk;
+            return chunk;
+        }
+        if (chunk->index > index)
+            break;
+    }
+    return NULL;
+}
+
+static struct ramfs_data_chunk *ramfs_chunk_get(struct ramfs_node *n, size_t index)
+{
+    struct ramfs_data_chunk *prev = NULL, *chunk;
+    if (!n)
+        return NULL;
+    if (n->chunks_tail && index >= n->chunks_tail->index) {
+        if (index == n->chunks_tail->index)
+            return n->chunks_tail;
+        prev = n->chunks_tail;
+        chunk = NULL;
+    } else {
+        for (chunk = n->chunks; chunk && chunk->index < index; chunk = chunk->next)
+            prev = chunk;
+    }
+    if (chunk && chunk->index == index)
+        return chunk;
+
+    struct ramfs_data_chunk *created = (struct ramfs_data_chunk *)kmalloc(sizeof(*created));
+    if (!created)
+        return NULL;
+    memset(created, 0, sizeof(*created));
+    if (ramfs_chunk_alloc_data(created) != 0) {
+        kfree(created);
+        return NULL;
+    }
+    created->index = index;
+    if (prev) {
+        created->next = prev->next;
+        prev->next = created;
+    } else {
+        created->next = n->chunks;
+        n->chunks = created;
+    }
+    if (!created->next)
+        n->chunks_tail = created;
+    if (!n->chunks_tail)
+        n->chunks_tail = created;
+    return created;
+}
+
+static ssize_t ramfs_chunked_read_locked(struct ramfs_node *n, void *buf,
+                                         size_t size, size_t offset)
+{
+    size_t copy, pos, done = 0;
+    if (!n || !n->chunked || !buf)
+        return -EINVAL;
+    if (offset >= n->size)
+        return 0;
+    copy = size;
+    if (copy > n->size - offset)
+        copy = n->size - offset;
+    pos = offset;
+    while (done < copy) {
+        size_t index = pos / RAMFS_DATA_CHUNK_SIZE;
+        size_t in_chunk = pos % RAMFS_DATA_CHUNK_SIZE;
+        size_t amount = RAMFS_DATA_CHUNK_SIZE - in_chunk;
+        if (amount > copy - done)
+            amount = copy - done;
+        struct ramfs_data_chunk *chunk = ramfs_chunk_find(n, index);
+        if (chunk)
+            memcpy((char *)buf + done, chunk->data + in_chunk, amount);
+        else
+            memset((char *)buf + done, 0, amount);
+        pos += amount;
+        done += amount;
+    }
+    return (ssize_t)done;
+}
+
+static ssize_t ramfs_chunked_write_locked(struct ramfs_node *n, const void *buf,
+                                          size_t size, size_t offset)
+{
+    size_t done = 0;
+    if (!n || !n->chunked || (!buf && size != 0))
+        return -EINVAL;
+    while (done < size) {
+        size_t pos = offset + done;
+        size_t index = pos / RAMFS_DATA_CHUNK_SIZE;
+        size_t in_chunk = pos % RAMFS_DATA_CHUNK_SIZE;
+        size_t amount = RAMFS_DATA_CHUNK_SIZE - in_chunk;
+        if (amount > size - done)
+            amount = size - done;
+        struct ramfs_data_chunk *chunk = ramfs_chunk_get(n, index);
+        if (!chunk)
+            break;
+        memcpy(chunk->data + in_chunk, (const char *)buf + done, amount);
+        done += amount;
+    }
+    if (done && offset + done > n->size)
+        n->size = offset + done;
+    return done ? (ssize_t)done : (size ? -ENOMEM : 0);
+}
+
+/* Convert a contiguous or initfs-borrowed file to independently allocated
+ * pages. File data can use the PMM pool instead of the kernel object heap;
+ * holes remain implicit zeroes. */
+static int ramfs_chunkify_locked(struct ramfs_node *n)
+{
+    struct ramfs_data_chunk *head = NULL, *tail = NULL;
+    size_t copy_len;
+
+    if (!n || n->is_dir)
+        return -1;
+    if (n->chunked)
+        return 0;
+    copy_len = n->data ? n->capacity : 0;
+    if (copy_len > n->size)
+        copy_len = n->size;
+    for (size_t off = 0; off < copy_len; ) {
+        size_t index = off / RAMFS_DATA_CHUNK_SIZE;
+        size_t in_chunk = off % RAMFS_DATA_CHUNK_SIZE;
+        size_t amount = RAMFS_DATA_CHUNK_SIZE - in_chunk;
+        if (amount > copy_len - off)
+            amount = copy_len - off;
+        struct ramfs_data_chunk *chunk = (struct ramfs_data_chunk *)kmalloc(sizeof(*chunk));
+        if (!chunk)
+            goto fail;
+        memset(chunk, 0, sizeof(*chunk));
+        if (ramfs_chunk_alloc_data(chunk) != 0) {
+            kfree(chunk);
+            goto fail;
+        }
+        memcpy(chunk->data + in_chunk, n->data + off, amount);
+        chunk->index = index;
+        if (tail)
+            tail->next = chunk;
+        else
+            head = chunk;
+        tail = chunk;
+        off += amount;
+    }
+
+    if (n->data && !n->data_borrowed && heap_ptr_is_kmalloc(n->data))
+        kfree(n->data);
+    n->data = NULL;
+    n->data_borrowed = 0;
+    n->capacity = 0;
+    n->chunks = head;
+    n->chunks_tail = tail;
+    n->chunks_cursor = NULL;
+    n->chunked = 1;
+    return 0;
+
+fail:
+    ramfs_chunk_list_free(head);
+    return -ENOMEM;
+}
+
 static void ramfs_free_data_owned(struct ramfs_node *n) {
-    if (!n || !n->data)
+    if (!n)
         return;
-    if (!n->data_borrowed && heap_ptr_is_kmalloc(n->data))
+    ramfs_chunk_list_free(n->chunks);
+    n->chunks = NULL;
+    n->chunks_tail = NULL;
+    n->chunks_cursor = NULL;
+    n->chunked = 0;
+    if (n->data && !n->data_borrowed && heap_ptr_is_kmalloc(n->data))
         kfree(n->data);
     n->data = NULL;
     n->data_borrowed = 0;
@@ -502,8 +806,11 @@ static int ramfs_materialize_node_locked(struct ramfs_node *n) {
         n->capacity = 0;
         return 0;
     }
+    if (n->size > RAMFS_CHUNKIFY_THRESHOLD)
+        return ramfs_chunkify_locked(n);
     char *copy = (char *)kmalloc(n->size);
-    if (!copy) return -12;
+    if (!copy)
+        return ramfs_chunkify_locked(n);
     memcpy(copy, n->data, n->size);
     n->data = copy;
     n->data_borrowed = 0;
@@ -518,6 +825,8 @@ static int ramfs_materialize_node_locked(struct ramfs_node *n) {
  */
 static int ramfs_ensure_heap_data_locked(struct ramfs_node *n) {
     if (!n || n->is_dir)
+        return 0;
+    if (n->chunked)
         return 0;
     if (n->data_borrowed)
         return ramfs_materialize_node_locked(n);
@@ -1090,6 +1399,11 @@ static ssize_t ramfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         }
         size_t copy = size;
         if (offset + copy > n->size) copy = n->size - offset;
+        if (n->chunked) {
+            ssize_t result = ramfs_chunked_read_locked(n, buf, size, offset);
+            release_irqrestore(&n->io_lock, irqf);
+            return result;
+        }
         /* Sparse grow (posix_fallocate): i_size can exceed the kmalloc payload. */
         if (!n->data || offset >= n->capacity) {
             memset(buf, 0, copy);
@@ -1114,7 +1428,7 @@ int ramfs_chmod(const char *path, mode_t mode) {
     /* permission: only owner or root */
     thread_t* ct = ramfs_cred();
     uid_t uid = ct ? ct->euid : 0;
-    if (uid != 0 && uid != n->uid) return -1;
+    if (ct && (unsigned)uid != n->uid && !ramfs_capable(ct, AXON_CAP_FOWNER)) return -1;
     /* chmod changes permission/special bits, never the inode file type. */
     n->mode = (n->mode & 0170000u) | (mode & 07777u);
     return 0;
@@ -1127,7 +1441,7 @@ int ramfs_fchmod_file(struct fs_file *file, mode_t mode) {
     struct ramfs_node *n = h->node;
     if (!n) return -1;
     thread_t *ct = ramfs_cred();
-    if (ct && ct->euid != 0 && ct->euid != n->uid) return -1;
+    if (ct && (unsigned)ct->euid != n->uid && !ramfs_capable(ct, AXON_CAP_FOWNER)) return -1;
     unsigned long flags;
     ramfs_tree_lock_acquire(&flags);
     n->mode = (n->mode & 0170000u) | (mode & 07777u);
@@ -1140,7 +1454,7 @@ int ramfs_chown(const char *path, uid_t uid, gid_t gid) {
     struct ramfs_node *n = ramfs_lookup(path);
     if (!n) return -1;
     thread_t *ct = ramfs_cred();
-    if (ct && ct->euid != 0) return -1;
+    if (ct && !ramfs_capable(ct, AXON_CAP_CHOWN)) return -1;
     /* Linux chown(2): (uid_t)-1 / (gid_t)-1 means leave unchanged. */
     if (uid != (uid_t)-1) n->uid = uid;
     if (gid != (gid_t)-1) n->gid = gid;
@@ -1155,7 +1469,7 @@ int ramfs_lchown(const char *path, uid_t uid, gid_t gid) {
     struct ramfs_node *n = ramfs_lookup_nofollow(path);
     if (!n) return -1;
     thread_t *ct = ramfs_cred();
-    if (ct && ct->euid != 0) return -1;
+    if (ct && !ramfs_capable(ct, AXON_CAP_CHOWN)) return -1;
     if (uid != (uid_t)-1) n->uid = uid;
     if (gid != (gid_t)-1) n->gid = gid;
     n->mode &= ~(mode_t)06000;
@@ -1169,7 +1483,7 @@ int ramfs_ftruncate(struct fs_file *file, off_t length) {
     struct ramfs_node *n = fh->node;
     if (!n || n->is_dir) return -22;
     thread_t *ct = ramfs_cred();
-    if (ct && ct->euid != 0 && (unsigned)ct->euid != n->uid) return -22;
+    if (ct && (unsigned)ct->euid != n->uid && !ramfs_capable(ct, AXON_CAP_FOWNER)) return -22;
     size_t newsize = (size_t)length;
     if ((off_t)newsize != length) return -22; /* overflow */
 
@@ -1197,9 +1511,40 @@ int ramfs_ftruncate(struct fs_file *file, off_t length) {
         return 0;
     }
     if (newsize < n->size) {
-        if (ramfs_ensure_heap_data_locked(n) != 0) {
+        /* Materializing borrowed data can itself convert it to pages.
+         * Decide how to truncate only after that conversion. */
+        if (!n->chunked && ramfs_ensure_heap_data_locked(n) != 0) {
             release(&n->io_lock);
             return -12;
+        }
+        if (n->chunked) {
+            size_t keep_index = newsize / RAMFS_DATA_CHUNK_SIZE;
+            size_t keep_bytes = newsize % RAMFS_DATA_CHUNK_SIZE;
+            struct ramfs_data_chunk **link = &n->chunks;
+            n->chunks_cursor = NULL;
+            n->chunks_tail = NULL;
+            while (*link) {
+                struct ramfs_data_chunk *chunk = *link;
+                int discard = chunk->index > keep_index ||
+                        (chunk->index == keep_index && keep_bytes == 0);
+                if (discard) {
+                    *link = chunk->next;
+                    chunk->next = NULL;
+                    ramfs_chunk_list_free(chunk);
+                    continue;
+                }
+                if (chunk->index == keep_index && keep_bytes > 0)
+                    memset(chunk->data + keep_bytes, 0,
+                           RAMFS_DATA_CHUNK_SIZE - keep_bytes);
+                n->chunks_tail = chunk;
+                link = &chunk->next;
+            }
+            n->size = newsize;
+            file->size = (off_t)n->size;
+            ramfs_inode_changed(n);
+            file->backing_gen = n->generation;
+            release(&n->io_lock);
+            return 0;
         }
         char *d = (char *)krealloc(n->data, newsize);
         if (!d) {
@@ -1250,10 +1595,13 @@ int ramfs_fill_stat(struct fs_file *file, struct stat *st) {
 
 static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, size_t offset) {
     if (!file || !file->driver_private) return -1;
+    if (!buf && size != 0) return -EFAULT;
     struct ramfs_file_handle *fh = (struct ramfs_file_handle*)file->driver_private;
     struct ramfs_node *n = fh->node;
     if (!n) return -1;
     if (n->is_dir) return -EISDIR;
+    if (size == 0) return 0;
+    if (size > (size_t)-1 - offset) return -EINVAL;
     /* Linux: write(2) on an already-open fd does not re-check ownership.
      * Re-checking euid here turned apt sandbox / fork+exec writes into EIO. */
     /*
@@ -1266,6 +1614,21 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
     if (ramfs_ensure_heap_data_locked(n) != 0) {
         release(&n->io_lock);
         return -ENOMEM;
+    }
+    size_t write_end = offset + size;
+    if (n->chunked || write_end > RAMFS_CHUNKIFY_THRESHOLD) {
+        if (!n->chunked && ramfs_chunkify_locked(n) != 0) {
+            release(&n->io_lock);
+            return -ENOMEM;
+        }
+        ssize_t result = ramfs_chunked_write_locked(n, buf, size, offset);
+        if (result > 0) {
+            file->size = (off_t)n->size;
+            ramfs_inode_changed(n);
+            file->backing_gen = n->generation;
+        }
+        release(&n->io_lock);
+        return result;
     }
     /* Geometric capacity avoids O(file_size^2) copying during archive extract. */
     const size_t CHUNK = 64 * 1024; /* 64 KiB */
@@ -1311,14 +1674,36 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
                 }
             }
             if (!d) {
+                /* A fragmented heap may have plenty of free memory but no
+                 * contiguous block large enough even below the normal chunking
+                 * threshold. Preserve the existing data and finish this write
+                 * using small chunks instead of failing archive extraction. */
+                if (ramfs_chunkify_locked(n) == 0) {
+                    ssize_t part = ramfs_chunked_write_locked(
+                        n, (const char *)buf + src_pos, remaining, write_pos);
+                    if (part > 0)
+                        src_pos += (size_t)part;
+                    if (src_pos) {
+                        file->size = (off_t)n->size;
+                        ramfs_inode_changed(n);
+                        file->backing_gen = n->generation;
+                    }
+                    release(&n->io_lock);
+                    return src_pos ? (ssize_t)src_pos : part;
+                }
                 kprintf("ramfs OOM: write alloc failed path=%s needed=%llu heap_used=%llu heap_total=%llu\n",
                     file && file->path ? file->path : "(null)", (unsigned long long)needed_end,
                     (unsigned long long)heap_used_bytes(), (unsigned long long)heap_total_bytes());
                 /* kprintf only: never klogprintf here — klog may hold klog_lock during fs_write (deadlock). */
                 kprintf("ramfs: write: alloc failed path=%s needed_end=%u\n",
                         file && file->path ? file->path : "(null)", (unsigned)needed_end);
+                if (src_pos) {
+                    file->size = (off_t)n->size;
+                    ramfs_inode_changed(n);
+                    file->backing_gen = n->generation;
+                }
                 release(&n->io_lock);
-                return -ENOMEM;
+                return src_pos ? (ssize_t)src_pos : -ENOMEM;
             }
             n->data = d;
             n->capacity = capacity;
@@ -1759,6 +2144,7 @@ struct fs_driver *ramfs_get_driver(void) {
 static struct fs_driver tmpfs_driver;
 static struct fs_driver_ops tmpfs_ops;
 static int tmpfs_ready = 0;
+static uint32_t tmpfs_private_seq;
 
 int tmpfs_mount(const char *path) {
     if (!path || path[0] != '/') {
@@ -1792,6 +2178,20 @@ int tmpfs_mount(const char *path) {
         tmpfs_ready = 1;
     }
     (void)ramfs_mkdir(path);
+    thread_t *current = thread_get_current_user();
+    if (!current) current = thread_current();
+    uint32_t current_mnt_ns = ns_inum(current ? current->process : NULL, NS_TYPE_MNT);
+    uint32_t initial_mnt_ns = ns_inum(NULL, NS_TYPE_MNT);
+    if (current_mnt_ns && current_mnt_ns != initial_mnt_ns) {
+        struct stat target_stat;
+        uint32_t serial = ++tmpfs_private_seq;
+        if (!serial) serial = ++tmpfs_private_seq;
+        if (vfs_stat(path, &target_stat) != 0 ||
+            (target_stat.st_mode & 0170000u) != S_IFDIR)
+            return -1;
+        return fs_mount_private_tmpfs(path, current_mnt_ns, serial,
+                                      target_stat.st_mode);
+    }
     if (fs_mount(path, &tmpfs_driver) != 0) {
         kprintf("tmpfs_mount: fs_mount failed path=%s mounts=%d\n",
                 path, fs_mount_count());

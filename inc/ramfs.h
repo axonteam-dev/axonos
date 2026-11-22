@@ -18,6 +18,8 @@ int ramfs_link(const char *oldpath, const char *newpath);
 int ramfs_link_open_file(struct fs_file *file, const char *newpath);
 /* create a regular file backed by immutable boot-time data; copied on first write */
 int ramfs_create_borrowed_file(const char *path, const void *data, size_t size);
+/* Anonymous, unlinked regular file; caller owns one fs_file reference. */
+struct fs_file *ramfs_create_memfd(const char *name);
 int ramfs_make_whiteout(const char *path);
 int ramfs_path_is_whiteout(const char *path);
 

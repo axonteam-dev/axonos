@@ -17,6 +17,9 @@ extern "C" {
  */
 int pagecache_get(struct fs_file *file, uint64_t file_off, uint64_t *pa_out);
 
+/* Number of frames held by this mmap page cache, including pinned frames. */
+size_t pagecache_cached_pages(void);
+
 /* Drop every cached frame for this inode (all generations). */
 void pagecache_invalidate(uint64_t backing_id, uint64_t new_generation);
 

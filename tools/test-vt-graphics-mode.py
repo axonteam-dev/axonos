@@ -12,7 +12,7 @@ assert 'if (!tty || !tty->screen || video_kd_graphics()) return;' in devfs
 assert devfs.count('if (!video_kd_graphics()) devfs_tty_snapshot_visible(') == 3
 program = r'''
 #include <assert.h>
-#define DEVFS_TTY_COUNT 6
+#define DEVFS_TTY_COUNT 12
 static int active;
 static int devfs_get_active(void) { return active; }
 ''' + body + r'''
@@ -24,7 +24,10 @@ int main(void) {
     active = 0; assert(!video_kd_graphics());
     assert(video_set_vt_graphics(1, 0) == 0);
     active = 1; assert(!video_kd_graphics());
-    assert(video_set_vt_graphics(6, 1) == -1);
+    assert(video_set_vt_graphics(11, 1) == 0);
+    active = 11; assert(video_kd_graphics());
+    active = 1; assert(!video_kd_graphics());
+    assert(video_set_vt_graphics(12, 1) == -1);
 }
 '''
 with tempfile.TemporaryDirectory(prefix="axon-vt-graphics-", dir="/tmp/opencode") as tmp:

@@ -27,6 +27,16 @@ static struct pagecache_ent *g_pc_bucket[PAGECACHE_BUCKETS];
 static int g_pc_count;
 static uint64_t g_pc_tick;
 
+size_t pagecache_cached_pages(void)
+{
+    unsigned long irqf;
+    size_t count;
+    acquire_irqsave(&g_pc_lock, &irqf);
+    count = (size_t)g_pc_count;
+    release_irqrestore(&g_pc_lock, irqf);
+    return count;
+}
+
 static int g_pc_trace;
 #define PC_TRACE_MAX 1500
 static int g_pc_inv_left = 800;
@@ -50,7 +60,7 @@ static unsigned pc_hash(uint64_t backing_id, uint64_t generation, uint64_t page_
 }
 
 static struct pagecache_ent *pc_find_locked(uint64_t backing_id, uint64_t generation,
-                                            uint64_t page_index)
+                                             uint64_t page_index)
 {
     unsigned b = pc_hash(backing_id, generation, page_index);
     struct pagecache_ent *e;
@@ -60,6 +70,21 @@ static struct pagecache_ent *pc_find_locked(uint64_t backing_id, uint64_t genera
             return e;
     }
     return NULL;
+}
+
+/* A short read need not mean EOF. Reject missing bytes instead of caching a
+ * partly initialized page, but keep reading when a filesystem makes progress. */
+static int pc_read_exact(struct fs_file *file, void *page, size_t n, uint64_t offset)
+{
+    size_t done = 0;
+    while (done < n) {
+        ssize_t nr = fs_read(file, (char *)page + done, n - done,
+                             (size_t)(offset + done));
+        if (nr <= 0 || (size_t)nr > n - done)
+            return -1;
+        done += (size_t)nr;
+    }
+    return 0;
 }
 
 static int pc_evict_one_locked(void)
@@ -105,7 +130,6 @@ int pagecache_get(struct fs_file *file, uint64_t file_off, uint64_t *pa_out)
     struct pagecache_ent *hit;
     void *page;
     uint64_t pa;
-    ssize_t nr;
     size_t n;
     int rc = -1;
     mm_dm_ctx_t dm;
@@ -200,8 +224,7 @@ int pagecache_get(struct fs_file *file, uint64_t file_off, uint64_t *pa_out)
     else if ((uint64_t)n > (uint64_t)file->size - aligned)
         n = (size_t)((uint64_t)file->size - aligned);
     if (n > 0) {
-        nr = fs_read(file, page, n, (size_t)aligned);
-        if (nr < 0 || (size_t)nr != n) {
+        if (pc_read_exact(file, page, n, aligned) != 0) {
             frame_release(pa);
             goto out;
         }

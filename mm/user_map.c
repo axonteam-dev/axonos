@@ -24,18 +24,18 @@ int user_map_unmap_range(uint64_t va_begin, uint64_t va_end) {
         uint64_t l2i = (va >> 21) & 0x1FF;
         uint64_t l1i = (va >> 12) & 0x1FF;
         if (!(l4[l4i] & PG_PRESENT)) continue;
-        uint64_t *l3 = (uint64_t *)(uintptr_t)(l4[l4i] & ~0xFFFULL);
+        uint64_t *l3 = (uint64_t *)(uintptr_t)(l4[l4i] & PG_ADDR_MASK);
         if (!(l3[l3i] & PG_PRESENT)) continue;
         uint64_t l3e = l3[l3i];
         if (l3e & PG_PS_2M) continue;
-        uint64_t l2_phys = l3e & ~0xFFFULL;
+        uint64_t l2_phys = l3e & PG_ADDR_MASK;
         uint64_t *l2 = (uint64_t *)(uintptr_t)l2_phys;
         if (!(l2[l2i] & PG_PRESENT)) continue;
         uint64_t l2e = l2[l2i];
         if (l2e & PG_PS_2M) {
             uint64_t page_lo = va & ~((uint64_t)(PAGE_SIZE_2M - 1));
             uint64_t page_hi = page_lo + PAGE_SIZE_2M;
-            uint64_t l3_phys = l4[l4i] & ~0xFFFULL;
+            uint64_t l3_phys = l4[l4i] & PG_ADDR_MASK;
             uint64_t l4_phys = cr3 & ~0xFFFULL;
             if ((l2_phys >= page_lo && l2_phys < page_hi) ||
                 (l3_phys >= page_lo && l3_phys < page_hi) ||
@@ -45,7 +45,7 @@ int user_map_unmap_range(uint64_t va_begin, uint64_t va_end) {
             invlpg((void *)(uintptr_t)va);
             continue;
         }
-        uint64_t *l1 = (uint64_t *)(uintptr_t)(l2e & ~0xFFFULL);
+        uint64_t *l1 = (uint64_t *)(uintptr_t)(l2e & PG_ADDR_MASK);
         l1[l1i] = 0;
         invlpg((void *)(uintptr_t)va);
     }
@@ -95,11 +95,11 @@ int user_map_mprotect_range(uint64_t va_begin, uint64_t va_end, int prot) {
         /* Lazy VMAs need not have page tables yet. Their future fault uses
          * the VMA's updated prot; only existing leaves need changing here. */
         if (!(l4[l4i] & PG_PRESENT)) continue;
-        uint64_t *l3 = (uint64_t *)(uintptr_t)(l4[l4i] & ~0xFFFULL);
+        uint64_t *l3 = (uint64_t *)(uintptr_t)(l4[l4i] & PG_ADDR_MASK);
         if (!(l3[l3i] & PG_PRESENT)) continue;
         uint64_t l3e = l3[l3i];
         if (l3e & PG_PS_2M) return -1;
-        uint64_t *l2 = (uint64_t *)(uintptr_t)(l3e & ~0xFFFULL);
+        uint64_t *l2 = (uint64_t *)(uintptr_t)(l3e & PG_ADDR_MASK);
         if (!(l2[l2i] & PG_PRESENT)) continue;
         uint64_t l2e = l2[l2i];
         if (l2e & PG_PS_2M) {
@@ -117,7 +117,7 @@ int user_map_mprotect_range(uint64_t va_begin, uint64_t va_end, int prot) {
                 f &= ~PG_RW;
             l2[l2i] = pa | f;
         } else {
-            uint64_t *l1 = (uint64_t *)(uintptr_t)(l2e & ~0xFFFULL);
+            uint64_t *l1 = (uint64_t *)(uintptr_t)(l2e & PG_ADDR_MASK);
             uint64_t chunk_lo = va;
             uint64_t chunk_hi = va + PAGE_SIZE_2M;
             if (chunk_lo < prot_begin) chunk_lo = prot_begin;
@@ -126,7 +126,9 @@ int user_map_mprotect_range(uint64_t va_begin, uint64_t va_end, int prot) {
                 uint64_t l1i = (v >> 12) & 0x1FF;
                 /* Never install PA==VA into a hole — that re-identities the
                  * BusyBox slab/stack after vfork detach (ash GPF at RIP=="ls"). */
-                if (!(l1[l1i] & PG_PRESENT))
+                /* PROT_NONE keeps an owned frame in a non-present PTE. It is
+                 * not a hole and must be restored with the same PA/COW bit. */
+                if (!(l1[l1i] & (PG_PRESENT | PG_SOFT_OWNED)))
                     continue;
                 uint64_t pa = l1[l1i] & PG_ADDR_MASK;
                 uint64_t f = (new_flags & ~PG_PS_2M) |
@@ -261,7 +263,7 @@ int user_map_mark_identity_2m(uint64_t va_begin, uint64_t va_end) {
         if (!(l4[l4i] & PG_PRESENT)) return -1;
         l4[l4i] |= PG_US | PG_RW;
         l4[l4i] &= ~PG_NX;
-        uint64_t *l3 = (uint64_t *)(uintptr_t)(l4[l4i] & ~0xFFFULL);
+        uint64_t *l3 = (uint64_t *)(uintptr_t)(l4[l4i] & PG_ADDR_MASK);
         if (!(l3[l3i] & PG_PRESENT)) return -1;
         l3[l3i] |= PG_US | PG_RW;
         l3[l3i] &= ~PG_NX;
@@ -276,7 +278,7 @@ int user_map_mark_identity_2m(uint64_t va_begin, uint64_t va_end) {
             invlpg((void *)(uintptr_t)va);
             continue;
         }
-        uint64_t *l2 = (uint64_t *)(uintptr_t)(l3e & ~0xFFFULL);
+        uint64_t *l2 = (uint64_t *)(uintptr_t)(l3e & PG_ADDR_MASK);
         if (!(l2[l2i] & PG_PRESENT)) return -1;
         l2[l2i] |= PG_US | PG_RW;
         l2[l2i] &= ~PG_NX;
@@ -290,7 +292,7 @@ int user_map_mark_identity_2m(uint64_t va_begin, uint64_t va_end) {
             invlpg((void *)(uintptr_t)va);
             continue;
         }
-        uint64_t *l1 = (uint64_t *)(uintptr_t)(l2e & ~0xFFFULL);
+        uint64_t *l1 = (uint64_t *)(uintptr_t)(l2e & PG_ADDR_MASK);
         uint64_t chunk_end = va + PAGE_SIZE_2M;
         if (chunk_end > end) chunk_end = end;
         for (uint64_t p = va; p < chunk_end; p += PAGE_SIZE_4K) {

@@ -9,6 +9,8 @@
 #include <debug.h>
 #include <vga.h>
 #include <fpu.h>
+#include <syscall.h>
+#include <idt.h>
 
 #define MSR_IA32_TSC_AUX 0xC0000103u
 
@@ -26,7 +28,9 @@ static int smp_topology_from_madt;
  * executes, stranding BusyBox init in wait4.  Keep the boot core uniprocessor
  * until that ABI is completed; topology discovery remains available.
  */
+#ifndef AXON_BOOT_ENABLE_APS
 #define AXON_BOOT_ENABLE_APS 0
+#endif
 
 /* AP trampoline mailbox at fixed phys 0x9000 (see linker.payload.ld). */
 struct __attribute__((packed)) smp_mailbox {
@@ -44,6 +48,8 @@ struct __attribute__((packed)) smp_mailbox {
 __attribute__((section(".smp_mailbox"), aligned(64))) static struct smp_mailbox smp_mbox;
 
 volatile uint32_t smp_online_mask;
+/* Initialization handshake is distinct from eligibility to receive work. */
+static uint32_t smp_started_mask;
 
 /* BSP sets to 1 after INIT/SIPI and mailbox work complete; APs must not run
  * thread_schedule until then (avoids races with BSP smp_boot_aps and guest reboot loops). */
@@ -292,6 +298,7 @@ void smp_boot_aps(void) {
         asm volatile("wbinvd" ::: "memory");
 
         smp_online_mask |= 1u;
+        __atomic_store_n(&smp_started_mask, 1u, __ATOMIC_RELEASE);
 
         uint64_t cr4 = 0;
         asm volatile("mov %%cr4, %0" : "=r"(cr4));
@@ -347,22 +354,22 @@ void smp_boot_aps(void) {
                 smp_mdelay_tsc(10);
                 lapic_send_sipi(apic_id, SMP_SIPI_VECTOR);
 
-                qemu_debug_printf("SMP: wait AP cpu=%d online (mask now %#x)\n", cpu,
-                                  (unsigned)__atomic_load_n(&smp_online_mask, __ATOMIC_RELAXED));
+                qemu_debug_printf("SMP: wait AP cpu=%d initialized (mask now %#x)\n", cpu,
+                                  (unsigned)__atomic_load_n(&smp_started_mask, __ATOMIC_RELAXED));
                 int spins = 0;
                 while (spins < 200000000) {
-                        uint32_t m = __atomic_load_n(&smp_online_mask, __ATOMIC_ACQUIRE);
+                        uint32_t m = __atomic_load_n(&smp_started_mask, __ATOMIC_ACQUIRE);
                         if (m & (1u << (unsigned)cpu))
                                 break;
                         asm volatile("pause" ::: "memory");
                         spins++;
                 }
-                if (!(__atomic_load_n(&smp_online_mask, __ATOMIC_RELAXED) & (1u << (unsigned)cpu))) {
+                if (!(__atomic_load_n(&smp_started_mask, __ATOMIC_ACQUIRE) & (1u << (unsigned)cpu))) {
                         uint32_t d0 = *(volatile uint32_t *)(uintptr_t)SMP_DIAG_PING_RM;
                         uint32_t d4 = *(volatile uint32_t *)(uintptr_t)SMP_DIAG_PING_LM;
                         uint32_t d8 = *(volatile uint32_t *)(uintptr_t)SMP_DIAG_PING_PM32;
                         qemu_debug_printf("SMP: TIMEOUT cpu=%d mask=%#x\n", cpu,
-                                          (unsigned)__atomic_load_n(&smp_online_mask, __ATOMIC_RELAXED));
+                                           (unsigned)__atomic_load_n(&smp_started_mask, __ATOMIC_RELAXED));
                         klogprintf("SMP: AP cpu=%d apic_id=%u did not come online (diag phys %#x=%#x %#x=%#x %#x=%#x; "
                                    "exp RM %#x PM32 %#x LM %#x)\n",
                                    cpu, (unsigned)apic_id,
@@ -370,9 +377,13 @@ void smp_boot_aps(void) {
                                    SMP_DIAG_PING_PM32, (unsigned)d8,
                                    (unsigned)SMP_DIAG_MAGIC_RM, (unsigned)SMP_DIAG_MAGIC_PM32,
                                    (unsigned)SMP_DIAG_MAGIC_LM);
+                        /* A delayed AP may still consume this single shared
+                         * mailbox. Reusing it for another CPU would make the
+                         * two APs adopt the same identity and stack. */
+                        break;
                 } else {
-                        qemu_debug_printf("SMP: AP cpu=%d online\n", cpu);
-                        klogprintf("SMP: AP cpu=%d apic_id=%u online\n", cpu, (unsigned)apic_id);
+                        qemu_debug_printf("SMP: AP cpu=%d initialized\n", cpu);
+                        klogprintf("SMP: AP cpu=%d apic_id=%u initialized\n", cpu, (unsigned)apic_id);
                 }
         }
 
@@ -388,26 +399,31 @@ void smp_ap_entry(void) {
         if (cpu >= (uint32_t)SMP_MAX_CPUS)
                 cpu = 0;
 
-        /* Unblock BSP wait before TR/TSS/LAPIC: if ltr or TSS faults, BSP no longer spins forever. */
-        __atomic_or_fetch(&smp_online_mask, 1u << cpu, __ATOMIC_SEQ_CST);
-        asm volatile("mfence" ::: "memory");
-
         wrmsr_u32(MSR_IA32_TSC_AUX, cpu, 0u);
 
+        /* IDTR, TR, FPU state and syscall MSRs belong to this CPU. The BSP
+         * must not count the AP as ready until all of them and its LAPIC are
+         * initialized; otherwise a fault or interrupt can triple-fault it. */
+        idt_load_cpu();
         gdt_ltr_for_cpu((int)cpu);
 
         /* Match BSP: OSFXSR/OSXSAVE + XCR0.AVX before any user/FPU work. */
         fpu_init_cpu();
+        syscall_init_cpu();
 
         thread_t *idle = thread_idle_for_cpu((int)cpu);
         if (idle && idle->kernel_stack)
                 tss_set_rsp0(idle->kernel_stack);
 
+        apic_ap_enable_local();
+        __atomic_or_fetch(&smp_started_mask, 1u << cpu, __ATOMIC_RELEASE);
+
         while (!__atomic_load_n(&smp_boot_done, __ATOMIC_ACQUIRE))
                 asm volatile("pause" ::: "memory");
 
-        apic_ap_enable_local();
-
+        /* A CPU advertised as online must be able to receive IPIs. */
+        asm volatile("sti" ::: "memory");
+        __atomic_or_fetch(&smp_online_mask, 1u << cpu, __ATOMIC_RELEASE);
         for (;;) {
                 thread_schedule();
                 asm volatile("sti; hlt" ::: "memory");

@@ -13,6 +13,20 @@ syscalls = (root / "syscall/dispatch/syscall_dispatch.c").read_text()
 elf = (root / "core/elf.c").read_text()
 vma = (root / "mm/user_vma.c").read_text()
 mm = (root / "core/mm.c").read_text()
+init = (root / "core/entry/init.c").read_text()
+
+# The helper is defined above the boot sequence, but invoked only after the
+# NIC is ready and sysfs has been registered/mounted.
+net_driver = init.index("if (e1000_init() != 0)")
+net_preinit = init.index("syscall_net_preinit()", net_driver)
+sysfs_mount = init.index('if (sysfs_mount("/sys") == 0)')
+sysfs_populate = init.index("kernel_sysfs_populate_default();", sysfs_mount)
+populate_start = init.index("void kernel_sysfs_populate_default(void) {")
+populate_end = init.index("\n}\n", populate_start)
+assert "syscall_net_sysfs_publish();" in init[populate_start:populate_end]
+init_exec = init.index("if (boot_try_run_init() != 0)")
+assert init.count("syscall_net_sysfs_publish();") == 1
+assert net_driver < net_preinit < sysfs_mount < sysfs_populate < init_exec
 
 
 def function(source, signature):
@@ -154,6 +168,7 @@ vma_test = r'''
 #include <stdio.h>
 #include <string.h>
 #define USER_VMA_MAX 4
+#define USER_VMA_MM_MAX USER_VMA_MAX
 typedef struct { int used; uint64_t tid; uintptr_t addr, len; int prot; } user_vma_t;
 typedef struct { user_vma_t vmas[USER_VMA_MAX]; } mm_t;
 typedef struct { uint64_t tid; mm_t *mm; } thread_t;

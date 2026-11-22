@@ -11,6 +11,7 @@
 #include <spinlock.h>
 #include <ext2.h>
 #include <vga.h>
+#include <klog.h>
 #include <fs.h>
 #include <ns.h>
 
@@ -63,6 +64,14 @@ static struct fs_driver_ops cgroup_ops;
 static spinlock_t g_cg_lock;
 static char g_cg_mount[64] = "/sys/fs/cgroup";
 static int g_cg_ready;
+
+static int cgroup_caller_has_admin(void)
+{
+        thread_t *t = thread_get_current_user();
+        if (!t) t = thread_current();
+        return t && t->process ? process_has_cap(t->process, AXON_CAP_SYS_ADMIN) :
+                                (t && t->euid == 0);
+}
 
 static int cg_name_ok(const char *s)
 {
@@ -481,8 +490,10 @@ static int parse_u64_or_max(const char *s, size_t n, uint64_t *out)
 
 static ssize_t cg_store(struct cgroup *cg, int fid, const char *buf, size_t size)
 {
-	if (!cg || !buf)
-		return -1;
+        if (!cg || !buf)
+                return -1;
+        if (!cgroup_caller_has_admin())
+                return -1;
 	if (fid == CG_FILE_SUBTREE) {
 		uint32_t bits = cg->subtree;
 		size_t i = 0;
@@ -572,6 +583,8 @@ static int cgroupfs_mkdir_op(const char *path)
 
 	if (!rel)
 		return -1;
+	if (!cgroup_caller_has_admin())
+		return -1;
 	/* Linux mkdir() on an existing cgroup, including the hierarchy root,
 	 * returns EEXIST.  The syscall layer maps this driver's -4 to EEXIST. */
 	if (rel[0] == '\0' || strcmp(rel, "/") == 0)
@@ -616,6 +629,7 @@ int cgroupfs_rmdir(const char *path)
 	struct cgroup **link;
 
 	if (!rel) return -2; /* ENOENT */
+	if (!cgroup_caller_has_admin()) return -1; /* EPERM */
 	if (!rel[0] || strcmp(rel, "/") == 0) return -16; /* EBUSY */
 	if (cg_split(rel, dir, sizeof(dir), base, sizeof(base)) != 0 || !cg_name_ok(base))
 		return -22; /* EINVAL */
@@ -880,7 +894,16 @@ static ssize_t cgroupfs_write(struct fs_file *file, const void *buf, size_t size
 	h = (struct cgroupfs_handle *)file->driver_private;
 	if (!h->file_id)
 		return -1;
-	return cg_store(h->cg, h->file_id, (const char *)buf, size);
+	ssize_t rc = cg_store(h->cg, h->file_id, (const char *)buf, size);
+	static unsigned cgroup_write_log_budget = 32;
+	if (cgroup_write_log_budget) {
+		cgroup_write_log_budget--;
+		klogprintf_logonly("cgroup-write: path=%s file=%d size=%zu rc=%lld admin=%d data=%.*s\n",
+			file->path ? file->path : "?", h->file_id, size,
+			(long long)rc, cgroup_caller_has_admin(),
+			(int)(size > 48 ? 48 : size), (const char *)buf);
+	}
+	return rc;
 }
 
 static void cgroupfs_release(struct fs_file *file)
@@ -923,6 +946,15 @@ int cgroupfs_fill_stat(struct fs_file *file, struct stat *st)
 		st->st_nlink = 2;
 	}
 	return 0;
+}
+
+int cgroupfs_open_truncate_noop(const struct fs_file *file)
+{
+	if (!file || file->fs_private != &cgroup_driver || !file->driver_private)
+		return 0;
+	const struct cgroupfs_handle *h =
+		(const struct cgroupfs_handle *)file->driver_private;
+	return h->file_id != 0;
 }
 
 int cgroupfs_register(void)

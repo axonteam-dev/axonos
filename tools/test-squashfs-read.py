@@ -14,8 +14,12 @@ root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--kernel-objects", type=Path,
                     help="link actual miniz/string/heap objects from this build directory")
+parser.add_argument("--image", type=Path,
+                    help="SquashFS image to test (defaults to the source initfs)")
+parser.add_argument("--check-usr-merge", action="store_true",
+                    help="require /bin/busybox and /usr/bin/busybox to resolve to one inode")
 args = parser.parse_args()
-image = root / "iso/boot/initfs.sfs"
+image = args.image or (root / "iso/boot/initfs.sfs")
 if not image.is_file():
     raise SystemExit("SKIP: local initfs.sfs is unavailable")
 
@@ -31,6 +35,9 @@ prefix = r'''
 #include <stdarg.h>
 #include <sys/types.h>
 #include <mm.h>
+#include <spinlock.h>
+void acquire(spinlock_t *lock) { assert(!lock->lock); lock->lock = 1; }
+void release(spinlock_t *lock) { assert(lock->lock); lock->lock = 0; }
 struct fs_driver { int unused; };
 struct fs_driver_ops { int unused; };
 void *kmalloc(size_t n) { return malloc(n); }
@@ -85,8 +92,31 @@ static void read_pages(struct squashfs_sb *s, const char *path) {
            (unsigned long long)ino.file_size);
     sq_inode_info_free(&ino);
 }
+static void test_usr_merge(struct squashfs_sb *s, int required) {
+    struct squashfs_inode_info bin, usr, link;
+    memset(&bin, 0, sizeof(bin)); memset(&usr, 0, sizeof(usr));
+    memset(&link, 0, sizeof(link));
+    int rb = sq_path_to_inode(s, "/bin/busybox", &bin);
+    int ru = sq_path_to_inode(s, "/usr/bin/busybox", &usr);
+    int rl = sq_path_to_inode(s, "/bin", &link);
+    if (required) assert(rb == 0 && ru == 0);
+    if (rb == 0 && ru == 0) {
+        assert(bin.inode_number == usr.inode_number);
+        assert(bin.type == SQUASHFS_REG_TYPE || bin.type == SQUASHFS_LREG_TYPE);
+        puts("PASS: relative multi-component /bin -> usr/bin symlink resolution");
+    }
+    if (required) {
+        assert(rl == 0);
+        assert(link.type == SQUASHFS_SYMLINK_TYPE || link.type == SQUASHFS_LSYMLINK_TYPE);
+        assert(link.symlink && strcmp(link.symlink, "usr/bin") == 0);
+        puts("PASS: /bin is the expected relative symlink to usr/bin");
+    }
+    if (rb == 0) sq_inode_info_free(&bin);
+    if (ru == 0) sq_inode_info_free(&usr);
+    if (rl == 0) sq_inode_info_free(&link);
+}
 int main(int argc, char **argv) {
-    assert(argc == 2);
+    assert(argc == 4);
     FILE *f = fopen(argv[1], "rb"); assert(f);
     assert(fseek(f, 0, SEEK_END) == 0);
     long size = ftell(f); assert(size > 96); rewind(f);
@@ -97,11 +127,17 @@ int main(int argc, char **argv) {
     memcpy(&s->sb, image, sizeof(s->sb)); s->block_size = s->sb.block_size;
     assert(s->sb.s_magic == 0x73717368 && s->sb.compression == 1);
     assert(sq_load_fragment_table(s) == 0);
-    read_pages(s, "/usr/lib/x86_64-linux-gnu/libc.so.6");
-    read_pages(s, "/usr/lib/systemd/systemd");
-    read_pages(s, "/usr/sbin/openrc");
-    read_pages(s, "/lib/librc.so.1");
-    read_pages(s, "/lib/rc/sh/gendepends.sh");
+    test_usr_merge(s, atoi(argv[2]));
+    if (atoi(argv[3])) {
+        read_pages(s, "/usr/bin/busybox");
+        read_pages(s, "/usr/lib/systemd/systemd");
+    } else {
+        read_pages(s, "/usr/lib/x86_64-linux-gnu/libc.so.6");
+        read_pages(s, "/usr/lib/systemd/systemd");
+        read_pages(s, "/usr/sbin/openrc");
+        read_pages(s, "/lib/librc.so.1");
+        read_pages(s, "/lib/rc/sh/gendepends.sh");
+    }
     /* Malformed block bounds must fail and still restore the caller root. */
     uint8_t out[8]; size_t got;
     assert(sq_read_data_block(s, s->size, 9, out, sizeof(out), &got, 0) == -1);
@@ -150,7 +186,7 @@ void kprintf(const char *fmt, ...) {
 }
 struct fs_driver { int unused; };
 ''')
-        program = program.replace("assert(argc == 2);", "assert(argc == 2);\n"
+        program = program.replace("assert(argc == 4);", "assert(argc == 4);\n"
                                   "    void *arena = malloc(256u << 20); assert(arena);\n"
                                   "    heap_init((uintptr_t)arena, 256u << 20);")
     else:
@@ -159,4 +195,5 @@ struct fs_driver { int unused; };
     source.write_text(program)
     binary = temp / "test"
     subprocess.run(flags + [str(source)] + libraries + ["-o", str(binary)], check=True)
-    subprocess.run([str(binary), str(image)], check=True)
+    subprocess.run([str(binary), str(image), "1" if args.check_usr_merge else "0",
+                    "1" if args.image else "0"], check=True)

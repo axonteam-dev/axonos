@@ -42,6 +42,11 @@ static struct fs_driver *fs_get_mount_driver(const char *p) {
 static int cgroupfs_rmdir(const char *p) {
     (void)p; cgroup_removes++; return scenario == 7 ? 0 : -ENOTEMPTY;
 }
+static int fs_mount_is_readonly(const char *p) { (void) p; return 0; }
+static int syscall_parent_access(const void *task, const char *path) { (void) task; (void) path; return 0; }
+static int syscall_sticky_allows(const void *task, const char *path) { (void) task; (void) path; return 0; }
+struct thread_stub_t { int dummy; };
+static struct thread_stub_t *thread_get_current_user(void) { static struct thread_stub_t t; return &t; }
 static struct fs_file *fs_open(const char *p) { (void)p; opens++; return &file; }
 static void fs_file_free(struct fs_file *f) { (void)f; closes++; }
 static int fs_unlink(const char *p) { (void)p; unlinks++; return 0; }

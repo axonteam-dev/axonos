@@ -1,5 +1,6 @@
 #include <paging.h>
 #include <mm.h>
+#include <mmio.h>
 #include <debug.h>
 #include <klog.h>
 
@@ -16,6 +17,21 @@ static uint64_t* next_free_table(void) {
     if (used >= 128) return 0;
     for (size_t i = 0; i < PT_ENTRIES; i++) pool[used][i] = 0;
     return pool[used++];
+}
+
+/* The table pool and active/kernel roots are shared by all CPUs. */
+static spinlock_t g_page_table_map_lock;
+
+/* Page-table entries may carry PG_NX as well as low permission flags.  The
+ * architectural address mask is required here; clearing only the low 12 bits
+ * can turn an NX table pointer into 0xfffffffffffff000.  This kernel identity-
+ * maps only the low 4GiB, so reject table addresses outside that direct range. */
+static uint64_t *page_table_from_entry(uint64_t entry) {
+    uint64_t pa = entry & PG_ADDR_MASK;
+    if (!(entry & PG_PRESENT) || (entry & PG_PS_2M) || pa == 0 ||
+        pa >= MMIO_IDENTITY_LIMIT)
+        return NULL;
+    return (uint64_t *)(uintptr_t)pa;
 }
 
 uint64_t paging_read_cr3(void) {
@@ -168,7 +184,8 @@ static int map_page_2m_on_l4(uint64_t *l4, uint64_t va, uint64_t pa, uint64_t fl
         l4[l4i] = ((uint64_t)new_l3) | PG_PRESENT | PG_RW;
     }
 
-    uint64_t* l3 = (uint64_t*)(l4[l4i] & ~0xFFFULL);
+    uint64_t *l3 = page_table_from_entry(l4[l4i]);
+    if (!l3) return -3;
     if (!(l3[l3i] & PG_PRESENT)) {
         uint64_t* new_l2 = next_free_table();
         if (!new_l2) return -2;
@@ -183,7 +200,7 @@ static int map_page_2m_on_l4(uint64_t *l4, uint64_t va, uint64_t pa, uint64_t fl
         if (!new_l2) return -2;
 
         /* 1GiB page base PA (bits 30+) */
-        uint64_t base_pa = leaf & ~0x3FFFFFFFULL;
+        uint64_t base_pa = leaf & PG_ADDR_MASK_1G;
         /* Preserve relevant flags from the leaf entry. */
         uint64_t keep = leaf & (PG_PRESENT | PG_RW | PG_US | PG_PWT | PG_PCD | PG_GLOBAL | PG_NX);
         for (size_t i = 0; i < PT_ENTRIES; i++) {
@@ -194,7 +211,8 @@ static int map_page_2m_on_l4(uint64_t *l4, uint64_t va, uint64_t pa, uint64_t fl
         l3[l3i] = ((uint64_t)new_l2) | (keep & ~PG_PS_2M);
     }
 
-    uint64_t* l2 = (uint64_t*)(l3[l3i] & ~0xFFFULL);
+    uint64_t *l2 = page_table_from_entry(l3[l3i]);
+    if (!l2) return -3;
     uint64_t old_l2e = l2[l2i];
     /*
      * Never collapse an existing 4KiB L1 table back into a 2MiB identity leaf.
@@ -203,7 +221,8 @@ static int map_page_2m_on_l4(uint64_t *l4, uint64_t va, uint64_t pa, uint64_t fl
      * If an L1 is present, only refresh US/RW flags on existing leaves.
      */
     if ((old_l2e & PG_PRESENT) && !(old_l2e & PG_PS_2M)) {
-        uint64_t *l1 = (uint64_t *)(uintptr_t)(old_l2e & ~0xFFFULL);
+        uint64_t *l1 = page_table_from_entry(old_l2e);
+        if (!l1) return -3;
         uint64_t add = (flags & (PG_US | PG_PWT | PG_PCD | PG_GLOBAL | PG_RW));
         for (size_t i = 0; i < PT_ENTRIES; i++) {
             if (!(l1[i] & PG_PRESENT))
@@ -238,19 +257,31 @@ int map_page_2m(uint64_t va, uint64_t pa, uint64_t flags) {
                 (unsigned long long)flags,
                 (unsigned long long)(paging_read_cr3() & ~0xFFFULL));
     }
+    unsigned long irqf = 0;
+    acquire_irqsave(&g_page_table_map_lock, &irqf);
     uint64_t cr3 = paging_read_cr3();
     uint64_t *live = (uint64_t *)(uintptr_t)(cr3 & ~0xFFFULL);
+    /*
+     * A task CR3 can remove or write-protect identity aliases used to access
+     * page-table pages. Keep the caller's root captured above, but perform all
+     * table walks/stores through the kernel direct map. This is required even
+     * for the top-level store: the PML4's physical page can itself be read-only
+     * through the active task mapping (supervisor #PF, error=0x3).
+     */
+    mm_dm_ctx_t dm = mm_enter_direct_map();
     int rc = map_page_2m_on_l4(live, va, pa, flags);
-    if (rc != 0)
-        return rc;
     /*
      * Linux: kernel mappings are installed into swapper_pg_dir so mm_alloc()
      * (init_new_context) always inherits a coherent kernel PGD. When the live
      * task has already duplicated L3, update mm_kernel() as well.
      */
-    mm_t *kmm = mm_kernel();
-    if (kmm && kmm->pml4 && kmm->pml4 != live)
-        rc = map_page_2m_on_l4(kmm->pml4, va, pa, flags);
+    if (rc == 0) {
+        mm_t *kmm = mm_kernel();
+        if (kmm && kmm->pml4 && kmm->pml4 != live)
+            rc = map_page_2m_on_l4(kmm->pml4, va, pa, flags);
+    }
+    mm_leave_direct_map(dm);
+    release_irqrestore(&g_page_table_map_lock, irqf);
     return rc;
 }
 
@@ -260,22 +291,29 @@ static int unmap_page_2m_on_l4(uint64_t *l4, uint64_t va) {
     uint64_t l2i = (va >> 21) & 0x1FF;
     if (!l4) return -1;
     if (!(l4[l4i] & PG_PRESENT)) return -1;
-    uint64_t* l3 = (uint64_t*)(l4[l4i] & ~0xFFFULL);
+    uint64_t *l3 = page_table_from_entry(l4[l4i]);
+    if (!l3) return -1;
     if (!(l3[l3i] & PG_PRESENT)) return -1;
     if (l3[l3i] & PG_PS_2M)
         return -1;
-    uint64_t* l2 = (uint64_t*)(l3[l3i] & ~0xFFFULL);
+    uint64_t *l2 = page_table_from_entry(l3[l3i]);
+    if (!l2) return -1;
     l2[l2i] = 0;
     invlpg((void*)va);
     return 0;
 }
 
 int unmap_page_2m(uint64_t va) {
+    unsigned long irqf = 0;
+    acquire_irqsave(&g_page_table_map_lock, &irqf);
     uint64_t cr3 = paging_read_cr3();
     uint64_t *live = (uint64_t *)(uintptr_t)(cr3 & ~0xFFFULL);
+    mm_dm_ctx_t dm = mm_enter_direct_map();
     int rc = unmap_page_2m_on_l4(live, va);
     mm_t *kmm = mm_kernel();
     if (kmm && kmm->pml4 && kmm->pml4 != live)
         (void)unmap_page_2m_on_l4(kmm->pml4, va);
+    mm_leave_direct_map(dm);
+    release_irqrestore(&g_page_table_map_lock, irqf);
     return rc;
 }

@@ -63,8 +63,8 @@ static void thread_yield(void) {
 int main(void) {
     int rounds;
     for (rounds = 0; rounds < 20 && !child_selected; rounds++) thread_sleep(1);
-    assert(child_selected && rounds == 5); /* old path kept sleeper at vruntime 0 forever */
-    assert(sleeper.sched_vruntime == 105);
+    assert(child_selected && rounds == 2); /* wakeup placement and charging avoid starvation */
+    assert(sleeper.sched_vruntime == 121);
     current = &sleeper; sleeper.state = THREAD_RUNNING;
     uint64_t before = sleeper.sched_vruntime;
     thread_block(1);

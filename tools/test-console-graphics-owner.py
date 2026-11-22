@@ -7,7 +7,7 @@ import tempfile
 source = (Path(__file__).resolve().parents[1] / "syscall/dispatch/syscall_dispatch.c").read_text()
 start = source.index("static int console_kbd_mode =")
 end = source.index("#define mark_user_identity_range_2m_sys", start)
-assert "console_graphics_owner = cur ? cur->process : NULL;" in source
+assert "console_graphics_owner[mode_tty] = cur ? cur->process : NULL;" in source
 program = r'''
 #include <assert.h>
 #include <stdint.h>
@@ -16,9 +16,10 @@ program = r'''
 #define DEVFS_TTY_COUNT 8
 typedef struct process { int id; } process_t;
 typedef struct thread { process_t *process; uint64_t tid; } thread_t;
-static int graphics, repaint, restore;
-static void video_set_kd_mode(int mode) { graphics=mode; }
-static int video_set_vt_graphics(int tty, int mode) { (void)tty; graphics=mode; return 0; }
+static int graphics[DEVFS_TTY_COUNT], repaint, restore, active = 1;
+static int devfs_get_active(void) { return active; }
+static int video_vt_graphics(int tty) { return graphics[tty]; }
+static int video_set_vt_graphics(int tty, int mode) { graphics[tty]=mode; return 0; }
 static void devfs_tty_restore_sane(int tty) { (void)tty; restore++; }
 static int devfs_tty_leave_alt_screen(int tty) { (void)tty; return 0; }
 static void devfs_tty_force_reblit(int tty) { (void)tty; repaint++; }
@@ -29,16 +30,16 @@ int main(void) {
     assert(console_graphics_wait_syscall(441) && !console_graphics_wait_syscall(1));
     process_t x={1}, child={2};
     thread_t xorg={&x,19}, worker={&x,20}, helper={&child,26}, no_process={NULL,30};
-    console_graphics_owner=&x; console_graphics_owner_tid=19;
-    graphics=1; kd_mode=1; console_kbd_mode=4;
+    console_graphics_owner[1]=&x; console_graphics_owner_tid[1]=19;
+    graphics[1]=1; console_kbd_mode=4;
     console_kd_reset_for_dead_owner(&helper,1);
-    assert(graphics==1 && kd_mode==1 && console_kbd_mode==4 && !repaint && !restore);
+    assert(graphics[1]==1 && console_kbd_mode==4 && !repaint && !restore);
     assert(console_graphics_owned_by(&worker));
     console_kd_reset_for_dead_owner(&xorg,1);
-    assert(!graphics && !kd_mode && console_kbd_mode==1 && repaint==1 && restore==1);
-    console_graphics_owner_tid=30; graphics=1; kd_mode=1;
-    console_kd_reset_for_dead_owner(&helper,1); assert(graphics);
-    console_kd_reset_for_dead_owner(&no_process,1); assert(!graphics);
+    assert(!graphics[1] && console_kbd_mode==1 && repaint==1 && restore==1);
+    console_graphics_owner_tid[1]=30; graphics[1]=1;
+    console_kd_reset_for_dead_owner(&helper,1); assert(graphics[1]);
+    console_kd_reset_for_dead_owner(&no_process,1); assert(!graphics[1]);
     puts("PASS: only graphics owner exit restores console; child exit leaves Xorg visible");
 }
 '''

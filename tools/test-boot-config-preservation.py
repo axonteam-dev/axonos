@@ -8,7 +8,8 @@ source = (Path(__file__).resolve().parents[1] / "core/entry/init.c").read_text()
 start = source.index("static int boot_seed_file_if_missing(")
 body = source[start:source.index("\n}\n", start) + 3]
 paths = ["/etc/passwd", "/etc/group", "/etc/shadow", "/etc/gshadow",
-         "/etc/nsswitch.conf", "/etc/fstab", "/usr/share/udhcpc/default.script"]
+         "/etc/nsswitch.conf", "/etc/fstab", "/etc/resolv.conf",
+         "/usr/share/udhcpc/default.script"]
 for path in paths:
     assert f'boot_seed_file_if_missing("{path}"' in source
     assert f'fs_unlink("{path}")' not in source
@@ -38,7 +39,8 @@ static int fs_chmod(const char *p, mode_t mode) { (void)p; chmods++; saved_mode 
 ''' + body + r'''
 int main(void) {
     const char *paths[] = {"/etc/passwd", "/etc/group", "/etc/shadow", "/etc/gshadow",
-                          "/etc/nsswitch.conf", "/etc/fstab", "/usr/share/udhcpc/default.script"};
+                          "/etc/nsswitch.conf", "/etc/fstab", "/etc/resolv.conf",
+                          "/usr/share/udhcpc/default.script"};
     for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
         exists = 1; strcpy(content, "root:x:0:0:root:/root:/bin/sh\nsshd:x:22:22:sshd:/dev/null:/sbin/nologin\n");
         char before[1024]; strcpy(before, content);
@@ -53,7 +55,7 @@ int main(void) {
     assert(boot_seed_file_if_missing("/etc/shadow", "root:!\n", 7, 0600) == 0);
     assert(creates == 1 && writes == 1 && frees == 1 && chmods == 1);
     assert(strcmp(content, "root:!\n") == 0 && saved_mode == 0600);
-    puts("PASS: boot preserves packaged accounts/passwords/NSS/fstab/DHCP hook; seeds only absent files");
+    puts("PASS: boot preserves packaged configuration and dangling resolver symlinks");
 }
 '''
 with tempfile.TemporaryDirectory(prefix="axon-boot-config-") as tmp:

@@ -31,7 +31,7 @@ static uint32_t word=1,second=1,alias=1;
 static int change_on_lock, live_allocs, blocks, yields, mode;
 static uint64_t now_ns;
 static uint32_t delay_ms;
-enum { TIMEOUT, WAKE, SIGNAL, BITSET, REQUEUE, SHARED };
+enum { TIMEOUT, WAKE, SIGNAL, BITSET, REQUEUE, SHARED, CLEAR_TID };
 static thread_t *thread_current(void) { return current; }
 static thread_t *thread_get(int tid) { return tid==5?&a:tid==6?&b:NULL; }
 static void acquire_irqsave(spinlock_t *l,unsigned long *f) {
@@ -84,6 +84,11 @@ static void thread_yield(void) {
         } else if(mode==SHARED) {
             b.mm=&b_mm;
             assert(futex_syscall((uintptr_t)&alias,1,1,NULL,0,0)==1);
+        } else if(mode==CLEAR_TID) {
+            b.mm=&a_mm;
+            word=0;
+            assert(futex_syscall((uintptr_t)&word,129,1,NULL,0,0)==0);
+            assert(futex_syscall((uintptr_t)&word,1,1,NULL,0,0)==1);
         }
         current=&a;
     }
@@ -114,6 +119,8 @@ int main(void) {
     assert(futex_syscall((uintptr_t)&word,128,1,NULL,0,0)==0);reset();
     mode=SHARED;
     assert(futex_syscall((uintptr_t)&word,0,1,NULL,0,0)==0);reset();
+    mode=CLEAR_TID;
+    assert(futex_syscall((uintptr_t)&word,9|256,1,NULL,0,-1)==0);reset();
     mode=TIMEOUT;ts.sec=100;ts.ns=5000000;
     assert(futex_syscall((uintptr_t)&word,137|256,1,&ts,0,1)==-110&&delay_ms==5);reset();
     ts.sec=30*24*60*60;ts.ns=0;

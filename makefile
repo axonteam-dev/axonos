@@ -86,7 +86,7 @@ ASCII_PF2_SRC := $(firstword $(wildcard /usr/share/grub/ascii.pf2 /boot/grub/fon
 SYS_CA_PEM := $(BUILD_DIR)/certs/axonos-system-ca.pem
 SYS_CA_BLOB_OBJ := $(BUILD_DIR)/certs/axonos-system-ca.blob.o
 
-.PHONY: all kernel iso clean run run-uefi for-production config oldconfig archive test test-build test-boot FORCE
+.PHONY: all kernel iso glibc-iso clean run run-uefi for-production config oldconfig archive test test-build test-boot FORCE
 
 all: iso
 
@@ -254,7 +254,7 @@ $(PAYLOAD_BLOB_OBJ): $(PAYLOAD_LZ4)
 		"$@"
 	@$(call mark_noexecstack,$@)
 
-$(KERNEL_ELF): $(MULTIBOOT_OBJ) $(STUB_OBJ) $(PAYLOAD_BLOB_OBJ) linker.stub.ld
+$(KERNEL_ELF): $(MULTIBOOT_OBJ) $(STUB_OBJ) $(BUILD_DIR)/mem/bootmem.c.o $(PAYLOAD_BLOB_OBJ) linker.stub.ld
 	@mkdir -p $(BUILD_DIR)
 	@echo "LD		$@"
 	@ld $(LDFLAGS) -T linker.stub.ld -o $@ $(filter %.o,$^)
@@ -272,16 +272,11 @@ $(GRUB_DIR):
 
 
 
-iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg archive
-	@cp $(KERNEL_ELF) $(ISO_BOOT)/axonos.elf
-	@mkdir -p $(GRUB_DIR)/fonts
-	@if [ -f /usr/share/grub/ascii.pf2 ]; then cp /usr/share/grub/ascii.pf2 $(GRUB_DIR)/fonts/; fi
-	@if [ -f /usr/share/grub/unicode.pf2 ]; then cp /usr/share/grub/unicode.pf2 $(GRUB_DIR)/fonts/; fi
-	@if [ -f /usr/share/grub/euro.pf2 ]; then cp /usr/share/grub/euro.pf2 $(GRUB_DIR)/fonts/; fi
-	@grub-mkrescue -o $(ISO_IMAGE) $(ISO_DIR) || { \
-		echo "grub-mkrescue failed. Need xorriso, grub-pc-bin; for UEFI also grub-efi-amd64-bin and mtools" >&2; \
-		exit 1; \
-	}
+# Debian/glibc + systemd is the default image. The source initfs stays untouched.
+iso: $(KERNEL_ELF)
+	@tools/build-glibc-iso.sh $(ISO_IMAGE) $(KERNEL_ELF)
+
+glibc-iso: iso
 
 QEMU_MEMORY ?= 3072M
 QEMU_SMP ?= 4

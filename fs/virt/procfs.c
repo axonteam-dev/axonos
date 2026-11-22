@@ -5,11 +5,15 @@
 #include <fs.h>
 #include <procfs.h>
 #include <heap.h>
+#include <pmm.h>
+#include <pagecache.h>
+#include <ram_page_pool.h>
 #include <ext2.h>
 #include <stat.h>
 #include <spinlock.h>
 #include <thread.h>
 #include <process.h>
+#include <ns.h>
 #include <rtc.h>
 #include <sysinfo.h>
 #include <axonos.h>
@@ -287,6 +291,26 @@ fail:
     return -1;
 }
 
+static int procfs_build_ns_dir(struct procfs_handle *h)
+{
+    if (!h) return -1;
+    process_t *p = process_find((uint64_t)(unsigned)h->pid);
+    if (!p) return -1;
+    char *buf = NULL;
+    size_t len = 0, cap = 0;
+    for (int type = 0; type < NS_TYPE_COUNT; type++) {
+        const char *name = ns_type_name((enum ns_type)type);
+        if (procfs_append_dirent(&buf, &len, &cap, name,
+                ns_inum(p, (enum ns_type)type), EXT2_FT_SYMLINK) != 0) {
+            if (buf) kfree(buf);
+            return -1;
+        }
+    }
+    h->cache = buf;
+    h->cache_len = len;
+    return 0;
+}
+
 static void procfs_sanitize_comm(char *comm, size_t cap) {
     if (!comm || cap == 0) return;
     /* Linux get_task_comm / proc_task_name: '(' ')' never appear raw in (comm). */
@@ -503,7 +527,7 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
     struct procfs_handle *h = (struct procfs_handle *)priv;
     int pid = h ? h->pid : 0;
     if (!buf || size == 0) return 0;
-    thread_t *t = procfs_thread_by_id(pid);
+    thread_t *t = h && h->is_task ? thread_get(pid) : procfs_thread_by_id(pid);
     /*
      * BusyBox ps does strchr(buf, ')') then *p = 0 with no NULL check.
      * An empty / missing-paren line → #PF at cr2=0. Always emit Linux form.
@@ -567,7 +591,7 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
         "%d %d %d %d %llu %llu %lu "
         "%llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
         "%d %d %llu %llu %lld %llu %llu %llu %llu %llu %llu %llu %d\n",
-        procfs_tgid(t), comm, procfs_state_char(t), ppid, pgrp, sid, tty_nr, tpgid,
+        h && h->is_task ? pid : procfs_tgid(t), comm, procfs_state_char(t), ppid, pgrp, sid, tty_nr, tpgid,
         0u,
         0ull, 0ull, 0ull, 0ull,
         (unsigned long long)utime,
@@ -590,7 +614,7 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
     if ((size_t)written >= size || !strchr(buf, ')')) {
         int stub = snprintf(buf, size, "%d (%s) %c %d 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 "
             "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-            procfs_tgid(t), comm[0] ? comm : "?", procfs_state_char(t), ppid);
+            h && h->is_task ? pid : procfs_tgid(t), comm[0] ? comm : "?", procfs_state_char(t), ppid);
         if (stub < 0) return 0;
         written = stub;
     }
@@ -600,9 +624,10 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
 }
 
 static ssize_t procfs_show_status(char *buf, size_t size, void *priv) {
-    int pid = (int)(uintptr_t)priv;
+    struct procfs_handle *h = (struct procfs_handle *)priv;
+    int pid = h ? h->pid : 0;
     if (!buf || size == 0) return 0;
-    thread_t *t = procfs_thread_by_id(pid);
+    thread_t *t = h && h->is_task ? thread_get(pid) : procfs_thread_by_id(pid);
     if (!t) return 0;
     char comm[sizeof(t->name)];
     memcpy(comm, t->name, sizeof(comm));
@@ -617,7 +642,7 @@ static ssize_t procfs_show_status(char *buf, size_t size, void *priv) {
                (t->parent_tid >= 0 ? t->parent_tid : 0);
     int pgrp = (t->pgid >= 0) ? t->pgid : (int)t->tid;
     int sid = (t->sid >= 0) ? t->sid : pgrp;
-    const char *cap_hex = (t->euid == 0) ? "000001ffffffffff" : "0000000000000000";
+    process_t *process = t->process;
     struct procfs_proc_mem mem;
     procfs_calc_proc_mem(t, &mem);
     unsigned long vm_size_kb = (unsigned long)(mem.vsize_bytes / 1024ull);
@@ -628,6 +653,7 @@ static ssize_t procfs_show_status(char *buf, size_t size, void *priv) {
         buf, size,
         "Name:\t%s\n"
         "State:\t%c\n"
+        "Tgid:\t%d\n"
         "Pid:\t%d\n"
         "PPid:\t%d\n"
         "VmPeak:\t%lu kB\n"
@@ -637,20 +663,29 @@ static ssize_t procfs_show_status(char *buf, size_t size, void *priv) {
         "VmStk:\t%lu kB\n"
         "Uid:\t%u\t%u\t%u\t%u\n"
         "Gid:\t%u\t%u\t%u\t%u\n"
-        "CapInh:\t%s\n"
-        "CapPrm:\t%s\n"
-        "CapEff:\t%s\n"
-        "CapBnd:\t%s\n"
-        "CapAmb:\t0000000000000000\n"
+        "CapInh:\t%016llx\n"
+        "CapPrm:\t%016llx\n"
+        "CapEff:\t%016llx\n"
+        "CapBnd:\t%016llx\n"
+        "CapAmb:\t%016llx\n"
+        "NoNewPrivs:\t%u\n"
+        "Seccomp:\t%u\n"
         "Threads:\t1\n"
         "NSpgid:\t%d\n"
-        "NSsid:\t%d\n",
-        comm, procfs_state_char(t), procfs_tgid(t), ppid,
+        "NSsid:\t%d\n"
+        "NSpid:\t%u\n",
+        comm, procfs_state_char(t), procfs_tgid(t), h && h->is_task ? pid : procfs_tgid(t), ppid,
         vm_size_kb, vm_size_kb, vm_rss_kb, vm_data_kb, vm_stk_kb,
         (unsigned)t->uid, (unsigned)t->euid, (unsigned)t->suid, (unsigned)t->euid,
         (unsigned)t->gid, (unsigned)t->egid, (unsigned)t->sgid, (unsigned)t->egid,
-        cap_hex, cap_hex, cap_hex, cap_hex,
-        pgrp, sid
+        (unsigned long long)(process ? process->cap_inheritable : 0),
+        (unsigned long long)(process ? process->cap_permitted : (t->euid == 0 ? PROCESS_CAP_MASK : 0)),
+        (unsigned long long)(process ? process->cap_effective : (t->euid == 0 ? PROCESS_CAP_MASK : 0)),
+        (unsigned long long)(process ? process->capability_bounding : (t->euid == 0 ? PROCESS_CAP_MASK : 0)),
+        (unsigned long long)(process ? process->cap_ambient : 0),
+        (unsigned)(process ? process->no_new_privs : 0),
+        (unsigned)(process ? process->seccomp_mode : 0),
+        pgrp, sid, (unsigned)(process ? ns_pid_local(process) : (uint32_t)pid)
     );
     if (written < 0) return 0;
     size_t w = (size_t)written;
@@ -679,22 +714,45 @@ static ssize_t procfs_show_meminfo(char *buf, size_t size, void *priv) {
 	if (!buf || size == 0) return 0;
 	int mb = sysinfo_ram_mb();
 	if (mb < 0) mb = 0;
-	int total_kb = mb * 1024;
+	uint64_t total64 = (uint64_t)(unsigned)mb * 1024u;
 	uint64_t user_rss_kb = procfs_sum_unique_user_rss_kb();
 	uint64_t heap_kb = heap_used_bytes() / 1024u;
-	uint64_t kernel_visible_kb = heap_kb;
-	if (kernel_visible_kb > 16u * 1024u)
-		kernel_visible_kb = 16u * 1024u;
-	uint64_t used64 = user_rss_kb + kernel_visible_kb;
-	if (used64 > (uint64_t)total_kb) used64 = (uint64_t)total_kb;
-	int used_kb = (int)used64;
-	int free_kb = total_kb - used_kb;
+	uint64_t cached_kb = (uint64_t)pagecache_cached_pages() * 4u;
+	uint64_t free64;
+#if defined(AXON_EXPERIMENTAL_DIRECT_MAP) && AXON_EXPERIMENTAL_DIRECT_MAP
+	uint64_t high_free_kb = 0;
+#endif
+	/* Firmware-reported RAM is not necessarily managed: MMIO holes, boot
+	 * reservations and address-space limits can exclude substantial ranges.
+	 * Report actual allocator capacity/free space instead of inventing free
+	 * memory from installed RAM minus a capped heap estimate. */
+	if (pmm_ready()) {
+		total64 = (uint64_t)pmm_total_pages() * 4u + heap_total_bytes() / 1024u;
+		free64 = (uint64_t)pmm_free_pages() * 4u + heap_free_bytes() / 1024u;
+#if defined(AXON_EXPERIMENTAL_DIRECT_MAP) && AXON_EXPERIMENTAL_DIRECT_MAP
+		/* High RAM is currently usable for RAMFS only. Include it in total
+		 * and free, but not MemAvailable for ordinary process allocation. */
+		high_free_kb = (uint64_t)ramfs_high_page_free_pages() * 4u;
+		total64 += (uint64_t)ramfs_high_page_total_pages() * 4u;
+		free64 += high_free_kb;
+#endif
+	} else {
+		if (heap_total_bytes())
+			total64 = heap_total_bytes() / 1024u;
+		free64 = heap_free_bytes() / 1024u;
+	}
+	if (free64 > total64) free64 = total64;
+	uint64_t available64 = free64;
+#if defined(AXON_EXPERIMENTAL_DIRECT_MAP) && AXON_EXPERIMENTAL_DIRECT_MAP
+	if (pmm_ready() && available64 >= high_free_kb)
+		available64 -= high_free_kb;
+#endif
 	int written = snprintf(buf, size,
-		"MemTotal:       %d kB\n"
-		"MemFree:        %d kB\n"
-		"MemAvailable:   %d kB\n"
+		"MemTotal:       %llu kB\n"
+		"MemFree:        %llu kB\n"
+		"MemAvailable:   %llu kB\n"
 		"Buffers:          0 kB\n"
-		"Cached:           0 kB\n"
+		"Cached:        %llu kB\n"
 		"SwapCached:       0 kB\n"
 		"Active:        %llu kB\n"
 		"Inactive:         0 kB\n"
@@ -706,7 +764,9 @@ static ssize_t procfs_show_meminfo(char *buf, size_t size, void *priv) {
 		"PageTables:       0 kB\n"
 		"SwapTotal:        0 kB\n"
 		"SwapFree:         0 kB\n",
-		total_kb, free_kb, free_kb,
+		(unsigned long long)total64, (unsigned long long)free64,
+		(unsigned long long)available64,
+		(unsigned long long)cached_kb,
 		(unsigned long long)user_rss_kb,
 		(unsigned long long)heap_kb,
 		(unsigned long long)heap_kb);
@@ -902,7 +962,10 @@ static ssize_t procfs_show_mounts(char *buf, size_t size, void *priv) {
     for (int i = 0; i < n; i++) {
         char mpath[64];
         char drv[32];
+        char source[256];
         if (fs_mount_get(i, mpath, sizeof(mpath), drv, sizeof(drv)) != 0) continue;
+        if (fs_mount_get_source(i, source, sizeof(source)) != 0)
+            source[0] = '\0';
         int is_root = (mpath[0] == '/' && mpath[1] == '\0');
         if (is_root)
             have_root = 1;
@@ -914,7 +977,7 @@ static ssize_t procfs_show_mounts(char *buf, size_t size, void *priv) {
          * any of its subdirectories for df(1). The AxonOS root is the real
          * overlay mount, so expose it as such.
          */
-        const char *src = fstype;
+        const char *src = source[0] ? source : fstype;
         int wr = snprintf(buf + w, (w < size) ? (size - w) : 0,
                           "%s %s %s rw,relatime 0 0\n",
                           src, mpath, fstype);
@@ -944,7 +1007,10 @@ static ssize_t procfs_show_mountinfo(char *buf, size_t size, void *priv) {
     for (int i = 0; i < n; i++) {
         char mpath[64];
         char drv[32];
+        char source[256];
         if (fs_mount_get(i, mpath, sizeof(mpath), drv, sizeof(drv)) != 0) continue;
+        if (fs_mount_get_source(i, source, sizeof(source)) != 0)
+            source[0] = '\0';
         int is_root = (mpath[0] == '/' && mpath[1] == '\0');
         if (is_root)
             have_root = 1;
@@ -953,7 +1019,7 @@ static ssize_t procfs_show_mountinfo(char *buf, size_t size, void *priv) {
         int parent_id = 1;
         int wr = snprintf(buf + w, (w < size) ? (size - w) : 0,
                           "%d %d 0:0 / %s rw,relatime shared:1 - %s %s rw,relatime\n",
-                          id, parent_id, mpath, fstype, fstype);
+                          id, parent_id, mpath, fstype, source[0] ? source : fstype);
         if (wr < 0) break;
         w += (size_t)wr;
         if (w >= size) { w = size; break; }
@@ -1389,7 +1455,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 			if (ok) pid = atoi(tmp);
 		}
 		/* special subtree: /proc/sys/... */
-		if (first_len == 3 && strncmp(p, "sys", 3) == 0) {
+        if (first_len == 3 && strncmp(p, "sys", 3) == 0) {
 			if (!slash) {
 				h->kind = 8; h->file_id = 0; f->type = FS_TYPE_DIR; f->size = 0;
 				f->driver_private = h;
@@ -1651,7 +1717,18 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 			f->size = 0;
 		} else {
 			/* deeper paths: could be /proc/<pid>/cmdline, /proc/<pid>/stat, /proc/<pid>/fd, /proc/<pid>/fd/<n> */
-			const char *rest = slash + 1;
+            const char *rest = slash + 1;
+            if (strcmp(rest, "ns") == 0) {
+                h->kind = 19;
+                h->pid = pid;
+                f->type = FS_TYPE_DIR;
+                f->size = 0;
+                (void)procfs_build_ns_dir(h);
+                f->size = h->cache_len;
+                f->driver_private = h;
+                *out_file = f;
+                return 0;
+            }
             /* /proc/bus/... */
             if (first_len == 3 && strncmp(p, "bus", 3) == 0) {
                 if (strncmp(rest, "usb", 3) == 0 && (rest[3] == '\0' || rest[3] == '/')) {
@@ -1788,7 +1865,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 						else if (h->file_id == 1)
 							full = procfs_show_stat(h->cache, cap, h);
 						else if (h->file_id == 2)
-							full = procfs_show_status(h->cache, cap, (void *)(uintptr_t)h->pid);
+							full = procfs_show_status(h->cache, cap, h);
 						else if (h->file_id == 3)
 							full = procfs_show_statm(h->cache, cap, (void *)(uintptr_t)h->pid);
 						else if (h->file_id == 6)
@@ -1898,7 +1975,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					ssize_t full = 0;
 					if (h->file_id == 0) full = procfs_show_cmdline(h->cache, cap, (void*)(uintptr_t)h->pid);
 					else if (h->file_id == 1) full = procfs_show_stat(h->cache, cap, h);
-					else if (h->file_id == 2) full = procfs_show_status(h->cache, cap, (void*)(uintptr_t)h->pid);
+					else if (h->file_id == 2) full = procfs_show_status(h->cache, cap, h);
 					else if (h->file_id == 3) full = procfs_show_statm(h->cache, cap, (void*)(uintptr_t)h->pid);
 					else if (h->file_id == 4) full = procfs_show_environ(h->cache, cap, (void*)(uintptr_t)h->pid);
 					else if (h->file_id == 5) full = procfs_show_cgroup(h->cache, cap, h->pid);
@@ -1929,7 +2006,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
     if (!h) return -1;
 
     /* /proc root and /proc/<pid>/fd — snapshots built at open. */
-    if (h->kind == 1 || h->kind == 5) {
+    if (h->kind == 1 || h->kind == 5 || h->kind == 19) {
         if (h->kind == 5 && !h->cache) {
             unsigned long irqf;
             acquire_irqsave(&procfs_lock, &irqf);
@@ -1937,6 +2014,8 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
                 (void)procfs_build_fd_dir(h);
             release_irqrestore(&procfs_lock, irqf);
         }
+        if (h->kind == 19 && !h->cache)
+            (void)procfs_build_ns_dir(h);
         if (!h->cache)
             return 0;
         if ((size_t)offset >= h->cache_len)
@@ -1950,11 +2029,11 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 
     if (h->kind == 2) {
         /* /proc/<pid> directory entries */
-		const char *names[11] = { "task", "cmdline", "stat", "status", "statm", "environ", "mounts", "mountinfo", "exe", "cgroup", "oom_score_adj" };
-		const uint8_t types[11] = { EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
+		const char *names[12] = { "task", "cmdline", "stat", "status", "statm", "environ", "mounts", "mountinfo", "exe", "cgroup", "oom_score_adj", "ns" };
+		const uint8_t types[12] = { EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
 								   EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_REG_FILE,
 								   EXT2_FT_REG_FILE, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK, EXT2_FT_REG_FILE,
-								   EXT2_FT_REG_FILE };
+								   EXT2_FT_REG_FILE, EXT2_FT_DIR };
         size_t pos = 0;
         size_t written = 0;
         uint8_t *out = (uint8_t*)buf;
@@ -1994,7 +2073,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
                 pos += rec_len;
             }
         }
-		for (int idx = 0; idx < 11; idx++) {
+		for (int idx = 0; idx < 12; idx++) {
             size_t namelen = strlen(names[idx]);
             size_t rec_len = 8 + namelen;
             rec_len = (rec_len + 3) & ~3u;
@@ -2431,7 +2510,7 @@ int procfs_fill_stat(struct fs_file *file, struct stat *st) {
     if (!h) return -1;
     if (h->kind == 1 || h->kind == 2 || h->kind == 5 || h->kind == 8 || h->kind == 10 ||
         h->kind == 11 || h->kind == 12 || h->kind == 13 || h->kind == 14 || h->kind == 15 ||
-        h->kind == 16 || h->kind == 17) {
+        h->kind == 16 || h->kind == 17 || h->kind == 19) {
         st->st_ino = (h->kind == 2 && h->pid > 0) ? (ino_t)((unsigned)h->pid + 100u)
                    : (h->kind == 5 && h->pid > 0) ? (ino_t)((unsigned)h->pid + 200u)
                    : 1;

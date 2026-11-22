@@ -44,6 +44,7 @@ struct ext2_dir_entry { uint32_t inode; uint16_t rec_len; uint8_t name_len, file
 #define EXT2_FT_REG_FILE 1
 #define EXT2_FT_SYMLINK 7
 #define S_IFLNK 0120000
+static ssize_t ramfs_chunked_read_locked(struct ramfs_node *n, void *buf, size_t size, size_t offset);
 static void acquire_irqsave(spinlock_t *l, unsigned long *f) {
     assert(!l->held); l->held = 1; *f = 0;
 }
@@ -77,6 +78,14 @@ static void init_trace_read(thread_t *t, struct fs_file *f, int fd,
 static void openrc_trace_deptree_read(thread_t *t, struct fs_file *f, int fd,
                                     off_t pos, ssize_t n, const void *data, const void *user) {
     (void)t; (void)f; (void)fd; (void)pos; (void)n; (void)data; (void)user;
+}
+static ssize_t ramfs_chunked_read_locked(struct ramfs_node *n, void *buf, size_t size, size_t offset) {
+    if (!n || !buf) return -1;
+    if (offset >= n->size) return 0;
+    size_t copy = size;
+    if (offset + copy > n->size) copy = n->size - offset;
+    memcpy(buf, n->data + offset, copy);
+    return (ssize_t)copy;
 }
 static ssize_t fs_read(struct fs_file *f, void *buf, size_t len, size_t off) {
     return ramfs_read(f, buf, len, off);

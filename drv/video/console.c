@@ -5,8 +5,10 @@
 #include <cirrusfb.h>
 #include <devfs.h>
 #include <font.h>
+#include <video.h>
 
 void console_putch_xy(uint32_t x, uint32_t y, uint16_t ch, uint8_t attr) {
+	if (video_kd_graphics()) return;
 	if (cirrusfb_is_ready()) {
 		cirrusfb_putch_xy(x, y, ch, attr);
 	} else if (vbe_is_available()) {
@@ -43,6 +45,7 @@ int console_max_cols() {
 }
 
 void console_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint16_t ch, uint8_t attr) {
+	if (video_kd_graphics()) return;
 	if (cirrusfb_is_ready()) {
 		uint16_t run[256];
 		cirrusfb_begin_batch();
@@ -79,7 +82,7 @@ void console_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint16_t 
 }
 
 void console_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
-	if (!s) return;
+	if (!s || video_kd_graphics()) return;
 	if (cirrusfb_is_ready()) {
 		uint32_t cx = x, cy = y;
 		uint32_t maxc = (uint32_t)console_max_cols();
@@ -185,7 +188,9 @@ void console_end_tty_batch(void) {
 		return;
 	if (g_tty_cursor_pending) {
 		g_tty_cursor_pending = 0;
-		if (cirrusfb_is_ready())
+		if (video_kd_graphics()) {
+			/* The VT changed mode while the batch was in flight. */
+		} else if (cirrusfb_is_ready())
 			cirrusfb_set_cursor(g_tty_cursor_x, g_tty_cursor_y);
 		else if (vbe_is_available())
 			vbefb_set_cursor(g_tty_cursor_x, g_tty_cursor_y);
@@ -199,6 +204,7 @@ void console_end_tty_batch(void) {
 }
 
 void console_set_cursor(uint32_t x, uint32_t y) {
+	if (video_kd_graphics()) return;
 	if (g_tty_batch > 0) {
 		/* Record only — apply once in console_end_tty_batch(). */
 		g_tty_cursor_x = x;
@@ -228,6 +234,7 @@ static void console_sync_active_tty_home(void) {
 }
 
 void console_clear_screen_attr(uint8_t attr) {
+	if (video_kd_graphics()) return;
 	if (cirrusfb_is_ready()) {
 		cirrusfb_clear(attr);
 		console_set_cursor(0, 0);
@@ -245,6 +252,7 @@ void console_clear_screen_attr(uint8_t attr) {
 }
 
 void console_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr) {
+	if (video_kd_graphics()) return;
 	if (cirrusfb_is_ready()) {
 		if (x0 > x1) return;
 		for (uint32_t x = x0; x <= x1; x++)
@@ -264,6 +272,7 @@ void console_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t at
 
 void console_scroll_region_up(uint32_t top, uint32_t bottom, uint8_t attr)
 {
+	if (video_kd_graphics()) return;
 	if (cirrusfb_is_ready()) {
 		cirrusfb_scroll_region(top, bottom);
 		return;
@@ -284,6 +293,7 @@ uint8_t console_get_cell_attr(uint32_t x, uint32_t y) {
 }
 
 void console_putc_tty_literal(uint16_t ch, uint8_t attr) {
+	if (video_kd_graphics()) return;
 	if (cirrusfb_is_ready()) {
 		cirrusfb_putchar_literal(ch, attr);
 		return;

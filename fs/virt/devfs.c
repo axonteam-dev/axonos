@@ -25,8 +25,8 @@
 #include <pty.h>
 #include <video.h>
 #include <font.h>
+#include <vt.h>
 
-#define DEVFS_TTY_COUNT 6
 
 /* Linux x86 termbits (same as fs/virt/pty.c). */
 #define TTY_IGNCR   0x00000080u
@@ -52,6 +52,7 @@
 static struct devfs_tty dev_ttys[DEVFS_TTY_COUNT];
 static int devfs_active = 0;
 static int devfs_ready = 0;
+static volatile int devfs_tty_switch_debug_active;
 
 static struct fs_driver devfs_driver;
 static struct fs_driver_ops devfs_ops;
@@ -99,6 +100,17 @@ int devfs_chown(const char *path, uid_t uid, gid_t gid) {
     int tty = devfs_path_to_tty(path);
     if (tty < 0 || tty >= DEVFS_TTY_COUNT) return -1;
     thread_t *caller = thread_get_current_user();
+    if (path && strcmp(path, "/dev/console") == 0) {
+        static unsigned console_chown_log_budget = 12;
+        if (console_chown_log_budget) {
+            console_chown_log_budget--;
+            klogprintf_logonly("devfs-console-chown: pid=%llu euid=%u old=%u:%u new=%u:%u\n",
+                (unsigned long long)(caller ? process_pid(caller) : 0),
+                (unsigned)(caller ? caller->euid : 0),
+                (unsigned)dev_ttys[tty].node_uid, (unsigned)dev_ttys[tty].node_gid,
+                (unsigned)uid, (unsigned)gid);
+        }
+    }
     if (caller && caller->euid != 0) return -1;
     if (uid != (uid_t)-1) dev_ttys[tty].node_uid = uid;
     if (gid != (gid_t)-1) dev_ttys[tty].node_gid = gid;
@@ -141,15 +153,22 @@ static void devfs_tty_snapshot_visible(struct devfs_tty *tty) {
     if (!tty || !tty->screen) return;
     size_t scr_sz = devfs_tty_screen_bytes();
     if (cirrusfb_is_ready()) {
+        devfs_tty_switch_debug_mark("VT snapshot: cirrus begin");
         cirrusfb_snapshot_screen(tty->screen, scr_sz);
+        devfs_tty_switch_debug_mark("VT snapshot: cirrus copied");
         cirrusfb_get_cursor(&tty->cursor_x, &tty->cursor_y);
+        devfs_tty_switch_debug_mark("VT snapshot: cirrus cursor done");
         return;
     }
     if (vbe_is_available()) {
+        devfs_tty_switch_debug_mark("VT snapshot: vbe begin");
         vbefb_snapshot_screen(tty->screen, scr_sz);
+        devfs_tty_switch_debug_mark("VT snapshot: vbe copied");
         vbefb_get_cursor(&tty->cursor_x, &tty->cursor_y);
+        devfs_tty_switch_debug_mark("VT snapshot: vbe cursor done");
         return;
     }
+    devfs_tty_switch_debug_mark("VT snapshot: vga begin");
     const uint32_t vga_rows = devfs_tty_rows();
     uint32_t n = vga_rows * (uint32_t)MAX_COLS;
     if (n > (uint32_t)MAX_ROWS * (uint32_t)MAX_COLS)
@@ -159,6 +178,7 @@ static void devfs_tty_snapshot_visible(struct devfs_tty *tty) {
         tty_cell_store(tty->screen, i, (uint16_t)w[0], w[1]);
     }
     uint16_t pos = get_cursor();
+    devfs_tty_switch_debug_mark("VT snapshot: vga cursor done");
     uint32_t tty_cols = MAX_COLS;
     tty->cursor_x = (pos % (tty_cols * 2)) / 2;
     tty->cursor_y = pos / (tty_cols * 2);
@@ -735,11 +755,8 @@ static void devfs_tty_vt_reset(struct devfs_tty *tty) {
     tty->ansi_current_param = 0;
 }
 
-void devfs_tty_console_write_locked(const char *s, size_t n) {
-    if (!s || n == 0)
-        return;
-    struct devfs_tty *tty = devfs_get_tty_by_index(devfs_get_active());
-    if (!tty)
+void devfs_tty_console_write_locked(struct devfs_tty *tty, const char *s, size_t n) {
+    if (!tty || !s || n == 0)
         return;
 
     /*
@@ -749,23 +766,27 @@ void devfs_tty_console_write_locked(const char *s, size_t n) {
      */
     uint8_t saved_acs = tty->acs_mode;
     uint8_t saved_insert = tty->insert_mode;
+    /* A VT switch may have completed before we acquired this tty's lock. */
+    int visible = tty->id == devfs_get_active() && !video_vt_graphics(tty->id);
     tty->acs_mode = 0;
     tty->insert_mode = 0;
-    console_begin_tty_batch();
+    if (visible) console_begin_tty_batch();
     for (size_t i = 0; i < n; i++) {
         /* Long printk bursts mask IRQs too — keep the 8042 drained. */
         if ((i & 0x0Fu) == 0)
             keyboard_poll_drain();
         uint8_t ch = (uint8_t)s[i];
         if (ch == '\n')
-            devfs_tty_emit_byte(tty, 1, '\r');
+            devfs_tty_emit_byte(tty, visible, '\r');
         if (ch == '\b' || ch == '\t' || ch == '\n' || ch == '\r' ||
             ch == 0x0B || ch == 0x0C ||
             (ch >= 0x20 && ch != 0x7F))
-            devfs_tty_emit_byte(tty, 1, ch);
+            devfs_tty_emit_byte(tty, visible, ch);
     }
-    console_set_cursor(tty->cursor_x, tty->cursor_y);
-    console_end_tty_batch();
+    if (visible) {
+        console_set_cursor(tty->cursor_x, tty->cursor_y);
+        console_end_tty_batch();
+    }
     tty->acs_mode = saved_acs;
     tty->insert_mode = saved_insert;
 }
@@ -802,7 +823,7 @@ void devfs_tty_console_write(const char *s, size_t n) {
         return;
     unsigned long flags = 0;
     acquire_irqsave(&tty->out_lock, &flags);
-    devfs_tty_console_write_locked(s, n);
+    devfs_tty_console_write_locked(tty, s, n);
     release_irqrestore(&tty->out_lock, flags);
     devfs_tty_console_leave();
 }
@@ -1028,19 +1049,32 @@ typedef struct {
 } stdio_ring_t;
 static stdio_ring_t stdio_bufs[2]; /* 0 = stdout, 1 = stderr */
 
+/* Parse a canonical decimal VT number without accepting suffixes or overflow. */
+static int devfs_vt_number(const char *s) {
+    if (*s < '0' || *s > '9') return -1;
+    int n = *s++ - '0';
+    if (*s >= '0' && *s <= '9') {
+        if (n == 0) return -1;
+        n = n * 10 + (*s++ - '0');
+    }
+    return *s == '\0' && n <= DEVFS_TTY_COUNT ? n : -1;
+}
+
 /* helper: get tty index from path like /dev/ttyN */
 static int devfs_path_to_tty(const char *path) {
     if (!path) return -1;
     if (strcmp(path, "/dev/console") == 0) return 0;
     /* /dev/N -> ttyN (getty/inittab sometimes passes "1" = tty1 = first VC) */
-    if (strncmp(path, "/dev/", 5) == 0 && path[5] >= '0' && path[5] <= '9' && path[6] == '\0') {
-        int n = path[5] - '0';
+    if (strncmp(path, "/dev/", 5) == 0) {
+        int n = devfs_vt_number(path + 5);
         if (n >= 1 && n <= DEVFS_TTY_COUNT) return n - 1;  /* 1->0, 2->1, ... */
         if (n == 0) return 0;
     }
     /* /dev/vc/N -> ttyN (BusyBox CURRENT_VC = /dev/vc/0) */
-    if (strncmp(path, "/dev/vc/", 8) == 0 && path[8] >= '0' && path[8] < '0' + DEVFS_TTY_COUNT && path[9] == '\0')
-        return path[8] - '0';
+    if (strncmp(path, "/dev/vc/", 8) == 0) {
+        int n = devfs_vt_number(path + 8);
+        if (n >= 0) return n == 0 ? devfs_get_active() : n - 1;
+    }
     if (strncmp(path, "/dev/tty", 8) == 0) {
         /* /dev/ttyS0 -> map to tty0 (serial console alias) */
         if (path[8] == 'S' && path[9] >= '0' && path[9] <= '9' && path[10] == '\0') {
@@ -1049,10 +1083,10 @@ static int devfs_path_to_tty(const char *path) {
             return 0;
         }
         /* /dev/ttyN: Linux tty1 = first VC, tty2 = second VC. Our index 0 = first VC. */
-        if (path[8] >= '0' && path[8] <= '9' && path[9] == '\0') {
-            int n = path[8] - '0';
+        {
+            int n = devfs_vt_number(path + 8);
             if (n >= 1 && n <= DEVFS_TTY_COUNT) return n - 1;  /* tty1->0, tty2->1, ... */
-            if (n == 0) return 0;  /* tty0 = current = first at boot */
+            if (n == 0) return devfs_get_active(); /* tty0 is the foreground VT */
         }
     }
     return -1;
@@ -1600,7 +1634,8 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             for (int t = 1; t <= DEVFS_TTY_COUNT; t++) {
                 char tn[8];
                 tn[0] = 't'; tn[1] = 't'; tn[2] = 'y';
-                tn[3] = (char)('0' + t); tn[4] = '\0';
+                if (t >= 10) { tn[3] = '1'; tn[4] = (char)('0' + t - 10); tn[5] = '\0'; }
+                else { tn[3] = (char)('0' + t); tn[4] = '\0'; }
                 DEVFS_ADD_NAME(tn, 0);
             }
             for (int si = 0; si < devfs_special_count; si++)
@@ -1956,18 +1991,46 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
     return devfs_tty_write_stream(t, (const char *)buf, size, file->path);
 }
 
+/* ANSI orders colors as black/red/green/yellow/blue/magenta/cyan/white;
+ * the VGA palette used by fbcon stores them in RGB order. Bit 3 selects the
+ * bright half. fastfetch's Colors module prints 40-47 and 100-107 as two
+ * swatch rows, so both halves must stay distinct. */
+static uint8_t devfs_sgr_fg_to_vga(int ansi, int bright) {
+    static const uint8_t ansi_to_vga[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
+    return (uint8_t)(ansi_to_vga[ansi & 7] | (bright ? 8 : 0));
+}
+
+static uint8_t devfs_sgr_bg_to_vga(int ansi, int bright) {
+    static const uint8_t ansi_to_vga[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
+    return (uint8_t)(ansi_to_vga[ansi & 7] | (bright ? 8 : 0));
+}
+
 static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
                                       size_t size, const char *path) {
     if (!t || !s) return -1;
     int idx = t->id;
     /* Keep parsing into the tty's backing store, but never paint glyphs,
      * cursor moves or scroll operations into a userspace-owned framebuffer. */
-    const int tty_on_vga_batch = (idx == devfs_active && !video_kd_graphics());
+    int tty_on_vga_batch = (idx == devfs_active && !video_kd_graphics());
     unsigned long out_flags = 0;
     acquire_irqsave(&t->out_lock, &out_flags);
+    tty_on_vga_batch = (idx == devfs_active && !video_kd_graphics());
     if (tty_on_vga_batch)
         console_begin_tty_batch();
     for (size_t i = 0; i < size; i++) {
+        /* Do not mask interrupts for an arbitrarily large userspace write.
+         * Parser state lives in the tty and survives these lock boundaries. */
+        if (i && (i % 64u) == 0) {
+            if (tty_on_vga_batch) {
+                console_set_cursor(t->cursor_x, t->cursor_y);
+                console_end_tty_batch();
+            }
+            release_irqrestore(&t->out_lock, out_flags);
+            acquire_irqsave(&t->out_lock, &out_flags);
+            tty_on_vga_batch = (idx == devfs_active && !video_kd_graphics());
+            if (tty_on_vga_batch)
+                console_begin_tty_batch();
+        }
         /* IRQs stay masked for this whole paint; drain the PS/2 controller
          * periodically so a key burst during a long redraw isn't lost to FIFO
          * overflow (arrows/Home on wrapped lines). */
@@ -2027,7 +2090,7 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
             /*
              * Linux VT executes ordinary C0 controls without turning them into
              * glyphs.  State survives write boundaries, but a complete write
-             * is serialized by out_lock so another writer cannot splice bytes.
+             * is serialized by out_lock within each bounded batch.
              */
             if (uc == 0x00 || uc == 0x7F)
                 continue;
@@ -2167,6 +2230,9 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
                             tty->attr_reverse = 0;
                         } else {
                             int bright = tty->ansi_bold ? 1 : 0;
+                            /* Bit 7 is VGA blink; Linux console uses it for
+                             * bright backgrounds (fastfetch sets SGR 5). */
+                            int blink = (tty->current_attr & 0x80) ? 1 : 0;
                             for (int pi = 0; pi < tty->ansi_param_count; pi++) {
                                 int code = tty->ansi_param[pi];
                                 if (code == 38 || code == 48) {
@@ -2175,51 +2241,48 @@ static ssize_t devfs_tty_write_stream(struct devfs_tty *t, const char *s,
                                         pi += 2;
                                     continue;
                                 }
+                                int fg = tty->current_attr & 0x0F;
+                                int bg = (tty->current_attr >> 4) & 0x0F;
                                 if (code == 0) {
-                                    tty->current_attr = GRAY_ON_BLACK;
+                                    fg = 7;
+                                    bg = 0;
                                     bright = 0;
+                                    blink = 0;
                                     tty->attr_reverse = 0;
                                 } else if (code == 1) {
                                     bright = 1;
+                                } else if (code == 5) {
+                                    blink = 1;
                                 } else if (code == 22) {
                                     bright = 0;
+                                } else if (code == 25) {
+                                    blink = 0;
                                 } else if (code == 7) {
                                     tty->attr_reverse = 1;
                                 } else if (code == 27) {
                                     tty->attr_reverse = 0;
                                 } else if (code == 39) {
-                                    int bg = (tty->current_attr & 0xF0) >> 4;
-                                    int fg = 7;
-                                    if (bright) fg |= 8;
-                                    tty->current_attr = (uint8_t)((bg << 4) | (fg & 0x0F));
+                                    fg = devfs_sgr_fg_to_vga(7, bright);
+                                } else if (code == 49) {
+                                    bg = 0;
                                 } else if (code >= 30 && code <= 37) {
-                                    static const uint8_t ansi_to_vga[8] = {0, 4, 2, 6, 1, 5, 3, 7};
-                                    int fg_vga = ansi_to_vga[(code - 30) & 7];
-                                    if (bright) fg_vga |= 8;
-                                    int bg = (tty->current_attr & 0xF0) >> 4;
-                                    tty->current_attr = (uint8_t)((bg << 4) | (fg_vga & 0x0F));
+                                    fg = devfs_sgr_fg_to_vga(code - 30, bright);
                                 } else if (code >= 90 && code <= 97) {
-                                    static const uint8_t ansi_to_vga[8] = {0, 4, 2, 6, 1, 5, 3, 7};
-                                    int fg_vga = ansi_to_vga[(code - 90) & 7] | 8;
-                                    int bg = (tty->current_attr & 0xF0) >> 4;
-                                    tty->current_attr = (uint8_t)((bg << 4) | (fg_vga & 0x0F));
+                                    fg = devfs_sgr_fg_to_vga(code - 90, 1);
                                 } else if (code >= 40 && code <= 47) {
-                                    static const uint8_t ansi_to_vga_bg[8] = {0, 4, 2, 6, 1, 5, 3, 0};
-                                    int bg_vga = ansi_to_vga_bg[(code - 40) & 7];
-                                    int fg = tty->current_attr & 0x0F;
-                                    tty->current_attr = (uint8_t)((bg_vga << 4) | (fg & 0x0F));
+                                    bg = devfs_sgr_bg_to_vga(code - 40, 0);
                                 } else if (code >= 100 && code <= 107) {
-                                    static const uint8_t ansi_to_vga_bg[8] = {0, 4, 2, 6, 1, 5, 3, 0};
-                                    int bg_vga = ansi_to_vga_bg[(code - 100) & 7];
-                                    int fg = tty->current_attr & 0x0F;
-                                    tty->current_attr = (uint8_t)((bg_vga << 4) | (fg & 0x0F));
+                                    bg = devfs_sgr_bg_to_vga(code - 100, 1);
                                 }
+                                tty->current_attr = (uint8_t)((bg << 4) | fg);
                             }
                             if (tty->attr_reverse) {
                                 uint8_t fg = tty->current_attr & 0x0F;
                                 uint8_t bg = (tty->current_attr >> 4) & 0x0F;
-                                tty->current_attr = (uint8_t)((fg << 4) | (bg & 0x0F));
+                                tty->current_attr = (uint8_t)((fg << 4) | bg);
                             }
+                            if (blink)
+                                tty->current_attr |= 0x80u;
                             tty->ansi_bold = bright ? 1 : 0;
                         }
                     } else if (final_byte == 'G') {
@@ -2723,8 +2786,12 @@ int devfs_fill_stat(struct fs_file *file, struct stat *st) {
         st->st_rdev = MKDEV(5, 1);
     } else {
         int ttyi = devfs_path_to_tty(p);
-        if (ttyi >= 0 && ttyi < DEVFS_TTY_COUNT)
-            st->st_rdev = MKDEV(4, (unsigned)ttyi);
+        if (ttyi >= 0 && ttyi < DEVFS_TTY_COUNT) {
+            int minor = ttyi + 1;
+            if (!strcmp(p, "/dev/tty0") || !strcmp(p, "/dev/vc/0")) minor = 0;
+            else if (!strncmp(p, "/dev/ttyS", 9)) minor = ttyi;
+            st->st_rdev = MKDEV(4, (unsigned)minor);
+        }
     }
     /* Special device nodes need Linux rdev numbers. glibc daemon() validates
      * /dev/null via fstat: st_mode S_IFCHR and st_rdev == makedev(1,3), else
@@ -2818,7 +2885,11 @@ int devfs_register(void) {
     devfs_driver_data = &devfs_driver; /* unique pointer */
     devfs_driver.driver_data = &devfs_driver_data;
     int r = fs_register_driver(&devfs_driver);
-    if (r == 0) devfs_ready = 1;
+    if (r == 0) {
+        devfs_ready = 1;
+        if (!thread_create(vt_worker, "vt-worker"))
+            klogprintf("devfs: unable to start VT worker\n");
+    }
     return r;
 }
 
@@ -2868,18 +2939,46 @@ int devfs_mount(const char *path) {
     return fs_mount(path, &devfs_driver);
 }
 
+void devfs_tty_switch_debug_mark(const char *message) {
+    if (!devfs_tty_switch_debug_active || !message) return;
+    int cols = console_max_cols();
+    int rows = console_max_rows();
+    if (cols <= 0 || rows <= 4) return;
+    if (cols > 120) cols = 120;
+    console_fill_rect(0, 4, (uint32_t)cols, 1, ' ', 0x1Fu);
+    console_write_str_xy(0, 4, message, 0x1Fu);
+}
+
+void devfs_tty_switch_debug_begin(void) {
+    /* Disabled after locating the VT path: painting here perturbs handoff. */
+    devfs_tty_switch_debug_active = 0;
+}
+
+void devfs_tty_switch_debug_end(void) {
+    devfs_tty_switch_debug_mark("VT_ACTIVATE: switch returned");
+    devfs_tty_switch_debug_active = 0;
+}
+
 int devfs_switch_tty(int index) {
+    devfs_tty_switch_debug_mark("VT switch: entered");
     if (index < 0 || index >= DEVFS_TTY_COUNT) return -1;
-    if (index == devfs_active) return 0;
+    if (index == devfs_active) {
+        devfs_tty_switch_debug_mark("VT switch: already active");
+        return 0;
+    }
 
     /* Serialize against the painter for the destination tty (write_stream /
      * echo hold out_lock). ISR-callable: never spin here, defer the switch
      * if the destination is being painted right now (T6). */
     struct devfs_tty *dst = &dev_ttys[index];
-    if (!try_acquire(&dst->out_lock))
+    if (!try_acquire(&dst->out_lock)) {
+        devfs_tty_switch_debug_mark("VT switch: destination busy");
         return -1;
+    }
+    devfs_tty_switch_debug_mark("VT switch: destination locked");
     if (index == devfs_active) {
         release(&dst->out_lock);
+        devfs_tty_switch_debug_mark("VT switch: already active after lock");
         return 0;
     }
 
@@ -2887,16 +2986,22 @@ int devfs_switch_tty(int index) {
        Never memcpy fbcon-sized buffers into legacy VGA text memory; that corrupts memory. */
     if (cirrusfb_is_ready()) {
         if (!video_kd_graphics()) devfs_tty_snapshot_visible(&dev_ttys[devfs_active]);
+        devfs_tty_switch_debug_mark("VT switch: source snapshot done");
         devfs_active = index;
+        devfs_tty_switch_debug_mark("VT switch: repaint begin");
         devfs_tty_blit_to_console(dst);
+        devfs_tty_switch_debug_mark("VT switch: repaint returned");
         release(&dst->out_lock);
         return 0;
     }
 
     if (vbe_is_available()) {
         if (!video_kd_graphics()) devfs_tty_snapshot_visible(&dev_ttys[devfs_active]);
+        devfs_tty_switch_debug_mark("VT switch: source snapshot done");
         devfs_active = index;
+        devfs_tty_switch_debug_mark("VT switch: repaint begin");
         devfs_tty_blit_to_console(dst);
+        devfs_tty_switch_debug_mark("VT switch: repaint returned");
         release(&dst->out_lock);
         return 0;
     }
@@ -2904,8 +3009,11 @@ int devfs_switch_tty(int index) {
     /* Fallback: legacy VGA text mode only.
        Clamp copy size so we never write beyond the actual VGA text buffer. */
     if (!video_kd_graphics()) devfs_tty_snapshot_visible(&dev_ttys[devfs_active]);
+    devfs_tty_switch_debug_mark("VT switch: source snapshot done");
     devfs_active = index;
+    devfs_tty_switch_debug_mark("VT switch: repaint begin");
     devfs_tty_blit_to_console(dst);
+    devfs_tty_switch_debug_mark("VT switch: repaint returned");
     release(&dst->out_lock);
     /* set current user/process to first process attached to this tty, if any */
     /* NOTE:
@@ -3317,6 +3425,9 @@ int devfs_is_tty_file(struct fs_file *file) {
 +   Encapsulates logic used to resolve /dev/stdin/out/err, /dev/tty and ttyN. */
 int devfs_get_tty_index_from_file(struct fs_file *file) {
     if (!file) return -1;
+    if (file->path && (!strcmp(file->path, "/dev/tty0") ||
+                       !strcmp(file->path, "/dev/vc/0")))
+        return devfs_get_active();
     if (file->driver_private) {
         uintptr_t dp = (uintptr_t)file->driver_private;
         uintptr_t base_tty = (uintptr_t)&dev_ttys[0];
@@ -3336,18 +3447,9 @@ int devfs_get_tty_index_from_file(struct fs_file *file) {
         }
     }
     if (file->path) {
+        int path_tty = devfs_path_to_tty(file->path);
+        if (path_tty >= 0) return path_tty;
         if (strcmp(file->path, "/dev/console") == 0) return 0;
-        /* /dev/N and /dev/ttyN: same mapping as devfs_path_to_tty */
-        if (strncmp(file->path, "/dev/", 5) == 0 && file->path[5] >= '0' && file->path[5] <= '9' && file->path[6] == '\0') {
-            int n = file->path[5] - '0';
-            if (n >= 1 && n <= DEVFS_TTY_COUNT) return n - 1;
-            if (n == 0) return 0;
-        }
-        if (strlen(file->path) >= 9 && strncmp(file->path, "/dev/tty", 8) == 0 && file->path[8] >= '0' && file->path[8] <= '9') {
-            int n = file->path[8] - '0';
-            if (n >= 1 && n <= DEVFS_TTY_COUNT) return n - 1;
-            if (n == 0) return 0;
-        }
         if (strcmp(file->path, "/dev/stdin") == 0 || strcmp(file->path, "/dev/tty") == 0) {
             thread_t *cur = thread_current();
             return (cur && cur->attached_tty >= 0) ? cur->attached_tty : devfs_get_active();

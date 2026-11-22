@@ -21,12 +21,36 @@
 #include <sysinfo.h>
 #include <devfs.h>
 #include <stddef.h>
+#include <serial.h>
+
+/* Temporary X11 hang diagnostics for a VMware COM1 file.  Never wait
+ * indefinitely for a UART: the machine may not have a serial device. */
+static void xdiag_serial_write(const char *s, size_t n) {
+	static int initialized;
+	if (!initialized) {
+		outb(0x3f9, 0);
+		outb(0x3fb, 0x80);
+		outb(0x3f8, 1); /* 115200 baud */
+		outb(0x3f9, 0);
+		outb(0x3fb, 3); /* 8N1 */
+		outb(0x3fa, 0xc7);
+		outb(0x3fc, 3);
+		initialized = 1;
+	}
+	for (size_t i = 0; i < n; i++) {
+		unsigned spins = 10000;
+		while (spins && !(inb(0x3fd) & 0x20)) --spins;
+		if (!spins) return;
+		outb(0x3f8, (unsigned char)s[i]);
+	}
+}
 
 static spinlock_t klog_lock;
 static int klog_inited;
 
 /* Single ring for early + post-init (Linux log_buf). */
-#define KLOG_RING_SZ (256 * 1024)
+/* Keep the low kernel image below the fixed 0x400000 user ET_EXEC window. */
+#define KLOG_RING_SZ (160 * 1024)
 static char klog_ring[KLOG_RING_SZ];
 static size_t klog_ring_pos;  /* next write offset */
 static size_t klog_ring_len;  /* bytes valid (<= KLOG_RING_SZ) */
@@ -329,6 +353,8 @@ static void klogprintf_v(int to_console, const char *fmt, va_list ap) {
 		release_irqrestore(&klog_lock, irqf);
 	}
 
+	if (strstr(line, "xdiag") || strstr(line, "fbdev: user mmap"))
+		xdiag_serial_write(line, outlen);
 	if (do_console)
 		klog_console_write_sync_tty(line, outlen);
 

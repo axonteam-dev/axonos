@@ -7,6 +7,8 @@
 #include <vga.h>
 #include <klog.h>
 #include <pit.h>
+#include <devfs.h>
+#include <video.h>
 
 /* Simple framebuffer console built on top of vbe double-buffer */
 extern int vbe_is_available(void);
@@ -81,6 +83,7 @@ static void vbe_dirty_mark(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 }
 
 static void vbefb_flush_dirty(void) {
+	if (video_kd_graphics()) { g_vbe_dirty = 0; return; }
 	if (!g_vbe_dirty)
 		return;
 	if (g_vbe_batch > 0)
@@ -96,6 +99,7 @@ static void vbefb_flush_dirty(void) {
  * start with front and shadow identical or unflushed glyphs would be lost when
  * both buffers are scrolled independently. */
 static void vbefb_flush_dirty_now(void) {
+	if (video_kd_graphics()) { g_vbe_dirty = 0; return; }
 	if (!g_vbe_dirty)
 		return;
 	uint32_t w = g_vbe_dx1 - g_vbe_dx0 + 1;
@@ -180,6 +184,7 @@ static void draw_text_row(uint32_t row) {
 }
 
 void vbefb_putch_xy(uint32_t x, uint32_t y, uint16_t ch, uint8_t attr) {
+	if (video_kd_graphics()) return;
 	if (!vbe_is_available() || !textbuf) return;
 	if (x >= cols || y >= rows) return;
 	textbuf[y * cols + x].ch = ch;
@@ -270,6 +275,7 @@ static void vbefb_emit_tty_char(uint16_t ch) {
 }
 
 void vbefb_putchar(uint16_t ch, uint8_t attr) {
+	if (video_kd_graphics()) return;
 	if (!vbe_is_available() || !textbuf || cols == 0 || rows == 0) { return; }
 	/* Honor caller-selected color when printing raw chars (devfs/tty path). */
 	if (!esc_mode && ch != 0x1B) current_attr = attr;
@@ -373,6 +379,7 @@ void vbefb_putchar(uint16_t ch, uint8_t attr) {
 }
 
 void vbefb_putchar_literal(uint16_t ch, uint8_t attr) {
+	if (video_kd_graphics()) return;
 	if (!vbe_is_available() || !textbuf || cols == 0 || rows == 0) return;
 	esc_mode = 0;
 	esc_len = 0;
@@ -381,6 +388,7 @@ void vbefb_putchar_literal(uint16_t ch, uint8_t attr) {
 }
 
 void draw_cursor(void) {
+	if (video_kd_graphics()) return;
 	if (!vbe_is_available() || !textbuf) return;
 	if (cursor_frozen || cursor_drawn || !cursor_visible) return;
 	if (cursor_x >= cols || cursor_y >= rows) return;
@@ -423,6 +431,7 @@ void draw_cursor(void) {
 }
 
 void erase_cursor(void) {
+	if (video_kd_graphics()) return;
 	if (!vbe_is_available() || !textbuf) return;
 	if (!cursor_drawn) return;
 	if (cursor_x >= cols || cursor_y >= rows) return;
@@ -433,6 +442,7 @@ void erase_cursor(void) {
 }
 
 void vbefb_update_cursor(void) {
+	if (video_kd_graphics()) return;
 	if (!vbe_is_available()) return;
 	if (cursor_frozen) return;
 	uint64_t phase = cursor_blink_phase();
@@ -459,6 +469,7 @@ void vbefb_get_cursor(uint32_t *x, uint32_t *y) {
 }
 
 void vbefb_set_cursor(uint32_t x, uint32_t y) {
+	if (video_kd_graphics()) return;
 	if (x >= cols) x = cols - 1;
 	if (y >= rows) y = rows - 1;
 	if (g_vbe_batch > 0 || cursor_frozen) {
@@ -475,6 +486,7 @@ void vbefb_set_cursor(uint32_t x, uint32_t y) {
 }
 
 void vbefb_clear(uint8_t attr) {
+	if (video_kd_graphics()) return;
 	if (!vbe_is_available() || !textbuf) return;
 	vbefb_begin_batch();
 	current_attr = attr;
@@ -492,6 +504,7 @@ void vbefb_clear(uint8_t attr) {
 
 void vbefb_scroll_region(uint32_t top, uint32_t bottom, uint8_t attr)
 {
+	if (video_kd_graphics()) return;
 	if (!vbe_is_available() || !textbuf || cols == 0 || rows == 0)
 		return;
 	if (top >= rows)
@@ -528,6 +541,7 @@ void vbefb_snapshot_screen(uint8_t *out, size_t max_bytes) {
 }
 
 void vbefb_restore_screen(const uint8_t *src, uint32_t src_cols, uint32_t src_rows) {
+	if (video_kd_graphics()) return;
 	if (!vbe_is_available() || !textbuf || !src) return;
 	if (src_cols != cols || src_rows != rows) return;
 	vbefb_begin_batch();
@@ -541,9 +555,11 @@ void vbefb_restore_screen(const uint8_t *src, uint32_t src_cols, uint32_t src_ro
 			draw_cell_to_framebuffer(x, y);
 		}
 	}
+	devfs_tty_switch_debug_mark("VT repaint: cells complete; flush begin");
 	g_vbe_dirty = 0;
 	vbe_dirty_mark(0, 0, fb_width, fb_height);
 	vbefb_end_batch();
+	devfs_tty_switch_debug_mark("VT repaint: flush complete");
 }
 
 /* Initialize console state after vbe init; called externally if needed */
@@ -576,5 +592,3 @@ int vbefb_init(uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp) {
 	vbefb_clear(WHITE_ON_BLACK);
 	return 0;
 }
-
-

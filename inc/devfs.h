@@ -10,7 +10,7 @@ typedef struct thread thread_t;
 
 /* Number of virtual ttys provided by devfs (default) */
 #ifndef DEVFS_TTY_COUNT
-#define DEVFS_TTY_COUNT 6
+#define DEVFS_TTY_COUNT 12
 #endif
 #ifndef DEVFS_TTY_IRQ_OVF
 #define DEVFS_TTY_IRQ_OVF 512
@@ -121,6 +121,10 @@ int devfs_find_block_by_path(const char *path);
 int devfs_get_device_id(const char *path);
 /* Switch current active virtual terminal (0..N-1); return -1 if busy. */
 int devfs_switch_tty(int index);
+/* Temporary visual trace for locating a stalled userspace VT switch. */
+void devfs_tty_switch_debug_begin(void);
+void devfs_tty_switch_debug_end(void);
+void devfs_tty_switch_debug_mark(const char *message);
 
 /* Return number of virtual ttys available */
 int devfs_tty_count(void);
@@ -128,8 +132,8 @@ int devfs_tty_count(void);
 /* Kernel console output (kprintf): write through the active tty so cursor and
  * screen backing stay aligned with userspace /dev/console I/O. */
 void devfs_tty_console_write(const char *s, size_t n);
-/* Same kernel-console path with tty->out_lock already held by the caller. */
-void devfs_tty_console_write_locked(const char *s, size_t n);
+/* Same kernel-console path with this tty's out_lock already held. */
+void devfs_tty_console_write_locked(struct devfs_tty *tty, const char *s, size_t n);
 /* Console paint re-entrancy guard: 1 allows taking out_lock, 0 drops a nested
  * kprintf/klog output fired from a fault inside an active paint. */
 extern volatile int devfs_tty_render_depth;
@@ -207,4 +211,3 @@ int devfs_chown(const char *path, uid_t uid, gid_t gid);
 /* Enumerate registered block devices (created via devfs_create_block_node). */
 int devfs_block_count(void);
 int devfs_block_get(int index, char *out_name, size_t out_cap, int *out_device_id, uint32_t *out_sectors);
-

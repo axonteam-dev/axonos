@@ -22,6 +22,7 @@ program = r'''
 typedef struct { uint64_t tid, pid; } thread_t;
 struct fs_file { const char *path; off_t pos; };
 static int init_verbose_trace;
+static int mmap_failure_trace;
 static struct { char read_path[96]; } init_progress[64];
 static int init_runtime_thread(thread_t *t) { return t != NULL; }
 static uint64_t process_pid(thread_t *t) { return t->pid; }

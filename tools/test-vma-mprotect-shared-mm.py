@@ -20,10 +20,11 @@ typedef struct user_vma {
     fs_file *file;
 } user_vma_t;
 #define USER_VMA_MAX 16
+#define USER_VMA_MM_MAX 8
 typedef struct { user_vma_t *vmas; } mm_t;
 typedef struct { int tid, ring; mm_t *mm; } thread_t;
 typedef struct { int locked; } spinlock_t;
-static user_vma_t g_user_vmas[USER_VMA_MAX], mm_vmas[USER_VMA_MAX];
+static user_vma_t g_user_vmas[USER_VMA_MAX], mm_vmas[USER_VMA_MM_MAX];
 static spinlock_t g_user_vma_lock;
 static mm_t shared = {mm_vmas};
 static thread_t threads[] = {{1,3,&shared}, {2,3,&shared}};
@@ -68,6 +69,6 @@ int main(void) {
 with tempfile.TemporaryDirectory(prefix="axon-vma-mprotect-") as tmp:
     c, binary = Path(tmp) / "test.c", Path(tmp) / "test"
     c.write_text(program)
-    subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+    subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
                     str(c), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

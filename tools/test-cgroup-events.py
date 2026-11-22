@@ -49,7 +49,7 @@ static void acquire_irqsave(spinlock_t *l, unsigned long *f) {
 static void release_irqrestore(spinlock_t *l, unsigned long f) {
     (void)f; assert(l->held); l->held = 0;
 }
-''' + function("static int cg_populated(") + function("static ssize_t cg_show(") + function("void cgroup_task_enter(") + function("void cgroup_task_leave(") + function("static int cg_refresh_cache(") + function("int cgroupfs_poll(") + r'''
+''' + function("static int cg_populated(") + function("static ssize_t cg_show(") + function("void cgroup_task_enter(") + function("void cgroup_task_leave(") + function("static int cg_refresh_cache(") + function("int cgroupfs_poll(") + function("int cgroupfs_open_truncate_noop(") + r'''
 static ssize_t read_file(struct fs_file *file, void *buf, size_t size, size_t offset) {
     struct cgroupfs_handle *h = file->driver_private;
 ''' + read_source[begin:end] + r'''
@@ -59,6 +59,14 @@ int main(void) {
     struct cgroup service = {.parent = &g_cgroup_root};
     struct cgroupfs_handle h = {.cg = &service, .file_id = CG_FILE_EVENTS};
     struct fs_file file = {.driver_private = &h, .fs_private = &cgroup_driver};
+    struct cgroupfs_handle control_h = {.cg = &service, .file_id = CG_FILE_SUBTREE};
+    struct fs_file control = {.driver_private = &control_h, .fs_private = &cgroup_driver};
+    struct cgroupfs_handle dir_h = {.cg = &service, .file_id = 0};
+    struct fs_file dir = {.driver_private = &dir_h, .fs_private = &cgroup_driver};
+    assert(cgroupfs_open_truncate_noop(&control));
+    assert(!cgroupfs_open_truncate_noop(&dir));
+    dir.fs_private = NULL;
+    assert(!cgroupfs_open_truncate_noop(&dir));
     char buf[128] = {0}; short ready = -1;
     assert(cg_refresh_cache(&h, &file) == 0);
     assert(cgroupfs_poll(&file, 2, &ready) == 1 && ready == 0); /* PRI quiet */

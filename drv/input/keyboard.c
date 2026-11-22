@@ -1,4 +1,5 @@
 #include <keyboard.h>
+#include <vt.h>
 #include <syscall.h>
 #include <idt.h>
 #include <vga.h>
@@ -12,6 +13,7 @@
 #include <devfs.h>
 #include <mouse.h>
 #include <input_evdev.h>
+#include <video.h>
 
 // Вспомогательные функции для ожидания статусов контроллера PS/2
 static int ps2_wait_input_empty(void) {
@@ -240,8 +242,10 @@ void keyboard_process_scancode(uint8_t scancode) {
                 kbd_extended_prefix = false;
                 return;
         }
-        /* linux evdev EVIOCGRAB: TTY stops seeing keys while SDL/libinput holds the device. */
-        if (evdev_keyboard_grabbed()) {
+        /* The active graphics VT belongs to its userspace display server.
+         * Keep feeding evdev and handling Alt+Fn, but do not also type the
+         * same keys into the underlying text console. */
+        if (evdev_keyboard_grabbed() || video_kd_graphics()) {
                 uint8_t make = scancode & 0x7Fu;
                 int down = !(scancode & 0x80);
                 if (kbd_extended_prefix) {
@@ -253,8 +257,10 @@ void keyboard_process_scancode(uint8_t scancode) {
                 if (make == 0x2A || make == 0x36) shift_pressed = down;
                 else if (make == 0x1D) ctrl_pressed = down;
                 else if (make == 0x38) alt_pressed = down;
-                else if (down && alt_pressed && make >= 0x3B && make <= 0x40)
-                        devfs_switch_tty(make - 0x3B);
+                else if (down && alt_pressed && make >= 0x3B && make <= 0x44)
+                        vt_request_switch_irq(make - 0x3B);
+                else if (down && alt_pressed && (make == 0x57 || make == 0x58))
+                        vt_request_switch_irq(make - 0x57 + 10);
                 return;
         }
         // Обрабатываем только нажатие клавиш (не отпускание)
@@ -380,12 +386,12 @@ void keyboard_process_scancode(uint8_t scancode) {
                 case 0x3E: // F4
                 case 0x3F: // F5
                 case 0x40: // F6
-                        /* Alt+F1..F6 or Ctrl+Alt+F1..F6 — switch virtual terminal (same as chvt 1..6) */
+                        /* Alt+Fn and Ctrl+Alt+Fn switch virtual terminals. */
                         if (alt_pressed) {
                                 int idx = (scancode == 0x3B) ? 0 : (scancode == 0x3C) ? 1 :
                                           (scancode == 0x3D) ? 2 : (scancode == 0x3E) ? 3 :
                                           (scancode == 0x3F) ? 4 : 5;
-                                devfs_switch_tty(idx);
+                                vt_request_switch_irq(idx);
                         } else {
                                 /* Always push (ISR has no user context; same as arrow keys). */
                                 switch (scancode) {
@@ -404,6 +410,11 @@ void keyboard_process_scancode(uint8_t scancode) {
                 case 0x44: // F10
                 case 0x57: // F11
                 case 0x58: // F12
+                        if (alt_pressed) {
+                                int idx = scancode <= 0x44 ? scancode - 0x3B : scancode - 0x57 + 10;
+                                vt_request_switch_irq(idx);
+                                break;
+                        }
                         switch (scancode) {
                                 /* F10 doubles as a diagnostics key: dumps input-path
                                  * counters to the debugcon so we can tell whether
@@ -438,10 +449,11 @@ void ps2_keyboard_init() {
         ctrlc_pending = false;
         kbd_extended_prefix = false;
 
+        /* Keep IRQ1 masked while polling command ACKs. If the IRQ handler
+         * consumes an ACK first, the synchronous setup path can time out. */
+        pic_mask_irq(1);
         // Устанавливаем обработчик прерывания
         idt_set_handler(33, keyboard_handler);
-        // Ensure PIC delivers IRQ1
-        pic_unmask_irq(1);
         /* Flush stale controller output before programming it. */
         ps2_flush_output();
         // Try to enable first PS/2 port at controller level (command 0xAE)
@@ -483,9 +495,16 @@ void ps2_keyboard_init() {
         (void)ps2_kbd_send_ack(0xF0);
         (void)ps2_kbd_send_ack(0x02);
 
+        /* PS/2 typematic byte 0x00 selects the shortest initial delay
+         * (250 ms) and fastest repeat rate (about 30 characters/sec). */
+        if (ps2_kbd_send_ack(0xF3) == 0)
+                (void)ps2_kbd_send_ack(0x00);
+
         /* Enable scanning on the keyboard (0xF4) and optionally consume ACK (0xFA). */
         (void)ps2_kbd_send_ack(0xF4);
         keyboard_register_sysfs();
+        // Deliver IRQ1 only after all command ACKs have been consumed.
+        pic_unmask_irq(1);
 }
 
 // Получить символ (блокирующая функция, как в Unix)

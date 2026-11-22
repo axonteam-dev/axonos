@@ -15,6 +15,7 @@ program = r'''
 #include <stddef.h>
 #include <stdio.h>
 #define USER_VMA_MAX 16
+#define USER_VMA_MM_MAX USER_VMA_MAX
 #define USER_VMA_KIND_MMAP 1
 #define USER_VMA_KIND_SHM 2
 #define USER_VMA_KIND_MMAP_LAZY 3

@@ -18,6 +18,7 @@ program = r'''
 #include <stdint.h>
 #include <stdio.h>
 #define USER_VMA_MAX 4
+#define USER_VMA_MM_MAX USER_VMA_MAX
 typedef struct { int used; uint64_t tid; int *refs; } user_vma_t;
 typedef struct { int locked; } spinlock_t;
 static user_vma_t g_user_vmas[USER_VMA_MAX];

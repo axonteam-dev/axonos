@@ -105,6 +105,10 @@ void exec_boot_ensure_stdio(thread_t *ut) {
         struct fs_file *console = devfs_open_direct("/dev/console");
         if (!console)
             return;
+        if (fs_file_account(console) != 0) {
+            fs_file_free(console);
+            return;
+        }
         struct fs_file *old[3] = { ut->fds[0], ut->fds[1], ut->fds[2] };
         /* Replace only slots that need a console; keep pipes/redirections. */
         for (int fd = 0; fd <= 2; fd++) {
@@ -132,6 +136,8 @@ void exec_boot_ensure_stdio(thread_t *ut) {
                     n++;
             }
             for (int k = 0; k < n; k++)
+                fs_file_fd_close(f);
+            for (int k = 0; k < n; k++)
                 fs_file_free(f);
         }
         int adopted = 0;
@@ -143,14 +149,19 @@ void exec_boot_ensure_stdio(thread_t *ut) {
         }
         if (adopted == 0)
             fs_file_free(console);
-        else
+        else {
             console->refcount = adopted;
+            for (int k = 0; k < adopted; k++)
+                fs_file_fd_open(console);
+        }
     } else {
         for (int fd = 1; fd <= 2; fd++) {
             if (!ut->fds[fd]) {
                 ut->fds[fd] = ut->fds[0];
-                if (ut->fds[fd])
+                if (ut->fds[fd]) {
                     ut->fds[fd]->refcount++;
+                    fs_file_fd_open(ut->fds[fd]);
+                }
             }
         }
     }
@@ -550,21 +561,21 @@ uint64_t virt_to_phys(uint64_t va) {
     uint64_t l3e = l4[l4i];
     if (l3e & PG_PS_2M) {
         /* 1GiB page */
-        return (l3e & ~0x3FFFFFFFULL) | (va & 0x3FFFFFFFULL);
+        return (l3e & PG_ADDR_MASK_1G) | (va & 0x3FFFFFFFULL);
     }
-    uint64_t *l3 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
+    uint64_t *l3 = (uint64_t*)(uintptr_t)(l3e & PG_ADDR_MASK);
     if (!(l3[l3i] & PG_PRESENT)) return 0;
     uint64_t l2e = l3[l3i];
     if (l2e & PG_PS_2M) {
         /* 2MiB page */
-        return (l2e & ~(PAGE_SIZE_2M - 1)) | (va & (PAGE_SIZE_2M - 1));
+        return (l2e & PG_ADDR_MASK_2M) | (va & (PAGE_SIZE_2M - 1));
     }
-    uint64_t *l2 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
+    uint64_t *l2 = (uint64_t*)(uintptr_t)(l2e & PG_ADDR_MASK);
     if (!(l2[l2i] & PG_PRESENT)) return 0;
     uint64_t l1e = l2[l2i];
-    uint64_t *l1 = (uint64_t*)(uintptr_t)(l1e & ~0xFFFULL);
+    uint64_t *l1 = (uint64_t*)(uintptr_t)(l1e & PG_ADDR_MASK);
     if (!(l1[l1i] & PG_PRESENT)) return 0;
-    return (l1[l1i] & ~0xFFFULL) | (va & 0xFFFULL);
+    return (l1[l1i] & PG_ADDR_MASK) | (va & 0xFFFULL);
 }
 
 /* Create new PML4 by cloning current active CR3 contents. */
@@ -585,7 +596,7 @@ static uint64_t *ensure_child_table(uint64_t *parent_entries, int idx) {
     uint64_t ent = parent_entries[idx];
     if (ent & PG_PRESENT) {
         /* existing */
-        return (uint64_t*)(uintptr_t)(ent & ~0xFFFULL);
+        return (uint64_t*)(uintptr_t)(ent & PG_ADDR_MASK);
     }
     void *nt = alloc_page_table();
     if (!nt) return NULL;
@@ -608,7 +619,7 @@ static int pml4_map_one(void *pml4_ptr, uint64_t va, uint64_t pa, uint64_t flags
     /* allocate l3 if missing or clone if present and shared with kernel */
     uint64_t *l3;
     if (ent4 & PG_PRESENT) {
-        l3 = (uint64_t*)(uintptr_t)(ent4 & ~0xFFFULL);
+        l3 = (uint64_t*)(uintptr_t)(ent4 & PG_ADDR_MASK);
         /* clone to avoid modifying kernel tables */
         l3 = dup_page_table(l3);
         if (!l3) return -1;
@@ -627,7 +638,7 @@ static int pml4_map_one(void *pml4_ptr, uint64_t va, uint64_t pa, uint64_t flags
     }
     uint64_t *l2;
     if (ent3 & PG_PRESENT) {
-        l2 = (uint64_t*)(uintptr_t)(ent3 & ~0xFFFULL);
+        l2 = (uint64_t*)(uintptr_t)(ent3 & PG_ADDR_MASK);
         l2 = dup_page_table(l2);
         if (!l2) return -1;
         l3[l3i] = ((uint64_t)(uintptr_t)l2) | (ent3 & 0xFFF);
@@ -645,7 +656,7 @@ static int pml4_map_one(void *pml4_ptr, uint64_t va, uint64_t pa, uint64_t flags
     }
     uint64_t *l1;
     if (ent2 & PG_PRESENT) {
-        l1 = (uint64_t*)(uintptr_t)(ent2 & ~0xFFFULL);
+        l1 = (uint64_t*)(uintptr_t)(ent2 & PG_ADDR_MASK);
         l1 = dup_page_table(l1);
         if (!l1) return -1;
         l2[l2i] = ((uint64_t)(uintptr_t)l1) | (ent2 & 0xFFF);
@@ -1183,7 +1194,7 @@ static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
         l4[l4i] |= PG_US | PG_RW;
         l4[l4i] &= ~PG_NX;
 
-        uint64_t *l3 = (uint64_t *)(uintptr_t)(l4[l4i] & ~0xFFFULL);
+        uint64_t *l3 = (uint64_t *)(uintptr_t)(l4[l4i] & PG_ADDR_MASK);
         if (!(l3[l3i] & PG_PRESENT)) return -1;
         /* Do not OR flags onto a 1GiB leaf — that would publish the whole GB. */
         if (l3[l3i] & PG_PS_2M)
@@ -1192,7 +1203,7 @@ static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
         l3[l3i] &= ~PG_NX;
         uint64_t l3e = l3[l3i];
 
-        uint64_t *l2 = (uint64_t *)(uintptr_t)(l3e & ~0xFFFULL);
+        uint64_t *l2 = (uint64_t *)(uintptr_t)(l3e & PG_ADDR_MASK);
         if (!(l2[l2i] & PG_PRESENT)) return -1;
         uint64_t l2e = l2[l2i];
         if (l2e & PG_PS_2M) {
@@ -1205,7 +1216,7 @@ static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
             continue;
         }
 
-        uint64_t *l1 = (uint64_t *)(uintptr_t)(l2e & ~0xFFFULL);
+        uint64_t *l1 = (uint64_t *)(uintptr_t)(l2e & PG_ADDR_MASK);
         uint64_t chunk_end = va + PAGE_SIZE_2M;
         if (chunk_end > end) chunk_end = end;
         for (uint64_t p = va; p < chunk_end; p += PAGE_SIZE_4K) {
@@ -1319,7 +1330,7 @@ static int mark_user_identity_range_2m(uint64_t va_begin, uint64_t va_end) {
         uint64_t *l4 = active_l4;
         if (!(l4[l4i] & PG_PRESENT)) return -1;
         l4[l4i] |= PG_US;
-        uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
+        uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & PG_ADDR_MASK);
         if (!(l3[l3i] & PG_PRESENT)) return -1;
         l3[l3i] |= PG_US;
         uint64_t l3e = l3[l3i];
@@ -1328,14 +1339,14 @@ static int mark_user_identity_range_2m(uint64_t va_begin, uint64_t va_end) {
             invlpg((void *)(uintptr_t)va);
             continue;
         }
-        uint64_t *l2 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
+        uint64_t *l2 = (uint64_t*)(uintptr_t)(l3e & PG_ADDR_MASK);
         if (!(l2[l2i] & PG_PRESENT)) return -1;
         uint64_t l2e = l2[l2i];
         if (l2e & PG_PS_2M) {
             l2[l2i] |= PG_US;
         } else {
             l2[l2i] |= PG_US;
-            uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
+            uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & PG_ADDR_MASK);
             uint64_t chunk_end = va + PAGE_SIZE_2M;
             if (chunk_end > end) chunk_end = end;
             for (uint64_t p = va; p < chunk_end; p += PAGE_SIZE_4K) {
@@ -2326,8 +2337,8 @@ int kernel_execve_from_path(const char *path, const char *const argv[],
     return 0;
 }
 
-int kernel_execve_init_from_path(const char *path, const char *const argv[],
-                                 const char *const envp[]) {
+static int kernel_execve_init_on_safe_stack(const char *path, const char *const argv[],
+                                            const char *const envp[]) {
     if (thread_get_current_user() != NULL)
         return -1;
     thread_t *caller = thread_current();
@@ -2354,6 +2365,32 @@ int kernel_execve_init_from_path(const char *path, const char *const argv[],
     return rc;
 }
 
+extern int boot_exec_call_on_stack(const char *path, const char *const argv[],
+                                   const char *const envp[],
+                                   int (*fn)(const char *, const char *const *,
+                                             const char *const *),
+                                   void *stack_top);
+
+int kernel_execve_init_from_path(const char *path, const char *const argv[],
+                                 const char *const envp[]) {
+    /* The bootstrap stack can lie inside the ELF/mmap user window. Switching
+     * CR3 while executing there replaces the live stack with user pages. */
+    const size_t stack_size = 128u * 1024u;
+    void *stack = kmalloc(stack_size);
+    uintptr_t lo = (uintptr_t)stack;
+    if (!stack || lo < (uintptr_t)USER_STACK_TOP ||
+        lo > (uintptr_t)MMIO_IDENTITY_LIMIT - stack_size) {
+        if (stack) kfree(stack);
+        kprintf("init: no kernel-only bootstrap exec stack available\n");
+        return -3;
+    }
+    int rc = boot_exec_call_on_stack(path, argv, envp,
+                                     kernel_execve_init_on_safe_stack,
+                                     (void *)(lo + stack_size));
+    kfree(stack);
+    return rc;
+}
+
 static int kernel_execve_into_mm(const char *path, const char *const argv[],
                                  const char *const envp[], mm_t *resume_mm) {
     if (!path) return -1;
@@ -2368,7 +2405,11 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
     memset(&main_info, 0, sizeof(main_info));
     memset(&interp_info, 0, sizeof(interp_info));
     memset(&main_tls, 0, sizeof(main_tls));
-    exec_reset_shared_user_space(thread_get_current_user(), 8u * 1024u * 1024u);
+    /* PID 1 boot/fallback has no current user task: its nascent private mm
+     * belongs to the ring-0 image preparer. Passing NULL enters the legacy
+     * shared-CR3 teardown and scrubs every task's VMAs, including addresses
+     * overlapping the live kernel stack. */
+    exec_reset_shared_user_space(elf_bprm_thread(), 8u * 1024u * 1024u);
     {
         thread_t *tr = thread_get_current_user();
         if (tr && tr->name[0] &&
@@ -2848,6 +2889,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
                 if (ut->fds[i]) {
                     if (ut->fds[i]->refcount <= 0) ut->fds[i]->refcount = 1;
                     else ut->fds[i]->refcount++;
+                    fs_file_fd_open(ut->fds[i]);
                 }
             }
             /* block caller until user program exits */

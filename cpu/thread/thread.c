@@ -63,7 +63,10 @@ static uint32_t thread_deadline_ms(uint32_t delay_ms) {
         uint32_t now = (uint32_t)pit_get_time_ms();
         if (delay_ms == 0) delay_ms = 1;
         if (delay_ms > 0x7FFFFFFFu) delay_ms = 0x7FFFFFFFu;
-        return now + delay_ms;
+        uint32_t deadline = now + delay_ms;
+        /* Zero means no timeout in the wakeup scans.  A wrapped deadline
+         * must not turn a timed sleep into an indefinite one. */
+        return deadline ? deadline : 1;
 }
 
 void thread_wake_expired_timeouts(void) {
@@ -243,6 +246,23 @@ static void thread_note_ready_nolock(thread_t *t) {
          */
         if (t->vfork_waiting)
                 return;
+        /* A long-blocked task must not accumulate unlimited priority over the
+         * tasks that ran while it slept. Place it at the runnable floor, but
+         * never reduce its runtime (or adjust a RUNNING task being requeued). */
+        if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING) {
+                uint64_t floor = UINT64_MAX;
+                for (int i = 0; i < thread_count; ++i) {
+                        thread_t *r = threads[i];
+                        if (!r || r == t || thread_is_any_idle(r) ||
+                            (r->state != THREAD_READY && r->state != THREAD_RUNNING) ||
+                            r->vfork_waiting)
+                                continue;
+                        if (r->sched_vruntime < floor)
+                                floor = r->sched_vruntime;
+                }
+                if (floor != UINT64_MAX && t->sched_vruntime < floor)
+                        t->sched_vruntime = floor;
+        }
         t->sched_fifo_seq = ++sched_fifo_counter;
         t->state = THREAD_READY;
 }
@@ -538,6 +558,7 @@ void thread_init() {
         /* Linux init_fs starts with 0022; PID 1 inherits it at exec. */
         main_thread.umask = 0022;
         main_thread.nice = 0;
+        main_thread.ioprio = 0;
         main_thread.sched_fifo_seq = 0;
         main_thread.start_ticks = timer_ticks;
         main_thread.context.rflags = 0x202; // ensure IF set for idle/main thread
@@ -638,6 +659,29 @@ static void thread_trampoline(void) {
         }
 }
 
+/* Select and publish under the same lock: an earlier availability check does
+ * not reserve a slot while the thread and its stacks are being allocated. */
+static int thread_publish_new(thread_t *t) {
+        unsigned long irqf;
+        acquire_irqsave(&sched_lock, &irqf);
+        int slot;
+        for (slot = 1; slot < MAX_THREADS; slot++) {
+                if (threads[slot] == NULL)
+                        break;
+        }
+        if (slot == MAX_THREADS) {
+                release_irqrestore(&sched_lock, irqf);
+                return -1;
+        }
+        t->tid = slot;
+        threads[slot] = t;
+        if (slot >= thread_count) thread_count = slot + 1;
+        if (t->state == THREAD_READY)
+                t->sched_fifo_seq = ++sched_fifo_counter;
+        release_irqrestore(&sched_lock, irqf);
+        return 0;
+}
+
 static thread_t* thread_create_with_state(void (*entry)(void), const char* name, thread_state_t st) {
         /* Find a free slot so we can reuse reaped threads. */
         int slot = -1;
@@ -704,6 +748,7 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->state = st;
         thread_t *creator = thread_current();
         t->nice = creator ? creator->nice : 0;
+        t->ioprio = creator ? creator->ioprio : 0;
         t->umask = creator ? creator->umask : 0022;
         t->sched_fifo_seq = 0;
         t->sched_vruntime = creator ? creator->sched_vruntime : 0;
@@ -775,16 +820,10 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->cwd[sizeof(t->cwd) - 1] = '\0';
         strncpy(t->fs_root, "/", sizeof(t->fs_root));
         t->fs_root[sizeof(t->fs_root) - 1] = '\0';
-        /* Use next free slot and tid so we never overwrite an existing thread. */
-        {
-                unsigned long irqf;
-                acquire_irqsave(&sched_lock, &irqf);
-                threads[slot] = t;
-                t->tid = slot;
-                if (slot >= thread_count) thread_count = slot + 1;
-                if (st == THREAD_READY)
-                        t->sched_fifo_seq = ++sched_fifo_counter;
-                release_irqrestore(&sched_lock, irqf);
+        if (thread_publish_new(t) != 0) {
+                /* Another creator filled the table during allocation. */
+                thread_free_resources(t);
+                return NULL;
         }
         return t;
 }
@@ -865,8 +904,10 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                 /* copy fd table and bump refcount so close in parent doesn't free shared files (e.g. pipe) */
                 for (int i = 0; i < THREAD_MAX_FD; i++) {
                     t->fds[i] = tc->fds[i];
-                    if (t->fds[i])
+                    if (t->fds[i]) {
                         fs_file_get(t->fds[i]);
+                        fs_file_fd_open(t->fds[i]);
+                    }
                 }
                 t->attached_tty = tc->attached_tty;
                 t->attached_pty = tc->attached_pty;
@@ -1075,10 +1116,24 @@ int thread_fd_alloc(struct fs_file *file) {
              */
             if (file->refcount <= 0)
                     file->refcount = 1;
+            fs_file_fd_open(file);
             return i;
         }
     }
     return -24; /* EMFILE */
+}
+
+/* Thread fd slots mirror the process table without owning references.  Clear
+ * every mirror before the shared descriptor can release its file object. */
+static void thread_fd_clear_mirrors(process_t *process, int fd) {
+    if (!process || fd < 0 || fd >= THREAD_MAX_FD) return;
+    unsigned long flags;
+    acquire_irqsave(&sched_lock, &flags);
+    for (int i = 0; i < thread_count; ++i) {
+        thread_t *t = threads[i];
+        if (t && t->process == process) t->fds[fd] = NULL;
+    }
+    release_irqrestore(&sched_lock, flags);
 }
 
 int thread_fd_close_for(thread_t *cur, int fd) {
@@ -1095,9 +1150,9 @@ int thread_fd_close_for(thread_t *cur, int fd) {
     if (cur->process) {
         cur->process->fds[fd] = NULL;
         cur->process->fd_cloexec[fd] = 0;
+        thread_fd_clear_mirrors(cur->process, fd);
     }
-    /* Linux: close() auto-removes fd from all epoll interest lists. */
-    epoll_notify_fd_closed(cur, fd);
+    fs_file_fd_close(f);
     fs_file_free(f);
     return 0;
 }
@@ -1124,6 +1179,7 @@ int thread_fd_dup(int oldfd) {
                 cur->process->fds[i] = f;
             if (f->refcount <= 0) f->refcount = 1;
             else f->refcount++;
+            fs_file_fd_open(f);
             return i;
         }
     }
@@ -1145,22 +1201,26 @@ int thread_fd_dup2(int oldfd, int newfd) {
                 (int)(cur->tid ? cur->tid : 1), oldfd, newfd,
                 fs_pipe_is_write_end(f) ? 'W' : 'R',
                 (void *)f, f->refcount, f->driver_private);
-    /* close newfd if open; process->fds is authoritative for a process. */
+    /* process->fds is authoritative for a process. */
     struct fs_file *replaced = cur->process ?
         cur->process->fds[newfd] : cur->fds[newfd];
-    if (replaced)
-        fs_file_free(replaced);
     cur->fds[newfd] = NULL;
     if (cur->process) {
         cur->process->fds[newfd] = NULL;
         /* Linux dup2 clears close-on-exec on the new descriptor. */
         cur->process->fd_cloexec[newfd] = 0;
+        thread_fd_clear_mirrors(cur->process, newfd);
     }
     cur->fds[newfd] = f;
     if (cur->process)
         cur->process->fds[newfd] = f;
     if (f->refcount <= 0) f->refcount = 1;
     else f->refcount++;
+    fs_file_fd_open(f);
+    if (replaced) {
+        fs_file_fd_close(replaced);
+        fs_file_free(replaced);
+    }
     return newfd;
 }
 

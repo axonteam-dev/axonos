@@ -20,9 +20,11 @@ ap_trampoline_bin_start:
     mov ss, ax
     mov sp, 0x7E00
 
-    ; Real mode default address size is 16-bit: [pm_gdt_desc] truncates to low 16 bits of EA.
-    ; At TRAMP_BASE 0x10000 that points at 0x0080 (IVT/BDA), not the real descriptor — #GP before prot32.
-    o32 a32 lgdt [pm_gdt_desc]
+    ; SIPI starts at CS=TRAMP_BASE>>4, IP=0. DS=0 has a 64 KiB real-mode
+    ; limit, so a 32-bit DS-relative address of 0x10000+ faults even with
+    ; address-size override. Read the descriptor through the trampoline CS
+    ; using its 16-bit offset; o32 retains the full 32-bit GDT base.
+    o32 lgdt [cs:pm_gdt_desc - TRAMP_BASE]
 
     mov eax, cr0
     or al, 1

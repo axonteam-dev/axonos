@@ -1,4 +1,5 @@
 #include <process.h>
+#include <seccomp.h>
 #include <thread.h>
 #include <heap.h>
 #include <string.h>
@@ -12,6 +13,7 @@
 #include <pit.h>
 #include <syscall.h>
 #include <cgroup.h>
+#include <ns.h>
 
 extern void kprintf(const char *fmt, ...);
 
@@ -59,6 +61,11 @@ static process_t *process_alloc_locked(process_t *parent) {
     p->ngroups = 1;
     p->groups[0] = 0;
     p->dumpable = 1; /* Linux SUID_DUMP_USER */
+    p->cap_effective = PROCESS_CAP_MASK;
+    p->cap_permitted = PROCESS_CAP_MASK;
+    p->cap_inheritable = 0;
+    p->cap_ambient = 0;
+    p->capability_bounding = PROCESS_CAP_MASK;
     p->rlim_nofile_cur = PROCESS_RLIMIT_NOFILE_SOFT;
     p->rlim_nofile_max = PROCESS_RLIMIT_NOFILE_HARD;
     p->rlim_stack_cur = 8ULL * 1024ULL * 1024ULL;
@@ -86,6 +93,14 @@ static process_t *process_alloc_locked(process_t *parent) {
             p->ngroups = 0;
         p->dumpable = parent->dumpable;
         p->secure_bits = parent->secure_bits;
+        p->keep_caps = parent->keep_caps;
+        p->personality = parent->personality;
+        p->cap_effective = parent->cap_effective;
+        p->cap_permitted = parent->cap_permitted;
+        p->cap_inheritable = parent->cap_inheritable;
+        p->cap_ambient = parent->cap_ambient;
+        p->capability_bounding = parent->capability_bounding;
+        seccomp_process_inherit(p, parent);
         if (p->ngroups > AXON_NGROUPS_MAX)
             p->ngroups = AXON_NGROUPS_MAX;
         if (p->ngroups > 0)
@@ -126,11 +141,23 @@ process_t *process_create(process_t *parent) {
     acquire_irqsave(&process_lock, &flags);
     process_t *p = process_alloc_locked(parent);
     release_irqrestore(&process_lock, flags);
+    if (p) {
+        if (parent)
+            ns_process_inherit(p, parent);
+        else
+            ns_process_init_install(p);
+    }
     return p;
 }
 
 process_t *process_create_init(void) {
     return process_create(NULL);
+}
+
+int process_has_cap(const process_t *process, unsigned capability)
+{
+    return process && capability <= PROCESS_CAP_LAST &&
+           (process->cap_effective & (1ULL << capability)) != 0;
 }
 
 void process_claim_pid1(process_t *process) {
@@ -294,10 +321,41 @@ static int process_wait_spec_match(const process_t *p, int pid, int pgid) {
     return p->pgid == -pid;
 }
 
+/* A damaged sibling chain must not trap wait/exit with interrupts disabled.
+ * The process table and each child's parent pointer are authoritative. */
+static void process_validate_children_locked(process_t *parent) {
+    if (!parent)
+        return;
+    process_t *p = parent->first_child;
+    int count = 0;
+    while (p && count < PROCESS_TABLE_MAX && p != parent && p->parent == parent) {
+        p = p->next_sibling;
+        count++;
+    }
+    if (!p)
+        return;
+    parent->first_child = NULL;
+    for (int i = 0; i < PROCESS_TABLE_MAX; i++) {
+        p = process_table[i];
+        if (!p || p == parent || p->parent != parent)
+            continue;
+        p->next_sibling = parent->first_child;
+        parent->first_child = p;
+    }
+}
+
 static void process_relink_child_locked(process_t *parent, process_t *p) {
     int linked = 0;
-    if (p->parent != parent)
-        p->parent = parent;
+    if (p->parent && p->parent != parent) {
+        process_validate_children_locked(p->parent);
+        process_t **link = &p->parent->first_child;
+        while (*link && *link != p)
+            link = &(*link)->next_sibling;
+        if (*link == p)
+            *link = p->next_sibling;
+    }
+    process_validate_children_locked(parent);
+    p->parent = parent;
     for (process_t *c = parent->first_child; c; c = c->next_sibling) {
         if (c == p) {
             linked = 1;
@@ -320,6 +378,7 @@ process_t *process_find_child(process_t *parent, int pid, int pgid,
     int matched = 0;
     unsigned long flags;
     acquire_irqsave(&process_lock, &flags);
+    process_validate_children_locked(parent);
     /* Linux waitpid(pid>0): TGID only. Relink lost sibling/parent pointers so
      * the real_parent invariant holds; do not match by tid slot. */
     for (process_t *p = parent->first_child; p; p = p->next_sibling) {
@@ -348,13 +407,16 @@ process_t *process_find_child(process_t *parent, int pid, int pgid,
         }
     }
     if (!matched) {
-        /* Restore real_parent when parent_tid names any thread of this process
-         * (fork from a worker, not only the group leader). */
+        /* Repair only a parentless record. parent_tid is a recyclable thread
+         * slot, and must not override an already known process parent. */
         for (int i = 0; i < PROCESS_TABLE_MAX; ++i) {
             process_t *p = process_table[i];
             thread_t *pt;
             int cpt;
-            if (!p || p == parent || !p->leader)
+            if (!p || p == parent || p->parent || !p->leader)
+                continue;
+            if (p->leader->linux_ppid > 0 &&
+                p->leader->linux_ppid != (int)parent->pid)
                 continue;
             cpt = p->leader->parent_tid;
             if (cpt < 0)
@@ -397,12 +459,17 @@ void process_reparent_children(process_t *process, process_t *new_parent) {
         return;
     unsigned long flags;
     acquire_irqsave(&process_lock, &flags);
+    process_validate_children_locked(process);
+    process_validate_children_locked(new_parent);
     process_t *child = process->first_child;
     process->first_child = NULL;
     while (child) {
         process_t *next = child->next_sibling;
         child->parent = new_parent;
         if (child->leader) {
+            child->leader->parent_tid =
+                new_parent && new_parent->leader ?
+                (int)(new_parent->leader->tid ? new_parent->leader->tid : 1) : -1;
             if (new_parent)
                 child->leader->linux_ppid = (int)new_parent->pid;
             else
@@ -424,6 +491,7 @@ int process_reap(process_t *parent, process_t *child) {
         return -1;
     unsigned long flags;
     acquire_irqsave(&process_lock, &flags);
+    process_validate_children_locked(parent);
     process_t **link = &parent->first_child;
     while (*link && *link != child)
         link = &(*link)->next_sibling;
@@ -443,8 +511,9 @@ int process_reap(process_t *parent, process_t *child) {
     release_irqrestore(&process_lock, flags);
     /* The zombie path already detached cgroup membership; keep reap
      * idempotent for legacy exit paths as well. */
-    cgroup_task_leave(child);
+    ns_process_exit(child);
     thread_detach_process(child);
+    seccomp_process_release(child);
     kfree(child);
     return 0;
 }
@@ -455,6 +524,7 @@ int process_reap_zombie(process_t *child) {
     unsigned long flags;
     acquire_irqsave(&process_lock, &flags);
     if (child->parent) {
+        process_validate_children_locked(child->parent);
         process_t **link = &child->parent->first_child;
         while (*link && *link != child)
             link = &(*link)->next_sibling;
@@ -472,8 +542,9 @@ int process_reap_zombie(process_t *child) {
     release_irqrestore(&process_lock, flags);
     /* The zombie path already detached cgroup membership; keep reap
      * idempotent for legacy exit paths as well. */
-    cgroup_task_leave(child);
+    ns_process_exit(child);
     thread_detach_process(child);
+    seccomp_process_release(child);
     kfree(child);
     return 0;
 }
@@ -483,6 +554,7 @@ int process_discard(process_t *parent, process_t *child) {
         return -1;
     unsigned long flags;
     acquire_irqsave(&process_lock, &flags);
+    process_validate_children_locked(parent);
     process_t **link = &parent->first_child;
     while (*link && *link != child)
         link = &(*link)->next_sibling;
@@ -504,8 +576,9 @@ int process_discard(process_t *parent, process_t *child) {
     release_irqrestore(&process_lock, flags);
     /* ns_process_inherit() accounts the child before it is published. Roll
      * that back if clone/exec setup fails before the process can exit. */
-    cgroup_task_leave(child);
+    ns_process_exit(child);
     thread_detach_process(child);
+    seccomp_process_release(child);
     kfree(child);
     return 0;
 }
@@ -572,6 +645,7 @@ void process_exec_reset(process_t *process, thread_t *thread) {
             process->fd_cloexec[j] = 0;
             if (thread)
                 thread->fds[j] = NULL;
+            fs_file_fd_close(file);
             n++;
         }
         for (int k = 0; k < n; k++)
@@ -588,6 +662,18 @@ void process_exec_reset(process_t *process, thread_t *thread) {
     }
     /* POSIX/Linux execve: interval timers are disarmed; the signal mask is kept. */
     process->secure_bits &= ~(1u << 4); /* SECBIT_KEEP_CAPS resets on exec */
+    process->keep_caps = 0;
+    /* Linux execve derives capabilities from the file and ambient sets. This
+     * VFS has no file capabilities yet: non-root exec gets only ambient caps;
+     * root regains its remaining bset unless SECBIT_NOROOT is set. */
+    if (process->euid == 0 && !(process->secure_bits & 1u)) {
+        process->cap_permitted = process->capability_bounding;
+        process->cap_effective = process->capability_bounding;
+    } else {
+        process->cap_permitted = process->cap_ambient;
+        process->cap_effective = process->cap_ambient;
+    }
+    process->cap_ambient = 0;
     process->itimer_expire_ms = 0;
     process->itimer_interval_ms = 0;
     process_posix_timers_flush_pid(process->pid);
@@ -618,12 +704,14 @@ int process_adopt_child(process_t *parent, process_t *child) {
     unsigned long flags;
     acquire_irqsave(&process_lock, &flags);
     if (child->parent && child->parent != parent) {
+        process_validate_children_locked(child->parent);
         process_t **link = &child->parent->first_child;
         while (*link && *link != child)
             link = &(*link)->next_sibling;
         if (*link == child)
             *link = child->next_sibling;
     }
+    process_validate_children_locked(parent);
     int linked = 0;
     for (process_t *c = parent->first_child; c; c = c->next_sibling) {
         if (c == child) { linked = 1; break; }
@@ -667,6 +755,21 @@ int process_collect_signal_targets(process_t *caller, int pid,
     }
     release_irqrestore(&process_lock, flags);
     return mcount > out_max ? out_max : mcount;
+}
+
+/* A maskable process-directed signal cannot take its default action while
+ * every live member blocks it. SIGKILL is handled separately by kill(). */
+int process_signal_has_unblocked_thread(process_t *p, int sig) {
+    if (!p || sig <= 0 || sig > 63)
+        return 0;
+    uint64_t bit = 1ULL << (sig - 1);
+    for (int i = 0; i < thread_get_count(); ++i) {
+        thread_t *t = thread_get_by_index(i);
+        if (t && t->process == p && t->state != THREAD_TERMINATED &&
+            !(t->saved_sig_mask & bit))
+            return 1;
+    }
+    return 0;
 }
 
 int process_signal_targets(process_t *caller, int pid, int sig) {

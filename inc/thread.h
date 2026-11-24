@@ -302,6 +302,7 @@ int thread_reap(int pid);
 void thread_detach_process(process_t *p);
 /* Non-idle threads in READY or RUNNING (scheduler load sample). */
 int thread_runnable_nonidle_count(void);
+int thread_has_ready_on_cpu(int cpu);
 void thread_sleep(uint32_t ms);
 
 // access thread by index (0..thread_get_count()-1)

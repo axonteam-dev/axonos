@@ -41,8 +41,10 @@ int main(int argc, char **argv) {
     fail_large = argc > 1;
     unsigned capacity = fail_large ? PAGES / 2u : PAGES;
     frame_init();
+    assert(frame_free_slots() == capacity);
     for (unsigned i = 0; i < capacity; i++)
         assert(frame_alloc() == (void *)(uintptr_t)((uint64_t)(i + 1) * 4096));
+    assert(frame_free_slots() == 0);
     assert(frame_alloc() == NULL);
     for (unsigned i = 0; i < capacity; i++) {
         uint64_t pa = (uint64_t)(i + 1) * 4096;
@@ -50,6 +52,7 @@ int main(int argc, char **argv) {
         frame_release(pa);
     }
     assert(returned == capacity + (fail_large ? 1u : 0u));
+    assert(frame_free_slots() == capacity);
     return 0;
 }
 '''

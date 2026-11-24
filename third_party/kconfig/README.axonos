@@ -1,0 +1,14 @@
+Linux Kconfig host tools, imported from Gentoo's linux-6.18.54 source tree.
+Upstream: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+
+The Kconfig and lxdialog sources and scripts/include headers retain their
+original copyright and SPDX notices, generally GPL-2.0-only or GPL-2.0-or-later.
+The GPL version 2 text is in COPYING. The generated parser includes the
+GNU Bison skeleton notice and exception; its source grammar is parser.y.
+The generated lexer and its source lexer.l are included.
+Local change: confdata.c declares its mutable configuration-line symbol name
+as char * to match strchr() and avoid discarded-qualifier warnings.
+
+These files build the standalone host programs conf and mconf. They are not
+linked into the Axon kernel. AxonOS's own MIT license remains applicable
+to AxonOS files; it does not replace the notices on these third-party files.

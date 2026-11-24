@@ -9,6 +9,8 @@ start = source.index("static int boot_seed_file_if_missing(")
 body = source[start:source.index("\n}\n", start) + 3]
 paths = ["/etc/passwd", "/etc/group", "/etc/shadow", "/etc/gshadow",
          "/etc/nsswitch.conf", "/etc/fstab", "/etc/resolv.conf",
+         "/etc/ld.so.conf", "/etc/ld.so.conf.d/libc.conf",
+         "/etc/ld.so.conf.d/x86_64-linux-gnu.conf",
          "/usr/share/udhcpc/default.script"]
 for path in paths:
     assert f'boot_seed_file_if_missing("{path}"' in source
@@ -40,6 +42,8 @@ static int fs_chmod(const char *p, mode_t mode) { (void)p; chmods++; saved_mode 
 int main(void) {
     const char *paths[] = {"/etc/passwd", "/etc/group", "/etc/shadow", "/etc/gshadow",
                           "/etc/nsswitch.conf", "/etc/fstab", "/etc/resolv.conf",
+                          "/etc/ld.so.conf", "/etc/ld.so.conf.d/libc.conf",
+                          "/etc/ld.so.conf.d/x86_64-linux-gnu.conf",
                           "/usr/share/udhcpc/default.script"};
     for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
         exists = 1; strcpy(content, "root:x:0:0:root:/root:/bin/sh\nsshd:x:22:22:sshd:/dev/null:/sbin/nologin\n");

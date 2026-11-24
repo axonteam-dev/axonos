@@ -2,6 +2,7 @@
 """Exercise the transformed XFCE startup script with real timeout processes."""
 import os
 from pathlib import Path
+import socket
 import subprocess
 import tempfile
 
@@ -56,6 +57,11 @@ fi
     session.chmod(0o755)
     env = dict(os.environ, PATH=f"{bindir}:/usr/bin:/bin", TEST_DIR=tmp)
     env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/tmp/existing-session"
+    runtime = root / "runtime"
+    (runtime / "systemd").mkdir(parents=True)
+    manager = socket.socket(socket.AF_UNIX)
+    manager.bind(str(runtime / "systemd/private"))
+    env["XDG_RUNTIME_DIR"] = str(runtime)
     for probe, update in (("ok", "ok"), ("fail", "fail"), ("hang", "hang")):
         env.update(systemctl_mode=probe, dbus_mode=update)
         result = subprocess.run(["sh", str(script)], env=env, text=True,
@@ -63,7 +69,7 @@ fi
         assert "session-started" in result.stdout
         assert (root / "systemctl.args").read_text().strip() == "--user list-jobs"
         args = (root / "dbus-update-activation-environment.args").read_text().split()
-        assert args == (["--systemd"] if probe == "ok" else []) + ["DESKTOP_SESSION", "XDG_RUNTIME_DIR"]
+        assert args == (["--systemd"] if probe == "ok" else []) + ["BROWSER", "DESKTOP_SESSION", "XDG_RUNTIME_DIR"]
         assert ("systemctl user probe" in result.stderr) == (probe != "ok")
         assert ("D-Bus activation environment" in result.stderr) == (update != "ok")
         if probe == "hang":
@@ -75,6 +81,14 @@ fi
                     pass
                 else:
                     raise AssertionError(f"{name} survived timeout: {pid}")
+    manager.close()
+    (runtime / "systemd/private").unlink()
+    (root / "systemctl.args").unlink()
+    env.update(systemctl_mode="hang", dbus_mode="ok")
+    result = subprocess.run(["sh", str(script)], env=env, text=True,
+                            capture_output=True, timeout=2, check=True)
+    assert "session-started" in result.stdout
+    assert not (root / "systemctl.args").exists()
     script.write_text("unexpected upstream script\n")
     assert subprocess.run(patch, capture_output=True).returncode != 0
     assert script.read_text() == "unexpected upstream script\n"

@@ -68,6 +68,32 @@ static uint64_t high_total(const struct bootmem *m) {
     }
     return result;
 }
+static void linux_e820_tests(void) {
+    uint8_t params[4096] = {0};
+    struct bootmem map;
+    uint8_t *e = params + 0x2d0;
+    params[0x1e8] = 3;
+    w64(e, 256 * M); w64(e + 8, 6 * M); w32(e + 16, 2);
+    e += 20;
+    w64(e, M); w64(e + 8, 1023 * M); w32(e + 16, 1);
+    e += 20;
+    w64(e, 900 * M); w64(e + 8, 300 * M); w32(e + 16, 1);
+    assert(bootmem_from_linux_e820(&map, params, sizeof(params), LIMIT) == 0);
+    assert(bootmem_is_free(&map, 100 * M, 200 * M));
+    assert(!bootmem_is_free(&map, 256 * M, 257 * M));
+    assert(bootmem_is_free(&map, 1024 * M, 1100 * M));
+    assert(bootmem_from_linux_e820(&map, params, 4095, LIMIT) != 0);
+    params[0x1e8] = 129;
+    assert(bootmem_from_linux_e820(&map, params, sizeof(params), LIMIT) != 0);
+    params[0x1e8] = 3;
+    w64(params + 0x250, 1);
+    assert(bootmem_from_linux_e820(&map, params, sizeof(params), LIMIT) != 0);
+    w64(params + 0x250, 0);
+    w64(e, UINT64_MAX - 1); w64(e + 8, 4);
+    assert(bootmem_from_linux_e820(&map, params, sizeof(params), LIMIT) != 0);
+    params[0x1e8] = 0;
+    assert(bootmem_from_linux_e820(&map, params, sizeof(params), LIMIT) != 0);
+}
 static void map_tests(void) {
     struct bootmem map;
     struct builder b;
@@ -191,8 +217,8 @@ static void pmm_tests(void) {
     assert(munmap(mem, size) == 0);
 }
 int main(void) {
-    map_tests(); pmm_tests();
-    puts("PASS: Multiboot reservations, RAM sizing and disjoint PMM ranges");
+    map_tests(); linux_e820_tests(); pmm_tests();
+    puts("PASS: Multiboot reservations, Linux E820 parsing and disjoint PMM ranges");
     return 0;
 }
 '''

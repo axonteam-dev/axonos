@@ -8,20 +8,33 @@ import sys
 import tempfile
 
 
-def generate(config, output):
+def generate(config, output, kconfig=False):
     values = {}
     for number, raw in enumerate(config.read_text().splitlines(), 1):
         line = raw.strip()
         disabled = re.fullmatch(r"#\s*([A-Za-z_]\w*)\s+is\s+not\s+set", line)
         if disabled:
-            values[disabled[1]] = "n"
+            key = disabled[1]
+            if kconfig:
+                if not key.startswith("CONFIG_"):
+                    raise ValueError(f"{config}:{number}: expected CONFIG_ symbol")
+                key = key[7:]
+            values[key] = "n"
         elif not line or line.startswith("#") or re.fullmatch(r"\[.*\]", line):
             continue
         else:
             entry = re.fullmatch(r"([A-Za-z_]\w*)\s*=\s*(.*)", line)
             if not entry:
                 raise ValueError(f"{config}:{number}: invalid configuration")
-            values[entry[1]] = entry[2].strip()
+            key = entry[1]
+            if kconfig:
+                if not key.startswith("CONFIG_"):
+                    raise ValueError(f"{config}:{number}: expected CONFIG_ symbol")
+                key = key[7:]
+            value = entry[2].strip()
+            if kconfig and value == "m":
+                raise ValueError(f"{config}:{number}: loadable modules are not implemented")
+            values[key] = value
     conf = ["# Generated; do not edit", "# m is linked in until modules exist"]
     header = ["/* Generated; do not edit */", "#pragma once"]
     for key, value in values.items():
@@ -56,7 +69,14 @@ def generate(config, output):
 
 if __name__ == "__main__":
     try:
-        generate(Path(sys.argv[1] if len(sys.argv) > 1 else "config.cfg"),
-                 Path(sys.argv[2] if len(sys.argv) > 2 else "build/include"))
+        args = sys.argv[1:]
+        kconfig = "--kconfig" in args
+        if kconfig:
+            args.remove("--kconfig")
+        if len(args) > 2:
+            raise ValueError("usage: genconfig.py [--kconfig] [config [output]]")
+        generate(Path(args[0] if args else "config.cfg"),
+                 Path(args[1] if len(args) > 1 else "build/include"),
+                 kconfig=kconfig)
     except (OSError, ValueError) as error:
         sys.exit(f"genconfig: {error}")

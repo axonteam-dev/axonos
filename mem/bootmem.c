@@ -50,6 +50,38 @@ static int add_usable(struct bootmem *map, uint64_t start, uint64_t end)
     return 0;
 }
 
+int bootmem_from_linux_e820(struct bootmem *map, const void *params,
+                            size_t params_size, uint64_t limit)
+{
+    const uint8_t *p = (const uint8_t *)params;
+    const size_t table = 0x2d0, stride = 20;
+    unsigned count;
+
+    if (!map || !p || params_size < 4096 || !limit ||
+        (limit & (PAGE_SIZE_4K - 1u)) || limit > UINT64_MAX - PAGE_SIZE_4K)
+        return -1;
+    /* The linked setup_data list may extend or change the memory map. */
+    if (read64(p + 0x250) != 0) return -1;
+    count = p[0x1e8];
+    if (!count || count > 128) return -1;
+    map->count = 0;
+    map->limit = limit;
+    for (unsigned i = 0; i < count; i++) {
+        const uint8_t *e = p + table + i * stride;
+        uint64_t base = read64(e), len = read64(e + 8);
+        if (len > UINT64_MAX - base) return -1;
+        if (read32(e + 16) == 1 && add_usable(map, base, base + len) != 0)
+            return -1;
+    }
+    for (unsigned i = 0; i < count; i++) {
+        const uint8_t *e = p + table + i * stride;
+        uint64_t base = read64(e), len = read64(e + 8);
+        if (read32(e + 16) != 1 && bootmem_reserve(map, base, base + len) != 0)
+            return -1;
+    }
+    return map->count ? 0 : -1;
+}
+
 int bootmem_reserve(struct bootmem *map, uint64_t start, uint64_t end)
 {
     if (!map || end < start) return -1;

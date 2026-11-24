@@ -718,12 +718,6 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
             uint64_t pa = 0;
             int mapped = tcur && tcur->mm &&
                 mm_va_leaf_pa(tcur->mm, addr, &pa) == 0;
-            klogprintf("filemap-trace: mmap va=0x%llx len=0x%zx off=0x%llx prot=%d lazy=1 file=%s mapped=%d pa=0x%llx mm=0x%llx\n",
-                (unsigned long long)addr, len,
-                (unsigned long long)file_lazy_off, prot & 7,
-                file_lazy_f->path, mapped,
-                (unsigned long long)(mapped ? pa : 0),
-                (unsigned long long)(tcur && tcur->mm ? tcur->mm->cr3 : 0));
         }
     } else if (eager_file) {
         if (user_vma_add_file(vtid, addr, len, prot & 7, mmap_vma_kind,

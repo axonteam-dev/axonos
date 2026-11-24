@@ -150,6 +150,10 @@ typedef struct {
 
 static pvscsi_target_priv_t g_pvscsi_targets[16];
 
+static int pvscsi_scsi_status_ok(uint8_t status) {
+	return status == 0; /* SCSI GOOD */
+}
+
 static int pvscsi_execute_command(void *priv,
     const uint8_t *cdb, size_t cdb_len,
     void *data, size_t data_len, int direction)
@@ -218,7 +222,9 @@ static int pvscsi_execute_command(void *priv,
 			           cmp->hostStatus, cmp->scsiStatus, (unsigned)target);
 		return -1;
 	}
-	if (cmp->scsiStatus != 0x00 && cmp->scsiStatus != 0x02) { /* GOOD / CHECK CONDITION */
+	/* CHECK CONDITION requires REQUEST SENSE, not a successful transfer.
+	 * The SCSI core can issue sense and retry where appropriate. */
+	if (!pvscsi_scsi_status_ok(cmp->scsiStatus)) {
 		klogprintf("pvscsi: scsiStatus=0x%x (hostStatus=0x%x) target=%u\n",
 		           cmp->scsiStatus, cmp->hostStatus, (unsigned)target);
 		return -1;

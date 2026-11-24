@@ -30,6 +30,7 @@ static thread_t *current=&a;
 static uint32_t word=1,second=1,alias=1;
 static int change_on_lock, live_allocs, blocks, yields, mode;
 static uint64_t now_ns;
+static uint64_t word_frame=0x10000;
 static uint32_t delay_ms;
 enum { TIMEOUT, WAKE, SIGNAL, BITSET, REQUEUE, SHARED, CLEAR_TID };
 static thread_t *thread_current(void) { return current; }
@@ -47,9 +48,15 @@ static int mm_copy_from_user(mm_t *m,void *dst,uint64_t address,size_t n) {
 }
 static int mm_user_leaf_pa(mm_t *m,uint64_t address,int write,uint64_t *pa) {
     (void)m;(void)write;
-    if(address==(uintptr_t)&word||address==(uintptr_t)&alias) { *pa=0x10000;return 0; }
+    if(address==(uintptr_t)&word||address==(uintptr_t)&alias) { *pa=word_frame;return 0; }
     if(address==(uintptr_t)&second) { *pa=0x20000;return 0; }
     return -1;
+}
+/* Only SHARED models a MAP_SHARED VMA in each mm; all other cases,
+ * including clear_child_tid, are private mappings without shared VMAs. */
+static int user_vma_is_shared_page_mm(mm_t *m,uintptr_t address) {
+    return m && mode==SHARED &&
+           (address==(uintptr_t)&word || address==(uintptr_t)&alias);
 }
 static uint64_t time_monotonic_us(void) { return now_ns/1000; }
 static void ktime_get_real_ts64(int64_t *sec,int64_t *ns) {
@@ -86,6 +93,7 @@ static void thread_yield(void) {
             assert(futex_syscall((uintptr_t)&alias,1,1,NULL,0,0)==1);
         } else if(mode==CLEAR_TID) {
             b.mm=&a_mm;
+            word_frame=0x30000; /* COW after waiter queued, before wake */
             word=0;
             assert(futex_syscall((uintptr_t)&word,129,1,NULL,0,0)==0);
             assert(futex_syscall((uintptr_t)&word,1,1,NULL,0,0)==1);
@@ -96,7 +104,7 @@ static void thread_yield(void) {
 }
 static void reset(void) {
     assert(!live_allocs&&!a.active_futex_waiter&&!futex_lock.held);
-    a.state=THREAD_RUNNING;a.pending_signals=0;word=1;now_ns=0;blocks=0;yields=0;
+    a.state=THREAD_RUNNING;a.pending_signals=0;word=1;word_frame=0x10000;now_ns=0;blocks=0;yields=0;
 }
 int main(void) {
     struct { int64_t sec,ns; } ts={0,5000000};

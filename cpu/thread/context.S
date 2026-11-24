@@ -14,17 +14,26 @@ context_switch_with_prev:
         /* Scheduler entered with IRQs disabled.  Preserve IF=0 until the
            resumed thread_schedule() finishes its restore_irqflags() tail. */
         movq %rax, 0x88(%rdi)
-        pushq %rsi
+        /* Keep sched_lock until we are no longer using the outgoing stack.
+           If prev becomes READY before this CPU leaves that stack, another
+           CPU can resume prev and overwrite the still-live switch frame. */
+        movq %rsi, %r12
         movq %rdx, %rdi
+        movq 0x80(%r12), %rsp
+        movq %rsp, %r13
+        /* Newly created threads and resumed threads can have different stack
+           alignment. Align the C call without changing their saved RSP. */
+        andq $-16, %rsp
         call thread_schedule_prev_saved
-        popq %rsi
+        movq %r13, %rsp
+        movq %r12, %rsi
         movq 0x68(%rsi), %rbx
         movq 0x50(%rsi), %rbp
         movq 0x18(%rsi), %r12
         movq 0x10(%rsi), %r13
         movq 0x08(%rsi), %r14
         movq 0x00(%rsi), %r15
-        movq 0x80(%rsi), %rsp
+        /* RSP already belongs to the incoming task. */
         pushq 0x88(%rsi)
         popfq
         ret

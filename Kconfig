@@ -1,0 +1,101 @@
+mainmenu "Axon kernel configuration"
+
+menu "Kernel"
+
+config KERNEL_LOG_TIME
+	bool "Timestamps in kernel log"
+
+config AXON_EXPERIMENTAL_SMP
+	bool "Experimental SMP"
+	help
+	  Enable application processors. SMP remains experimental: page-table
+	  synchronization and remote TLB invalidation are not complete.
+
+config AXON_PRODUCTION
+	bool "Production diagnostics policy"
+
+endmenu
+
+menu "File systems"
+config FAT32_SUPPORT
+	bool "FAT32"
+config MINIX_SUPPORT
+	bool "Minix"
+config EXT2_SUPPORT
+	bool "ext2"
+config ISO9660_SUPPORT
+	bool "ISO 9660"
+endmenu
+
+menu "Network"
+config AUTO_CONFIGURE_DNS
+	bool "Automatically configure DNS"
+endmenu
+
+menu "Graphics"
+config DRIVER_VMWGFX
+	bool "Legacy VMware graphics setting (currently no effect)"
+	help
+	  Retained for compatibility with config.cfg. VMware graphics probing
+	  is currently unconditional; changing this option does not disable it.
+config DRIVER_VBOXGFX
+	bool "Legacy VirtualBox graphics setting (currently no effect)"
+	help
+	  Retained for compatibility with config.cfg. This option currently
+	  has no consumers in the kernel and does not control the driver.
+config DRIVER_INTEL
+	bool "Experimental Intel Gen6/7 display"
+	help
+	  Experimental framebuffer takeover, not an i915/DRM driver. It is
+	  not validated on real hardware and does not support UHD 620.
+config DRIVER_CIRRUS
+	bool "Cirrus graphics"
+endmenu
+
+menu "Diagnostics"
+config DEVEL_DEBUG
+	bool "Development diagnostics"
+	depends on !AXON_PRODUCTION
+config AXON_FORK_DEBUG
+	bool "Fork diagnostics"
+	depends on !AXON_PRODUCTION
+	help
+	  When this option is disabled, fork diagnostics currently inherit
+	  DEVEL_DEBUG rather than being forced off independently.
+config NET_TCP_TRACE
+	bool "TCP tracing"
+config AXON_WGET_DNS_TRACE
+	bool "DNS tracing"
+config KBD_DEBUG
+	bool "Keyboard tracing"
+config QEMU_LOG
+	bool "QEMU serial debugging"
+config KERNEL_DEBUG_NET
+	bool "Legacy network debug setting (currently no effect)"
+endmenu
+
+menu "Experimental memory features"
+config AXON_EXPERIMENTAL_DIRECT_MAP
+	bool "Experimental high-memory direct map"
+	help
+	  Research-only path. It is not validated for production use.
+config AXON_EXPERIMENTAL_HIGH_USER_FRAMES
+	bool "Experimental high user frames"
+	depends on AXON_EXPERIMENTAL_DIRECT_MAP
+	help
+	  Experimental allocator, restricted by the kernel to one online CPU.
+config AXON_EXPERIMENTAL_HIGH_FORK
+	bool "Experimental fork with high user frames"
+	depends on AXON_EXPERIMENTAL_HIGH_USER_FRAMES
+	help
+	  Research-only path with single-CPU and single-mm-owner restrictions.
+endmenu
+
+menu "Legacy image options"
+config CONFIG_NGINX_CONF
+	bool "Legacy nginx configuration setting (currently no effect)"
+config GEN_NET_FOLDER
+	bool "Legacy network directory setting (currently no effect)"
+endmenu
+
+comment "Loadable kernel modules are not implemented; all options are built-in."

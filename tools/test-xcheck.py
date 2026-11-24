@@ -8,7 +8,7 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='axon-xcheck-', dir='/tmp/opencode') as tmp:
     path = Path(tmp)
-    for name in ('dbus-launch',):
+    for name in ('dbus-run-session',):
         tool = path / name
         tool.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGS_FILE"\n')
         tool.chmod(0o755)
@@ -19,5 +19,5 @@ with tempfile.TemporaryDirectory(prefix='axon-xcheck-', dir='/tmp/opencode') as 
     assert subprocess.run(['sh', str(script)], env=env, capture_output=True).returncode == 2
     env['DISPLAY'] = ':0'
     subprocess.run(['sh', str(script)], env=env, check=True)
-    assert (path / 'args').read_text().splitlines() == ['--exit-with-session', 'startxfce4']
+    assert (path / 'args').read_text().splitlines() == ['--', 'startxfce4']
 print('PASS: Xorg and XFCE diagnostic sessions start separately')

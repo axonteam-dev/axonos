@@ -511,7 +511,8 @@ static int ahci_rw(int device_id, uint32_t lba, void *buf, uint32_t sectors, int
 	if (device_id < 0 || device_id >= DISK_MAX_DEVICES) return -1;
 	ahci_port_state_t *st = &g_ports[device_id];
 	if (!st->used || !st->dma_bounce) return -1;
-	if (!buf || sectors == 0) return 0;
+	if (sectors == 0) return 0;
+	if (!buf || lba >= st->sectors || sectors > st->sectors - lba) return -1;
 
 	hba_port_t *p = &st->hba->ports[st->port_no];
 	if (ahci_port_wait_ready(p) != 0) return -1;
@@ -726,7 +727,15 @@ static int ahci_register_disk(int controller_idx, int port_no, hba_mem_t *hba, u
 	}
 
 	{
-		uint32_t secs = g_ports[id].sectors ? g_ports[id].sectors : 0xFFFFFFFFu;
+		/* A link alone is not a disk: do not expose a fabricated capacity
+		 * when port setup or IDENTIFY failed. The registered slot remains
+		 * inaccessible, since the disk registry has no unregister operation. */
+		if (!g_ports[id].sectors) {
+			g_ports[id].used = 0;
+			klogprintf("ahci: port %d: IDENTIFY failed; disk not published\n", port_no);
+			return -1;
+		}
+		uint32_t secs = g_ports[id].sectors;
 		int sd = disk_publish_sd(id, secs);
 		(void)scsi_register_disk_as_lun(id, secs, "AHCI   ",
 			g_ports[id].model[0] ? g_ports[id].model : "SATA", "1.0 ");
@@ -834,16 +843,19 @@ int ahci_probe_and_register(void) {
 		for (int port = 0; port < n_ports; port++) {
 			if (!(pi & (1u << port))) continue;
 			hba_port_t *p = &hba->ports[port];
+			klogprintf("ahci: port %d ssts=0x%08x tfd=0x%08x sig=0x%08x\n",
+			           port, p->ssts, p->tfd, p->sig);
 			/* Some controllers report PI bits for ports that read as all-ones when unmapped. */
 			if (p->ssts == 0xFFFFFFFFu || p->tfd == 0xFFFFFFFFu) continue;
 			if (!ahci_port_device_present(p)) continue;
 			uint32_t sig = p->sig;
-			if (sig != SATA_SIG_ATA) continue; /* only SATA disks for now */
+			/* Immediately after HBA reset the link may already be active
+			 * while the initial device-to-host FIS has not arrived. Start the
+			 * port and let IDENTIFY establish whether this is an ATA disk. */
+			if (sig != SATA_SIG_ATA && sig != 0xFFFFFFFFu) continue;
 			if (ahci_register_disk(ctrl_idx, port, hba, phys) >= 0) registered++;
 		}
 		ctrl_idx++;
 	}
 	return registered;
 }
-
-

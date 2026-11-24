@@ -24,7 +24,9 @@ STUB_SRC := boot/kzip_stub.c
 STUB_OBJ := $(BUILD_DIR)/$(STUB_SRC:.c=.c.o)
 
 # Linux-style kernel config (config.cfg → auto.conf + autoconf.h)
-CONFIG_FILE ?= config.cfg
+KCONFIG_FILE ?= $(BUILD_DIR)/.config
+CONFIG_FILE ?= $(if $(wildcard $(KCONFIG_FILE)),$(KCONFIG_FILE),config.cfg)
+CONFIG_FORMAT := $(if $(or $(filter $(KCONFIG_FILE),$(CONFIG_FILE)),$(filter .config,$(notdir $(CONFIG_FILE)))),--kconfig,)
 GENCONFIG := scripts/genconfig.sh
 AUTOCONF_DIR := $(BUILD_DIR)/include
 AUTO_CONF := $(AUTOCONF_DIR)/config/auto.conf
@@ -86,13 +88,13 @@ ASCII_PF2_SRC := $(firstword $(wildcard /usr/share/grub/ascii.pf2 /boot/grub/fon
 SYS_CA_PEM := $(BUILD_DIR)/certs/axonos-system-ca.pem
 SYS_CA_BLOB_OBJ := $(BUILD_DIR)/certs/axonos-system-ca.blob.o
 
-.PHONY: all kernel iso glibc-iso clean run run-uefi for-production config oldconfig archive test test-build test-boot FORCE
+.PHONY: all kernel iso glibc-iso clean run run-uefi for-production config menuconfig olddefconfig oldconfig archive test test-build test-boot FORCE
 
 all: iso
 
 # Regenerate autoconf when config.cfg changes (or on `make config`).
 $(AUTO_CONF) $(AUTOCONF_H) &: $(CONFIG_FILE) $(GENCONFIG) scripts/genconfig.py FORCE
-	@bash $(GENCONFIG) $(CONFIG_FILE) $(AUTOCONF_DIR)
+	@bash $(GENCONFIG) $(CONFIG_FORMAT) $(CONFIG_FILE) $(AUTOCONF_DIR)
 
 FORCE:
 
@@ -109,6 +111,31 @@ config: $(AUTO_CONF)
 	@echo "Active config: $(CONFIG_FILE)"
 	@echo "  auto.conf:  $(AUTO_CONF)"
 	@echo "  autoconf.h: $(AUTOCONF_H)"
+
+# Linux's host-only Kconfig frontends use their original GPL-2.0 license;
+# see third_party/kconfig/README.axonos. They are not linked into AxonOS.
+HOSTCC ?= cc
+KCONFIG_SRC := third_party/kconfig/kconfig
+KCONFIG_INCLUDE := third_party/kconfig/include
+KCONFIG_HOST_DIR := $(BUILD_DIR)/host-kconfig
+KCONFIG_COMMON := $(addprefix $(KCONFIG_SRC)/,confdata.c expr.c lexer.lex.c menu.c parser.tab.c preprocess.c symbol.c util.c)
+KCONFIG_HEADERS := $(wildcard $(KCONFIG_SRC)/*.h $(KCONFIG_SRC)/lxdialog/*.h $(KCONFIG_INCLUDE)/*.h)
+KCONFIG_DIALOG := $(addprefix $(KCONFIG_SRC)/lxdialog/,checklist.c inputbox.c menubox.c textbox.c util.c yesno.c)
+
+$(KCONFIG_HOST_DIR)/conf: $(KCONFIG_SRC)/conf.c $(KCONFIG_COMMON) $(KCONFIG_HEADERS)
+	@mkdir -p $(dir $@)
+	@$(HOSTCC) -O2 -I$(KCONFIG_SRC) -I$(KCONFIG_INCLUDE) $(KCONFIG_SRC)/conf.c $(KCONFIG_COMMON) -o $@
+
+$(KCONFIG_HOST_DIR)/mconf: $(KCONFIG_SRC)/mconf.c $(KCONFIG_SRC)/mnconf-common.c $(KCONFIG_COMMON) $(KCONFIG_DIALOG) $(KCONFIG_HEADERS)
+	@mkdir -p $(dir $@)
+	@$(HOSTCC) -O2 -I$(KCONFIG_SRC) -I$(KCONFIG_INCLUDE) $$(pkg-config --cflags ncursesw 2>/dev/null || true) $(KCONFIG_SRC)/mconf.c $(KCONFIG_SRC)/mnconf-common.c $(KCONFIG_COMMON) $(KCONFIG_DIALOG) -o $@ $$(pkg-config --libs ncursesw 2>/dev/null || printf '%s' '-lncursesw')
+
+# Import legacy settings only when this build directory has no .config.
+menuconfig: $(KCONFIG_HOST_DIR)/conf $(KCONFIG_HOST_DIR)/mconf
+	@python3 scripts/kconfig.py $@ "$(KCONFIG_FILE)" "$(CONFIG_FILE)" "$(KCONFIG_HOST_DIR)/conf" "$(KCONFIG_HOST_DIR)/mconf"
+
+olddefconfig: $(KCONFIG_HOST_DIR)/conf
+	@python3 scripts/kconfig.py $@ "$(KCONFIG_FILE)" "$(CONFIG_FILE)" "$(KCONFIG_HOST_DIR)/conf" "$(KCONFIG_HOST_DIR)/mconf"
 
 for-production:
 	@$(MAKE) CONFIG_FILE=config.production.cfg OPTFLAGS='-O0 -g0' iso

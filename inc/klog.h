@@ -7,12 +7,18 @@
 void klog_init(void);
 
 /* Kernel printf → console + fixed ring buffer (+ qemu debug). */
+enum klog_level {
+	KLOG_EMERG = 0, KLOG_ALERT, KLOG_CRIT, KLOG_ERR,
+	KLOG_WARNING, KLOG_NOTICE, KLOG_INFO, KLOG_DEBUG
+};
 void klogprintf(const char *fmt, ...);
 void klogprintf_logonly(const char *fmt, ...);
+void klogprintf_level(enum klog_level level, const char *fmt, ...);
+void klogprintf_level_logonly(enum klog_level level, const char *fmt, ...);
 
 /* /dev/kmsg and SYS_syslog: inject a message into the printk ring. */
 void klog_user_write(const char *s, size_t n);
-/* Copy ring bytes into buf; returns bytes copied (Linux SYSLOG_ACTION_READ_ALL). */
+/* Copy priority-prefixed records into buf (Linux SYSLOG_ACTION_READ_ALL). */
 long klog_syslog_read_all(char *buf, size_t size);
 /* Byte-offset read of the linearized ring (for /dev/kmsg). */
 long klog_ring_read(char *buf, size_t size, size_t offset);
@@ -32,5 +38,4 @@ extern uint64_t klog_tsc_hz;
 /* Monotonic time (us/ms) — same source as kernel log timestamps (TSC when calibrated). */
 uint64_t time_monotonic_us(void);
 uint64_t time_monotonic_ms(void);
-
 

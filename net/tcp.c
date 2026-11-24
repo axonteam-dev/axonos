@@ -67,8 +67,6 @@ static int tcp_seq_in_window(uint32_t seq, uint32_t rcv_nxt, uint32_t wnd) {
 }
 
 static void tcp_apply_ack(net_tcp_conn_t *c, uint32_t ack) {
-    if (ack == 0)
-        return;
     /* RFC 793: an ACK beyond SND.NXT is unacceptable and must never advance
      * SND.UNA. Accept only cumulative ACKs in (SND.UNA, SND.NXT]. */
     if (tcp_seq_after(ack, c->snd_una) && !tcp_seq_after(ack, c->snd_nxt))
@@ -342,7 +340,7 @@ static size_t tcp_accept_inorder(net_tcp_conn_t *c, uint32_t seq, const uint8_t 
         if (payload_len > 0)
             c->rcv_nxt += (uint32_t)cp;
         return accepted;
-    } else if (seq < c->rcv_nxt) {
+    } else if (tcp_seq_after(c->rcv_nxt, seq)) {
         uint32_t skip_u32 = c->rcv_nxt - seq;
         size_t skip = (size_t)skip_u32;
         if (skip < payload_len) {
@@ -493,7 +491,7 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
         }
         if (c->dst_port == 80 || c->dst_port == 443) {
             static unsigned http_seg_budget = 48;
-            if (http_seg_budget--)
+            if (http_seg_budget > 0 && http_seg_budget--)
                 klogprintf_logonly("tcp-http-seg: peer=%u.%u.%u.%u:%u flags=0x%x seq=%u ack=%u payload=%zu win=%u rxnext=%u\n",
                     (unsigned)((src_ip_be >> 24) & 255), (unsigned)((src_ip_be >> 16) & 255),
                     (unsigned)((src_ip_be >> 8) & 255), (unsigned)(src_ip_be & 255),
@@ -551,7 +549,8 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
             continue;
         }
 
-        tcp_apply_ack(c, ack);
+        if (th->flags & 0x10u)
+            tcp_apply_ack(c, ack);
 
         /* Pure ACK (no data): cumulative ack for our sends — must not be ignored. */
         if (payload_len == 0 && (th->flags & 0x10u) && !(th->flags & 0x02u) && !(th->flags & 0x01u)) {
@@ -929,7 +928,7 @@ int net_tcp_send(net_tcp_conn_t *c, const net_tcp_ops_t *ops, const uint8_t *dat
         uint32_t seq0 = c->snd_nxt;
         if (c->dst_port == 80 || c->dst_port == 443) {
             static unsigned http_tx_budget = 24;
-            if (http_tx_budget--)
+            if (http_tx_budget > 0 && http_tx_budget--)
                 klogprintf_logonly("tcp-http-tx: peer=%u.%u.%u.%u:%u seq=%u bytes=%zu first=%02x%02x%02x%02x\n",
                     (unsigned)((c->dst_ip_be >> 24) & 255), (unsigned)((c->dst_ip_be >> 16) & 255),
                     (unsigned)((c->dst_ip_be >> 8) & 255), (unsigned)(c->dst_ip_be & 255),
@@ -942,7 +941,7 @@ int net_tcp_send(net_tcp_conn_t *c, const net_tcp_ops_t *ops, const uint8_t *dat
         /* Do not block until peer ACK here: HTTP servers may reply+close before send() returns. */
         for (int poll = 0; poll < 32; poll++) {
             (void)net_tcp_service(c, ops, 8);
-            if (c->snd_una >= seq0 + (uint32_t)chunk)
+            if (!tcp_seq_after(seq0 + (uint32_t)chunk, c->snd_una))
                 break;
             if ((poll & 3) == 3)
                 ops->yield(ops->context);
@@ -954,15 +953,15 @@ int net_tcp_send(net_tcp_conn_t *c, const net_tcp_ops_t *ops, const uint8_t *dat
 
 int net_tcp_flush_tx(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t timeout_ms) {
     if (!c || !ops || !ops->time_ms || !ops->yield) return -1;
-    if (!c->established || c->snd_una >= c->snd_nxt) return 0;
+    if (!c->established || !tcp_seq_after(c->snd_nxt, c->snd_una)) return 0;
     uint64_t start = ops->time_ms();
     while ((ops->time_ms() - start) < timeout_ms) {
         (void)net_tcp_service(c, ops, 16);
-        if (c->snd_una >= c->snd_nxt)
+        if (!tcp_seq_after(c->snd_nxt, c->snd_una))
             return 0;
         ops->yield(ops->context);
     }
-    return (c->snd_una >= c->snd_nxt) ? 0 : -2;
+    return !tcp_seq_after(c->snd_nxt, c->snd_una) ? 0 : -2;
 }
 
 int net_tcp_window_update(net_tcp_conn_t *c, const net_tcp_ops_t *ops) {
@@ -996,7 +995,7 @@ int net_tcp_recv(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t *out, size
         c->rx_len -= n;
         if (c->dst_port == 80 || c->dst_port == 443) {
             static unsigned http_read_budget = 20;
-            if (http_read_budget--) klogprintf_logonly("tcp-http-read: peer-port=%u ret=%zu remains=%zu cap=%zu\n",
+            if (http_read_budget > 0 && http_read_budget--) klogprintf_logonly("tcp-http-read: peer-port=%u ret=%zu remains=%zu cap=%zu\n",
                 (unsigned)c->dst_port, n, c->rx_len, cap);
         }
         tcp_try_merge_ooo(c, ops);
@@ -1018,7 +1017,7 @@ int net_tcp_recv(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t *out, size
             c->rx_len -= n;
             if (c->dst_port == 80 || c->dst_port == 443) {
                 static unsigned http_block_read_budget = 20;
-                if (http_block_read_budget--) klogprintf_logonly("tcp-http-read: peer-port=%u ret=%zu remains=%zu cap=%zu\n",
+                if (http_block_read_budget > 0 && http_block_read_budget--) klogprintf_logonly("tcp-http-read: peer-port=%u ret=%zu remains=%zu cap=%zu\n",
                     (unsigned)c->dst_port, n, c->rx_len, cap);
             }
             (void)net_tcp_window_update(c, ops);

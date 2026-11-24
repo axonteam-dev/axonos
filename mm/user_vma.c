@@ -15,6 +15,9 @@
 #include <frame.h>
 #include <vga.h>
 #include <klog.h>
+#if defined(AXON_VTE_TRACE) && AXON_VTE_TRACE
+#include <pmm.h>
+#endif
 
 static user_vma_t *g_user_vmas;
 static spinlock_t g_user_vma_lock;
@@ -1481,22 +1484,15 @@ static int user_vma_fill_file_page(thread_t *t, const user_vma_t *hit, uint64_t 
                      (uint64_t)hit->kind, foff, (uint64_t)hit->file->size);
     if (trace) {
         int mapped = t && t->mm && mm_va_leaf_pa(t->mm, lo, &page_pa) == 0;
-        klogprintf("filemap-trace: begin va=0x%llx off=0x%llx size=0x%llx mapped=%d pa=0x%llx mm=0x%llx live=0x%llx\n",
-            (unsigned long long)lo, (unsigned long long)foff,
-            (unsigned long long)hit->file->size, mapped,
-            (unsigned long long)(mapped ? page_pa : 0),
-            (unsigned long long)(t && t->mm ? t->mm->cr3 : 0),
-            (unsigned long long)paging_read_cr3());
     }
+
     if (user_vma_read_file_page(hit->file, foff, kbuf) != 0)
         return 0;
+
     if (lo == 0x8235000ULL && t && t->name[0] && strstr(t->name, "xrdb"))
         klogprintf("xrdb-page: file read off=0x%llx bytes=%02x%02x%02x%02x\n",
                    (unsigned long long)foff, kbuf[0], kbuf[1], kbuf[2], kbuf[3]);
-    if (trace)
-        klogprintf("filemap-trace: read va=0x%llx bytes=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-            (unsigned long long)lo, kbuf[0], kbuf[1], kbuf[2], kbuf[3],
-            kbuf[4], kbuf[5], kbuf[6], kbuf[7]);
+
     /* Process mm (not swapper): copy via PA like user_mmap_copyin_file. */
     if (t && t->mm && t->mm->pml4 && t->mm != mm_kernel()) {
         share = t->mm_ptemplate ? t->mm_ptemplate : mm_kernel();
@@ -1506,24 +1502,9 @@ static int user_vma_fill_file_page(thread_t *t, const user_vma_t *hit, uint64_t 
                 hit->prot, hit->file->path ? hit->file->path : "?");
             return 0;
         }
-        if (trace) {
-            uint8_t *dst;
-            if (mm_va_leaf_pa(t->mm, lo, &page_pa) == 0) {
-                dst = (uint8_t *)(uintptr_t)(page_pa + (lo & 0xFFFULL));
-                klogprintf("filemap-trace: copied va=0x%llx pa=0x%llx bytes=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-                    (unsigned long long)lo, (unsigned long long)page_pa,
-                    dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], dst[6], dst[7]);
-            } else {
-                klogprintf("filemap-trace: copied va=0x%llx no-leaf\n",
-                    (unsigned long long)lo);
-            }
-        }
         return 1;
     }
     memcpy((void *)(uintptr_t)lo, kbuf, 0x1000u);
-    if (trace)
-        klogprintf("filemap-trace: copied identity va=0x%llx\n",
-            (unsigned long long)lo);
     return 1;
 }
 
@@ -1579,14 +1560,7 @@ int user_vma_fault_lazy_anon(uint64_t cr2) {
 
     uint64_t lo = (uint64_t)cr2 & ~0xFFFULL;
     uint64_t hi = lo + 0x1000ULL;
-    if (uv_is_libcom_err_file(&hit_copy)) {
-        uint64_t pa = 0;
-        int mapped = t->mm && mm_va_leaf_pa(t->mm, lo, &pa) == 0;
-        klogprintf("filemap-trace: lazy-fault va=0x%llx kind=%d prot=%d off=0x%llx mapped=%d pa=0x%llx\n",
-            (unsigned long long)lo, hit_copy.kind, hit_copy.prot,
-            (unsigned long long)(hit_copy.file_off + (lo - (uint64_t)hit_copy.addr)),
-            mapped, (unsigned long long)(mapped ? pa : 0));
-    }
+
     if (hit_copy.kind == USER_VMA_KIND_SHM && hit_copy.file)
         return user_vma_map_shared_file_page(t, &hit_copy, lo);
     mm_t *k = mm_kernel();
@@ -1599,10 +1573,26 @@ int user_vma_fault_lazy_anon(uint64_t cr2) {
         return 1;
     }
     mm_t *share = t->mm_ptemplate ? t->mm_ptemplate : k;
-    if (mm_privatize_identity_range_blank(t->mm, lo, hi) != 0)
+    if (mm_privatize_identity_range_blank(t->mm, lo, hi) != 0) {
+#if defined(AXON_VTE_TRACE) && AXON_VTE_TRACE
+        if (strstr(t->name, "high-ram-process"))
+            klogprintf_logonly("high-ram-fault: stage=privatize va=0x%llx pmm_free=%llu pmm_total=%llu heap_free=%llu\n",
+                (unsigned long long)lo, (unsigned long long)pmm_free_pages(),
+                (unsigned long long)pmm_total_pages(),
+                (unsigned long long)heap_free_bytes());
+#endif
         return 0;
-    if (mm_make_private_range_noyield(t->mm, lo, hi, 0, share) != 0)
+    }
+    if (mm_make_private_range_noyield(t->mm, lo, hi, 0, share) != 0) {
+#if defined(AXON_VTE_TRACE) && AXON_VTE_TRACE
+        if (strstr(t->name, "high-ram-process"))
+            klogprintf_logonly("high-ram-fault: stage=allocate va=0x%llx pmm_free=%llu pmm_total=%llu heap_free=%llu\n",
+                (unsigned long long)lo, (unsigned long long)pmm_free_pages(),
+                (unsigned long long)pmm_total_pages(),
+                (unsigned long long)heap_free_bytes());
+#endif
         return 0;
+    }
 
     if (!user_vma_fill_file_page(t, &hit_copy, lo))
         return 0;
@@ -1645,12 +1635,6 @@ int user_vma_fault_nonpresent(uint64_t cr2, uint64_t err) {
     if (hit_copy.prot == 0) return 0;
     if (is_write && !(hit_copy.prot & 2)) return 0;
     if (is_exec && !(hit_copy.prot & 4) && hit_copy.kind != USER_VMA_KIND_ELF_LOAD) return 0;
-    if (uv_is_libcom_err_file(&hit_copy))
-        klogprintf("filemap-trace: nonpresent va=0x%llx err=0x%llx kind=%d prot=%d off=0x%llx\n",
-            (unsigned long long)(cr2 & ~0xFFFULL), (unsigned long long)err,
-            hit_copy.kind, hit_copy.prot,
-            (unsigned long long)(hit_copy.file_off +
-                ((cr2 & ~0xFFFULL) - (uint64_t)hit_copy.addr)));
 
     {
         mm_t *k = mm_kernel();

@@ -143,6 +143,11 @@ static inline uint16_t nvme_status_sct(uint16_t status_field) {
 	return (uint16_t)((status_field >> 9) & 0x7u);
 }
 
+static int nvme_status_ok(uint16_t status_field) {
+	return nvme_status_code(status_field) == 0 &&
+	       nvme_status_sct(status_field) == 0;
+}
+
 static inline int nvme_cqe_phase(const nvme_cqe_t *cqe) {
 	return (int)(cqe->status & 0x1u);
 }
@@ -208,7 +213,7 @@ static int nvme_submit_and_wait(nvme_dev_t *d,
 
 			if (done.cid == cid) {
 				if (out_cqe) *out_cqe = done;
-				if (nvme_status_code(done.status) != 0) {
+				if (!nvme_status_ok(done.status)) {
 					klogprintf("nvme: cmd opc=0x%x failed cid=%u sct=%u sc=0x%x status=0x%x dw0=0x%x\n",
 					           (unsigned)(c.cdw0 & 0xFFu), (unsigned)cid,
 					           (unsigned)nvme_status_sct(done.status),
@@ -397,7 +402,8 @@ static int nvme_rw(int device_id, uint32_t lba, void *buf, uint32_t sectors, int
 	if (device_id < 0 || device_id >= DISK_MAX_DEVICES) return -1;
 	nvme_dev_t *d = &g_nvme[device_id];
 	if (!d->used) return -1;
-	if (!buf || sectors == 0) return 0;
+	if (sectors == 0) return 0;
+	if (!buf || lba >= d->sectors || sectors > d->sectors - lba) return -1;
 	if (d->lba_size != 512) return -1;
 	if (!d->io_bounce) return -1;
 
@@ -600,4 +606,3 @@ int nvme_init(void) {
 	if (registered == 0) klogprintf("nvme: no namespaces registered\n");
 	return registered;
 }
-

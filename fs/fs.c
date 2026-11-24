@@ -896,10 +896,22 @@ int fs_mount_private_tmpfs(const char *target, uint32_t mnt_ns, uint32_t serial,
 int fs_mkdir(const char *path) {
         if (!path) return -1;
         if (fs_private_source_denied(path)) return -1;
+        /* mkdir("name/") creates name just like mkdir("name"). Resolve the
+         * actual parent, not the as-yet nonexistent leaf as a directory. */
+        char input[512];
+        size_t input_len = strlen(path);
+        if (input_len == 0 || input_len >= sizeof(input)) return -1;
+        memcpy(input, path, input_len + 1);
+        while (input_len > 1 && input[input_len - 1] == '/')
+                input[--input_len] = '\0';
         char normalized[512];
-        if (fs_resolve_parent_path(path, normalized, sizeof(normalized)) != 0)
+        if (fs_resolve_parent_path(input, normalized, sizeof(normalized)) != 0)
                 return -1;
         path = normalized;
+        /* A mountpoint itself already exists, even when the mounted driver's
+         * mkdir cannot create its own root. unsquashfs -f relies on EEXIST. */
+        if (fs_get_mount_driver_exact(path))
+                return -4;
         if (fs_mount_is_readonly(path)) return -30; /* EROFS */
         char backing[512];
         if (fs_translate_mount_path(path, backing, sizeof(backing)) != 0) return -1;
@@ -1043,10 +1055,12 @@ static int fs_readlink_no_resolve(const char *path, char *out, size_t out_cap, s
         }
         size_t sz = (size_t)lf->size;
         if (sz == 0) { fs_file_free(lf); return -1; }
-        if (sz >= out_cap) sz = out_cap - 1;
+        /* Truncating here would resolve a different pathname. Unlike
+         * readlink(2), this helper must obtain the complete target. */
+        if (sz >= out_cap) { fs_file_free(lf); return -1; }
         ssize_t rr = fs_read(lf, out, sz, 0);
         fs_file_free(lf);
-        if (rr <= 0) return -1;
+        if (rr <= 0 || (size_t)rr != sz) return -1;
         out[(size_t)rr] = '\0';
         if (out_len) *out_len = (size_t)rr;
         return 0;
@@ -1081,11 +1095,11 @@ static char *fs_normalize_abs_path(const char *in) {
                 } else if (len == 2 && seg[0] == '.' && seg[1] == '.') {
                         if (pc > 0) pc--;
                 } else {
-                        if (pc < (int)(sizeof(parts)/sizeof(parts[0]))) {
-                                parts[pc] = seg;
-                                plen[pc] = len;
-                                pc++;
-                        }
+                        if (pc >= (int)(sizeof(parts)/sizeof(parts[0])))
+                                return NULL;
+                        parts[pc] = seg;
+                        plen[pc] = len;
+                        pc++;
                 }
         }
         /* compute size */
@@ -1177,7 +1191,11 @@ static char *fs_resolve_symlinks(const char *path) {
                                         const char *slash = strrchr(prefix, '/');
                                         size_t plen = slash ? (size_t)(slash - prefix) : 0;
                                         if (plen == 0) plen = 1;
-                                        if (plen >= sizeof(base) - 2) plen = sizeof(base) - 2;
+                                        if (plen >= sizeof(base) - 2) {
+                                                kfree(prefix);
+                                                kfree(cur);
+                                                return NULL;
+                                        }
                                         memcpy(base, prefix, plen);
                                         base[plen] = '\0';
                                         if (plen == 1) { base[0] = '/'; base[1] = '\0'; }
@@ -1185,7 +1203,12 @@ static char *fs_resolve_symlinks(const char *path) {
                                         if (bl > 1 && base[bl - 1] == '/') base[bl - 1] = '\0';
                                         bl = strlen(base);
                                         if (bl + 1 < sizeof(base)) { base[bl] = '/'; base[bl + 1] = '\0'; }
-                                        strncat(base, target, sizeof(base) - strlen(base) - 1);
+                                        if (strlen(target) >= sizeof(base) - strlen(base)) {
+                                                kfree(prefix);
+                                                kfree(cur);
+                                                return NULL;
+                                        }
+                                        strcat(base, target);
                                 }
 
                                 /* join base + rest */
@@ -1679,6 +1702,8 @@ int fs_link(const char *oldpath, const char *newpath) {
         oldpath = old_normalized;
         newpath = new_normalized;
         if (fs_mount_is_readonly(newpath)) return -30;
+        if (fs_get_mount_index(oldpath) != fs_get_mount_index(newpath))
+                return -18; /* EXDEV */
         char old_backing[512], new_backing[512];
         if (fs_translate_mount_path(oldpath, old_backing, sizeof(old_backing)) != 0 ||
             fs_translate_mount_path(newpath, new_backing, sizeof(new_backing)) != 0)
@@ -1891,6 +1916,8 @@ int vfs_ftruncate(struct fs_file *file, off_t length) {
                         return ramfs_ftruncate(file, length);
                 if (name && strcmp(name, "fat32") == 0)
                         return fat32_ftruncate(file, length);
+                if (name && strcmp(name, "ext2") == 0)
+                        return ext2_ftruncate(file, length);
                 if (name && (strcmp(name, "overlay") == 0 || strcmp(name, "overlayfs") == 0))
                         return overlayfs_ftruncate(file, length);
                 /* Matched a driver without truncate — try others (e.g. wrap vs inner). */

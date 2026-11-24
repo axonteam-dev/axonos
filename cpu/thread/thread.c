@@ -116,22 +116,22 @@ void thread_account_timer_tick(int user_mode) {
                 cpu = 0;
 
         thread_t *cur = thread_current();
-        if (!cur || thread_is_any_idle(cur) || cur->ring != 3) {
-                cpu_idle_ticks_pc[cpu]++;
-                cpu_idle_ticks++;
-        } else if (user_mode) {
+        if (!cur || thread_is_any_idle(cur)) {
+                __atomic_fetch_add(&cpu_idle_ticks_pc[cpu], 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&cpu_idle_ticks, 1, __ATOMIC_RELAXED);
+        } else if (cur->ring == 3 && user_mode) {
                 cur->utime_ticks++;
                 if (cur->nice > 0) {
-                        cpu_nice_ticks_pc[cpu]++;
-                        cpu_nice_ticks++;
+                        __atomic_fetch_add(&cpu_nice_ticks_pc[cpu], 1, __ATOMIC_RELAXED);
+                        __atomic_fetch_add(&cpu_nice_ticks, 1, __ATOMIC_RELAXED);
                 } else {
-                        cpu_user_ticks_pc[cpu]++;
-                        cpu_user_ticks++;
+                        __atomic_fetch_add(&cpu_user_ticks_pc[cpu], 1, __ATOMIC_RELAXED);
+                        __atomic_fetch_add(&cpu_user_ticks, 1, __ATOMIC_RELAXED);
                 }
         } else {
                 cur->stime_ticks++;
-                cpu_system_ticks_pc[cpu]++;
-                cpu_system_ticks++;
+                __atomic_fetch_add(&cpu_system_ticks_pc[cpu], 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&cpu_system_ticks, 1, __ATOMIC_RELAXED);
         }
 
         /*
@@ -142,8 +142,10 @@ void thread_account_timer_tick(int user_mode) {
         if (cpu == 0) {
                 int n = smp_cpu_count();
                 for (int i = 1; i < n && i < SMP_MAX_CPUS; i++) {
-                        cpu_idle_ticks_pc[i]++;
-                        cpu_idle_ticks++;
+                        if (smp_online_cpus() & (1u << i))
+                                continue;
+                        __atomic_fetch_add(&cpu_idle_ticks_pc[i], 1, __ATOMIC_RELAXED);
+                        __atomic_fetch_add(&cpu_idle_ticks, 1, __ATOMIC_RELAXED);
                 }
         }
 }
@@ -159,10 +161,10 @@ static void thread_ticks_to_user_hz(uint64_t raw, uint64_t *out) {
 
 void thread_cpu_times_user_hz(uint64_t *user, uint64_t *nice, uint64_t *system,
                               uint64_t *idle) {
-        thread_ticks_to_user_hz(cpu_user_ticks, user);
-        thread_ticks_to_user_hz(cpu_nice_ticks, nice);
-        thread_ticks_to_user_hz(cpu_system_ticks, system);
-        thread_ticks_to_user_hz(cpu_idle_ticks, idle);
+        thread_ticks_to_user_hz(__atomic_load_n(&cpu_user_ticks, __ATOMIC_RELAXED), user);
+        thread_ticks_to_user_hz(__atomic_load_n(&cpu_nice_ticks, __ATOMIC_RELAXED), nice);
+        thread_ticks_to_user_hz(__atomic_load_n(&cpu_system_ticks, __ATOMIC_RELAXED), system);
+        thread_ticks_to_user_hz(__atomic_load_n(&cpu_idle_ticks, __ATOMIC_RELAXED), idle);
 }
 
 void thread_cpu_times_user_hz_cpu(int cpu, uint64_t *user, uint64_t *nice,
@@ -174,10 +176,10 @@ void thread_cpu_times_user_hz_cpu(int cpu, uint64_t *user, uint64_t *nice,
                 if (idle) *idle = 0;
                 return;
         }
-        thread_ticks_to_user_hz(cpu_user_ticks_pc[cpu], user);
-        thread_ticks_to_user_hz(cpu_nice_ticks_pc[cpu], nice);
-        thread_ticks_to_user_hz(cpu_system_ticks_pc[cpu], system);
-        thread_ticks_to_user_hz(cpu_idle_ticks_pc[cpu], idle);
+        thread_ticks_to_user_hz(__atomic_load_n(&cpu_user_ticks_pc[cpu], __ATOMIC_RELAXED), user);
+        thread_ticks_to_user_hz(__atomic_load_n(&cpu_nice_ticks_pc[cpu], __ATOMIC_RELAXED), nice);
+        thread_ticks_to_user_hz(__atomic_load_n(&cpu_system_ticks_pc[cpu], __ATOMIC_RELAXED), system);
+        thread_ticks_to_user_hz(__atomic_load_n(&cpu_idle_ticks_pc[cpu], __ATOMIC_RELAXED), idle);
 }
 
 /* declared below (needs main_thread, sched_lock, KERNEL_STACK_SIZE, thread_is_any_idle) */
@@ -196,6 +198,55 @@ int thread_runnable_nonidle_count(void) {
         }
         release_irqrestore(&sched_lock, irqf);
         return n;
+}
+
+/* Call only under sched_lock. A task running on another CPU is not a
+ * competitor for this CPU, and a pinned task cannot be scheduled here. */
+static int thread_ready_on_cpu_nolock(const thread_t *t, int cpu) {
+        if (!t || t->state != THREAD_READY || t->vfork_waiting ||
+            thread_is_any_idle(t))
+                return 0;
+        if (t->bound_cpu >= 0 && t->bound_cpu != cpu)
+                return 0;
+        /* A wake can mark a blocking task READY before its CPU has actually
+         * switched away. Never run the same task and kernel stack on another
+         * CPU during that window. sched_lock protects current_cpu[]. */
+        for (int i = 0; i < SMP_MAX_CPUS; i++) {
+                if (i != cpu && current_cpu[i] == t)
+                        return 0;
+        }
+#if !defined(AXON_EXPERIMENTAL_SMP) || !AXON_EXPERIMENTAL_SMP
+        if (t->ring == 3 && cpu != 0)
+                return 0;
+#endif
+        return 1;
+}
+
+/* The task's state may already be TERMINATED while it is still executing its
+ * exit path. Its object and both kernel stacks remain live until that CPU
+ * has switched away under sched_lock. */
+static int thread_on_any_cpu_nolock(const thread_t *t) {
+        if (!t)
+                return 0;
+        for (int i = 0; i < SMP_MAX_CPUS; i++) {
+                if (current_cpu[i] == t)
+                        return 1;
+        }
+        return 0;
+}
+
+int thread_has_ready_on_cpu(int cpu) {
+        int ready = 0;
+        unsigned long irqf;
+        acquire_irqsave(&sched_lock, &irqf);
+        for (int i = 0; i < thread_count; i++) {
+                if (thread_ready_on_cpu_nolock(threads[i], cpu)) {
+                        ready = 1;
+                        break;
+                }
+        }
+        release_irqrestore(&sched_lock, irqf);
+        return ready;
 }
 
 thread_t *thread_idle_for_cpu(int cpu) {
@@ -391,6 +442,7 @@ int thread_reap(int pid) {
                 if (t->state != THREAD_TERMINATED) break;
                 /* don't reap main or idle threads */
                 if (t == &main_thread || thread_is_any_idle(t)) break;
+                if (thread_on_any_cpu_nolock(t)) break;
                 threads[i] = NULL;
                 victim = t;
                 break;
@@ -462,7 +514,7 @@ int thread_wait_parent_alive(const thread_t *t) {
  * marks exit_status 0x80000000 and may be freed immediately. */
 static int thread_zombie_autoreap_ok(thread_t *t) {
         if (!t || t->state != THREAD_TERMINATED) return 0;
-        if (t == thread_current()) return 0;
+        if (thread_on_any_cpu_nolock(t)) return 0;
         if (t == &main_thread || thread_is_any_idle(t)) return 0;
         if (t->waiter_tid >= 0) return 0;
         /* IGN/NOCLDWAIT already dropped the process_t; the slot can go.
@@ -1258,20 +1310,9 @@ void thread_ring3_preempt_if_waiters(void) {
         thread_t *cur = thread_current();
         if (!cur || cur->ring != 3 || cur->state != THREAD_RUNNING)
                 return;
-        for (int i = 0; i < thread_count; ++i) {
-                thread_t *t = threads[i];
-                if (!t || t == cur || thread_is_any_idle(t))
-                        continue;
-                if (t->state == THREAD_READY) {
-                        thread_request_resched();
-                        thread_schedule();
-                        return;
-                }
-        }
-        if (thread_runnable_nonidle_count() > 1) {
+        if (thread_has_ready_on_cpu(smp_sched_cpu_id())) {
                 thread_request_resched();
                 thread_schedule();
-                return;
         }
 }
 
@@ -1436,9 +1477,9 @@ void thread_schedule() {
                 int peer_ready = 0;
                 for (int i = 0; i < thread_count; ++i) {
                         thread_t *t = threads[i];
-                        if (!t || t == cur || thread_is_any_idle(t))
+                        if (t == cur)
                                 continue;
-                        if (t->state == THREAD_READY && !t->vfork_waiting) {
+                        if (thread_ready_on_cpu_nolock(t, my_cpu)) {
                                 peer_ready = 1;
                                 break;
                         }
@@ -1462,16 +1503,19 @@ void thread_schedule() {
                         /* Frozen vfork parent must not run (see note_ready guard). */
                         if (t->vfork_waiting)
                                 continue;
-                        /*
-                         * syscall_entry64 still has a legacy global register/RSP
+                         /*
+                          * syscall_entry64 still has a legacy global register/RSP
                          * snapshot used by the assembly prologue.  Two ring-3
                          * tasks entering SYSCALL on separate CPUs overwrite that
                          * snapshot before C can copy it to thread-local storage.
                          * Keep userspace on BSP until that entry ABI is entirely
-                         * per-CPU; kernel/idle work may still run on APs.
+                          * per-CPU; kernel/idle work may still run on APs. The
+                          * experimental option deliberately lifts this guard.
                          */
+#if !defined(AXON_EXPERIMENTAL_SMP) || !AXON_EXPERIMENTAL_SMP
                         if (t->ring == 3 && my_cpu != 0)
                                 continue;
+#endif
                         if ((int)(t->tid ? t->tid : 1) == thread_get_init_user_tid()) {
                                 static int pid1_see_left = 24;
                                 if (pid1_see_left-- > 0)
@@ -1484,6 +1528,9 @@ void thread_schedule() {
                                                 my_cpu);
                         }
                         if (t->bound_cpu >= 0 && t->bound_cpu != my_cpu)
+                                continue;
+                        if (!thread_is_any_idle(t) &&
+                            !thread_ready_on_cpu_nolock(t, my_cpu))
                                 continue;
                         if (pass == 0 && thread_is_any_idle(t))
                                 continue;
@@ -1649,7 +1696,7 @@ void thread_unblock_fork_child(int pid) {
                 /* Keep the first post-fork dispatch on the parent's CPU; another
                    CPU can otherwise run the child before the parent has iretq'd. */
                 if (cpu >= 0 && cpu < SMP_MAX_CPUS)
-                        t->bound_cpu = t->ring == 3 ? 0 : cpu;
+                        t->bound_cpu = cpu;
                 if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING) {
                         thread_t *cur = current_cpu[cpu >= 0 && cpu < SMP_MAX_CPUS ? cpu : 0];
                         t->sleep_until = 0;

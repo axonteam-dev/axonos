@@ -11,6 +11,7 @@
 #include <fpu.h>
 #include <syscall.h>
 #include <idt.h>
+#include <apic_timer.h>
 
 #define MSR_IA32_TSC_AUX 0xC0000103u
 
@@ -29,7 +30,11 @@ static int smp_topology_from_madt;
  * until that ABI is completed; topology discovery remains available.
  */
 #ifndef AXON_BOOT_ENABLE_APS
-#define AXON_BOOT_ENABLE_APS 0
+# if defined(AXON_EXPERIMENTAL_SMP) && AXON_EXPERIMENTAL_SMP
+#  define AXON_BOOT_ENABLE_APS 1
+# else
+#  define AXON_BOOT_ENABLE_APS 0
+# endif
 #endif
 
 /* AP trampoline mailbox at fixed phys 0x9000 (see linker.payload.ld). */
@@ -50,6 +55,10 @@ __attribute__((section(".smp_mailbox"), aligned(64))) static struct smp_mailbox 
 volatile uint32_t smp_online_mask;
 /* Initialization handshake is distinct from eligibility to receive work. */
 static uint32_t smp_started_mask;
+
+uint32_t smp_online_cpus(void) {
+        return __atomic_load_n(&smp_online_mask, __ATOMIC_ACQUIRE) | 1u;
+}
 
 /* BSP sets to 1 after INIT/SIPI and mailbox work complete; APs must not run
  * thread_schedule until then (avoids races with BSP smp_boot_aps and guest reboot loops). */
@@ -96,7 +105,7 @@ static void rdmsr_u32(uint32_t msr, uint32_t *lo, uint32_t *hi) {
                 *hi = d;
 }
 
-/* Intel/AMD extended topology (CPUID.0Bh): product of EBX[15:0] at each non-zero level.
+/* Intel/AMD extended topology (CPUID.0Bh): EBX[15:0] is cumulative at each level.
  * VMware/QEMU often leave CPUID.1 EBX[23:16] at 1 even with several vCPUs. */
 static int smp_ncpus_from_cpuid_leaf_b(void) {
         uint32_t max_leaf = 0;
@@ -104,7 +113,7 @@ static int smp_ncpus_from_cpuid_leaf_b(void) {
         if (max_leaf < 11u)
                 return 0;
 
-        uint64_t prod = 1;
+        uint32_t logical = 0;
         for (uint32_t sub = 0; sub < 32u; sub++) {
                 uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
                 asm volatile("cpuid"
@@ -117,14 +126,14 @@ static int smp_ncpus_from_cpuid_leaf_b(void) {
                 uint32_t cnt = ebx & 0xffffu;
                 if (cnt == 0)
                         continue;
-                uint64_t next = prod * (uint64_t)cnt;
-                if (next > (uint64_t)SMP_MAX_CPUS)
-                        return SMP_MAX_CPUS;
-                prod = next;
+                if (cnt > logical)
+                        logical = cnt;
         }
-        if (prod <= 1u)
+        if (logical <= 1u)
                 return 0;
-        return (int)prod;
+        if (logical > SMP_MAX_CPUS)
+                logical = SMP_MAX_CPUS;
+        return (int)logical;
 }
 
 void smp_early_init(void) {
@@ -416,11 +425,22 @@ void smp_ap_entry(void) {
                 tss_set_rsp0(idle->kernel_stack);
 
         apic_ap_enable_local();
+#if defined(AXON_EXPERIMENTAL_SMP) && AXON_EXPERIMENTAL_SMP
+        apic_timer_start_secondary((int)cpu);
+#endif
         __atomic_or_fetch(&smp_started_mask, 1u << cpu, __ATOMIC_RELEASE);
 
         while (!__atomic_load_n(&smp_boot_done, __ATOMIC_ACQUIRE))
                 asm volatile("pause" ::: "memory");
 
+#if defined(AXON_EXPERIMENTAL_SMP) && AXON_EXPERIMENTAL_SMP
+        /* Without a local clockevent the idle AP can sleep forever and an
+         * executing user task cannot be preempted. Do not advertise it. */
+        if (!apic_timer_is_running()) {
+                klogprintf("SMP: CPU %u parked: no local timer\n", cpu);
+                for (;;) asm volatile("cli; hlt" ::: "memory");
+        }
+#endif
         /* A CPU advertised as online must be able to receive IPIs. */
         asm volatile("sti" ::: "memory");
         __atomic_or_fetch(&smp_online_mask, 1u << cpu, __ATOMIC_RELEASE);

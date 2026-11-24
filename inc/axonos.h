@@ -2,7 +2,7 @@
 
         #include <stdint.h>
 
-        #define OS_NAME "axonOS"
+        #define OS_NAME "AxonOS"
         #define OS_VERSION "4.1.0" 
         #define OS_PREFIX "stable"
         #define OS_AUTHORS "Axon Team"

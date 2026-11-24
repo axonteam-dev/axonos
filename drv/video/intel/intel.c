@@ -8,8 +8,8 @@
  *    memory base;
  *  - take over the pixel pipeline the BIOS left running: allocate a contiguous
  *    scanout buffer in stolen memory, map it, program its GTT PTEs, flip the
- *    active primary plane (DSPSURF), and hand the buffer to fbdev + sysfs so
- *    /dev/fb0 and /dev/dri/card0 serve X (fbdev/modeset style).
+ *    active primary plane (DSPSURF), and hand the buffer to fbdev + sysfs.
+ *    The fbdev compatibility card node is not a DRM/KMS implementation.
  *
  * Stability contract: we never reprogram the DPLL/FDI/transcoder/port clocks
  * in this phase.  If the plane flip cannot be validated (DSPSURFLIVE) we roll
@@ -115,6 +115,14 @@ static int intel_probe_pci(intel_drv_t *d)
 	d->total_gtt_bytes = (d->pte_bytes / 4u) << 12;
 	d->stolen_size = ((gmch >> INTEL_GMS_SHIFT) & 0x1Fu) << 25;
 	d->stolen_base = bsm & INTEL_BSM_MASK;
+
+	/* Diagnostics and takeover access registers through GFX_FLSH_CNTL and
+	 * the PTE table in the second half of the BAR. Reject truncated BARs. */
+	if (d->bar0_len < INTEL_GFX_FLSH_CNTL_GEN6 + sizeof(uint32_t) ||
+	    d->pte_bytes > d->bar0_len - d->bar0_len / 2) {
+		klogprintf("intel: BAR0 too small for registers or GTT PTEs\n");
+		return -1;
+	}
 
 	d->mmio = mmio_map_phys((uint64_t)d->bar0_phys, (size_t)d->bar0_len);
 	if (!d->mmio) {

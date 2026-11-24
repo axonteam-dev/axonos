@@ -15,3 +15,5 @@ initfs.sfs
 .cursor/
 .vscode/
 AGENTS.md
+/include/config/
+/include/generated/

@@ -25,6 +25,12 @@ int bootmem_from_multiboot(struct bootmem *map, uint32_t magic,
 int bootmem_from_multiboot_except_module(struct bootmem *map, uint32_t magic,
                                          const void *info, uint64_t limit,
                                          uint32_t module_offset);
+/* Parse only the fixed E820 table in a 4096-byte Linux x86 boot_params.
+ * This is not a complete boot memory map: the caller must reserve all live
+ * objects (including boot_params, initrd and framebuffer) before allocation.
+ * setup_data is rejected because it can contain additional E820 entries. */
+int bootmem_from_linux_e820(struct bootmem *map, const void *params,
+                            size_t params_size, uint64_t limit);
 int bootmem_reserve(struct bootmem *map, uint64_t start, uint64_t end);
 int bootmem_is_free(const struct bootmem *map, uint64_t start, uint64_t end);
 /* Sum the remaining usable bytes in a half-open physical-address window. */

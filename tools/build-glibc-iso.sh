@@ -161,6 +161,13 @@ chmod 755 "$ROOTFS/usr/sbin/policy-rc.d"
 # non-setuid in the image. Register the override before dbus.postinst runs.
 unshare -Ur chroot "$ROOTFS" /usr/bin/dpkg-statoverride --add root root 0755 \
     /usr/lib/dbus-1.0/dbus-daemon-launch-helper
+# The staging user namespace cannot map the utmp group. Disable the optional
+# setgid utempter helper in the image rather than failing package extraction.
+if ! unshare -Ur chroot "$ROOTFS" /usr/bin/dpkg-statoverride --list \
+    /usr/lib/x86_64-linux-gnu/utempter/utempter >/dev/null 2>&1; then
+    unshare -Ur chroot "$ROOTFS" /usr/bin/dpkg-statoverride --add root root 0755 \
+        /usr/lib/x86_64-linux-gnu/utempter/utempter
+fi
 APT=(unshare -Ur chroot "$ROOTFS" /usr/bin/apt-get
      -o APT::Sandbox::User=root -o APT::Sandbox::Seccomp=false)
 DEBIAN_FRONTEND=noninteractive LC_ALL=C "${APT[@]}" update
@@ -169,7 +176,8 @@ DEBIAN_FRONTEND=noninteractive LC_ALL=C "${APT[@]}" -y --no-install-recommends i
     xserver-xorg-core xserver-xorg-video-fbdev xserver-xorg-input-evdev \
     xinit xauth x11-xserver-utils xfonts-base xkb-data console-setup-linux \
     dbus dbus-x11 pm-utils at-spi2-core net-tools util-linux \
-    openbox tint2 pcmanfm dialog perl libterm-readline-perl-perl
+    openbox tint2 pcmanfm xfce4-terminal dialog perl libterm-readline-perl-perl \
+    grub-common grub-pc fdisk dosfstools
 DEBIAN_FRONTEND=noninteractive LC_ALL=C "${APT[@]}" check
 rm -f "$ROOTFS/usr/sbin/policy-rc.d"
 "${APT[@]}" clean
@@ -186,6 +194,37 @@ prepare_host_resolver() {
     fi
 }
 prepare_host_resolver
+
+# XFCE's default helper uses x-terminal-emulator. The xfce4 metapackage does
+# not guarantee a terminal with --no-install-recommends, including in old caches.
+if [[ "$(unshare -Ur chroot "$ROOTFS" /usr/bin/dpkg-query -W -f='${Status}' xfce4-terminal 2>/dev/null || true)" != 'install ok installed' ]] || \
+   [[ ! -x "$ROOTFS/usr/bin/xfce4-terminal" ]] || \
+   ! unshare -Ur chroot "$ROOTFS" /usr/bin/test -x /usr/bin/x-terminal-emulator; then
+    if ! unshare -Ur chroot "$ROOTFS" /usr/bin/dpkg-statoverride --list \
+        /usr/lib/x86_64-linux-gnu/utempter/utempter >/dev/null 2>&1; then
+        unshare -Ur chroot "$ROOTFS" /usr/bin/dpkg-statoverride --add root root 0755 \
+            /usr/lib/x86_64-linux-gnu/utempter/utempter
+    fi
+    printf '#!/bin/sh\nexit 101\n' > "$ROOTFS/usr/sbin/policy-rc.d"
+    chmod 755 "$ROOTFS/usr/sbin/policy-rc.d"
+    DEBIAN_FRONTEND=noninteractive LC_ALL=C unshare -Ur chroot "$ROOTFS" \
+        /usr/bin/apt-get -o APT::Sandbox::User=root -o APT::Sandbox::Seccomp=false update
+    DEBIAN_FRONTEND=noninteractive LC_ALL=C unshare -Ur chroot "$ROOTFS" \
+        /usr/bin/apt-get -o APT::Sandbox::User=root -o APT::Sandbox::Seccomp=false \
+        -y --fix-broken --no-install-recommends install
+    DEBIAN_FRONTEND=noninteractive LC_ALL=C unshare -Ur chroot "$ROOTFS" \
+        /usr/bin/apt-get -o APT::Sandbox::User=root -o APT::Sandbox::Seccomp=false \
+        -y --no-install-recommends install xfce4-terminal
+    rm -f "$ROOTFS/usr/sbin/policy-rc.d"
+fi
+unshare -Ur chroot "$ROOTFS" /usr/bin/test -x /usr/bin/x-terminal-emulator || {
+    echo "build-glibc-iso: no working x-terminal-emulator alternative" >&2
+    exit 1
+}
+[[ "$(unshare -Ur chroot "$ROOTFS" /usr/bin/dpkg-query -W -f='${Status}' xfce4-terminal 2>/dev/null || true)" == 'install ok installed' ]] || {
+    echo "build-glibc-iso: xfce4-terminal is not fully configured" >&2
+    exit 1
+}
 
 # A cached Debian staging root may predate the dbus package addition. The
 # dbus-daemon package alone provides dbus.socket, but not dbus.service.
@@ -244,6 +283,28 @@ if [[ ! -x "$ROOTFS/usr/bin/dialog" ]] || ! unshare -Ur chroot "$ROOTFS" \
         -y --no-install-recommends install dialog perl libterm-readline-perl-perl
     rm -f "$ROOTFS/usr/sbin/policy-rc.d"
 fi
+
+# Cached roots predate the disk-install tooling. The live installer needs GRUB
+# for i386-pc, a partition editor, and mkfs.vfat for the future EFI path.
+if [[ ! -x "$ROOTFS/usr/sbin/grub-install" ]] || \
+   [[ ! -x "$ROOTFS/usr/sbin/fdisk" ]] || \
+   [[ ! -x "$ROOTFS/usr/sbin/sfdisk" ]] || \
+   [[ ! -x "$ROOTFS/usr/sbin/mkfs.vfat" ]]; then
+    printf '#!/bin/sh\nexit 101\n' > "$ROOTFS/usr/sbin/policy-rc.d"
+    chmod 755 "$ROOTFS/usr/sbin/policy-rc.d"
+    DEBIAN_FRONTEND=noninteractive LC_ALL=C unshare -Ur chroot "$ROOTFS" \
+        /usr/bin/apt-get -o APT::Sandbox::User=root -o APT::Sandbox::Seccomp=false update
+    DEBIAN_FRONTEND=noninteractive LC_ALL=C unshare -Ur chroot "$ROOTFS" \
+        /usr/bin/apt-get -o APT::Sandbox::User=root -o APT::Sandbox::Seccomp=false \
+        -y --no-install-recommends install grub-common grub-pc fdisk dosfstools
+    rm -f "$ROOTFS/usr/sbin/policy-rc.d"
+fi
+for tool in /usr/sbin/grub-install /usr/sbin/fdisk /usr/sbin/sfdisk /usr/sbin/mkfs.vfat; do
+    [[ -x "$ROOTFS$tool" ]] || {
+        echo "build-glibc-iso: missing disk-install tool $tool" >&2
+        exit 1
+    }
+done
 
 # Fresh and cached roots both need the real XFCE power probe and AT-SPI service.
 bash "$ROOT/tools/prepare-xfce-services.sh" "$ROOTFS"
@@ -326,6 +387,10 @@ cat > "$ROOTFS/usr/local/bin/dmesg" <<'EOF'
 exec /usr/bin/dmesg --syslog --color=always "$@"
 EOF
 chmod 0755 "$ROOTFS/usr/local/bin/dmesg"
+
+# Destructive disk installer. It stays inert unless called with --yes-wipe.
+install -D -m 0755 "$ROOT/tools/axon-install-disk.sh" \
+    "$ROOTFS/usr/local/sbin/axon-install"
 
 # AxonOS boot integration: Debian systemd is PID 1; BusyBox is only a static
 # rescue applet. All dynamic userland uses Debian glibc.
@@ -573,7 +638,14 @@ StandardOutput=null
 StandardError=null
 RestartSec=30s
 """
-    if name in ("systemd-networkd.service", "systemd-udevd.service"):
+    if name == "systemd-logind.service":
+        # Preserve the reason for login failures instead of discarding both
+        # service output and systemd's own logind diagnostics.
+        text += """StandardOutput=journal
+StandardError=journal
+Environment=SYSTEMD_LOG_TARGET=journal SYSTEMD_LOG_LEVEL=info SYSTEMD_LOG_COLOR=1 SYSTEMD_COLORS=1
+"""
+    elif name in ("systemd-networkd.service", "systemd-udevd.service"):
         # Keep network daemon diagnostics in journald without flooding the tty.
         text += "Environment=SYSTEMD_LOG_TARGET=journal SYSTEMD_LOG_LEVEL=info SYSTEMD_LOG_COLOR=1 SYSTEMD_COLORS=1\n"
         if name == "systemd-networkd.service":
@@ -690,7 +762,7 @@ EndSection
     "    XDG_RUNTIME_DIR=$(mktemp -d /tmp/axonos-runtime-XXXXXXXXXX) || exit 1\n"
     "    export XDG_RUNTIME_DIR\n"
     "fi\n"
-    "exec dbus-launch --exit-with-session startxfce4\n")
+    "exec dbus-run-session -- startxfce4\n")
 (root / "root/.xinitrc").chmod(0o755)
 (root / "usr/share/fonts").mkdir(parents=True, exist_ok=True)
 font = root / "usr/share/consolefonts/Uni2-Terminus16.psf.gz"

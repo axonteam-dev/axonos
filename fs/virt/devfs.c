@@ -997,6 +997,7 @@ struct devfs_char {
 };
 static struct devfs_char dev_chars[32];
 static int dev_char_count = 0;
+static spinlock_t dev_chars_lock;
 static uint32_t devfs_rand_state = 0x12345678;
 /* special device names exposed under /dev */
 static const char * const devfs_special_names[] = {
@@ -1214,7 +1215,7 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
         return 0;
     }
     /* character device nodes (registered via devfs_create_char_node) */
-    for (int ci = 0; ci < dev_char_count; ci++) {
+    for (int ci = 0; ci < __atomic_load_n(&dev_char_count, __ATOMIC_ACQUIRE); ci++) {
         if (strcmp(path, dev_chars[ci].path) == 0) {
             struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
             if (!f) return -1;
@@ -1225,7 +1226,7 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
             memcpy(pp, path, plen);
             f->path = (const char*)pp;
             f->fs_private = &devfs_driver_data;
-            f->driver_private = dev_chars[ci].driver_private;
+            f->driver_private = __atomic_load_n(&dev_chars[ci].driver_private, __ATOMIC_ACQUIRE);
             f->type = FS_TYPE_REG;
             f->size = (strcmp(path, "/dev/fb0") == 0) ? (size_t)fbdev_byte_len() : 0;
             f->pos = 0;
@@ -1532,7 +1533,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             is_dirent_dir[nent++] = 1;
             names[nent] = "..";
             is_dirent_dir[nent++] = 1;
-            for (int ci = 0; ci < dev_char_count && nent < 16; ci++) {
+            for (int ci = 0; ci < __atomic_load_n(&dev_char_count, __ATOMIC_ACQUIRE) && nent < 16; ci++) {
                 const char *cpath = dev_chars[ci].path;
                 if (strncmp(cpath, "/dev/input/", 11) != 0) continue;
                 names[nent] = cpath + 11;
@@ -1649,7 +1650,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 if (strchr(rest, '/')) continue;
                 DEVFS_ADD_NAME(rest, 0);
             }
-            for (int ci = 0; ci < dev_char_count; ci++) {
+            for (int ci = 0; ci < __atomic_load_n(&dev_char_count, __ATOMIC_ACQUIRE); ci++) {
                 const char *path = dev_chars[ci].path;
                 if (strncmp(path, "/dev/", 5) != 0) continue;
                 const char *rest = path + 5;
@@ -2643,8 +2644,8 @@ static void devfs_release(struct fs_file *file) {
         if (dp >= base_tty && dp < end_tty) is_allocated_marker = 0;
         if (dp >= base_blk && dp < end_blk) is_allocated_marker = 0;
         /* if driver_private matches any registered dev_chars entry, do not free (it's owned by caller) */
-        for (int ci = 0; ci < dev_char_count; ci++) {
-            if (file->driver_private == dev_chars[ci].driver_private) { is_allocated_marker = 0; break; }
+        for (int ci = 0; ci < __atomic_load_n(&dev_char_count, __ATOMIC_ACQUIRE); ci++) {
+            if (file->driver_private == __atomic_load_n(&dev_chars[ci].driver_private, __ATOMIC_ACQUIRE)) { is_allocated_marker = 0; break; }
         }
         if (is_allocated_marker) {
             kfree(file->driver_private);
@@ -3610,19 +3611,28 @@ int devfs_create_block_node(const char *path, int device_id, uint32_t sectors) {
 
 /* Create a character device node and register mapping (e.g., /dev/fb0) */
 int devfs_create_char_node(const char *path, void *driver_private) {
-    if (!path) return -1;
-    if (dev_char_count >= (int)(sizeof(dev_chars)/sizeof(dev_chars[0]))) return -1;
+    unsigned long flags = 0;
+    int count;
+    if (!path || strlen(path) >= sizeof(dev_chars[0].path)) return -1;
+    acquire_irqsave(&dev_chars_lock, &flags);
+    count = __atomic_load_n(&dev_char_count, __ATOMIC_RELAXED);
     /* avoid duplicate registrations for same path: update driver_private if provided */
-    for (int i = 0; i < dev_char_count; i++) {
+    for (int i = 0; i < count; i++) {
         if (strcmp(dev_chars[i].path, path) == 0) {
-            if (driver_private) dev_chars[i].driver_private = driver_private;
+            if (driver_private)
+                __atomic_store_n(&dev_chars[i].driver_private, driver_private, __ATOMIC_RELEASE);
+            release_irqrestore(&dev_chars_lock, flags);
             return 0;
         }
     }
-    strncpy(dev_chars[dev_char_count].path, path, sizeof(dev_chars[dev_char_count].path)-1);
-    dev_chars[dev_char_count].path[sizeof(dev_chars[dev_char_count].path)-1] = '\0';
-    dev_chars[dev_char_count].driver_private = driver_private;
-    dev_char_count++;
+    if (count >= (int)(sizeof(dev_chars)/sizeof(dev_chars[0]))) {
+        release_irqrestore(&dev_chars_lock, flags);
+        return -1;
+    }
+    strcpy(dev_chars[count].path, path);
+    __atomic_store_n(&dev_chars[count].driver_private, driver_private, __ATOMIC_RELAXED);
+    __atomic_store_n(&dev_char_count, count + 1, __ATOMIC_RELEASE);
+    release_irqrestore(&dev_chars_lock, flags);
     return 0;
 }
 

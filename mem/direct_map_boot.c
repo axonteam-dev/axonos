@@ -4,6 +4,17 @@
 #include <heap.h>
 #include <mmio.h>
 #include <ram_page_pool.h>
+#if defined(AXON_EXPERIMENTAL_HIGH_USER_FRAMES) && AXON_EXPERIMENTAL_HIGH_USER_FRAMES
+#include <frame.h>
+#include <mm.h>
+#include <pmm.h>
+#endif
+#if defined(AXON_VTE_TRACE) && AXON_VTE_TRACE
+#include <debug.h>
+#define DM_BOOT_TRACE(s) qemu_debug_printf("high-map-stage: " s "\n")
+#else
+#define DM_BOOT_TRACE(s) ((void)0)
+#endif
 
 /* Detached construction can fail; retain all table allocations only after
  * publishing. Existing boot heap is identity-addressed below 4 GiB. */
@@ -79,6 +90,7 @@ int direct_map_boot_install(uint32_t magic, const void *info)
     uint32_t eax, ebx, ecx, edx, maxleaf;
     uint64_t cr4, efer, limit, entry, cr3;
     struct direct_map_allocator a = {&tables, boot_alloc, boot_resolve};
+    DM_BOOT_TRACE("enter");
     if (tables.count) return -1;
     __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
     if (cr4 & (1ULL << 12)) return -1; /* This layout assumes four levels. */
@@ -95,6 +107,7 @@ int direct_map_boot_install(uint32_t magic, const void *info)
     limit = 1ULL << bits;
     if (limit > DIRECT_MAP_SIZE) limit = DIRECT_MAP_SIZE;
     if (bootmem_from_multiboot(&ram, magic, info, limit) != 0) return -1;
+    DM_BOOT_TRACE("bootmem-ready");
     cr3 = paging_read_cr3() & PG_ADDR_MASK;
     if (!cr3 || cr3 >= MMIO_IDENTITY_LIMIT) return -1;
     if (direct_map_build(&ram, &a, &entry) != 0 ||
@@ -102,12 +115,30 @@ int direct_map_boot_install(uint32_t magic, const void *info)
         boot_free_tables();
         return -1;
     }
+    DM_BOOT_TRACE("published");
     paging_flush_tlb();
     /* ram is the same reservation-filtered map used to construct the direct
      * map. PMM only owns physical addresses below 4 GiB. Claim high pages
      * before APs or tasks can run; failure leaves this optional pool absent. */
     (void)ram_page_pool_bootstrap(&high_pool, &ram, NULL, high_resolve,
                                   kmalloc, kfree);
+#if defined(AXON_EXPERIMENTAL_HIGH_USER_FRAMES) && AXON_EXPERIMENTAL_HIGH_USER_FRAMES
+    /* Early BSP-only setup: grow reference metadata before user tasks exist.
+     * Failure is safe; frame_alloc_high will stop when metadata is exhausted. */
+    if (high_pool.ready && high_pool.total <= (size_t)-1 - pmm_total_pages()) {
+        (void)mm_kernel();
+        int reserve_rc = frame_reserve_capacity(high_pool.total + pmm_total_pages());
+#if defined(AXON_VTE_TRACE) && AXON_VTE_TRACE
+        qemu_debug_printf("high-user-lab: metadata-rc=%d capacity=%llu high-pages=%llu heap-free=%llu\n",
+                          reserve_rc, (unsigned long long)frame_capacity_pages(),
+                          (unsigned long long)high_pool.total,
+                          (unsigned long long)heap_free_bytes());
+#else
+        (void)reserve_rc;
+#endif
+    }
+#endif
+    DM_BOOT_TRACE("pool-ready-or-unavailable");
     return 0;
 }
 #endif

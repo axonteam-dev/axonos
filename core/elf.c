@@ -12,6 +12,7 @@
 #include <mmio.h>
 #include <thread.h>
 #include <process.h>
+#include <signal_abi.h>
 
 static int kernel_execve_into_mm(const char *path, const char *const argv[],
                                  const char *const envp[], mm_t *resume_mm);
@@ -20,6 +21,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
 #include <gdt.h>
 #include <paging.h>
 #include <mm.h>
+#include <frame.h>
 #include <user_vma.h>
 #include <user_as.h>
 #include <user_map.h>
@@ -267,9 +269,12 @@ static int elf_copy_into_mm(mm_t *mm, uint64_t va, const void *src, size_t n) {
         size_t chunk = (size_t)(0x1000ULL - off);
         if (chunk > n)
             chunk = n;
-        /* Store via leaf PA (identity of phys). No invlpg(va): CR3 may still
-         * be mid-exec and the write never went through the user VA. */
-        memcpy((void *)(uintptr_t)(page + off), s, chunk);
+        /* High physical pages need their tracked supervisor mapping. */
+        void *target = page < (uint64_t)MMIO_IDENTITY_LIMIT
+            ? (void *)(uintptr_t)(page + off) : frame_kva(page + off);
+        if (!target)
+            return -1;
+        memcpy(target, s, chunk);
         va += chunk;
         s += chunk;
         n -= chunk;
@@ -294,7 +299,11 @@ static int elf_zero_into_mm(mm_t *mm, uint64_t va, size_t n) {
         size_t chunk = (size_t)(0x1000ULL - off);
         if (chunk > n)
             chunk = n;
-        memset((void *)(uintptr_t)(page + off), 0, chunk);
+        void *target = page < (uint64_t)MMIO_IDENTITY_LIMIT
+            ? (void *)(uintptr_t)(page + off) : frame_kva(page + off);
+        if (!target)
+            return -1;
+        memset(target, 0, chunk);
         va += chunk;
         n -= chunk;
     }
@@ -433,9 +442,14 @@ static int exec_seed_static_tls(uintptr_t stack_top, uintptr_t random_addr,
     uint64_t guard = 0;
     if (tc && elf_needs_private_user_pages(tc) && tc->mm) {
         uint64_t rpa = 0;
-        if (mm_va_leaf_pa(tc->mm, (uint64_t)random_addr, &rpa) == 0)
-            guard = *(uint64_t *)(uintptr_t)(rpa + (random_addr & 0xFFFULL));
-        else
+        if (mm_va_leaf_pa(tc->mm, (uint64_t)random_addr, &rpa) == 0) {
+            uint64_t pa = rpa + (random_addr & 0xFFFULL);
+            const void *source = pa < (uint64_t)MMIO_IDENTITY_LIMIT
+                ? (const void *)(uintptr_t)pa : frame_kva(pa);
+            if (!source)
+                return -1;
+            memcpy(&guard, source, sizeof(guard));
+        } else
             guard = 0x8b13f00d2a11c0deULL;
     } else if (random_addr + 16 <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
         guard = *(uint64_t *)(uintptr_t)random_addr;
@@ -692,16 +706,8 @@ static int elf_probe_exec_open_depth(const char *path, unsigned depth) {
     int i;
     char interp[192];
 
-    int apk_trigger = path && strncmp(path, "/lib/apk/exec/", 14) == 0;
-    if (!path || depth >= 8) {
-        if (apk_trigger) kprintf("apk-trigger-exec: probe recursion/path invalid depth=%u path=%s\n", depth, path);
-        return -1;
-    }
     f = fs_open(path);
-    if (!f) {
-        if (apk_trigger) kprintf("apk-trigger-exec: cannot open path=%s fs-error=%d\n", path, fs_file_open_error_get());
-        return -1;
-    }
+
     if (fs_read(f, &eh, sizeof(eh), 0) != (ssize_t)sizeof(eh) ||
         !elf_validate_header(&eh, sizeof(eh))) {
         uint8_t hdr[256];
@@ -710,23 +716,13 @@ static int elf_probe_exec_open_depth(const char *path, unsigned depth) {
         fs_file_free(f);
         if (nr <= 0 || !parse_shebang(hdr, (size_t)nr, interp,
                                       sizeof(interp), arg, sizeof(arg))) {
-            if (apk_trigger) kprintf("apk-trigger-exec: bad/non-shebang path=%s read=%lld head=%02x%02x\n",
-                path, (long long)nr, hdr[0], hdr[1]);
             return -1;
         }
-        if (apk_trigger)
-            kprintf("apk-trigger-exec: script path=%s bytes=%lld interp=%s arg=%s\n",
-                    path, (long long)nr, interp, arg);
-        /* A script is executable only if its interpreter is executable too.
-         * Check the whole bounded chain before discarding the caller's mm. */
-        int rc = elf_probe_exec_open_depth(interp, depth + 1);
-        if (apk_trigger && rc != 0)
-            kprintf("apk-trigger-exec: missing/bad interpreter=%s for %s\n", interp, path);
-        return rc;
+
+        return elf_probe_exec_open_depth(interp, depth + 1);
     }
     if (eh.e_phoff == 0 || eh.e_phnum == 0 ||
         eh.e_phentsize != sizeof(Elf64_Phdr)) {
-        if (apk_trigger) kprintf("apk-trigger-exec: invalid ELF program headers path=%s\n", path);
         fs_file_free(f);
         return -1;
     }
@@ -869,18 +865,10 @@ static uint64_t elf_auxv_secure(const thread_t *t) {
  * user-VA store under the wrong CR3 fills identity phys and leaves GOT slots 0
  * (static IFUNC then `jmp *GOT` → RIP=0). */
 static int elf_store_u64_into_mm(mm_t *mm, uint64_t va, uint64_t val) {
-    if (va + sizeof(uint64_t) > (uint64_t)MMIO_IDENTITY_LIMIT)
+    if (va > (uint64_t)MMIO_IDENTITY_LIMIT - sizeof(uint64_t))
         return -1;
-    if (mm) {
-        uint64_t leaf = 0;
-        if (mm_va_leaf_pa(mm, va, &leaf) != 0)
-            return -1;
-        uint64_t page = leaf & ~0xFFFULL;
-        if (page == (va & ~0xFFFULL))
-            return -1;
-        *(uint64_t *)(uintptr_t)(page + (va & 0xFFFULL)) = val;
-        return 0;
-    }
+    if (mm)
+        return elf_copy_into_mm(mm, va, &val, sizeof(val));
     *(uint64_t *)(uintptr_t)va = val;
     return 0;
 }
@@ -953,7 +941,11 @@ static int elf_load_u8_from_mm(mm_t *mm, uint64_t va, void *dst, size_t n) {
             chunk = (size_t)(0x1000ULL - off);
             if (chunk > n)
                 chunk = n;
-            memcpy(d, (const void *)(uintptr_t)(page + off), chunk);
+            const void *source = page < (uint64_t)MMIO_IDENTITY_LIMIT
+                ? (const void *)(uintptr_t)(page + off) : frame_kva(page + off);
+            if (!source)
+                return -1;
+            memcpy(d, source, chunk);
         } else {
             off = va & 0xFFFULL;
             chunk = (size_t)(0x1000ULL - off);
@@ -2046,8 +2038,8 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
     for (int i = 0; i < envc; i++) env_strings_size += strlen(envp[i]) + 1;
 
     enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6, AT_BASE = 7, AT_ENTRY = 9,
-           AT_CLKTCK = 17, AT_SECURE = 23, AT_RANDOM = 25 };
-    const size_t aux_pairs = 10;
+           AT_CLKTCK = 17, AT_SECURE = 23, AT_RANDOM = 25, AT_MINSIGSTKSZ = 51 };
+    const size_t aux_pairs = 11;
     const size_t aux_qwords = aux_pairs * 2;
     size_t ptrs = (size_t)(argc + 1 + envc + 1) + aux_qwords;
     size_t ptrs_bytes = ptrs * sizeof(uint64_t);
@@ -2122,7 +2114,8 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
             sp64[ax +14] = (uint64_t)AT_CLKTCK;
             sp64[ax +15] = (uint64_t)pit_get_frequency();
             sp64[ax +16] = (uint64_t)AT_SECURE; sp64[ax +17] = elf_auxv_secure(tc);
-            sp64[ax +18] = (uint64_t)AT_NULL;   sp64[ax +19] = 0;
+            sp64[ax +18] = (uint64_t)AT_MINSIGSTKSZ; sp64[ax +19] = MINSIGSTKSZ_AXON;
+            sp64[ax +20] = (uint64_t)AT_NULL;   sp64[ax +21] = 0;
             *(uint64_t *)base = (uint64_t)argc;
         }
         if (tip_mm) {
@@ -2186,12 +2179,8 @@ static int try_exec_shebang(const char *resolved_path,
 
     char interp[192];
     char arg[64];
-    if (!parse_shebang(hdr, (size_t)rr, interp, sizeof(interp), arg, sizeof(arg))) {
-        if (strncmp(resolved_path, "/lib/apk/exec/", 14) == 0)
-            kprintf("apk-trigger-exec: load shebang parse failed path=%s bytes=%lld head=%02x%02x\n",
-                    resolved_path, (long long)rr, hdr[0], hdr[1]);
-        return -1;
-    }
+    if (!parse_shebang(hdr, (size_t)rr, interp, sizeof(interp), arg, sizeof(arg)))
+            return -1;
 
     /* Build new argv: [interp, (arg?), orig_path, argv[1..]] */
     int argc = 0;
@@ -2217,17 +2206,7 @@ static int try_exec_shebang(const char *resolved_path,
     for (int i = 1; i < argc; i++) nargv[p++] = argv[i];
     nargv[p] = NULL;
 
-    qemu_debug_printf("execve: shebang '%s' -> interp='%s'%s%s%s\n",
-                      resolved_path, interp,
-                      has_arg ? " arg='" : "",
-                      has_arg ? arg : "",
-                      has_arg ? "'" : "");
-    /* shebang: run interpreter with script path as argv0 */
-
     int rc = kernel_execve_into_mm(k_interp, nargv, envp, resume_mm);
-    if (strncmp(resolved_path, "/lib/apk/exec/", 14) == 0 && rc != 0)
-        kprintf("apk-trigger-exec: interpreter failed script=%s interp=%s rc=%d\n",
-                resolved_path, interp, rc);
     kfree((void*)nargv);
     kfree(k_interp);
     if (k_arg) kfree(k_arg);
@@ -2380,8 +2359,12 @@ int kernel_execve_init_from_path(const char *path, const char *const argv[],
     uintptr_t lo = (uintptr_t)stack;
     if (!stack || lo < (uintptr_t)USER_STACK_TOP ||
         lo > (uintptr_t)MMIO_IDENTITY_LIMIT - stack_size) {
+        klogprintf("init: bootstrap exec stack unavailable: addr=%p size=%llu; "
+                   "need kernel-only range [%p, %p)\n",
+                   stack, (unsigned long long)stack_size,
+                   (void *)(uintptr_t)USER_STACK_TOP,
+                   (void *)(uintptr_t)MMIO_IDENTITY_LIMIT);
         if (stack) kfree(stack);
-        kprintf("init: no kernel-only bootstrap exec stack available\n");
         return -3;
     }
     int rc = boot_exec_call_on_stack(path, argv, envp,
@@ -2420,12 +2403,8 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
     }
 
     if (!exec_img_path_cached(curpath) && elf_probe_exec_open(curpath) != 0) {
-        if (strncmp(curpath, "/lib/apk/exec/", 14) == 0)
-            kprintf("apk-trigger-exec: preflight rejected %s\n", curpath);
         return -1;
     }
-    if (strncmp(curpath, "/lib/apk/exec/", 14) == 0)
-        kprintf("apk-trigger-exec: preflight ok %s\n", curpath);
     {
         thread_t *tc = elf_bprm_thread();
         if (tc) {
@@ -2443,15 +2422,10 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
 
     int r = elf_load_from_path_info(curpath, 0, &main_info, &main_tls);
     if (r == -2) {
-        return -2;
+        return r;
     }
-    if (r != 0) {
-        /* Not an ELF. Try shebang scripts (e.g. /linuxrc). */
-        int rc = try_exec_shebang(curpath, path, argv, envp, resume_mm);
-        if (strncmp(curpath, "/lib/apk/exec/", 14) == 0 && rc != 0)
-            kprintf("apk-trigger-exec: shebang load failed path=%s elf_rc=%d rc=%d\n", curpath, r, rc);
-        return rc;
-    }
+    if (r != 0) return try_exec_shebang(curpath, path, argv, envp, resume_mm);
+
     {
         thread_t *tr = thread_get_current_user();
         if (tr && tr->name[0] &&
@@ -2496,11 +2470,13 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
             loaded_brk_end = (uintptr_t)interp_info.brk_end;
         if (interp_info.loaded_hi > loaded_image_hi)
             loaded_image_hi = interp_info.loaded_hi;
+#if defined(AXON_EXEC_TRACE) && AXON_EXEC_TRACE
         qemu_debug_printf("execve: dynamic '%s' interp='%s' entry=0x%llx AT_BASE=0x%llx main_entry=0x%llx\n",
                           path, main_info.interp_path,
                           (unsigned long long)entry,
                           (unsigned long long)aux_base,
                           (unsigned long long)aux_entry);
+#endif
     }
 
     /* Drop leftover bytes from the previous ET_EXEC (busybox @ 0x400000)
@@ -2567,8 +2543,8 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
               auxv pairs (a_type,a_val) ending with AT_NULL
        Many libc start routines expect auxv to exist; without AT_NULL they may parse garbage. */
     enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6, AT_BASE = 7, AT_ENTRY = 9,
-           AT_CLKTCK = 17, AT_SECURE = 23, AT_RANDOM = 25 };
-    const size_t aux_pairs = 10; /* PHDR,PHENT,PHNUM,BASE,ENTRY,PAGESZ,RANDOM,CLKTCK,SECURE,NULL */
+           AT_CLKTCK = 17, AT_SECURE = 23, AT_RANDOM = 25, AT_MINSIGSTKSZ = 51 };
+    const size_t aux_pairs = 11; /* PHDR,PHENT,PHNUM,BASE,ENTRY,PAGESZ,RANDOM,CLKTCK,SECURE,MINSIGSTKSZ,NULL */
     const size_t aux_qwords = aux_pairs * 2;
     /* pointer area: argv pointers + NULL + env pointers + NULL + auxv */
     size_t ptrs = (size_t)(argc + 1 + envc + 1) + aux_qwords;
@@ -2656,7 +2632,8 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         sp64[ax +14] = (uint64_t)AT_CLKTCK;
         sp64[ax +15] = (uint64_t)pit_get_frequency();
         sp64[ax +16] = (uint64_t)AT_SECURE; sp64[ax +17] = elf_auxv_secure(tip_tc);
-        sp64[ax +18] = (uint64_t)AT_NULL;   sp64[ax +19] = 0;
+        sp64[ax +18] = (uint64_t)AT_MINSIGSTKSZ; sp64[ax +19] = MINSIGSTKSZ_AXON;
+        sp64[ax +20] = (uint64_t)AT_NULL;   sp64[ax +21] = 0;
         *(uint64_t *)base = (uint64_t)argc;
     }
     if (tip_mm) {
@@ -2701,7 +2678,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
     uintptr_t fs_base = 0;
     if (aux_base == 0) {
         if (exec_seed_static_tls(stack_top, random_addr, &main_tls, &fs_base) != 0) {
-            kprintf("axonOS: failed to seed static TLS\n");
+            kprintf("AxonOS: failed to seed static TLS\n");
             return -1;
         }
         msr_write_u64_local(MSR_FS_BASE_LOCAL, (uint64_t)fs_base);
@@ -2935,7 +2912,9 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         return 0;
     }
 
-    /* Debug: print argv/env passed to execve for user debugging (qemu debug) */
+    /* Verbose exec tracing is opt-in: serial output is expensive and argv/env
+     * can contain credentials. */
+#if defined(AXON_EXEC_TRACE) && AXON_EXEC_TRACE
     if (argv) {
         int i = 0;
         qemu_debug_printf("execve: launching %s argv:", path);
@@ -2956,18 +2935,12 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         }
         qemu_debug_printf("\n");
     }
-
+#endif
 
     if ((uintptr_t)entry >= (uintptr_t)MMIO_IDENTITY_LIMIT || (uintptr_t)final_stack >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
         kprintf("execve: entry or stack outside identity-mapped region, abort\n");
         return -1;
     }
-
-    /* try to read first byte of entry */
-    volatile uint8_t *entry_b = (volatile uint8_t*)(uintptr_t)entry;
-    uint8_t first = 0;
-    /* wrap read in a benign check */
-    first = entry_b[0];
 
     {
         thread_t *tc = thread_current();
@@ -2978,6 +2951,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
         }
     }
 
+#if defined(AXON_EXEC_TRACE) && AXON_EXEC_TRACE
     /* Diagnostic: dump a few bytes at the entry and physical mapping to help debug PFs */
     if ((uintptr_t)entry < (uintptr_t)MMIO_IDENTITY_LIMIT) {
         uint64_t phys = virt_to_phys(entry);
@@ -2993,6 +2967,7 @@ static int kernel_execve_into_mm(const char *path, const char *const argv[],
     } else {
         qemu_debug_printf("execve: DEBUG entry outside identity map: 0x%llx\n", (unsigned long long)entry);
     }
+#endif
 
     /* Transfer to user mode (does not return on success for ring0 spawn).
      * In-place ring3 exec returns 0 and lets syscall.S iret with the patched

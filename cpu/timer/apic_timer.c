@@ -490,7 +490,7 @@ void apic_timer_handler(cpu_registers_t* regs) {
         thread_t *cur = thread_current();
         if ((!cur || cur == thread_idle_for_cpu(mycpu) || cur->state == THREAD_TERMINATED ||
              cur->state == THREAD_BLOCKED || cur->state == THREAD_SLEEPING) &&
-            thread_runnable_nonidle_count() > 0) {
+             thread_has_ready_on_cpu(mycpu)) {
             apic_eoi();
             thread_request_resched();
             thread_schedule();
@@ -580,6 +580,23 @@ void apic_timer_start(uint32_t freq_hz) {
     apic_timer_state.running = true;
     apic_timer_state.mode = APIC_TIMER_PERIODIC;
     apic_timer_ticks = 0;
+}
+
+/* The BSP has already calibrated the LAPIC. Program only this CPU's local
+ * timer, without resetting the global clock or the BSP's timer state. */
+void apic_timer_start_secondary(int cpu) {
+    if (cpu <= 0 || cpu >= SMP_MAX_CPUS || !apic_timer_state.running)
+        return;
+    if (g_tsc_deadline_mode && g_tsc_deadline_interval) {
+        uint64_t deadline = apic_rdtsc() + g_tsc_deadline_interval;
+        g_tsc_deadline_next_pc[cpu] = deadline;
+        apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_TSC_DEADLINE, false);
+        apic_wrmsr(MSR_IA32_TSC_DEADLINE, deadline);
+    } else if (g_timer_init_count) {
+        apic_write(LAPIC_TIMER_DIV_REG, g_timer_div_reg);
+        apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_PERIODIC, false);
+        apic_write(LAPIC_TIMER_INIT_REG, g_timer_init_count);
+    }
 }
 
 /*

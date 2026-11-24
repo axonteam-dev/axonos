@@ -14,8 +14,10 @@ xinitrc = ast.literal_eval('(' + expression + ')')
 
 with tempfile.TemporaryDirectory(prefix="axon-xinitrc-test-", dir="/tmp/opencode") as tmp:
     root = Path(tmp)
-    (root / "dbus-launch").write_text('#!/bin/sh\nprintf "%s\\n" "$XDG_RUNTIME_DIR"\n')
-    (root / "dbus-launch").chmod(0o755)
+    (root / "dbus-run-session").write_text(
+        '#!/bin/sh\n[ "$1" = -- ] && [ "$2" = startxfce4 ] || exit 90\n'
+        'printf "%s\\n" "$XDG_RUNTIME_DIR"\n')
+    (root / "dbus-run-session").chmod(0o755)
     script = root / "xinitrc"
     script.write_text(xinitrc)
     env = dict(os.environ, PATH=f"{root}:/usr/bin:/bin")

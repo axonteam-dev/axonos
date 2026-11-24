@@ -119,26 +119,27 @@ void vbe_detach_framebuffer(void) {
 
 static void vbe_flush_region_internal(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 	if (!g_enabled || !g_frontbuf || !g_backbuf) return;
-	if (x >= g_width || y >= g_height) return;
-	if (x + w > g_width) w = g_width - x;
-	if (y + h > g_height) h = g_height - y;
+	if (x >= g_width || y >= g_height || !w || !h) return;
+	if (w > g_width - x) w = g_width - x;
+	if (h > g_height - y) h = g_height - y;
 
 	uint32_t bytes_per_pixel = (g_bpp + 7) / 8;
 	if (x == 0 && w == g_width) {
 		memcpy((uint8_t *)g_frontbuf + (size_t)y * g_pitch,
 		       (const uint8_t *)g_backbuf + (size_t)y * g_pitch,
 		       (size_t)h * g_pitch);
+		vbe_fb_cache_flush_range((uint8_t *)g_frontbuf + (size_t)y * g_pitch,
+		                         (size_t)h * g_pitch);
 	} else {
 		for (uint32_t row = 0; row < h; row++) {
-			uint8_t *src = (uint8_t*)g_backbuf + (size_t)( (y + row) * g_pitch + x * bytes_per_pixel );
-			uint8_t *dst = (uint8_t*)g_frontbuf + (size_t)( (y + row) * g_pitch + x * bytes_per_pixel );
+			size_t offset = (size_t)(y + row) * g_pitch + (size_t)x * bytes_per_pixel;
+			uint8_t *src = (uint8_t *)g_backbuf + offset;
+			uint8_t *dst = (uint8_t *)g_frontbuf + offset;
 			memcpy(dst, src, (size_t)w * bytes_per_pixel);
+			vbe_fb_cache_flush_range(dst, (size_t)w * bytes_per_pixel);
 		}
 	}
-	/* Write-back stores must reach DRAM before the scanout engine samples the
-	 * framebuffer; CLWB/CLFLUSH the dirty rectangle, then fence store ordering. */
-	vbe_fb_cache_flush_range((uint8_t *)g_frontbuf + (size_t)y * g_pitch + (size_t)x * bytes_per_pixel,
-	                         (size_t)h * g_pitch);
+	/* Complete all cache writebacks before scanout observes the rectangle. */
 	vbe_fb_store_barrier();
 }
 
@@ -400,5 +401,4 @@ int vbe_init_from_multiboot(uint32_t multiboot_magic, uint64_t multiboot_info) {
 	klogprintf("vbe: no framebuffer tag found in multiboot info\n");
 	return 0;
 }
-
 

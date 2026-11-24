@@ -95,7 +95,8 @@ void fbdev_sync_user_frontbuffer(void)
 {
 	if (!g_fbdev.active || !g_fbdev_user_mapped)
 		return;
-	/* Temporary X11 diagnostic: sample scanout while a graphics client runs.
+#if defined(AXON_XDIAG_FBSCAN) && AXON_XDIAG_FBSCAN
+	/* Optional X11 diagnostic: sample scanout while a graphics client runs.
 	 * This distinguishes unchanged framebuffer bytes from host presentation. */
 	if (video_kd_graphics() && g_fbdev.bpp == 32 && g_fbdev.kva &&
 	    g_fbdev.width && g_fbdev.height &&
@@ -121,6 +122,7 @@ void fbdev_sync_user_frontbuffer(void)
 				(unsigned long long)g_fbdev.pa);
 		}
 	}
+#endif
 	fbdev_flush_display();
 }
 

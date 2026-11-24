@@ -861,11 +861,11 @@ static int vmwgfx_pick_mode(vmwgfx_ctx_t *ctx) {
 		uint32_t w, h;
 	} modes[] = {
 		/* Landscape first: normal VM window, no portrait scrollbars (fbcon = w/8 × h/16 cells). */
+		{ 1920, 1080 },
 		{ 1280, 800 },
 		{ 1024, 768 },
 		{ 1366, 768 },
 		{ 1280, 720 },
-		{ 1920, 1080 },
 		{ 1600, 1200 },
 		{ 1440, 900 },
 		{ 1280, 1024 },

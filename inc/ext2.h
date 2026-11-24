@@ -52,6 +52,16 @@ struct ext2_inode {
     uint32_t i_flags;
     uint32_t i_osd1;
     uint32_t i_block[15];
+    uint32_t i_generation;
+    uint32_t i_file_acl;
+    uint32_t i_dir_acl;
+    uint32_t i_faddr;
+    uint8_t i_frag;
+    uint8_t i_fsize;
+    uint16_t i_osd2_pad;
+    uint16_t i_uid_high;
+    uint16_t i_gid_high;
+    uint32_t i_osd2_reserved;
 };
 
 struct ext2_dir_entry {
@@ -80,5 +90,9 @@ int ext2_probe_and_mount_geom(int device_id, uint32_t start_lba, uint32_t sector
 void ext2_unmount_cleanup(void);
 struct fs_driver *ext2_get_driver(void);
 int ext2_fill_stat(struct fs_file *file, struct stat *st);
+int ext2_ftruncate(struct fs_file *file, off_t length);
+int ext2_symlink(const char *path, const char *target, uint32_t uid, uint32_t gid);
+int ext2_fchmod_file(struct fs_file *file, mode_t mode);
+int ext2_fchown_file(struct fs_file *file, uint32_t uid, uint32_t gid);
 
 #endif /* INC_EXT2_H */

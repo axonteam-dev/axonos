@@ -181,6 +181,33 @@ static void dump(const char* what, const char* who, cpu_registers_t* regs, uint6
                 }
         }
 
+        if (user_mode) {
+                /* The kernel log ring retains this as one entry. Serial output
+                 * from unrelated diagnostics may still interleave with it. */
+                logfn("user-regs: rip=0x%llx rsp=0x%llx rbp=0x%llx rax=0x%llx "
+                      "rbx=0x%llx rcx=0x%llx rdx=0x%llx rsi=0x%llx rdi=0x%llx "
+                      "r8=0x%llx r9=0x%llx r10=0x%llx r11=0x%llx r12=0x%llx "
+                      "r13=0x%llx r14=0x%llx r15=0x%llx cr2=0x%llx err=0x%llx\n",
+                      (unsigned long long)regs->rip,
+                      (unsigned long long)regs->rsp,
+                      (unsigned long long)regs->rbp,
+                      (unsigned long long)regs->rax,
+                      (unsigned long long)regs->rbx,
+                      (unsigned long long)regs->rcx,
+                      (unsigned long long)regs->rdx,
+                      (unsigned long long)regs->rsi,
+                      (unsigned long long)regs->rdi,
+                      (unsigned long long)regs->r8,
+                      (unsigned long long)regs->r9,
+                      (unsigned long long)regs->r10,
+                      (unsigned long long)regs->r11,
+                      (unsigned long long)regs->r12,
+                      (unsigned long long)regs->r13,
+                      (unsigned long long)regs->r14,
+                      (unsigned long long)regs->r15,
+                      (unsigned long long)cr2,
+                      (unsigned long long)err);
+        }
         logfn("Oops! %s in %s at RIP=0x%llx err=0x%llx\n", what, who, (unsigned long long)regs->rip, (unsigned long long)regs->error_code);
         logfn("RIP: 0x%llx\n", (unsigned long long)regs->rip);
         logfn("RSP: 0x%llx\n", (unsigned long long)regs->rsp);
@@ -271,7 +298,12 @@ static void ud_fault_handler(cpu_registers_t* regs) {
                                                 uint64_t leaf = 0;
                                                 if (mm_va_leaf_pa(umm, old_fs + 0x28u, &leaf) == 0) {
                                                         uint64_t page = leaf & ~0xFFFULL;
-                                                        old_guard = *(volatile uint64_t *)(uintptr_t)(page + ((old_fs + 0x28u) & 0xFFFULL));
+                                                        uint64_t off = (old_fs + 0x28u) & 0xFFFULL;
+                                                        const void *source = page < (uint64_t)MMIO_IDENTITY_LIMIT
+                                                            ? (const void *)(uintptr_t)(page + off)
+                                                            : frame_kva(page + off);
+                                                        if (source && off <= 0xFF8ULL)
+                                                                memcpy(&old_guard, source, sizeof(old_guard));
                                                 } else if (old_fs + 0x30u < (uint64_t)MMIO_IDENTITY_LIMIT) {
                                                         old_guard = *(volatile uint64_t *)(uintptr_t)(old_fs + 0x28u);
                                                 }
@@ -292,9 +324,23 @@ static void ud_fault_handler(cpu_registers_t* regs) {
                                                         uint64_t leaf = 0;
                                                         if (mm_va_leaf_pa(umm, new_fs + 0x28u, &leaf) == 0) {
                                                                 uint64_t page = leaf & ~0xFFFULL;
-                                                                existing = *(volatile uint64_t *)(uintptr_t)(page + ((new_fs + 0x28u) & 0xFFFULL));
-                                                                if (existing == 0)
-                                                                        *(volatile uint64_t *)(uintptr_t)(page + ((new_fs + 0x28u) & 0xFFFULL)) = old_guard;
+                                                                uint64_t off = (new_fs + 0x28u) & 0xFFFULL;
+                                                                void *target = page < (uint64_t)MMIO_IDENTITY_LIMIT
+                                                                    ? (void *)(uintptr_t)(page + off)
+                                                                    : frame_kva(page + off);
+                                                                if (target && off <= 0xFF8ULL) {
+                                                                        memcpy(&existing, target, sizeof(existing));
+                                                                        if (existing == 0) {
+                                                                                if (page < (uint64_t)MMIO_IDENTITY_LIMIT)
+                                                                                        memcpy(target, &old_guard, sizeof(old_guard));
+                                                                                else
+                                                                                        (void)mm_copy_to_user(umm,
+                                                                                            ut && ut->mm_ptemplate
+                                                                                                ? ut->mm_ptemplate : mm_kernel(),
+                                                                                            new_fs + 0x28u, &old_guard,
+                                                                                            sizeof(old_guard));
+                                                                        }
+                                                                }
                                                         } else {
                                                                 existing = *(volatile uint64_t *)(uintptr_t)(new_fs + 0x28u);
                                                                 if (existing == 0)
@@ -318,6 +364,21 @@ static void ud_fault_handler(cpu_registers_t* regs) {
                 }
 
                 dump("invalid opcode", "user", regs, 0, 0, true);
+#if defined(AXON_VTE_TRACE) && AXON_VTE_TRACE
+                {
+                    thread_t *t = thread_current();
+                    if (t && strstr(t->name, "vte-pty-probe") &&
+                        regs->rsp >= 0x200008ULL &&
+                        regs->rsp + 32 < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                        const uint64_t *sp = (const uint64_t *)(uintptr_t)regs->rsp;
+                        klogprintf("vte-ud-stack: tid=%llu sp[-1]=%llx sp[0]=%llx sp[1]=%llx sp[2]=%llx sp[3]=%llx\n",
+                            (unsigned long long)t->tid,
+                            (unsigned long long)sp[-1], (unsigned long long)sp[0],
+                            (unsigned long long)sp[1], (unsigned long long)sp[2],
+                            (unsigned long long)sp[3]);
+                    }
+                }
+#endif
                 /* Dump nearby code bytes to help diagnose user UD */
                 {
                     uintptr_t rip = (uintptr_t)regs->rip;

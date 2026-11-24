@@ -28,6 +28,7 @@ int smp_cpu_count(void);
 int smp_have_acpi_cpu_topology(void);
 uint64_t smp_default_affinity_mask(void);
 int smp_sched_cpu_id(void);
+uint32_t smp_online_cpus(void);
 
 /* Boot non-BSP processors (INIT-SIPI-SIPI + trampoline). Call after apic_init, pit_init, thread_init. */
 void smp_boot_aps(void);

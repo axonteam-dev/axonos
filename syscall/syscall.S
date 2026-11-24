@@ -112,40 +112,9 @@ syscall_entry64:
     pushq   %r14
     pushq   %r15
 
-    // Capture callee-saved user registers from the saved frame (needed for vfork).
-    // Frame base: rsp points to saved r15; offsets match the comment below.
-    movq    88(%rsp), %rax      // rbx
-    movq    %rax, syscall_user_saved_rbx(%rip)
-    movq    80(%rsp), %rax      // rbp
-    movq    %rax, syscall_user_saved_rbp(%rip)
-    movq    24(%rsp), %rax      // r12
-    movq    %rax, syscall_user_saved_r12(%rip)
-    movq    16(%rsp), %rax      // r13
-    movq    %rax, syscall_user_saved_r13(%rip)
-    movq    8(%rsp),  %rax      // r14
-    movq    %rax, syscall_user_saved_r14(%rip)
-    movq    0(%rsp),  %rax      // r15
-    movq    %rax, syscall_user_saved_r15(%rip)
-
-    // Capture caller-saved regs as well (to emulate a real SYSCALL return in vfork child).
-    movq    64(%rsp), %rax      // rdi
-    movq    %rax, syscall_user_saved_rdi(%rip)
-    movq    72(%rsp), %rax      // rsi
-    movq    %rax, syscall_user_saved_rsi(%rip)
-    movq    96(%rsp), %rax      // rdx
-    movq    %rax, syscall_user_saved_rdx(%rip)
-    movq    56(%rsp), %rax      // r8
-    movq    %rax, syscall_user_saved_r8(%rip)
-    movq    48(%rsp), %rax      // r9
-    movq    %rax, syscall_user_saved_r9(%rip)
-    movq    40(%rsp), %rax      // r10
-    movq    %rax, syscall_user_saved_r10(%rip)
-    movq    104(%rsp), %rax     // rcx (return RIP)
-    movq    %rax, syscall_user_saved_rcx(%rip)
-    movq    32(%rsp), %rax      // r11 (saved RFLAGS from SYSCALL)
-    movq    %rax, syscall_user_saved_r11(%rip)
-
-    // Both global snapshot slots consumed by the prologue; other CPUs may enter now.
+    // RSP and RFLAGS are now on the task's stack. The remaining registers are
+    // copied directly from this frame into the thread by the helper below.
+    // Do not serialize unrelated global debug snapshots on every syscall.
     lock    btrq $0, syscall_entry_lock(%rip)
 
     // Snapshot saved user regs into current thread (per-thread, avoids globals).

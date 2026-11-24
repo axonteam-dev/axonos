@@ -108,7 +108,7 @@ static int scsi_disk_read(int device_id, uint32_t lba, void *buf, uint32_t secto
 	scsi_lun_t *lun = scsi_lun_by_disk_id(device_id);
 	if (!lun || !lun->ops || !lun->ops->execute_command) return -1;
 	if (sectors == 0) return 0;
-	if (lba + sectors > lun->sector_count) return -1;
+	if (!buf || lba >= lun->sector_count || sectors > lun->sector_count - lba) return -1;
 
 	uint8_t cdb[SCSI_CDB_MAX_LEN];
 	uint32_t done = 0;
@@ -131,7 +131,7 @@ static int scsi_disk_write(int device_id, uint32_t lba, const void *buf, uint32_
 	scsi_lun_t *lun = scsi_lun_by_disk_id(device_id);
 	if (!lun || !lun->ops || !lun->ops->execute_command) return -1;
 	if (sectors == 0) return 0;
-	if (lba + sectors > lun->sector_count) return -1;
+	if (!buf || lba >= lun->sector_count || sectors > lun->sector_count - lba) return -1;
 
 	uint8_t cdb[SCSI_CDB_MAX_LEN];
 	uint32_t done = 0;

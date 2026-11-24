@@ -9,6 +9,7 @@
 #include <string.h>
 #include <vga.h>
 #include <mm.h>
+#include <user_vma.h>
 #include <klog.h>
 #include <timekeeping.h>
 
@@ -129,6 +130,16 @@ static int futex_key(thread_t *cur, uintptr_t address, int private,
     if (private) { *owner = cur->mm; *key = address; return 0; }
     uint64_t pa;
     if (mm_user_leaf_pa(cur->mm, address, 0, &pa) != 0) return -EFAULT;
+    /* A shared-operation futex in a private mapping (notably glibc's
+     * clear_child_tid) must survive COW in this same mm. Keying it by the
+     * current physical frame loses wakeups when the exiting thread's zero
+     * store replaces that frame after the waiter has queued. Bit 0 separates
+     * this key from FUTEX_PRIVATE_FLAG; futex addresses are 4-byte aligned. */
+    if (!user_vma_is_shared_page_mm(cur->mm, address)) {
+        *owner = cur->mm;
+        *key = address | 1;
+        return 0;
+    }
     *owner = NULL; *key = (uintptr_t)pa;
     return 0;
 }

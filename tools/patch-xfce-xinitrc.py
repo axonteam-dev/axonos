@@ -41,6 +41,17 @@ axon_dbus_update() {
     text = text.replace(update, "  axon_dbus_update $systemd_arg \\\n", 1)
     text = text.replace(anchor, helper + anchor, 1)
 
+# Do not wait for a user manager that has no private socket. The timeout is
+# still needed when the socket exists but the manager does not respond.
+probe_condition = "command -v systemctl >/dev/null 2>&1 && axon_systemctl_probe"
+guarded_probe = ('command -v systemctl >/dev/null 2>&1 && '
+                 '[ -n "${XDG_RUNTIME_DIR:-}" ] && '
+                 '[ -S "$XDG_RUNTIME_DIR/systemd/private" ] && axon_systemctl_probe')
+if guarded_probe not in text:
+    if text.count(probe_condition) != 1:
+        raise SystemExit("build-glibc-iso: unrecognized XFCE user manager probe")
+    text = text.replace(probe_condition, guarded_probe, 1)
+
 bus_marker = "# Axon shared XFCE session bus"
 if bus_marker not in text:
     shebang = "#!/bin/sh\n"
@@ -56,4 +67,35 @@ fi
 
 '''
     text = shebang + bus_setup + text[len(shebang):]
+
+browser_marker = "# Axon browser autodetection"
+if browser_marker not in text:
+    shebang = "#!/bin/sh\n"
+    if not text.startswith(shebang):
+        raise SystemExit("build-glibc-iso: unrecognized XFCE xinitrc interpreter")
+    browser_setup = '''# Axon browser autodetection
+# Debian's sensible-browser uses BROWSER or x-www-browser. Preserve both a
+# user's explicit choice and the Debian alternative; otherwise use an actually
+# installed graphical browser, including one installed after the image build.
+if [ -z "${BROWSER:-}" ] && ! command -v x-www-browser >/dev/null 2>&1; then
+  for axon_browser in firefox firefox-esr chromium chromium-browser google-chrome midori netsurf-gtk; do
+    if command -v "$axon_browser" >/dev/null 2>&1; then
+      BROWSER=$(command -v "$axon_browser")
+      export BROWSER
+      break
+    fi
+  done
+fi
+
+'''
+    text = shebang + browser_setup + text[len(shebang):]
+
+# The bus can already have been started by .xinitrc before the browser is
+# detected above. Export the result to services activated by that bus as well.
+browser_update_marker = "    BROWSER \\\n"
+if browser_update_marker not in text:
+    update_call = "  axon_dbus_update $systemd_arg \\\n"
+    if text.count(update_call) != 1:
+        raise SystemExit("build-glibc-iso: unrecognized XFCE activation update call")
+    text = text.replace(update_call, update_call + browser_update_marker, 1)
 path.write_text(text)

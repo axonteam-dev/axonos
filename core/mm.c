@@ -10,6 +10,15 @@
 #include <vga.h>
 #include <debug.h>
 #include <frame.h>
+#if defined(AXON_EXPERIMENTAL_DIRECT_MAP) && AXON_EXPERIMENTAL_DIRECT_MAP
+#include <direct_map.h>
+#endif
+#if defined(AXON_EXPERIMENTAL_HIGH_USER_FRAMES) && AXON_EXPERIMENTAL_HIGH_USER_FRAMES
+#include <smp.h>
+#if !defined(AXON_EXPERIMENTAL_DIRECT_MAP) || !AXON_EXPERIMENTAL_DIRECT_MAP
+#error "high user frames require the experimental direct map"
+#endif
+#endif
 
 #ifndef USER_STACK_TOP
 #define USER_STACK_TOP USER_STACK_TOP_LAYOUT
@@ -43,12 +52,43 @@ static void *kmalloc_aligned(size_t size, size_t align, void **out_raw) {
  * be controlled solely by frame refs.  Page-table pages remain in mm->allocs.
  */
 static void *mm_user_frame_alloc(int zero) {
-    return zero ? frame_alloc_zero() : frame_alloc();
+    void *page = zero ? frame_alloc_zero() : frame_alloc();
+#if defined(AXON_EXPERIMENTAL_HIGH_USER_FRAMES) && AXON_EXPERIMENTAL_HIGH_USER_FRAMES
+    /* Isolated single-CPU testing only: SMP page-table locking and shootdown,
+     * and fork of these pages, are not yet implemented. Never enable this in
+     * the normal build. */
+    if (!page && smp_cpu_count() == 1) {
+        struct frame_page high;
+        if (frame_alloc_high(&high, zero) == 0) {
+#if defined(AXON_VTE_TRACE) && AXON_VTE_TRACE
+            static int high_user_logged;
+            if (!high_user_logged) {
+                high_user_logged = 1;
+                qemu_debug_printf("high-user-lab: first-pa=0x%llx\n",
+                                  (unsigned long long)high.pa);
+            }
+#endif
+            return high.kva;
+        }
+    }
+#endif
+    return page;
+}
+
+/* The kernel mapping and PTE address are different for high RAM. Legacy low
+ * frame pointers are identity addresses. Call only on an allocated frame. */
+static uint64_t mm_user_frame_pa(const void *page) {
+    uint64_t va = (uint64_t)(uintptr_t)page;
+#if defined(AXON_EXPERIMENTAL_DIRECT_MAP) && AXON_EXPERIMENTAL_DIRECT_MAP
+    if (va >= DIRECT_MAP_BASE && va - DIRECT_MAP_BASE < DIRECT_MAP_SIZE)
+        return va - DIRECT_MAP_BASE;
+#endif
+    return va;
 }
 
 static void mm_user_frame_put(void *page) {
     if (page)
-        frame_release((uint64_t)(uintptr_t)page);
+        frame_release(mm_user_frame_pa(page));
 }
 
 /*
@@ -67,7 +107,7 @@ static void *mm_user_frame_alloc_avoid_va(uint64_t va, int zero) {
         p = mm_user_frame_alloc(zero);
         if (!p)
             break;
-        if (((uint64_t)(uintptr_t)p & ~0xFFFULL) != page)
+        if ((mm_user_frame_pa(p) & ~0xFFFULL) != page)
             break;
         hold[n++] = p;
         p = NULL;
@@ -218,6 +258,19 @@ static int mm_pte_same_pt_page(uint64_t ent, uint64_t other) {
     if (!pt_page_pa_ok(ent) || !pt_page_pa_ok(other))
         return 0;
     return (ent & PG_ADDR_MASK) == (other & PG_ADDR_MASK);
+}
+
+/* Until SMP page-table synchronization exists, high-frame fork is restricted
+ * to a single CPU and an mm with no other retained owners. */
+static int mm_high_fork_allowed(mm_t *parent) {
+#if defined(AXON_EXPERIMENTAL_HIGH_USER_FRAMES) && AXON_EXPERIMENTAL_HIGH_USER_FRAMES && \
+    defined(AXON_EXPERIMENTAL_HIGH_FORK) && AXON_EXPERIMENTAL_HIGH_FORK
+    return parent && smp_cpu_count() == 1 &&
+           __atomic_load_n(&parent->refcount, __ATOMIC_ACQUIRE) == 1;
+#else
+    (void)parent;
+    return 0;
+#endif
 }
 
 /* Map one 4K user page at `va` -> `pa` in `mm`, breaking sharing with baseline
@@ -450,14 +503,19 @@ static int mm_map_user_page_locked(mm_t *mm, uint64_t va, uint64_t pa,
 		return -1;
 	if (va >= (uint64_t)MMIO_IDENTITY_LIMIT)
 		return -2;
-	/*
-	 * Leaf PA: RAM frames stay in the identity window. Device maps
-	 * (/dev/fb0) may use a 64-bit BAR; those leaves are never PG_SOFT_OWNED.
-	 */
+	/* Device maps may use a 64-bit BAR; they are never PG_SOFT_OWNED.
+	 * A high owned leaf must be a live frame with a kernel mapping. */
 	if (pa & ~PG_ADDR_MASK)
 		return -2;
-	if ((flags & PG_SOFT_OWNED) && pa >= (uint64_t)MMIO_IDENTITY_LIMIT)
+	if ((flags & PG_SOFT_OWNED) && pa >= (uint64_t)MMIO_IDENTITY_LIMIT) {
+#if defined(AXON_EXPERIMENTAL_DIRECT_MAP) && AXON_EXPERIMENTAL_DIRECT_MAP
+		/* The caller must own a reference until the PTE takes ownership. */
+		if (!frame_kva(pa))
+			return -2;
+#else
 		return -2;
+#endif
+	}
 
 	l4i = (int)((va >> 39) & 0x1ff);
 	l3i = (int)((va >> 30) & 0x1ff);
@@ -559,10 +617,17 @@ int mm_map_user_page(mm_t *mm, uint64_t va, uint64_t pa,
 		     uint64_t flags)
 {
 	mm_dm_ctx_t dm;
+	unsigned long irqf;
 	int ret;
 
+	if (!mm)
+		return -1;
 	dm = mm_enter_direct_map();
+	/* Serializes this leaf-install path only. Other page-table writers and
+	 * remote TLB invalidation still need the same protocol before SMP use. */
+	acquire_irqsave(&mm->page_table_lock, &irqf);
 	ret = mm_map_user_page_locked(mm, va, pa, flags);
+	release_irqrestore(&mm->page_table_lock, irqf);
 	mm_leave_direct_map(dm);
 	return ret;
 }
@@ -730,7 +795,7 @@ static uint64_t *mm_leaf_pte_direct(uint64_t *l4, uint64_t va) {
  * the fork parent or swapper.  Linux munmap drops one mapping reference for
  * every removed frame; mmput must not be the first place that releases it.
  *
- * The retained supervisor identity map is an AxonOS kernel implementation
+ * The retained supervisor identity map is an Axon kernel implementation
  * detail, not a userspace mapping.  Do not punch holes in it unless the leaf
  * is user-accessible.
  */
@@ -934,7 +999,7 @@ static int mm_privatize_identity_range_ex(mm_t *mm, uint64_t va_begin, uint64_t 
         void *newp = mm_user_frame_alloc(!seed_from_live);
         if (!newp)
             goto out;
-        if (((uint64_t)(uintptr_t)newp & ~0xFFFULL) == (va & ~0xFFFULL)) {
+        if ((mm_user_frame_pa(newp) & ~0xFFFULL) == (va & ~0xFFFULL)) {
             mm_user_frame_put(newp);
             goto out;
         }
@@ -953,7 +1018,7 @@ static int mm_privatize_identity_range_ex(mm_t *mm, uint64_t va_begin, uint64_t 
                 memcpy(newp, (void *)(uintptr_t)pa, (size_t)PAGE_SIZE_4K);
             }
         }
-        if (mm_map_4k_sharedaware(mm, share->pml4, va, (uint64_t)(uintptr_t)newp,
+        if (mm_map_4k_sharedaware(mm, share->pml4, va, mm_user_frame_pa(newp),
                                   PG_RW | PG_US | PG_SOFT_OWNED) != 0) {
             mm_user_frame_put(newp);
             goto out;
@@ -962,7 +1027,7 @@ static int mm_privatize_identity_range_ex(mm_t *mm, uint64_t va_begin, uint64_t 
             uint64_t got = 0;
             if (mm_va_leaf_pa(mm, va, &got) != 0 ||
                 (got & ~0xFFFULL) == (va & ~0xFFFULL) ||
-                (got & ~0xFFFULL) != ((uint64_t)(uintptr_t)newp & ~0xFFFULL)) {
+                (got & ~0xFFFULL) != (mm_user_frame_pa(newp) & ~0xFFFULL)) {
                 kprintf("ident-priv-bug: va=0x%llx want=0x%llx got=0x%llx\n",
                         (unsigned long long)va,
                         (unsigned long long)(uintptr_t)newp,
@@ -1006,9 +1071,15 @@ mm_t *mm_kernel(void) {
 
 mm_t *mm_retain(mm_t *mm) {
     if (!mm) return mm_kernel();
-    if (mm->refcount <= 0) mm->refcount = 1;
-    else mm->refcount++;
-    return mm;
+    if (mm == &g_kernel_mm) return mm;
+    int refs = __atomic_load_n(&mm->refcount, __ATOMIC_RELAXED);
+    while (refs > 0 && refs < 0x7fffffff) {
+        if (__atomic_compare_exchange_n(&mm->refcount, &refs, refs + 1, 0,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return mm;
+    }
+    /* A final release cannot be undone by resurrecting a zero refcount. */
+    return NULL;
 }
 
 /*
@@ -1093,9 +1164,13 @@ static void mm_release_user_frames(mm_t *mm) {
 void mm_release(mm_t *mm) {
     if (!mm) return;
     if (mm == &g_kernel_mm) return;
-    if (mm->refcount <= 0) return;
-    mm->refcount--;
-    if (mm->refcount == 0) {
+    int refs = __atomic_load_n(&mm->refcount, __ATOMIC_RELAXED);
+    while (refs > 0 &&
+           !__atomic_compare_exchange_n(&mm->refcount, &refs, refs - 1, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        ;
+    if (refs <= 0) return;
+    if (refs == 1) {
         mm_release_user_frames(mm);
         /* Free page-table allocations only; user leaves are frame-owned. */
         mm_alloc_node_t *n = (mm_alloc_node_t*)mm->allocs;
@@ -1829,7 +1904,8 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
         uint64_t src_pa = parent_pa & PG_ADDR_MASK;
         int eager;
 
-        if (src_pa >= (uint64_t)MMIO_IDENTITY_LIMIT)
+        if (src_pa >= (uint64_t)MMIO_IDENTITY_LIMIT &&
+            (!owned || !mm_high_fork_allowed(parent) || !frame_kva(src_pa)))
             return -1;
 
         /*
@@ -1868,9 +1944,15 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
                 memcpy(private_copy, (void *)(uintptr_t)va, (size_t)PAGE_SIZE_4K);
                 paging_write_cr3(saved);
             } else {
-                memcpy(private_copy, (void *)(uintptr_t)src_pa, (size_t)PAGE_SIZE_4K);
+                const void *source = src_pa < (uint64_t)MMIO_IDENTITY_LIMIT
+                    ? (const void *)(uintptr_t)src_pa : frame_kva(src_pa);
+                if (!source) {
+                    mm_user_frame_put(private_copy);
+                    return -1;
+                }
+                memcpy(private_copy, source, (size_t)PAGE_SIZE_4K);
             }
-            child_pa = (uint64_t)(uintptr_t)private_copy;
+            child_pa = mm_user_frame_pa(private_copy);
             flags &= ~(PG_SOFT_COW | PG_SOFT_OWNED);
             if (parent_pte & PG_SOFT_COW)
                 flags |= PG_RW;
@@ -1882,6 +1964,8 @@ static int mm_fork_copy_user_leaf(mm_t *child, mm_t *parent,
                     retained = 1;
                     flags |= PG_SOFT_OWNED;
                 } else {
+                    if (child_pa >= (uint64_t)MMIO_IDENTITY_LIMIT)
+                        return -1;
                     /* 2MiB Soft_OWNED sliced to 4K: only the huge base is in
                      * the frame table. Share without a ref so mmput does not
                      * pmm_free a page the parent still maps. */
@@ -2171,8 +2255,16 @@ static int mm_cow_mark_all_user_writable_walk(mm_t *child, mm_t *parent_for_vma,
                         ((e1 & (PG_PRESENT | PG_SOFT_OWNED)) != PG_SOFT_OWNED))
                         continue;
                     uint64_t pa = e1 & PG_ADDR_MASK;
-                    if (pa >= (uint64_t)MMIO_IDENTITY_LIMIT || !pt_page_pa_ok(e1))
+                    /* Never silently omit a tracked high page from fork.
+                     * Until the high-frame fork path is complete, failing
+                     * fork is safer than returning a corrupted child. */
+                    if (pa >= (uint64_t)MMIO_IDENTITY_LIMIT &&
+                        (!(e1 & PG_SOFT_OWNED) ||
+                         !mm_high_fork_allowed(parent_for_vma))) {
+                        if (e1 & PG_SOFT_OWNED)
+                            goto out;
                         continue;
+                    }
                     int any_mm = 0;
                     unsigned pf = snap_full
                         ? mm_mv_page_exact(owner_tid, parent_for_vma, va)
@@ -2257,7 +2349,14 @@ static int mm_dup_ensure_brk_copied(mm_t *child, mm_t *parent, uint64_t owner_ti
 		if ((parent_pte & (PG_PRESENT | PG_US)) != (PG_PRESENT | PG_US))
 			continue;
 		pa = parent_pte & PG_ADDR_MASK;
-		if (pa >= (uint64_t)MMIO_IDENTITY_LIMIT || !pt_page_pa_ok(parent_pte))
+		if (pa >= (uint64_t)MMIO_IDENTITY_LIMIT &&
+		    (parent_pte & PG_SOFT_OWNED) &&
+		    !mm_high_fork_allowed(parent)) {
+			mm_leave_direct_map(dm);
+			return -1;
+		}
+		if (pa >= (uint64_t)MMIO_IDENTITY_LIMIT &&
+		    !(parent_pte & PG_SOFT_OWNED))
 			continue;
 
 		if (mm_va_leaf_entry_direct(child, (uint64_t)va, &child_pte) == 0 &&
@@ -2333,12 +2432,16 @@ static int mm_cow_fork_copy_one_page(mm_t *mm, uint64_t *share_l4, uint64_t va) 
         return 0;
     uint64_t old_child_pte = 0;
     (void)mm_va_leaf_entry(mm, va, &old_child_pte);
+    uint64_t source_pa = old_pa & PG_ADDR_MASK;
+    const void *source = source_pa < (uint64_t)MMIO_IDENTITY_LIMIT
+        ? (const void *)(uintptr_t)source_pa : frame_kva(source_pa);
+    if (!source)
+        return -1;
     void *newp = mm_user_frame_alloc(0);
     if (!newp)
         return -1;
-    memcpy(newp, (void *)(uintptr_t)(old_pa & PG_ADDR_MASK),
-           (size_t)PAGE_SIZE_4K);
-    if (mm_map_4k_sharedaware(mm, share_l4, va, (uint64_t)(uintptr_t)newp,
+    memcpy(newp, source, (size_t)PAGE_SIZE_4K);
+    if (mm_map_4k_sharedaware(mm, share_l4, va, mm_user_frame_pa(newp),
                               PG_RW | PG_US | PG_SOFT_OWNED) != 0) {
         mm_user_frame_put(newp);
         return -1;
@@ -2451,13 +2554,17 @@ static int mm_cow_private_writable_impl(mm_t *mm, uint64_t *share_l4, uint64_t v
         if (mm_va_leaf_pa(&source_mm, va, &old_pa) != 0)
             continue;
         (void)mm_va_leaf_entry(mm, va, &old_child_pte);
+        uint64_t source_pa = old_pa & ~0xFFFULL;
+        const void *source = source_pa < (uint64_t)MMIO_IDENTITY_LIMIT
+            ? (const void *)(uintptr_t)source_pa : frame_kva(source_pa);
+        if (!source)
+            return -1;
         void *newp = mm_user_frame_alloc(0);
         if (!newp) return -1;
-        memcpy(newp, (void *)(uintptr_t)(old_pa & ~0xFFFULL),
-               (size_t)PAGE_SIZE_4K);
+        memcpy(newp, source, (size_t)PAGE_SIZE_4K);
         /* The whole range already runs under the direct-map CR3. Avoid a
          * nested pushfq/cli/CR3 check for every 4 KiB page. */
-        if (mm_map_4k_sharedaware_body(mm, share_l4, va, (uint64_t)(uintptr_t)newp,
+        if (mm_map_4k_sharedaware_body(mm, share_l4, va, mm_user_frame_pa(newp),
                                       PG_RW | PG_US | PG_SOFT_OWNED) != 0) {
             mm_user_frame_put(newp);
             return -1;
@@ -2530,15 +2637,21 @@ int mm_fork_sync_from_parent(mm_t *child_mm, mm_t *parent_mm, uint64_t va_begin,
         if (mm_va_leaf_pa(parent_mm, va, &old_pa) != 0)
             continue;
         (void)mm_va_leaf_entry(child_mm, va, &old_child_pte);
+        uint64_t source_pa = old_pa & ~0xFFFULL;
+        const void *source = source_pa < (uint64_t)MMIO_IDENTITY_LIMIT
+            ? (const void *)(uintptr_t)source_pa : frame_kva(source_pa);
+        if (!source) {
+            mm_switch(child_mm);
+            return -1;
+        }
         void *newp = mm_user_frame_alloc(0);
         if (!newp) {
             mm_switch(child_mm);
             return (copied > 0) ? 0 : -1;
         }
-        memcpy(newp, (void *)(uintptr_t)(old_pa & ~0xFFFULL),
-               (size_t)PAGE_SIZE_4K);
+        memcpy(newp, source, (size_t)PAGE_SIZE_4K);
         mm_switch(child_mm);
-        if (mm_map_4k_sharedaware(child_mm, parent_l4, va, (uint64_t)(uintptr_t)newp,
+        if (mm_map_4k_sharedaware(child_mm, parent_l4, va, mm_user_frame_pa(newp),
                                   PG_RW | PG_US | PG_SOFT_OWNED) != 0) {
             mm_user_frame_put(newp);
             mm_switch(parent_mm);
@@ -2718,6 +2831,15 @@ int mm_cow_fault_page(mm_t *mm, uint64_t va, mm_t *share_cmp_mm) {
         goto out;
     }
 
+    /* A physical address above the identity window is not a kernel pointer.
+     * The caller must keep the source PTE/frame alive through the copy; the
+     * remaining SMP page-table lifetime work is required before enabling high
+     * frames for userspace. */
+    const void *old_data = old_pa < (uint64_t)MMIO_IDENTITY_LIMIT
+        ? (const void *)(uintptr_t)old_pa : frame_kva(old_pa);
+    if (!old_data)
+        goto out;
+
     /* Lunaix/Linux do_wp_page: a write to shared COW always gets a private copy. */
     uint64_t service_cr3 = paging_read_cr3();
     if (syscall_pipe_watch_active) {
@@ -2742,14 +2864,14 @@ int mm_cow_fault_page(mm_t *mm, uint64_t va, mm_t *share_cmp_mm) {
                     (unsigned long long)pg,
                     (unsigned long long)(uintptr_t)newp);
     }
-    memcpy(newp, (void *)(uintptr_t)old_pa, (size_t)PAGE_SIZE_4K);
+    memcpy(newp, old_data, (size_t)PAGE_SIZE_4K);
     int map_rc;
     if (share_cmp_mm && share_cmp_mm != mm && share_cmp_mm->pml4) {
         map_rc = mm_map_4k_sharedaware(mm, share_cmp_mm->pml4, pg,
-                                        (uint64_t)(uintptr_t)newp,
+                                        mm_user_frame_pa(newp),
                                         PG_RW | PG_US | PG_SOFT_OWNED);
     } else {
-        map_rc = mm_map_4k_private_force(mm, pg, (uint64_t)(uintptr_t)newp,
+        map_rc = mm_map_4k_private_force(mm, pg, mm_user_frame_pa(newp),
                                          PG_RW | PG_US | PG_SOFT_OWNED);
     }
     if (map_rc != 0) {
@@ -2915,7 +3037,7 @@ static int mm_va_has_private_4k(mm_t *mm, uint64_t *share_l4, uint64_t va) {
     if (!(e2 & PG_PRESENT) || (e2 & PG_PS_2M) || !pt_page_pa_ok(e2)) return 0;
     uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
     uint64_t e1 = l1[l1i];
-    if (!(e1 & PG_PRESENT) || !pt_page_pa_ok(e1)) return 0;
+    if (!(e1 & PG_PRESENT)) return 0;
     /* Identity leaf still has pa == va; real private backing does not. */
     if ((e1 & PG_ADDR_MASK) == (va & ~0xFFFULL)) return 0;
     /*
@@ -2934,7 +3056,7 @@ static int mm_va_has_private_4k(mm_t *mm, uint64_t *share_l4, uint64_t va) {
                 if ((se2 & PG_PRESENT) && !(se2 & PG_PS_2M) && pt_page_pa_ok(se2)) {
                     uint64_t *sl1 = (uint64_t *)(uintptr_t)(se2 & PG_ADDR_MASK);
                     uint64_t se1 = sl1[l1i];
-                    if ((se1 & PG_PRESENT) && pt_page_pa_ok(se1) &&
+                    if ((se1 & PG_PRESENT) &&
                         (se1 & PG_ADDR_MASK) == (e1 & PG_ADDR_MASK))
                         return 0;
                 } else if ((se2 & PG_PRESENT) && (se2 & PG_PS_2M)) {
@@ -2949,7 +3071,7 @@ static int mm_va_has_private_4k(mm_t *mm, uint64_t *share_l4, uint64_t va) {
     return 1;
 }
 
-/* Resolve the 4K leaf PA for va in mm's page tables (0 if unmapped/huge). */
+/* Resolve the page-aligned PA, including 2 MiB and 1 GiB leaves. */
 int mm_va_leaf_pa(mm_t *mm, uint64_t va, uint64_t *pa_out) {
     if (!mm || !mm->pml4 || !pa_out) return -1;
     va &= ~0xFFFULL;
@@ -2963,25 +3085,26 @@ int mm_va_leaf_pa(mm_t *mm, uint64_t va, uint64_t *pa_out) {
     uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
     uint64_t e3 = l3[l3i];
     if (!(e3 & PG_PRESENT) || (e3 & PG_PS_2M) || !pt_page_pa_ok(e3)) {
-        /* 2MiB/1GiB leaf: PA == aligned VA for identity. */
+        /* A leaf is physical data, not a page-table pointer. */
         if ((e3 & PG_PRESENT) && (e3 & PG_PS_2M)) {
-            *pa_out = (e3 & PG_ADDR_MASK_1G) | (va & 0x3FFFFFULL);
+            *pa_out = (e3 & PG_ADDR_MASK_1G) | (va & 0x3FFFFFFFULL);
             return 0;
         }
         return -1;
     }
     uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
     uint64_t e2 = l2[l2i];
-    if (!(e2 & PG_PRESENT) || !pt_page_pa_ok(e2)) return -1;
+    if (!(e2 & PG_PRESENT)) return -1;
     if (e2 & PG_PS_2M) {
         *pa_out = (e2 & PG_ADDR_MASK_2M) |
                   (va & (PAGE_SIZE_2M - 1ULL));
         *pa_out &= ~0xFFFULL;
         return 0;
     }
+    if (!pt_page_pa_ok(e2)) return -1;
     uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
     uint64_t e1 = l1[l1i];
-    if (!(e1 & PG_PRESENT) || !pt_page_pa_ok(e1)) return -1;
+    if (!(e1 & PG_PRESENT)) return -1;
     *pa_out = e1 & PG_ADDR_MASK;
     return 0;
 }
@@ -3194,25 +3317,31 @@ static int mm_user_memcpy_via_pa(mm_t *mm, uint64_t va, void *kbuf, size_t n,
             invlpg((void *)(uintptr_t)va);
             paging_write_cr3(mm_direct_map_cr3());
             rc = 0;
-        } else if (to_user) {
-            memcpy((void *)(uintptr_t)pa, kbuf, n);
-            /*
-             * Soft_OWNED store is via PA under swapper CR3. The task TLB may
-             * still cache a prior leaf for this VA (COW break / privatize).
-             * BusyBox ash then reads waitpid's *status through the stale TLB
-             * entry while mm_copy_from_user (PA) already sees the new value —
-             * OpenRC `if ! mount` fails despite wait4 logging status=0x0.
-             */
-            {
+        } else {
+            /* Low legacy frames retain identity addresses. High owned frames
+             * must use their supervisor mapping, never a cast of the PA.
+             * Concurrent unmap still needs page-table lifetime locking before
+             * high frames can safely be enabled for general userspace. */
+            void *mapped = pa < (uint64_t)MMIO_IDENTITY_LIMIT
+                ? (void *)(uintptr_t)pa : frame_kva(pa);
+            if (!mapped) {
+                rc = -1;
+                goto copy_done;
+            }
+            if (to_user)
+                memcpy(mapped, kbuf, n);
+            else
+                memcpy(kbuf, mapped, n);
+            if (to_user) {
+                /* Invalidate the local task TLB after a COW/privatize store. */
                 uint64_t proc = mm->cr3 ? mm->cr3 : (uint64_t)(uintptr_t)mm->pml4;
                 paging_write_cr3(proc);
                 invlpg((void *)(uintptr_t)va);
                 paging_write_cr3(mm_direct_map_cr3());
             }
-        } else {
-            memcpy(kbuf, (const void *)(uintptr_t)pa, n);
         }
     }
+copy_done:
     mm_leave_direct_map(dm);
     return rc;
 }
@@ -3410,11 +3539,13 @@ static int mm_make_private_range_impl(mm_t *mm, uint64_t va_begin, uint64_t va_e
                 continue;
             }
             spa &= ~0xFFFULL;
-            if (spa >= (uint64_t)MMIO_IDENTITY_LIMIT) {
+            const void *source = spa < (uint64_t)MMIO_IDENTITY_LIMIT
+                ? (const void *)(uintptr_t)spa : frame_kva(spa);
+            if (!source) {
                 mm_user_frame_put(newp);
                 goto out;
             }
-            memcpy(newp, (void *)(uintptr_t)spa, (size_t)PAGE_SIZE_4K);
+            memcpy(newp, source, (size_t)PAGE_SIZE_4K);
         }
         (void)source_cr3;
         /*
@@ -3424,14 +3555,14 @@ static int mm_make_private_range_impl(mm_t *mm, uint64_t va_begin, uint64_t va_e
          * take seconds on bare metal.
          */
         if (mm_map_4k_sharedaware_body(mm, share_l4, va,
-                                      (uint64_t)(uintptr_t)newp,
+                                      mm_user_frame_pa(newp),
                                       PG_RW | PG_US | PG_SOFT_OWNED) != 0) {
             mm_user_frame_put(newp);
             goto out;
         }
         if (had_replaced &&
             (replaced_pa & ~0xFFFULL) !=
-                ((uint64_t)(uintptr_t)newp & ~0xFFFULL) &&
+                (mm_user_frame_pa(newp) & ~0xFFFULL) &&
             (replaced_pte & PG_SOFT_OWNED))
             frame_release(replaced_pa);
         /* Guard against sharedaware "success" that left an identity leaf. */
@@ -3439,7 +3570,7 @@ static int mm_make_private_range_impl(mm_t *mm, uint64_t va_begin, uint64_t va_e
             uint64_t got = 0;
             if (mm_va_leaf_pa(mm, va, &got) != 0 ||
                 (got & ~0xFFFULL) == (va & ~0xFFFULL) ||
-                (got & ~0xFFFULL) != ((uint64_t)(uintptr_t)newp & ~0xFFFULL)) {
+                (got & ~0xFFFULL) != (mm_user_frame_pa(newp) & ~0xFFFULL)) {
                 kprintf("priv-map-bug: va=0x%llx want=0x%llx got=0x%llx\n",
                     (unsigned long long)va,
                     (unsigned long long)(uintptr_t)newp,
@@ -3504,7 +3635,7 @@ static int mm_make_private_range_bulk_zero_ex(mm_t *mm, uint64_t va_begin, uint6
         void *page = mm_user_frame_alloc_avoid_va(pg, 1);
         if (!page)
             goto out;
-        uint64_t want = (uint64_t)(uintptr_t)page;
+        uint64_t want = mm_user_frame_pa(page);
         if (mm_map_4k_sharedaware_body(mm, share_l4, pg, want,
                                       PG_RW | PG_US | PG_SOFT_OWNED) != 0) {
             mm_user_frame_put(page);
@@ -3583,7 +3714,7 @@ static int mm_dbg_ash_leaf_flags(mm_t *mm, uint64_t va, uint64_t *pa_out,
         return -1;
     uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PG_ADDR_MASK);
     uint64_t e3 = l3[l3i];
-    if (!(e3 & PG_PRESENT) || !pt_page_pa_ok(e3))
+    if (!(e3 & PG_PRESENT))
         return -1;
     if (e3 & PG_PS_2M) {
         *pa_out = (e3 & PG_ADDR_MASK_1G) |
@@ -3593,9 +3724,11 @@ static int mm_dbg_ash_leaf_flags(mm_t *mm, uint64_t va, uint64_t *pa_out,
         if (is_2m_out) *is_2m_out = 1;
         return 0;
     }
+    if (!pt_page_pa_ok(e3))
+        return -1;
     uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PG_ADDR_MASK);
     uint64_t e2 = l2[l2i];
-    if (!(e2 & PG_PRESENT) || !pt_page_pa_ok(e2))
+    if (!(e2 & PG_PRESENT))
         return -1;
     if (e2 & PG_PS_2M) {
         *pa_out = (e2 & PG_ADDR_MASK_2M) |
@@ -3605,9 +3738,11 @@ static int mm_dbg_ash_leaf_flags(mm_t *mm, uint64_t va, uint64_t *pa_out,
         if (is_2m_out) *is_2m_out = 1;
         return 0;
     }
+    if (!pt_page_pa_ok(e2))
+        return -1;
     uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & PG_ADDR_MASK);
     uint64_t e1 = l1[l1i];
-    if (!(e1 & PG_PRESENT) || !pt_page_pa_ok(e1))
+    if (!(e1 & PG_PRESENT))
         return -1;
     *pa_out = e1 & PG_ADDR_MASK;
     if (pte_out) *pte_out = e1;

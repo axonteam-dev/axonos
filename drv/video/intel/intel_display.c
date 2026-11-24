@@ -1,6 +1,6 @@
 /* Display engine take-over for Gen6/7: read the pipe the firmware left
  * running, promote a stolen-memory framebuffer through the GTT, flip the
- * active primary plane, and publish fbdev (/dev/fb0, /dev/dri/card0).
+ * active primary plane, and publish fbdev. Its card0 alias is not DRM/KMS.
  *
  * All writes are validated by read-back; any failure rolls the plane back to
  * the surface the BIOS was using, so the VBE console path remains intact.
@@ -17,9 +17,11 @@
 #include <boot_brk.h>
 #include <apic_timer.h>
 
-static uint32_t align_up_4k(uint32_t v)
+static uint32_t align_up_4k(uint64_t v)
 {
-	return (v + 0xFFFu) & ~0xFFFu;
+	if (v == 0 || v > 0xFFFFF000u)
+		return 0;
+	return (uint32_t)((v + 0xFFFu) & ~0xFFFULL);
 }
 
 /* Debug aid: paint the whole scanout a solid color. Once the primary plane is
@@ -90,8 +92,8 @@ static int intel_find_active_pipe(intel_drv_t *d)
 			d->pipe.surf = mmio_read32(mm, pbase + (INTEL_DSPASURF - INTEL_DSPACNTR));
 			d->pipe.dspcntr_format = fmt;
 			uint32_t src = mmio_read32(mm, INTEL_TRANS_OFFSET(p) + (INTEL_PIPESRC_A - INTEL_TRANS_A));
-			d->pipe.src_w = (src & 0xFFFFu) + 1;
-			d->pipe.src_h = ((src >> 16) & 0xFFFFu) + 1;
+			d->pipe.src_w = ((src >> 16) & 0xFFFFu) + 1;
+			d->pipe.src_h = (src & 0xFFFFu) + 1;
 			d->pipe.bpp = (uint32_t)bpp;
 			d->pipe.bytes_per_pixel = (uint32_t)bppx;
 			klogprintf("intel: active pipe%c %ux%u pitch=%u bpp=%u surf=0x%x (adopt)\n",
@@ -119,8 +121,8 @@ static int intel_find_active_pipe(intel_drv_t *d)
 		d->pipe.dspcntr_format = 6;   /* we select BGRX888 */
 		d->pipe.stride = 0;
 		d->pipe.surf = 0;
-		d->pipe.src_w = (bringup_src & 0xFFFFu) + 1;
-		d->pipe.src_h = ((bringup_src >> 16) & 0xFFFFu) + 1;
+		d->pipe.src_w = ((bringup_src >> 16) & 0xFFFFu) + 1;
+		d->pipe.src_h = (bringup_src & 0xFFFFu) + 1;
 		d->pipe.bpp = 32;
 		d->pipe.bytes_per_pixel = 4;
 		klogprintf("intel: bring-up pipe%c %ux%u at firmware timing\n",
@@ -150,51 +152,38 @@ static uint32_t intel_bios_fb_pa(const intel_drv_t *d)
 	return decode_pte_phys(pte);
 }
 
+/* The caller still needs an actual allocator to establish ownership; this
+ * only prevents arithmetic wrap and overlap with the known firmware range. */
+static uint32_t intel_pick_range(uint32_t base, uint32_t size, uint32_t len,
+                                 uint32_t reserved, int has_reserved)
+{
+	uint64_t top = (uint64_t)base + size;
+	if (!len || len > size || top > 0x100000000ULL)
+		return 0;
+	uint64_t start = (top - len) & ~0xFFFULL;
+	uint64_t end_reserved = (uint64_t)reserved + (16u << 20);
+	if (has_reserved && start < end_reserved && start + len > reserved) {
+		if (reserved < len)
+			return 0;
+		start = ((uint64_t)reserved - len) & ~0xFFFULL;
+	}
+	if (start < base || start + len > top ||
+	    (has_reserved && start < end_reserved && start + len > reserved))
+		return 0;
+	return (uint32_t)start;
+}
+
 static uint32_t intel_pick_fb_pa(const intel_drv_t *d, uint32_t len, uint32_t *bios_pa)
 {
-	uint32_t base = d->stolen_base;
-	uint32_t top = base + d->stolen_size;
 	uint32_t bios = intel_bios_fb_pa(d);
 	*bios_pa = bios;
-
-	uint32_t pa = (top - len) & ~0xFFFu;
-	/* Avoid overlapping the surface the plane still scans until the flip. */
-	int guard = 4;
-	while (bios && pa + len > bios && pa < bios + (16u << 20)) {
-		if (bios >= pa + len)        /* moved above wasted */
-			break;
-		if (bios > len && bios - len >= base) {
-			pa = (bios - len) & ~0xFFFu;
-		} else {
-			break;
-		}
-		if (--guard <= 0)
-			break;
-	}
-	if (pa < base || pa + len > top)
-		return 0;
-	return pa;
+	return intel_pick_range(d->stolen_base, d->stolen_size, len, bios, bios != 0);
 }
 
 static uint32_t intel_pick_gtt_off(const intel_drv_t *d, uint32_t len)
 {
-	uint32_t total = d->total_gtt_bytes;
-	uint32_t off = (total - len) & ~0xFFFu;
 	uint32_t bios = d->pipe.surf & ~0xFFFu;
-
-	int guard = 4;
-	while (bios && off + len > bios && off < bios + (16u << 20)) {
-		if (bios > len) {
-			off = (bios - len) & ~0xFFFu;
-		} else {
-			break;
-		}
-		if (--guard <= 0)
-			break;
-	}
-	if (off + len > total)
-		return 0;
-	return off;
+	return intel_pick_range(0, d->total_gtt_bytes, len, bios, !d->pipe.bringup);
 }
 
 static int intel_setup_gtt_ptes(intel_drv_t *d)
@@ -279,7 +268,9 @@ static void intel_copy_fw_fb(intel_drv_t *d)
 {
 	if (!d->fb.fb_va)
 		return;
-	if (vbe_is_available()) {
+	if (vbe_is_available() && vbe_get_width() == d->fb.width &&
+	    vbe_get_height() == d->fb.height && vbe_get_bpp() == d->fb.bpp &&
+	    vbe_get_pitch() >= d->fb.width * d->pipe.bytes_per_pixel) {
 		const void *fw = vbe_get_frontbuffer();
 		uint32_t fw_pitch = vbe_get_pitch();
 		if (fw) {
@@ -338,9 +329,8 @@ int intel_display_takeover(intel_drv_t *d)
 	uint64_t len64 = (uint64_t)pitch * (uint64_t)h;
 	if (len64 >= 0x100000000ULL)
 		return -1;
-	uint32_t len = (uint32_t)len64;
-	len = align_up_4k(len);
-	if (len > d->stolen_size || len > d->total_gtt_bytes) {
+	uint32_t len = align_up_4k(len64);
+	if (!len || len > d->stolen_size || len > d->total_gtt_bytes) {
 		klogprintf("intel: fb len 0x%x exceeds stolen/gtt\n", (unsigned)len);
 		return -1;
 	}

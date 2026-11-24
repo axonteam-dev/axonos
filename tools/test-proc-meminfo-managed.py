@@ -34,6 +34,11 @@ static size_t pagecache_cached_pages(void) { return 32; }
 static size_t ramfs_high_page_free_pages(void) { return 2048; }
 static size_t ramfs_high_page_total_pages(void) { return 3072; }
 #endif
+#if defined(AXON_EXPERIMENTAL_HIGH_USER_FRAMES) && AXON_EXPERIMENTAL_HIGH_USER_FRAMES
+static int cpus = 1;
+static int smp_cpu_count(void) { return cpus; }
+static size_t frame_free_slots(void) { return 1200; }
+#endif
 ''' + function + r'''
 int main(void) {
     char out[2048];
@@ -45,7 +50,14 @@ int main(void) {
     assert(strstr(out, "MemTotal:       4608 kB\n"));
     assert(strstr(out, "MemFree:        1408 kB\n"));
 #endif
+#if defined(AXON_EXPERIMENTAL_HIGH_USER_FRAMES) && AXON_EXPERIMENTAL_HIGH_USER_FRAMES
+    assert(strstr(out, "MemAvailable:   4800 kB\n"));
+    cpus = 4;
+    assert(procfs_show_meminfo(out, sizeof(out), NULL) > 0);
     assert(strstr(out, "MemAvailable:   1408 kB\n"));
+#else
+    assert(strstr(out, "MemAvailable:   1408 kB\n"));
+#endif
     assert(strstr(out, "Cached:        128 kB\n"));
     /* Before PMM initialization, do not claim all firmware RAM is free. */
     ready = 0;
@@ -58,7 +70,9 @@ int main(void) {
 with tempfile.TemporaryDirectory(prefix="axon-meminfo-") as tmp:
     src, binary = Path(tmp) / "test.c", Path(tmp) / "test"
     src.write_text(fixture)
-    for flags in ([], ["-DAXON_EXPERIMENTAL_DIRECT_MAP=1"]):
+    for flags in ([], ["-DAXON_EXPERIMENTAL_DIRECT_MAP=1"],
+                  ["-DAXON_EXPERIMENTAL_DIRECT_MAP=1",
+                   "-DAXON_EXPERIMENTAL_HIGH_USER_FRAMES=1"]):
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
                         "-fsanitize=undefined", *flags, str(src), "-o", str(binary)], check=True)
         subprocess.run([str(binary)], check=True)

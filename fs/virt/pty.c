@@ -40,6 +40,10 @@
 #define TCS_ECHONL  0x00000040u
 #define TCS_ECHOCTL 0x00000200u
 #define TCS_IEXTEN  0x00008000u
+#define PKT_FLUSHREAD  0x01u
+#define PKT_FLUSHWRITE 0x02u
+#define PKT_NOSTOP     0x10u
+#define PKT_DOSTOP     0x20u
 
 #define TCS_VINTR  0
 #define TCS_VQUIT  1
@@ -67,8 +71,11 @@ struct pty_pair {
 	int locked;
 	int master_opens;
 	int slave_opens;
+	int slave_ever_opened;
 	int fg_pgrp;
 	int controlling_sid;
+	int packet_mode;
+	uint8_t packet_status;
 	uint32_t term_iflag;
 	uint32_t term_oflag;
 	uint32_t term_cflag;
@@ -126,6 +133,17 @@ static void pty_ring_wake(struct pty_ring *r) {
 	r->waiters_count = 0;
 }
 
+/* Packet status and the master read waiters share the s2m ring lock. */
+static void pty_packet_signal(struct pty_pair *p, uint8_t flags) {
+	unsigned long irqf = 0;
+	acquire_irqsave(&p->s2m.lock, &irqf);
+	if (p->packet_mode) {
+		p->packet_status |= flags;
+		pty_ring_wake(&p->s2m);
+	}
+	release_irqrestore(&p->s2m.lock, irqf);
+}
+
 static size_t pty_ring_write(struct pty_ring *r, const char *src, size_t n) {
 	size_t done = 0;
 	unsigned long flags = 0;
@@ -153,6 +171,8 @@ static ssize_t pty_ring_read(struct pty_ring *r, char *dst, size_t n, int *eof) 
 		r->head = (r->head + 1) % PTY_BUF_CAP;
 		r->count--;
 	}
+	if (done)
+		pty_ring_wake(r); /* space became available to blocked writers */
 	release_irqrestore(&r->lock, flags);
 	return (ssize_t)done;
 }
@@ -257,10 +277,28 @@ static void pty_echo_char(struct pty_pair *p, unsigned char c) {
 }
 
 static size_t pty_output_from_slave(struct pty_pair *p, const char *src, size_t n) {
-	size_t i;
-	for (i = 0; i < n; i++) {
-		if (!pty_opost_one(p, (unsigned char)src[i]))
-			break;
+	size_t i = 0;
+	uint32_t oflag = p->term_oflag;
+	while (i < n) {
+		size_t end = i;
+		/* Most output needs no conversion. Queue it in one operation rather
+		 * than taking the ring lock and waking readers for every byte. */
+		while (end < n &&
+		       !((oflag & TCS_OPOST) &&
+		         (((oflag & TCS_ONLCR) && src[end] == '\n') ||
+		          ((oflag & TCS_OCRNL) && src[end] == '\r'))))
+			end++;
+		if (end != i) {
+			size_t written = pty_ring_write(&p->s2m, src + i, end - i);
+			i += written;
+			if (i != end)
+				break;
+		}
+		if (i < n) {
+			if (!pty_opost_one(p, (unsigned char)src[i]))
+				break;
+			i++;
+		}
 	}
 	return i;
 }
@@ -414,6 +452,9 @@ int pty_open_slave(int index, struct fs_file **out) {
 		release_irqrestore(&g_pty_table_lock, flags);
 		return -1;
 	}
+	acquire_irqsave(&g_pty_table_lock, &flags);
+	p->slave_ever_opened = 1;
+	release_irqrestore(&g_pty_table_lock, flags);
 	*out = f;
 	return 0;
 }
@@ -428,12 +469,35 @@ ssize_t pty_read(struct fs_file *f, void *buf, size_t n) {
 	r = h->is_master ? &h->pair->s2m : &h->pair->m2s;
 
 	for (;;) {
-		if (pty_ring_avail(r) > 0) {
-			ssize_t got = pty_ring_read(r, (char *)buf, n, &eof);
-			if (got > 0) return got;
+		int packet = 0;
+		if (h->is_master) {
+			unsigned long flags = 0;
+			uint8_t status;
+			acquire_irqsave(&r->lock, &flags);
+			packet = h->pair->packet_mode;
+			status = packet ? h->pair->packet_status : 0;
+			if (status) h->pair->packet_status = 0;
+			release_irqrestore(&r->lock, flags);
+			if (status) {
+				((uint8_t *)buf)[0] = status;
+				return 1;
+			}
 		}
-		if (h->is_master && h->pair->slave_opens == 0)
-			return 0;
+		if (pty_ring_avail(r) > 0) {
+			ssize_t got;
+			if (packet && n == 1) {
+				((uint8_t *)buf)[0] = 0; /* TIOCPKT_DATA */
+				return 1;
+			}
+			got = pty_ring_read(r, (char *)buf + packet, n - (size_t)packet, &eof);
+			if (got > 0) {
+				if (packet) ((uint8_t *)buf)[0] = 0;
+				return got + packet;
+			}
+		}
+		if (h->is_master && h->pair->slave_ever_opened &&
+		    h->pair->slave_opens == 0)
+			return -5; /* EIO: slave was opened and then closed */
 		if (!h->is_master && h->pair->master_opens == 0)
 			return 0;
 		/* Linux O_NONBLOCK: dpkg child FlushSTDIN would hang forever. */
@@ -449,7 +513,9 @@ ssize_t pty_read(struct fs_file *f, void *buf, size_t n) {
 				return 0;
 			acquire_irqsave(&r->lock, &flags);
 			if (r->count > 0 ||
-			    (h->is_master ? h->pair->slave_opens == 0 :
+			    (h->is_master && h->pair->packet_mode && h->pair->packet_status) ||
+			    (h->is_master ? (h->pair->slave_ever_opened &&
+			                     h->pair->slave_opens == 0) :
 			                    h->pair->master_opens == 0)) {
 				release_irqrestore(&r->lock, flags);
 				continue;
@@ -498,13 +564,51 @@ ssize_t pty_write(struct fs_file *f, const void *buf, size_t n) {
 		else
 			w = pty_output_from_slave(h->pair, src + done, n - done);
 		if (w == 0) {
-			thread_yield();
-			if (h->is_master)
-				w = pty_input_from_master(h->pair, src + done, n - done);
-			else
-				w = pty_output_from_slave(h->pair, src + done, n - done);
-			if (w == 0)
-				break;
+			struct pty_ring *r = h->is_master ? &h->pair->m2s : &h->pair->s2m;
+			size_t need = 1;
+			unsigned long flags = 0;
+			thread_t *cur;
+			if (done)
+				break; /* a partial write is valid */
+			if (!h->is_master && (h->pair->term_oflag & TCS_OPOST) &&
+			    (h->pair->term_oflag & TCS_ONLCR) && src[done] == '\n')
+				need = 2;
+			if (f->flags & 0x800)
+				return -11; /* EAGAIN */
+			cur = thread_current();
+			if (!cur)
+				cur = thread_get_current_user();
+			if (!cur)
+				return -5;
+			acquire_irqsave(&r->lock, &flags);
+			if (PTY_BUF_CAP - 1 - r->count >= need) {
+				release_irqrestore(&r->lock, flags);
+				continue;
+			}
+			if (!h->is_master && h->pair->master_opens == 0) {
+				release_irqrestore(&r->lock, flags);
+				return -5;
+			}
+			if (r->waiters_count >= (int)(sizeof(r->waiters) / sizeof(r->waiters[0]))) {
+				release_irqrestore(&r->lock, flags);
+				thread_sleep(1);
+			} else {
+				r->waiters[r->waiters_count++] = (int)cur->tid;
+				thread_block((int)cur->tid);
+				release_irqrestore(&r->lock, flags);
+				thread_yield();
+				acquire_irqsave(&r->lock, &flags);
+				for (int i = 0; i < r->waiters_count; i++) {
+					if (r->waiters[i] == (int)cur->tid) {
+						r->waiters[i] = r->waiters[--r->waiters_count];
+						break;
+					}
+				}
+				release_irqrestore(&r->lock, flags);
+			}
+			if (cur->pending_signals & ~cur->saved_sig_mask)
+				return -4;
+			continue;
 		}
 		done += w;
 	}
@@ -547,9 +651,18 @@ void pty_release_handle(struct fs_file *f) {
 
 int pty_available(struct fs_file *f) {
 	struct pty_handle *h = pty_handle_of(f);
+	struct pty_ring *r;
+	unsigned long flags = 0;
+	int count;
 	if (!h)
 		return 0;
-	return (int)pty_ring_avail(h->is_master ? &h->pair->s2m : &h->pair->m2s);
+	r = h->is_master ? &h->pair->s2m : &h->pair->m2s;
+	acquire_irqsave(&r->lock, &flags);
+	count = (int)r->count;
+	if (h->is_master && h->pair->packet_mode && h->pair->packet_status)
+		count = 1;
+	release_irqrestore(&r->lock, flags);
+	return count;
 }
 
 int pty_peer_hungup(struct fs_file *f) {
@@ -557,8 +670,22 @@ int pty_peer_hungup(struct fs_file *f) {
 	if (!h)
 		return 0;
 	if (h->is_master)
-		return h->pair->slave_opens == 0;
+		return h->pair->slave_ever_opened && h->pair->slave_opens == 0;
 	return h->pair->master_opens == 0;
+}
+
+int pty_writable(struct fs_file *f) {
+	struct pty_handle *h = pty_handle_of(f);
+	struct pty_ring *r;
+	unsigned long flags = 0;
+	int writable;
+	if (!h)
+		return 0;
+	r = h->is_master ? &h->pair->m2s : &h->pair->s2m;
+	acquire_irqsave(&r->lock, &flags);
+	writable = r->count < PTY_BUF_CAP - 1;
+	release_irqrestore(&r->lock, flags);
+	return writable;
 }
 
 static struct pty_ring *pty_in_ring(struct pty_handle *h) {
@@ -625,6 +752,30 @@ int pty_get_locked(struct fs_file *f) {
 	return h->pair->locked;
 }
 
+int pty_set_packet_mode(struct fs_file *f, int enabled) {
+	struct pty_handle *h = pty_handle_of(f);
+	unsigned long flags = 0;
+	if (!h || !h->is_master)
+		return -1;
+	acquire_irqsave(&h->pair->s2m.lock, &flags);
+	h->pair->packet_mode = enabled != 0;
+	h->pair->packet_status = 0;
+	release_irqrestore(&h->pair->s2m.lock, flags);
+	return 0;
+}
+
+int pty_get_packet_mode(struct fs_file *f) {
+	struct pty_handle *h = pty_handle_of(f);
+	unsigned long flags = 0;
+	int enabled;
+	if (!h || !h->is_master)
+		return -1;
+	acquire_irqsave(&h->pair->s2m.lock, &flags);
+	enabled = h->pair->packet_mode;
+	release_irqrestore(&h->pair->s2m.lock, flags);
+	return enabled;
+}
+
 uint32_t pty_get_lflag(struct fs_file *f) {
 	struct pty_handle *h = pty_handle_of(f);
 	return h ? h->pair->term_lflag : 0;
@@ -648,8 +799,11 @@ void pty_get_termios(struct fs_file *f, uint32_t *iflag, uint32_t *oflag,
 void pty_set_termios(struct fs_file *f, uint32_t iflag, uint32_t oflag,
 		     uint32_t cflag, uint32_t lflag, const uint8_t *cc, size_t ncc) {
 	struct pty_handle *h = pty_handle_of(f);
+	int old_stop, new_stop;
 	if (!h)
 		return;
+	old_stop = (h->pair->term_iflag & TCS_IXON) &&
+	           h->pair->term_cc[8] == 021 && h->pair->term_cc[9] == 023;
 	h->pair->term_iflag = iflag;
 	h->pair->term_oflag = oflag;
 	h->pair->term_cflag = cflag;
@@ -658,6 +812,10 @@ void pty_set_termios(struct fs_file *f, uint32_t iflag, uint32_t oflag,
 		size_t n = ncc < PTY_NCCS ? ncc : PTY_NCCS;
 		memcpy(h->pair->term_cc, cc, n);
 	}
+	new_stop = (h->pair->term_iflag & TCS_IXON) &&
+	           h->pair->term_cc[8] == 021 && h->pair->term_cc[9] == 023;
+	if (old_stop != new_stop)
+		pty_packet_signal(h->pair, new_stop ? PKT_DOSTOP : PKT_NOSTOP);
 }
 
 void pty_get_winsize(struct fs_file *f, uint16_t *row, uint16_t *col) {
@@ -726,6 +884,7 @@ void pty_flush_input(struct fs_file *f) {
 		return;
 	/* Input from the peer: flush the ring the reader would consume. */
 	pty_ring_flush(h->is_master ? &h->pair->s2m : &h->pair->m2s);
+	pty_packet_signal(h->pair, h->is_master ? PKT_FLUSHWRITE : PKT_FLUSHREAD);
 }
 
 int pty_list_slaves(char out_names[][16], int max) {

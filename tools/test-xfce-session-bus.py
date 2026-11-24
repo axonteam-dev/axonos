@@ -44,7 +44,8 @@ with tempfile.TemporaryDirectory(prefix="axon-xfce-bus-", dir="/tmp/opencode") a
     tool("dbus-update-activation-environment",
          'printf "%s\\n" "$DBUS_SESSION_BUS_ADDRESS" > "$TEST_DIR/update-bus"\n')
     tool("xfce4-session",
-         'printf "%s\\n" "${DBUS_SESSION_BUS_ADDRESS-unset}" "$@" > "$TEST_DIR/session"\n')
+         'printf "%s\\n" "${DBUS_SESSION_BUS_ADDRESS-unset}" "$@" > "$TEST_DIR/session"\n'
+         'printf "%s\\n" "${BROWSER-unset}" > "$TEST_DIR/browser"\n')
     bus = tool("dbus-run-session",
                'printf "started\\n" >> "$TEST_DIR/bus-count"\n'
                '[ "$1" = -- ] || exit 90\nshift\n'
@@ -52,6 +53,7 @@ with tempfile.TemporaryDirectory(prefix="axon-xfce-bus-", dir="/tmp/opencode") a
                'exec "$@"\n')
     env = dict(os.environ, PATH=str(bindir), TEST_DIR=tmp)
     env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+    env.pop("BROWSER", None)
 
     subprocess.run(["/bin/sh", str(script), "one", "two words"], env=env,
                    check=True, timeout=5)
@@ -59,6 +61,21 @@ with tempfile.TemporaryDirectory(prefix="axon-xfce-bus-", dir="/tmp/opencode") a
     assert (root / "session").read_text().splitlines() == [
         "unix:path=/tmp/test-bus", "one", "two words"]
     assert (root / "update-bus").read_text().strip() == "unix:path=/tmp/test-bus"
+    assert (root / "browser").read_text().strip() == "unset"
+
+    firefox = tool("firefox-esr", "exit 0\n")
+    subprocess.run(["/bin/sh", str(script)], env=env, check=True, timeout=5)
+    assert (root / "browser").read_text().strip() == str(firefox)
+    alternative = tool("x-www-browser", "exit 0\n")
+    subprocess.run(["/bin/sh", str(script)], env=env, check=True, timeout=5)
+    assert (root / "browser").read_text().strip() == "unset"
+    alternative.unlink()
+    env["BROWSER"] = "/chosen/browser --option"
+    subprocess.run(["/bin/sh", str(script)], env=env, check=True, timeout=5)
+    assert (root / "browser").read_text().strip() == "/chosen/browser --option"
+    env.pop("BROWSER")
+    firefox.unlink()
+    (root / "bus-count").write_text("started\n")
 
     env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/tmp/existing"
     subprocess.run(["/bin/sh", str(script), "keep"], env=env, check=True, timeout=5)

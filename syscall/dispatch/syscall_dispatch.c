@@ -24,6 +24,7 @@
 #include <minix.h>
 #include <isofs.h>
 #include <pty.h>
+#include <signal_abi.h>
 #include <disk.h>
 #include <e1000.h>
 #include <usb.h>
@@ -36,6 +37,7 @@
 #include <console.h>
 #include <font.h>
 #include <ramfs.h>
+#include <ram_page_pool.h>
 #include <tmpfs.h>
 #include <squashfs.h>
 #include <overlayfs.h>
@@ -69,6 +71,23 @@
 #include <user_brk.h>
 #include <user_mm.h>
 #include <utsname_host.h>
+
+/* Match /proc/meminfo's managed-pool accounting. Firmware RAM outside these
+ * pools is not currently available to ordinary user allocations. */
+static void syscall_managed_ram(uint64_t *total, uint64_t *free_bytes) {
+    uint64_t t = (uint64_t)heap_total_bytes();
+    uint64_t f = (uint64_t)heap_free_bytes();
+    if (pmm_ready()) {
+        t += (uint64_t)pmm_total_pages() * 4096u;
+        f += (uint64_t)pmm_free_pages() * 4096u;
+#if defined(AXON_EXPERIMENTAL_DIRECT_MAP) && AXON_EXPERIMENTAL_DIRECT_MAP
+        t += (uint64_t)ramfs_high_page_total_pages() * 4096u;
+        f += (uint64_t)ramfs_high_page_free_pages() * 4096u;
+#endif
+    }
+    *total = t;
+    *free_bytes = f > t ? t : f;
+}
 
 /* Console keyboard/mode state (ioctl KDSETMODE/KDGETMODE, KDSKBMODE).
  * Xorg switches the VC to KD_GRAPHICS + K_OFF; if it dies we must restore
@@ -353,15 +372,18 @@ static inline unsigned syscall_cpu_idx(void) {
 void syscall_bind_kstack_for_thread(thread_t *t) {
     int fast_tid = 0;
     uint64_t sc_tid = 0;
+    int apic = syscall_lapic_id();
+    if (apic < 0 || apic >= 256) apic = 0;
     if (t && t->syscall_kstack_top) {
         fast_tid = 1;
         sc_tid = t->tid ? t->tid : 1;
-        if (g_bind_cached_tid[0] == sc_tid &&
-            g_bind_cached_rsp0[0] == t->syscall_kstack_top)
+        /* A task can migrate. CPU 0 having the right stack says nothing
+         * about the slot for the CPU that is about to enter userspace. */
+        if (g_bind_cached_tid[apic] == sc_tid &&
+            g_bind_cached_rsp0[apic] == t->syscall_kstack_top &&
+            syscall_kernel_rsp0_by_apic[apic] == t->syscall_kstack_top)
             return;
     }
-    int apic = syscall_lapic_id();
-    if (apic < 0 || apic >= 256) apic = 0;
     uint64_t sp = 0;
     if (t && t->syscall_kstack_top)
         sp = t->syscall_kstack_top;
@@ -864,7 +886,7 @@ static void init_monitor_entry(void) {
             }
             asm volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
             if (report)
-                klogprintf_logonly("init-stall: pid=%llu tid=%llu name=%s state=%d active=%d last-n=%lld a1=0x%llx waitpid=%d rip=0x%llx last-read=%s\n",
+                klogprintf_level_logonly(KLOG_WARNING, "init-stall: pid=%llu tid=%llu name=%s state=%d active=%d last-n=%lld a1=0x%llx waitpid=%d rip=0x%llx last-read=%s\n",
                     (unsigned long long)pid, (unsigned long long)tid, name,
                     state, active, (long long)number, (unsigned long long)arg1,
                     waitpid, (unsigned long long)rip, path);
@@ -1443,6 +1465,18 @@ __attribute__((noreturn)) static void fork_child_return_entry(void) {
         fork_build_gpr_snap_from_thread(self);
     if (self->fork_child_user_rip)
         self->fork_gpr_snap[13] = self->fork_child_user_rip;
+#if defined(AXON_VTE_TRACE) && AXON_VTE_TRACE
+    if (strstr(self->name, "smp-stress-probe"))
+        klogprintf_logonly("smp-child-entry: cpu=%d tid=%llu parent=%d rip=%llx rsp=%llx rdx=%llx r8=%llx fs=%llx cr3=%llx preserve=%d\n",
+            smp_sched_cpu_id(), (unsigned long long)self->tid, self->parent_tid,
+            (unsigned long long)self->fork_gpr_snap[13],
+            (unsigned long long)self->fork_gpr_snap[15],
+            (unsigned long long)self->saved_user_rdx,
+            (unsigned long long)self->fork_gpr_snap[7],
+            (unsigned long long)self->user_fs_base,
+            (unsigned long long)(self->mm ? self->mm->cr3 : 0),
+            self->clone_preserve_rdx);
+#endif
     /*
      * Linux ABI:
      * - fork/_Fork/vfork child: edx=0 (glibc xor edx,edx / result in eax).
@@ -1637,6 +1671,7 @@ void syscall_snapshot_user_regs(uint64_t *frame) {
     if (!cur || cur->ring != 3)
         cur = thread_get_current_user();
     if (!cur) return;
+#if defined(AXON_SYSCALL_STACK_DIAG) && AXON_SYSCALL_STACK_DIAG
     /*
      * A user page must never be backed by either kernel stack.  SYSCALL has
      * already pushed frame[0..15] when we get here, so an overlap explains a
@@ -1689,6 +1724,7 @@ void syscall_snapshot_user_regs(uint64_t *frame) {
             }
         }
     }
+#endif
     if (!cur->syscall_frame_kbuf) {
         uint64_t *kbuf = (uint64_t *)kmalloc(16 * sizeof(uint64_t));
         if (kbuf) cur->syscall_frame_kbuf = kbuf;
@@ -1898,7 +1934,9 @@ uint64_t syscall_maybe_vfork_wait(uint64_t parent_ret) {
         thread_t *child = cur->fork_child_to_publish;
         cur->fork_child_to_publish = NULL;
         child->fork_child_user_rip = 0;
-        syscall_bind_kstack_for_thread(child);
+        /* The parent still executes on this CPU. Binding the child's syscall
+         * stack here corrupts this CPU's binding if the child runs elsewhere;
+         * thread_schedule() binds the chosen task on its actual CPU. */
         thread_unblock_fork_child((int)(child->tid ? child->tid : 1));
     }
     while (cur->vfork_waiting) {
@@ -8365,7 +8403,7 @@ static int netlink_build_ack(ksock_net_t *s, const nlmsghdr_k *request,
     if (!s || !request) return -1;
     int ack_error = error > 0 ? -error : error;
     if (ack_error)
-        klogprintf_logonly("netlink-ack-error: type=%u seq=%u error=%d port=%u\n",
+        klogprintf_level_logonly(KLOG_DEBUG, "netlink-ack-error: type=%u seq=%u error=%d port=%u\n",
             (unsigned)request->nlmsg_type, (unsigned)request->nlmsg_seq,
             ack_error, (unsigned)s->nl_pid);
     memset(&reply, 0, sizeof(reply));
@@ -10035,7 +10073,6 @@ typedef void (*user_sighandler_t)(int);
 #ifndef SS_DISABLE
 #define SS_DISABLE 2
 #endif
-#define MINSIGSTKSZ_AXON 2048u
 #define SIG_DFL ((user_sighandler_t)0)
 #define SIG_IGN ((user_sighandler_t)1)
 
@@ -10513,7 +10550,7 @@ static short fd_file_poll_revents(thread_t *thr, struct fs_file *f, short events
     if (pty_is_file(f)) {
         int hung = pty_peer_hungup(f);
         if ((events & POLLIN_K) && (pty_available(f) > 0 || hung)) revents |= POLLIN_K;
-        if (events & POLLOUT_K) revents |= POLLOUT_K;
+        if ((events & POLLOUT_K) && pty_writable(f)) revents |= POLLOUT_K;
         if (hung) revents |= POLLHUP_K;
         return revents;
     }
@@ -11869,6 +11906,37 @@ struct kernel_clone_args {
 	int exit_signal;
 };
 
+/* Permission checks shared by fd and pathname ext2 ownership operations. */
+static int syscall_ext2_chown_file(thread_t *cur, struct fs_file *file,
+                                   uint32_t uid, uint32_t gid)
+{
+    struct stat st;
+    if (vfs_fstat(file, &st) != 0)
+        return -EIO;
+    if (!syscall_task_capable(cur, AXON_CAP_CHOWN) &&
+        (cur->euid != st.st_uid ||
+         (uid != UINT32_MAX && uid != st.st_uid) ||
+         (gid != UINT32_MAX && gid != st.st_gid &&
+          !syscall_id_in_group_as(cur, gid, 0))))
+        return -EPERM;
+    return ext2_fchown_file(file, uid, gid);
+}
+
+static int syscall_ext2_chown_path(thread_t *cur, const char *path,
+                                   uint32_t uid, uint32_t gid, int nofollow)
+{
+    struct fs_file *file = nofollow ? fs_open_nofollow(path) : fs_open(path);
+    if (!file)
+        return -ENOENT;
+    if (fs_get_file_driver(file) != ext2_get_driver()) {
+        fs_file_free(file);
+        return -EOPNOTSUPP;
+    }
+    int rc = syscall_ext2_chown_file(cur, file, uid, gid);
+    fs_file_free(file);
+    return rc;
+}
+
 /* memfd_create: anonymous RAMFS inode. Seal application is not implemented;
  * report that explicitly rather than claiming a security seal was installed. */
 static uint64_t syscall_memfd_create(thread_t *cur, uint64_t name_ptr, uint64_t raw_flags)
@@ -12225,14 +12293,11 @@ static uint64_t do_linux_fork(thread_t *cur,
              */
             if (share_mm)
                 child->fork_child_user_rip = 0;
-            /*
-             * Linux: wake_up_new_task before copy_process returns. Parent then
-             * returns the child's pid (or waits in wait_for_vfork_done for VFORK).
-             * Child enters userspace via fork_child_return_entry with rax=0.
-             */
-            fork_wake_up_new_task(cur, child,
-                (args->flags & CLONE_VFORK) != 0);
-            fork_dbg(cur, 8, "wake_up_new_task",
+            /* kernel_clone still has to install TLS and child/parent TID
+             * pointers. On SMP, publishing here lets the child exec or exit
+             * while that code is still modifying its task and address space. */
+            fork_wake_up_new_task(cur, child, 1);
+            fork_dbg(cur, 8, "defer_new_task",
                 (unsigned long long)(cur->tid ? cur->tid : 1),
                 (unsigned long long)(child->tid ? child->tid : 1), 0);
             fork_dbg(cur, 9, "return pid",
@@ -12282,6 +12347,8 @@ static uint64_t kernel_clone(thread_t *parent,
 		return ret_err(ESRCH);
 
 	tid = (uint32_t)linux_task_tid(child);
+	if (!(args->flags & CLONE_VFORK))
+		child->clone_preserve_rdx = 0;
 	if (args->flags & CLONE_SETTLS)
 		child->user_fs_base = args->tls;
 	if (args->flags & CLONE_CHILD_CLEARTID)
@@ -12307,14 +12374,20 @@ static uint64_t kernel_clone(thread_t *parent,
 	}
 
 	if (args->flags & CLONE_VFORK) {
-		if (!parent->process)
+		if (!parent->process) {
+			parent->fork_child_to_publish = NULL;
+			fork_stop_child(child);
 			return ret_err(EINVAL);
-		/* Linux: child already woken in do_linux_fork; then parent waits. */
+		}
 		process_set_vfork_parent(child_process, parent->process);
 		parent->vfork_waiting = 1;
 		parent->vfork_saved_ret = nr;
 		if (!thread_block_current_atomic())
 			thread_block((int)(parent->tid ? parent->tid : 1));
+	} else {
+		/* All clone metadata is installed before another CPU can run child. */
+		parent->fork_child_to_publish = NULL;
+		thread_unblock_fork_child((int)(child->tid ? child->tid : 1));
 	}
 
 	return nr;
@@ -12699,6 +12772,18 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
                 child->fork_gpr_snap[13] = saved_rcx;
                 child->fork_gpr_snap[14] = 0;
                 child->fork_gpr_snap[15] = (uint64_t)child_rsp;
+#if defined(AXON_VTE_TRACE) && AXON_VTE_TRACE
+                if (strstr(cur->name, "smp-stress-probe"))
+                    klogprintf_logonly("smp-clone3: cpu=%d parent=%llu child=%llu rip=%llx rsp=%llx rdx=%llx r8=%llx tls=%llx cr3=%llx flags=%llx\n",
+                        smp_sched_cpu_id(), (unsigned long long)cur->tid,
+                        (unsigned long long)child->tid,
+                        (unsigned long long)saved_rcx, (unsigned long long)child_rsp,
+                        (unsigned long long)child->saved_user_rdx,
+                        (unsigned long long)child->saved_user_r8,
+                        (unsigned long long)tls,
+                        (unsigned long long)(child->mm ? child->mm->cr3 : 0),
+                        (unsigned long long)flags);
+#endif
 
                 child->user_stack = (uint64_t)child_rsp;
                 child->user_stack_base = (uint64_t)stack_lo;
@@ -12875,13 +12960,6 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
                 cur->fork_child_trap_rip = clone_ret_rip;
                 nr = kernel_clone(cur, &args);
                 cur->fork_from_clone = 0;
-                if ((int64_t)nr >= 0) {
-                    process_t *process = process_find(nr);
-                    thread_t *child = process ? process->leader : NULL;
-
-                    if (child)
-                        child->clone_preserve_rdx = 0;
-                }
                 return nr;
             }
         }
@@ -13191,13 +13269,6 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
                 cur->fork_child_trap_rip = clone3_ret_rip;
                 nr = kernel_clone(cur, &args);
                 cur->fork_from_clone = 0;
-                if ((int64_t)nr >= 0) {
-                    process_t *process = process_find(nr);
-                    thread_t *child = process ? process->leader : NULL;
-
-                    if (child)
-                        child->clone_preserve_rdx = 0;
-                }
                 return nr;
             }
         }
@@ -14017,6 +14088,11 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
             int parent_err = syscall_parent_access(cur, linkpath);
             if (parent_err) return ret_err(parent_err);
             if (fs_mount_is_readonly(linkpath)) return ret_err(EROFS);
+            struct fs_driver *symlink_drv = fs_get_mount_driver(linkpath);
+            if (symlink_drv == ext2_get_driver()) {
+                r = ext2_symlink(linkpath, target, cur->euid, cur->egid);
+                return r == 0 ? 0 : ret_err(-r);
+            }
             r = overlayfs_symlink(linkpath, target);
             if (r == 0)
                 return 0;
@@ -14054,6 +14130,11 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
             int parent_err = syscall_parent_access(cur, linkpath);
             if (parent_err) return ret_err(parent_err);
             if (fs_mount_is_readonly(linkpath)) return ret_err(EROFS);
+            struct fs_driver *symlink_drv = fs_get_mount_driver(linkpath);
+            if (symlink_drv == ext2_get_driver()) {
+                r = ext2_symlink(linkpath, target, cur->euid, cur->egid);
+                return r == 0 ? 0 : ret_err(-r);
+            }
             r = overlayfs_symlink(linkpath, target);
             if (r == 0)
                 return 0;
@@ -14327,7 +14408,12 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
             resolve_user_path(cur, path_u, path, sizeof(path));
             struct stat st;
             if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
-            int r = fs_chmod(path, mode);
+            if (cur->euid != st.st_uid && !syscall_task_capable(cur, AXON_CAP_FOWNER))
+                return ret_err(EPERM);
+            char resolved[512];
+            if (fs_resolve_symlink_path(path, resolved, sizeof(resolved)) != 0)
+                return ret_err(ENOENT);
+            int r = fs_chmod(resolved, mode);
             if (r == 0) return 0;
             if (r == -30) return ret_err(EROFS);
             return ret_err(EPERM);
@@ -14345,7 +14431,12 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
             if (rc != 0) return ret_err(-rc);
             struct stat st;
             if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
-            int r = fs_chmod(path, mode);
+            if (cur->euid != st.st_uid && !syscall_task_capable(cur, AXON_CAP_FOWNER))
+                return ret_err(EPERM);
+            char resolved[512];
+            if (fs_resolve_symlink_path(path, resolved, sizeof(resolved)) != 0)
+                return ret_err(ENOENT);
+            int r = fs_chmod(resolved, mode);
             if (r == 0) return 0;
             if (r == -30) return ret_err(EROFS);
             return ret_err(EPERM);
@@ -14359,6 +14450,10 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
             resolve_user_path(cur, path_u, path, sizeof(path));
             if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
             if (fs_mount_is_readonly(path)) return ret_err(EROFS);
+            if (fs_get_mount_driver(path) == ext2_get_driver()) {
+                int rc = syscall_ext2_chown_path(cur, path, (uint32_t)a2, (uint32_t)a3, 0);
+                return rc == 0 ? 0 : ret_err(-rc);
+            }
             if (devfs_chown(path, (uid_t)a2, (gid_t)a3) == 0)
                 return 0;
             if (overlayfs_chown(path, (uid_t)a2, (gid_t)a3) != 0)
@@ -14383,15 +14478,23 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
                     (unsigned long long)process_pid(cur), fd, f->path,
                     (unsigned)f->type, (unsigned)f->flags);
             if (f->path && fs_mount_is_readonly(f->path)) return ret_err(EROFS);
+            struct stat st;
+            if (vfs_fstat(f, &st) != 0) return ret_err(EIO);
+            if (cur->euid != st.st_uid && !syscall_task_capable(cur, AXON_CAP_FOWNER))
+                return ret_err(EPERM);
             /* Chmod the open inode, not a stale name (O_TMPFILE and rename). */
             if (ramfs_fchmod_file(f, (mode_t)a2) == 0) return 0;
+            if (fs_get_file_driver(f) == ext2_get_driver()) {
+                int rc = ext2_fchmod_file(f, (mode_t)a2);
+                return rc == 0 ? 0 : ret_err(-rc);
+            }
             if (f->flags & 0x400000 /* O_TMPFILE: inode has no pathname */)
                 return ret_err(EPERM);
             if (f->path) {
                 int r = fs_chmod(f->path, (mode_t)a2);
                 if (r == 0) return 0;
             }
-            return 0;
+            return ret_err(EPERM);
         }
         case 93: { /* fchown(fd, uid, gid) */
             int fd = (int)a1;
@@ -14412,6 +14515,10 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
                     (unsigned)f->type, (unsigned)a2, (unsigned)a3);
             if (!f->path) return ret_err(EINVAL);
             if (fs_mount_is_readonly(f->path)) return ret_err(EROFS);
+            if (fs_get_file_driver(f) == ext2_get_driver()) {
+                int rc = syscall_ext2_chown_file(cur, f, (uint32_t)a2, (uint32_t)a3);
+                return rc == 0 ? 0 : ret_err(-rc);
+            }
             if (devfs_chown(f->path, (uid_t)a2, (gid_t)a3) == 0)
                 return 0;
             if (overlayfs_chown(f->path, (uid_t)a2, (gid_t)a3) != 0)
@@ -14425,6 +14532,10 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
             char path[512];
             resolve_user_path(cur, path_u, path, sizeof(path));
             if (fs_mount_is_readonly(path)) return ret_err(EROFS);
+            if (fs_get_mount_driver(path) == ext2_get_driver()) {
+                int rc = syscall_ext2_chown_path(cur, path, (uint32_t)a2, (uint32_t)a3, 1);
+                return rc == 0 ? 0 : ret_err(-rc);
+            }
             if (devfs_chown(path, (uid_t)a2, (gid_t)a3) == 0)
                 return 0;
             if (overlayfs_lchown(path, (uid_t)a2, (gid_t)a3) != 0)
@@ -14461,6 +14572,19 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
                     (unsigned long long)process_pid(cur), dirfd, path, flags,
                     (unsigned)a3, (unsigned)a4);
             if (fs_mount_is_readonly(path)) return ret_err(EROFS);
+            if (fs_get_mount_driver(path) == ext2_get_driver()) {
+                int rc;
+                if (first == '\0') {
+                    struct fs_file *f = syscall_fd_get(cur, dirfd);
+                    if (!f || fs_get_file_driver(f) != ext2_get_driver())
+                        return ret_err(EBADF);
+                    rc = syscall_ext2_chown_file(cur, f, (uint32_t)a3, (uint32_t)a4);
+                } else {
+                    rc = syscall_ext2_chown_path(cur, path, (uint32_t)a3, (uint32_t)a4,
+                                                 (flags & AT_SYMLINK_NOFOLLOW_LOCAL) != 0);
+                }
+                return rc == 0 ? 0 : ret_err(-rc);
+            }
             if (devfs_chown(path, (uid_t)a3, (gid_t)a4) == 0)
                 return 0;
             int cr = (flags & AT_SYMLINK_NOFOLLOW_LOCAL)
@@ -14676,7 +14800,7 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
             tv.tv_sec = sec;
             tv.tv_usec = nsec / 1000;
             if (copy_to_user_safe(tv_u, &tv, sizeof(tv)) != 0) return ret_err(EFAULT);
-            fbdev_sync_user_frontbuffer();
+            console_graphics_wait_present(cur);
             return 0;
         }
         case SYS_time: { /* Linux x86_64 nr 201 — also vsyscall+0x400 */
@@ -14694,10 +14818,11 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
         case SYS_getcpu: { /* Linux x86_64 nr 309 — also vsyscall+0x800 */
             uint32_t *cpu_u = (uint32_t *)(uintptr_t)a1;
             uint32_t *node_u = (uint32_t *)(uintptr_t)a2;
+            uint32_t cpu = (uint32_t)smp_sched_cpu_id();
             uint32_t zero = 0;
             if (cpu_u) {
                 if (!user_range_ok(cpu_u, 4) ||
-                    copy_to_user_safe(cpu_u, &zero, 4) != 0)
+                    copy_to_user_safe(cpu_u, &cpu, 4) != 0)
                     return ret_err(EFAULT);
             }
             if (node_u) {
@@ -14820,7 +14945,7 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
             uint64_t ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
             if (ms == 0 && ts.tv_nsec > 0) ms = 1;
             if (ms > 0) thread_sleep((uint32_t)ms);
-            fbdev_sync_user_frontbuffer();
+            console_graphics_wait_present(cur);
             return 0;
         }
         case SYS_access: {
@@ -16026,7 +16151,9 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
                     }
 
                     if (want_w) {
-                        if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
+                        if (pty_is_file(f)) {
+                            can_w = pty_writable(f);
+                        } else if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
                             ksock_net_t *s = (ksock_net_t *)f->driver_private;
                             if ((s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) ||
                                 (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL))
@@ -16170,7 +16297,7 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
             uint64_t ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
             if (ms == 0 && ts.tv_nsec > 0) ms = 1;
             if (ms > 0) thread_sleep((uint32_t)(ms > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (uint32_t)ms));
-            fbdev_sync_user_frontbuffer();
+            console_graphics_wait_present(cur);
             if (thread_has_interrupt_signal(cur)) {
                 if (rem_u) {
                     struct timespec_k zero = { 0, 0 };
@@ -17287,6 +17414,10 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
                 if (copy_to_user_safe(optlen_u, &olen, 4) != 0) return ret_err(EFAULT);
                 return 0;
             }
+            /* SO_PEERPIDFD returns a newly installed pidfd, not an integer
+             * status.  A fabricated zero makes callers own and close stdin. */
+            if (level == SOL_SOCKET_LOCAL && optname == 77 /* SO_PEERPIDFD */)
+                return ret_err(ENOPROTOOPT);
             if (level == SOL_SOCKET_LOCAL && optname == 17 /* SO_PEERCRED */) {
                 /* Linux reports the peer's credentials captured at connect or
                  * socketpair time, not the credentials of getsockopt caller. */
@@ -18546,28 +18677,8 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
             unsigned long loads[3];
             loadavg_get_user(loads);
             memcpy(buf + 8, loads, 24);
-            int ram_mb = sysinfo_ram_mb();
-            uint64_t totalram;
-            if (ram_mb > 0)
-                totalram = (uint64_t)ram_mb * 1024ULL * 1024ULL;
-            else
-                totalram = heap_total_bytes() ? (uint64_t)heap_total_bytes() : (256ULL * 1024ULL * 1024ULL);
-            uint64_t used = (uint64_t)heap_used_bytes();
-            if (pmm_ready()) {
-                size_t taken = pmm_total_pages();
-                size_t avail = pmm_free_pages();
-                if (taken > avail)
-                    used += (uint64_t)(taken - avail) * 4096ULL;
-            }
-            /* Rough free: physical minus kernel heap + user frames; never claim
-             * less than 64MiB free or pthread/cgo stack allocation aborts. */
-            uint64_t freeram = totalram > used + (64ULL * 1024ULL * 1024ULL)
-                ? totalram - used
-                : (totalram > (64ULL * 1024ULL * 1024ULL)
-                   ? totalram / 2
-                   : (64ULL * 1024ULL * 1024ULL));
-            if (freeram > totalram)
-                freeram = totalram;
+            uint64_t totalram, freeram;
+            syscall_managed_ram(&totalram, &freeram);
             memcpy(buf + 32, &totalram, 8);
             memcpy(buf + 40, &freeram, 8);
             /* sharedram, bufferram at 48,56 = 0 */
@@ -18602,6 +18713,9 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
             /* Match the scheduler's real userspace CPU eligibility. Go uses
              * the raw syscall's returned byte count to determine GOMAXPROCS. */
             uint64_t mask = 1;
+#if defined(AXON_EXPERIMENTAL_SMP) && AXON_EXPERIMENTAL_SMP
+            mask = smp_online_cpus();
+#endif
             if (copy_to_user_safe(mask_u, &mask, sizeof(mask)) != 0) return ret_err(EFAULT);
             return sizeof(mask);
         }
@@ -18616,6 +18730,16 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
             uint8_t first;
             if (!mask_u || copy_from_user_raw(&first, mask_u, 1) != 0) return ret_err(EFAULT);
             if (!(first & 1)) return ret_err(EINVAL);
+#if defined(AXON_EXPERIMENTAL_SMP) && AXON_EXPERIMENTAL_SMP
+            /* Per-task affinity is not implemented yet. Do not report success
+             * for a restricted mask which the scheduler cannot enforce. */
+            uint64_t requested = 0;
+            size_t copy = len < sizeof(requested) ? len : sizeof(requested);
+            if (copy_from_user_raw(&requested, mask_u, copy) != 0)
+                return ret_err(EFAULT);
+            if ((requested & smp_online_cpus()) != smp_online_cpus())
+                return ret_err(EOPNOTSUPP);
+#endif
             return 0;
         }
         case SYS_sched_setscheduler: {
@@ -19085,7 +19209,13 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
         case 75: { /* fdatasync(fd) */
             int fd = (int)a1;
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
-            if (!cur->fds[fd]) return ret_err(EBADF);
+            struct fs_file *file = syscall_fd_get(cur, fd);
+            if (!file) return ret_err(EBADF);
+            /* Disk drivers do not yet expose a cache flush and ext2 also
+             * writes its superblock counters on unmount. Do not promise that
+             * data and metadata have reached stable storage. */
+            if (fs_get_file_driver(file) == ext2_get_driver())
+                return ret_err(EOPNOTSUPP);
             return 0;
         }
         case 137: /* statfs */
@@ -19382,7 +19512,11 @@ static uint64_t __attribute__((optimize("Os"))) syscall_do_inner(
             if (trace_ash_sa && cur->mm && cur->saved_user_rsp) {
                 sig_ra_va = cur->saved_user_rsp + 0x148ULL;
                 uint64_t leaf = 0;
-                if (mm_va_leaf_pa(cur->mm, sig_ra_va, &leaf) == 0) {
+                /* This diagnostic dereferences an identity PA directly. Skip
+                 * high or cross-page addresses rather than faulting in-kernel. */
+                if (mm_va_leaf_pa(cur->mm, sig_ra_va, &leaf) == 0 &&
+                    leaf < (uint64_t)MMIO_IDENTITY_LIMIT &&
+                    (sig_ra_va & 0xFFFULL) <= 0xFF8ULL) {
                     sig_ra_pa = (leaf & ~0xFFFULL) | (sig_ra_va & 0xFFFULL);
                     sig_ra_before = *(const uint64_t *)(uintptr_t)sig_ra_pa;
                 }
@@ -20616,6 +20750,7 @@ kfree(path);
                 BLKBSZGET    = 0x80081270,   /* get block size (int*) */
                 BLKGETSIZE64 = 0x80081272,   /* get device size in bytes (uint64_t*) */
                 FIONREAD  = 0x541B,
+                TIOCPKT   = 0x5420,
                 FIONBIO   = 0x5421,
                 FIOASYNC  = 0x5452, /* set/clear O_ASYNC (nginx worker channel) */
             };
@@ -20625,6 +20760,20 @@ kfree(path);
              * extends in some libc ioctl() wrappers to 0xffffffff80045430. */
             if (pty_is_file(f)) {
                 unsigned pty_nr = (unsigned)(req & 0xffffu);
+                if ((uint32_t)req == TIOCPKT) {
+                    int enabled;
+                    if (!pty_is_master(f)) return ret_err(ENOTTY);
+                    if (!argp || copy_from_user_raw(&enabled, argp, sizeof(enabled)) != 0)
+                        return ret_err(EFAULT);
+                    return pty_set_packet_mode(f, enabled) == 0 ? 0 : ret_err(ENOTTY);
+                }
+                if (pty_nr == 0x5438u) { /* TIOCGPKT */
+                    int enabled = pty_get_packet_mode(f);
+                    if (enabled < 0) return ret_err(ENOTTY);
+                    if (!argp || copy_to_user_safe(argp, &enabled, sizeof(enabled)) != 0)
+                        return ret_err(EFAULT);
+                    return 0;
+                }
                 if (req == TIOCGPTN || pty_nr == 0x5430u) {
                     unsigned int n;
                     if (!pty_is_master(f) || !argp) return ret_err(ENOTTY);
@@ -22753,7 +22902,7 @@ kfree(path);
             if (timeout == 0) {
                 if (has_net_socket)
                     net_pump_all_tcp(poll_thr);
-                fbdev_sync_user_frontbuffer();
+                console_graphics_wait_present(poll_thr);
                 if (copy_to_user_safe((void*)ufds, kbuf, bytes) != 0) {
                     kfree(kbuf);
                     return ret_err(EFAULT);
@@ -25519,11 +25668,25 @@ kfree(path);
                 int thread_only = cur->process && cur->process->leader &&
                                   cur->process->leader != cur;
                 if (thread_only) {
+#if defined(AXON_VTE_TRACE) && AXON_VTE_TRACE
+                    if (strstr(cur->name, "smp-stress-probe"))
+                        klogprintf_logonly("smp-thread-exit: cpu=%d tid=%llu stage=begin mm=%p clear=%llx\n",
+                            smp_sched_cpu_id(), (unsigned long long)cur->tid,
+                            (void *)cur->mm, (unsigned long long)cur->clear_child_tid);
+#endif
                     int code = (int)a1;
                     cur->exit_status = (code & 0xFF) << 8;
                     if (user_range_ok(
                             (const void *)(uintptr_t)cur->clear_child_tid, 4)) {
                         uint32_t zero = 0;
+#if defined(AXON_VTE_TRACE) && AXON_VTE_TRACE
+                        if (strstr(cur->name, "smp-stress-probe"))
+                            klogprintf_logonly("smp-clear-child: cpu=%d tid=%llu uaddr=%llx mm=%p cr3=%llx\n",
+                                smp_sched_cpu_id(), (unsigned long long)cur->tid,
+                                (unsigned long long)cur->clear_child_tid,
+                                (void *)cur->mm,
+                                (unsigned long long)(cur->mm ? cur->mm->cr3 : 0));
+#endif
                         (void)copy_to_user_safe(
                             (void *)(uintptr_t)cur->clear_child_tid,
                             &zero, sizeof(zero));
@@ -25533,12 +25696,23 @@ kfree(path);
                             extern int futex_syscall(uintptr_t uaddr, int op,
                                 int val, const void *timeout,
                                 uintptr_t uaddr2, int val3);
+#if defined(AXON_VTE_TRACE) && AXON_VTE_TRACE
+                            if (strstr(cur->name, "smp-stress-probe"))
+                                klogprintf_logonly("smp-clear-futex: cpu=%d tid=%llu uaddr=%llx\n",
+                                    smp_sched_cpu_id(), (unsigned long long)cur->tid,
+                                    (unsigned long long)cur->clear_child_tid);
+#endif
                             (void)futex_syscall(
                                 (uintptr_t)cur->clear_child_tid,
                                 1, 1, NULL, 0, 0);
                         }
                     }
                     cur->clear_child_tid = 0;
+#if defined(AXON_VTE_TRACE) && AXON_VTE_TRACE
+                    if (strstr(cur->name, "smp-stress-probe"))
+                        klogprintf_logonly("smp-thread-exit: cpu=%d tid=%llu stage=cleared\n",
+                            smp_sched_cpu_id(), (unsigned long long)cur->tid);
+#endif
                     sysv_shm_detach_all_for_tid(
                         (uint64_t)(cur->tid ? cur->tid : 1));
                     user_vma_remove_all_for_tid((uint64_t)(cur->tid ? cur->tid : 1));
@@ -25558,6 +25732,11 @@ kfree(path);
                     cur->parent_tid = -1;
                     cur->waiter_tid = -1;
                     cur->state = THREAD_TERMINATED;
+#if defined(AXON_VTE_TRACE) && AXON_VTE_TRACE
+                    if (strstr(cur->name, "smp-stress-probe"))
+                        klogprintf_logonly("smp-thread-exit: cpu=%d tid=%llu stage=schedule\n",
+                            smp_sched_cpu_id(), (unsigned long long)cur->tid);
+#endif
                     if (thread_get_current_user() == cur)
                         thread_set_current_user(NULL);
                     thread_schedule();
@@ -26331,7 +26510,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 (unsigned long long)trace_t->tid);
     if (video_kd_graphics() && console_graphics_owned_by(trace_t) &&
         console_graphics_wait_syscall(num))
-        fbdev_sync_user_frontbuffer();
+        console_graphics_wait_present(trace_t);
     if (trace_t && trace_t->name[0] &&
         (strstr(trace_t->name, "Xorg") || strstr(trace_t->name, "xinit") ||
          strstr(trace_t->name, "xfce4-session")) &&
@@ -26684,6 +26863,50 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
     } else {
         ret = syscall_do_inner(num, a1, a2, a3, a4, a5, a6);
     }
+#if defined(AXON_VTE_TRACE) && AXON_VTE_TRACE
+    if (trace_t && strstr(trace_t->name, "vte-pty-probe") &&
+        (num == 56 || num == 57 || num == 58 || num == 59 || num == 61 ||
+         num == 202 || num == 435 || num == 16 || num == 271)) {
+        static unsigned vte_trace_count;
+        unsigned slot = __atomic_fetch_add(&vte_trace_count, 1, __ATOMIC_RELAXED);
+        if (slot < 500)
+            klogprintf_logonly("vte-sys: cpu=%d tid=%llu nr=%llu a1=%llx a2=%llx a3=%llx ret=%lld rip=%llx rsp=%llx\n",
+                smp_sched_cpu_id(), (unsigned long long)trace_t->tid,
+                (unsigned long long)num, (unsigned long long)a1,
+                (unsigned long long)a2, (unsigned long long)a3,
+                (long long)(int64_t)ret, (unsigned long long)trace_t->saved_user_rip,
+                (unsigned long long)trace_t->saved_user_rsp);
+    }
+#endif
+#if defined(AXON_DBUS_FD_TRACE) && AXON_DBUS_FD_TRACE
+    if (trace_t && trace_t->name[0] &&
+        (strstr(trace_t->name, "dbus-daemon") || strstr(trace_t->name, "dbus-send")) &&
+        (num == SYS_close || num == 233 || num == 41 || num == 42 ||
+         num == 43 || num == 288 || num == 32 || num == 33 || num == 292 ||
+         num == 2 || num == 257 || num == 72 || num == 22 || num == 293 || num == 55 ||
+         (strstr(trace_t->name, "dbus-daemon") &&
+          (num == SYS_read || num == SYS_write || num == 46 || num == 47)) ||
+         ((num == 232 || num == 281) && (int64_t)ret != 0))) {
+        static unsigned dbus_fd_trace_left = 3000;
+        if (dbus_fd_trace_left) {
+            epoll_event_k event0 = {0}, event1 = {0};
+            dbus_fd_trace_left--;
+            if (num == 233 && a2 != EPOLL_CTL_DEL_K && a4)
+                (void)copy_from_user_raw(&event0, (void *)(uintptr_t)a4, sizeof(event0));
+            if ((num == 232 || num == 281) && (int64_t)ret > 0 && a2) {
+                (void)copy_from_user_raw(&event0, (void *)(uintptr_t)a2, sizeof(event0));
+                if ((int64_t)ret > 1)
+                    (void)copy_from_user_raw(&event1, (void *)(uintptr_t)(a2 + sizeof(event0)), sizeof(event1));
+            }
+            klogprintf_logonly("dbus-fd: pid=%llu tid=%llu nr=%llu a1=%lld a2=%lld a3=%lld ret=%lld e0=%x/%llx e1=%x/%llx\n",
+                (unsigned long long)process_pid(trace_t),
+                (unsigned long long)trace_t->tid, (unsigned long long)num,
+                (long long)a1, (long long)a2, (long long)a3, (long long)(int64_t)ret,
+                (unsigned)event0.events, (unsigned long long)event0.data,
+                (unsigned)event1.events, (unsigned long long)event1.data);
+        }
+    }
+#endif
     if (xdiag_fb_trace_this)
         klogprintf_logonly("xdiag-fb: exit tid=%llu nr=%llu ret=%lld\n",
             (unsigned long long)trace_t->tid, (unsigned long long)num,
@@ -26887,7 +27110,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         static unsigned netlink_error_trace_left = 96;
         if (is_netlink && netlink_error_trace_left) {
             netlink_error_trace_left--;
-            klogprintf_logonly("netlink-op-fail: name=%s pid=%llu nr=%llu ret=%lld fd=%llu proto=%d a2=0x%llx a3=0x%llx\n",
+            klogprintf_level_logonly(KLOG_DEBUG, "netlink-op-fail: name=%s pid=%llu nr=%llu ret=%lld fd=%llu proto=%d a2=0x%llx a3=0x%llx\n",
                 trace_t && trace_t->name[0] ? trace_t->name : "?",
                 (unsigned long long)(trace_t ? process_pid(trace_t) : 0),
                 (unsigned long long)num, (long long)(int64_t)ret,

@@ -19,7 +19,8 @@ program = r'''
 typedef int spinlock_t;
 struct pty_ring { char buf[PTY_BUF_CAP]; size_t head, tail, count;
                   spinlock_t lock; int waiters[8], waiters_count; };
-struct pty_pair { int master_opens, slave_opens; struct pty_ring m2s, s2m; };
+struct pty_pair { int master_opens, slave_opens, slave_ever_opened, packet_mode; uint8_t packet_status;
+                  struct pty_ring m2s, s2m; };
 struct pty_handle { struct pty_pair *pair; int is_master; };
 struct fs_file { struct pty_handle *h; int flags; };
 typedef struct { int tid; uint64_t pending_signals, saved_sig_mask; } thread_t;
@@ -42,21 +43,37 @@ static void release_irqrestore(spinlock_t *l, unsigned long flags) {
 }
 static void thread_block(int tid) { assert(tid == 1); blocked = 1; }
 static void thread_yield(void) { assert(!blocked); }
+static void pty_ring_wake(struct pty_ring *r) { (void)r; }
 static void thread_sleep(unsigned ms) {
     assert(ms == 1 && !blocked);
     pair->s2m.buf[pair->s2m.head] = 'Y'; pair->s2m.count = 1;
 }
 ''' + ring_read + avail + read + r'''
 int main(void) {
-    struct pty_pair p = {0}; p.master_opens = p.slave_opens = 1; pair = &p;
+    struct pty_pair p = {0}; p.master_opens = p.slave_opens = p.slave_ever_opened = 1; pair = &p;
     struct pty_handle h = {&p, 1}; struct fs_file f = {&h, 0}; char c;
     inject = 1; assert(pty_read(&f, &c, 1) == 1 && c == 'X');
-    inject = 2; assert(pty_read(&f, &c, 1) == 0);
+    inject = 2; assert(pty_read(&f, &c, 1) == -5);
+    p.slave_ever_opened = 0; f.flags = 0x800;
+    assert(pty_read(&f, &c, 1) == -11);
+    p.slave_ever_opened = 1;
     p.slave_opens = 1; f.flags = 0x800; assert(pty_read(&f, &c, 1) == -11);
     f.flags = 0; p.s2m.waiters_count = 8;
     assert(pty_read(&f, &c, 1) == 1 && c == 'Y');
     p.s2m.waiters_count = 0; inject = 3;
     assert(pty_read(&f, &c, 1) == -4 && p.s2m.waiters_count == 0);
+    thread.pending_signals = 0;
+    p.packet_mode = 1; p.packet_status = 0x10;
+    assert(pty_read(&f, &c, 1) == 1 && c == 0x10 && p.packet_status == 0);
+    p.s2m.buf[0] = 'A'; p.s2m.buf[1] = 'B';
+    p.s2m.head = 0; p.s2m.count = 2;
+    assert(pty_read(&f, &c, 1) == 1 && c == 0 && p.s2m.count == 2);
+    char data[4] = {1,1,1,1};
+    assert(pty_read(&f, data, sizeof data) == 3);
+    assert(data[0] == 0 && data[1] == 'A' && data[2] == 'B');
+    p.packet_mode = 0;
+    p.s2m.buf[0] = 'C'; p.s2m.head = 0; p.s2m.count = 1;
+    assert(pty_read(&f, &c, 1) == 1 && c == 'C');
     return 0;
 }
 '''

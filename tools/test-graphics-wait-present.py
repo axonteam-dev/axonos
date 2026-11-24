@@ -12,6 +12,10 @@ for token in ("console_graphics_wait_present(curth)",
               "console_graphics_wait_present(poll_thr)",
               "console_graphics_wait_present(wait_thr)"):
     assert token in source
+assert "console_graphics_wait_present(trace_t)" in source
+# All presentation goes through the owner check and 50 ms limiter, rather
+# than repainting the full framebuffer from unrelated applications' syscalls.
+assert source.count("fbdev_sync_user_frontbuffer();") == 1
 program = r'''
 #include <assert.h>
 #include <stdint.h>

@@ -6,4 +6,4 @@ if [ "$#" -ne 0 ] || [ -z "${DISPLAY:-}" ]; then
 fi
 log="${TMPDIR:-/tmp}/ax-xfce-check.log"
 echo "Starting XFCE on the existing Xorg; output: $log"
-exec dbus-launch --exit-with-session startxfce4 > "$log" 2>&1
+exec dbus-run-session -- startxfce4 > "$log" 2>&1

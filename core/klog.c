@@ -52,6 +52,9 @@ static int klog_inited;
 /* Keep the low kernel image below the fixed 0x400000 user ET_EXEC window. */
 #define KLOG_RING_SZ (160 * 1024)
 static char klog_ring[KLOG_RING_SZ];
+/* Three bit planes retain each byte's severity even when the ring wraps in
+ * the middle of a line, without consuming another full byte per character. */
+static uint8_t klog_ring_levels[3][(KLOG_RING_SZ + 7) / 8];
 static size_t klog_ring_pos;  /* next write offset */
 static size_t klog_ring_len;  /* bytes valid (<= KLOG_RING_SZ) */
 
@@ -142,9 +145,14 @@ void klog_calibrate_tsc(void) {
 void klog_reanchor_tsc(void) {
 	if (!klog_tsc_per_us)
 		return;
-	/* Keep TSC µs continuous with the tick clock after APIC takes over. */
-	klog_tsc_base = klog_rdtsc();
-	klog_time_base_usec = pit_get_time_us();
+	/* Read both epochs from the same TSC sample. pit_get_time_us() can
+	 * itself use this clock once calibrated, so updating the TSC epoch
+	 * before sampling the old time would make monotonic time jump back. */
+	uint64_t now = klog_rdtsc();
+	uint64_t usec = klog_time_base_usec +
+		(now - klog_tsc_base) / klog_tsc_per_us;
+	klog_time_base_usec = usec;
+	klog_tsc_base = now;
 }
 
 uint64_t time_monotonic_us(void) {
@@ -165,11 +173,21 @@ static uint64_t klog_get_time_us(void) {
 }
 
 /* Caller must hold klog_lock. Overwrite oldest when full. */
-static void klog_ring_append(const char *p, size_t n) {
+static void klog_ring_append(const char *p, size_t n, enum klog_level level) {
 	size_t i;
 	if (!p || n == 0)
 		return;
+	if ((unsigned)level > KLOG_DEBUG)
+		level = KLOG_INFO;
 	for (i = 0; i < n; i++) {
+		size_t byte = klog_ring_pos / 8;
+		uint8_t mask = (uint8_t)(1u << (klog_ring_pos % 8));
+		for (unsigned bit = 0; bit < 3; bit++) {
+			if ((unsigned)level & (1u << bit))
+				klog_ring_levels[bit][byte] |= mask;
+			else
+				klog_ring_levels[bit][byte] &= (uint8_t)~mask;
+		}
 		klog_ring[klog_ring_pos] = p[i];
 		klog_ring_pos++;
 		if (klog_ring_pos >= KLOG_RING_SZ)
@@ -227,17 +245,52 @@ void klog_user_write(const char *s, size_t n) {
 	if (!s || n == 0)
 		return;
 	acquire_irqsave(&klog_lock, &irqf);
-	klog_ring_append(s, n);
+	klog_ring_append(s, n, KLOG_INFO);
 	release_irqrestore(&klog_lock, irqf);
 	/* Mirror to console like a printk from userspace. */
 	klog_console_write_sync_tty(s, n);
 #ifdef QEMU_LOG_ENABLE
-	qemu_debug_printf("%.*s", (int)n, s);
+	/* qemu_debug_printf does not implement precision or '*'. The input is
+	 * length-delimited and need not be NUL terminated. */
+	xdiag_serial_write(s, n);
 #endif
 }
 
 long klog_syslog_read_all(char *buf, size_t size) {
-	return klog_ring_read(buf, size, 0);
+	unsigned long irqf;
+	size_t start, out = 0;
+	int line_start = 1;
+
+	if (!buf || !size)
+		return 0;
+	acquire_irqsave(&klog_lock, &irqf);
+	start = klog_ring_len < KLOG_RING_SZ ? 0 : klog_ring_pos;
+	for (size_t i = 0; i < klog_ring_len; i++) {
+		size_t pos = (start + i) % KLOG_RING_SZ;
+		char c = klog_ring[pos];
+		if (line_start) {
+			/* syslog(2) is a stream of <priority> records. Without
+			 * a prefix per line util-linux treats the entire ring as
+			 * one multiline record and indents its continuation lines. */
+			if (size - out < 4)
+				break;
+			buf[out++] = '<';
+			unsigned level = 0;
+			for (unsigned bit = 0; bit < 3; bit++)
+				if (klog_ring_levels[bit][pos / 8] & (1u << (pos % 8)))
+					level |= 1u << bit;
+			buf[out++] = (char)('0' + level);
+			buf[out++] = '>';
+			line_start = 0;
+		}
+		if (out == size)
+			break;
+		buf[out++] = c;
+		if (c == '\n')
+			line_start = 1;
+	}
+	release_irqrestore(&klog_lock, irqf);
+	return (long)out;
 }
 
 long klog_ring_read(char *buf, size_t size, size_t offset) {
@@ -268,23 +321,37 @@ size_t klog_syslog_buf_size(void) {
 	return KLOG_RING_SZ;
 }
 
-static void klogprintf_v(int to_console, const char *fmt, va_list ap);
+static void klogprintf_v(int to_console, enum klog_level level, const char *fmt, va_list ap);
 
 void klogprintf(const char *fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
-	klogprintf_v(1, fmt, ap);
+	klogprintf_v(1, KLOG_INFO, fmt, ap);
 	va_end(ap);
 }
 
 void klogprintf_logonly(const char *fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
-	klogprintf_v(0, fmt, ap);
+	klogprintf_v(0, KLOG_INFO, fmt, ap);
 	va_end(ap);
 }
 
-static void klogprintf_v(int to_console, const char *fmt, va_list ap) {
+void klogprintf_level(enum klog_level level, const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	klogprintf_v(1, level, fmt, ap);
+	va_end(ap);
+}
+
+void klogprintf_level_logonly(enum klog_level level, const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	klogprintf_v(0, level, fmt, ap);
+	va_end(ap);
+}
+
+static void klogprintf_v(int to_console, enum klog_level level, const char *fmt, va_list ap) {
 	/*
 	 * Format under the lock with IRQs off, then release before console.
 	 * Painting VBE/tty cell-by-cell with IF=0 froze the machine for seconds
@@ -349,12 +416,14 @@ static void klogprintf_v(int to_console, const char *fmt, va_list ap) {
 		line[outlen] = '\0';
 #endif
 		do_console = to_console;
-		klog_ring_append(line, outlen);
+		klog_ring_append(line, outlen, level);
 		release_irqrestore(&klog_lock, irqf);
 	}
 
+#if defined(AXON_XDIAG_SERIAL) && AXON_XDIAG_SERIAL
 	if (strstr(line, "xdiag") || strstr(line, "fbdev: user mmap"))
 		xdiag_serial_write(line, outlen);
+#endif
 	if (do_console)
 		klog_console_write_sync_tty(line, outlen);
 

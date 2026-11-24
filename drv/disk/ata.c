@@ -124,6 +124,18 @@ static int ata_wait_ready(uint16_t io_base, uint16_t ctrl_base, int timeout_ms) 
 	return -1;
 }
 
+/* A completed PIO write can still report an error after the data phase. */
+static int ata_write_completed(uint16_t io_base, uint16_t ctrl_base) {
+	ata_io_delay(ctrl_base);
+	if (ata_wait_ready(io_base, ctrl_base, 500) != 0)
+		return -1;
+	uint8_t status = inb(ATA_REG_STATUS(io_base));
+	if (status == 0 || status == 0xff ||
+	    (status & (ATA_SR_BSY | ATA_SR_DRQ | ATA_SR_DF | ATA_SR_ERR)))
+		return -1;
+	return 0;
+}
+
 /* Read IDENTIFY data (512 bytes) into buffer; returns 0 on success */
 static int ata_identify(uint16_t io_base, uint16_t ctrl_base, int is_slave, uint16_t *out_buf) {
 	/* select drive */
@@ -197,11 +209,18 @@ static void ata_model_from_ident(const uint16_t *ident, char *out, size_t outlen
 
 /* PIO read of sectors (LBA28). buf must be at least sectors*512 bytes.
    Returns 0 on success. */
+static int ata_lba28_valid(uint32_t lba, uint32_t sectors) {
+	/* Commands 0x20/0x30 encode only 28 address bits. Reject rather than
+	 * silently wrapping a request onto the beginning of a larger disk. */
+	const uint32_t limit = 1u << 28;
+	return sectors != 0 && lba < limit && sectors <= limit - lba;
+}
+
 static int ata_pio_read(int device_id, uint32_t lba, void *buf, uint32_t sectors) {
 	if (device_id < 0 || device_id >= ata_device_count) return -1;
 	ata_device_t *dev = &ata_devices[device_id];
 	if (!dev->exists) return -1;
-	if (sectors == 0) return -1;
+	if (!ata_lba28_valid(lba, sectors)) return -1;
 
 	while (sectors > 0) {
 		uint8_t to_read = sectors > 255 ? 255 : (uint8_t)sectors;
@@ -252,7 +271,7 @@ static int ata_pio_write(int device_id, uint32_t lba, const void *buf, uint32_t 
 	if (device_id < 0 || device_id >= ata_device_count) return -1;
 	ata_device_t *dev = &ata_devices[device_id];
 	if (!dev->exists) return -1;
-	if (sectors == 0) return -1;
+	if (!ata_lba28_valid(lba, sectors)) return -1;
 
 	while (sectors > 0) {
 		uint8_t to_write = sectors > 255 ? 255 : (uint8_t)sectors;
@@ -289,6 +308,11 @@ static int ata_pio_write(int device_id, uint32_t lba, const void *buf, uint32_t 
 			outsw(ATA_REG_DATA(dev->io_base), buf, 256);
 			buf = (const void *)((const char *)buf + 512);
 			lba++;
+		}
+		if (ata_write_completed(dev->io_base, dev->ctrl_base) != 0) {
+			klogprintf("ata: write completion failed dev=%d io=0x%x\n",
+			           device_id, dev->io_base);
+			return -1;
 		}
 		sectors -= to_write;
 	}
@@ -511,4 +535,3 @@ static void ata_irq_handler(cpu_registers_t *regs) {
 void ata_irq_dispatch_wrapper(cpu_registers_t *regs) {
 	ata_irq_handler(regs);
 }
-

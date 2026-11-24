@@ -8,6 +8,9 @@
 #include <pmm.h>
 #include <pagecache.h>
 #include <ram_page_pool.h>
+#if defined(AXON_EXPERIMENTAL_HIGH_USER_FRAMES) && AXON_EXPERIMENTAL_HIGH_USER_FRAMES
+#include <frame.h>
+#endif
 #include <ext2.h>
 #include <stat.h>
 #include <spinlock.h>
@@ -746,6 +749,19 @@ static ssize_t procfs_show_meminfo(char *buf, size_t size, void *priv) {
 #if defined(AXON_EXPERIMENTAL_DIRECT_MAP) && AXON_EXPERIMENTAL_DIRECT_MAP
 	if (pmm_ready() && available64 >= high_free_kb)
 		available64 -= high_free_kb;
+#endif
+#if defined(AXON_EXPERIMENTAL_HIGH_USER_FRAMES) && AXON_EXPERIMENTAL_HIGH_USER_FRAMES
+	/* In the lab mode only, upper pages are also usable by user faults on a
+	 * single CPU. Clamp by actual free frame metadata; the kernel heap cannot
+	 * currently be converted to PMM frames and is not counted as available. */
+	if (pmm_ready() && smp_cpu_count() == 1) {
+		uint64_t user_pages = (uint64_t)pmm_free_pages() +
+		                      (uint64_t)ramfs_high_page_free_pages();
+		uint64_t slots = (uint64_t)frame_free_slots();
+		if (user_pages > slots)
+			user_pages = slots;
+		available64 = user_pages * 4u;
+	}
 #endif
 	int written = snprintf(buf, size,
 		"MemTotal:       %llu kB\n"

@@ -81,6 +81,9 @@ int mptspi_init(void);
 
 static char g_cwd[256] = "/";
 static int boot_wants_systemd;
+/* Persistent install: axon.root=/dev/sdXN from the bootloader command line.
+ * Empty means boot the live initfs as before. */
+static char axon_root_dev[64];
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
 extern const char nss_dns_so_blob_start[];
@@ -984,6 +987,38 @@ static int boot_try_run_init(void) {
         return -1;
 }
 
+/* Accept root=/dev/... and the older axon.root=/dev/... spelling. The last
+ * root option wins, as with repeated Linux command-line parameters. */
+static void boot_parse_root_option(const char *cmdline, size_t len)
+{
+        if (!cmdline)
+                return;
+        for (size_t i = 0; i < len; i++) {
+                if (i && cmdline[i - 1] != ' ' && cmdline[i - 1] != '\t' &&
+                    cmdline[i - 1] != '\n' && cmdline[i - 1] != '\r')
+                        continue;
+                size_t kl = 0;
+                if (len - i >= 5 && memcmp(cmdline + i, "root=", 5) == 0)
+                        kl = 5;
+                else if (len - i >= 10 && memcmp(cmdline + i, "axon.root=", 10) == 0)
+                        kl = 10;
+                else
+                        continue;
+                size_t j = i + kl;
+                while (j < len && cmdline[j] && cmdline[j] != ' ' &&
+                       cmdline[j] != '\t' && cmdline[j] != '\n' &&
+                       cmdline[j] != '\r')
+                        j++;
+                size_t n = j - (i + kl);
+                if (!n || n >= sizeof(axon_root_dev)) {
+                        axon_root_dev[0] = '\0';
+                        continue;
+                }
+                memcpy(axon_root_dev, cmdline + i + kl, n);
+                axon_root_dev[n] = '\0';
+        }
+}
+
 static void boot_select_init(uint32_t magic, uint64_t info)
 {
         if (magic != 0x36d76289u || !info)
@@ -1008,12 +1043,54 @@ static void boot_select_init(uint32_t magic, uint64_t info)
                                 syscall_configure_init_trace(cmdline);
                         if (n < len && strstr(cmdline, "axon.init=systemd"))
                                 boot_wants_systemd = 1;
+                        boot_parse_root_option(cmdline, n);
                 }
                 if (size > UINT32_MAX - 7u)
                         break;
                 off += (size + 7u) & ~7u;
         }
 }
+
+#ifdef EXT2_SUPPORT
+/* Replace the live ramfs/overlay root with the persistent ext2 filesystem
+ * named by axon.root=. Returns 0 on success; on any failure the live root
+ * stays mounted so the machine still boots into the familiar live image. */
+static int boot_mount_disk_root(void)
+{
+        int dev_id = -1;
+        uint32_t start_lba = 0, sectors = 0;
+        struct fs_driver *old_root, *ext2_drv;
+        int unmounted = 0;
+
+        if (!axon_root_dev[0])
+                return -1;                          /* normal live boot */
+        if (devfs_get_block_geom(axon_root_dev, &dev_id, &start_lba, &sectors) != 0) {
+                klogprintf("boot: disk root %s: block device not found\n", axon_root_dev);
+                return -1;
+        }
+        if (ext2_probe_and_mount_geom(dev_id, start_lba, sectors) != 0) {
+                klogprintf("boot: disk root %s: ext2 probe failed, keeping live root\n",
+                           axon_root_dev);
+                return -1;
+        }
+        ext2_drv = ext2_get_driver();
+        old_root = fs_get_mount_driver_exact("/");
+        if (fs_unmount("/") == 0)
+                unmounted = 1;
+        if (!unmounted || fs_mount("/", ext2_drv) != 0) {
+                klogprintf("boot: disk root %s: failed to mount as /\n", axon_root_dev);
+                ext2_unmount_cleanup();
+                if (unmounted && old_root) {
+                        (void)fs_mount("/", old_root);
+                        (void)fs_mount_set_source("/", "initfs");
+                }
+                return -1;
+        }
+        fs_mount_set_source("/", axon_root_dev);
+        klogprintf("boot: disk root %s mounted as / (ext2)\n", axon_root_dev);
+        return 0;
+}
+#endif
 
 /*
  * start_kernel() — the AxonOS analog of Linux init/main.c start_kernel().
@@ -1453,6 +1530,9 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info, uint64_t st
         syscall_init();/* syscall (int 0x80) initialization */
         boot_brk(0x65);
         
+#if defined(AXON_EXPERIMENTAL_DIRECT_MAP) && AXON_EXPERIMENTAL_DIRECT_MAP && defined(AXON_VTE_TRACE) && AXON_VTE_TRACE
+        qemu_debug_printf("high-map-stage: paging-init\n");
+#endif
         paging_init();
 #if defined(AXON_EXPERIMENTAL_DIRECT_MAP) && AXON_EXPERIMENTAL_DIRECT_MAP
         /* BSP only: paging_init enabled NXE; no task CR3 or AP exists yet.
@@ -1466,6 +1546,12 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info, uint64_t st
 #endif
         boot_brk(0x66);
 
+#if defined(AXON_EXPERIMENTAL_EARLY_SCHED) && AXON_EXPERIMENTAL_EARLY_SCHED
+        /* Test Linux-like ordering without changing the production boot path.
+         * Finalize the APIC map before thread_init sizes the idle-thread set. */
+        smp_finalize_topology(multiboot_magic, multiboot_info);
+        thread_init();
+#endif
         // Enabling interrupts
         asm volatile("sti");
         boot_brk(0x67);
@@ -1526,7 +1612,8 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info, uint64_t st
                                  */
                                 apic_timer_state.frequency = apic_hz;
                                 timer_frequency = apic_hz;
-                                klog_reanchor_tsc();
+                                /* The clocksource is still the same TSC:
+                                 * switching clockevents needs no new epoch. */
                                 kprintf("APIC: clockevent live at %u Hz; TSC clocksource active\n",
                                         apic_hz);
                         }
@@ -1539,7 +1626,9 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info, uint64_t st
         kprintf("boot: post-timer (smp/pci/threads/initfs)...\n");
         /* Linux timekeeping_init(): snapshot RTC against the monotonic clock. */
         timekeeping_init();
+#if !defined(AXON_EXPERIMENTAL_EARLY_SCHED) || !AXON_EXPERIMENTAL_EARLY_SCHED
         smp_finalize_topology(multiboot_magic, multiboot_info);
+#endif
 
         pci_init();
         pci_dump_devices();
@@ -1548,7 +1637,9 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info, uint64_t st
 
         /* Keep NIC driver non-intrusive until full net stack is wired.
            This avoids affecting boot stability on machines where NIC init timing is sensitive. */
+#if !defined(AXON_EXPERIMENTAL_EARLY_SCHED) || !AXON_EXPERIMENTAL_EARLY_SCHED
         thread_init();
+#endif
         syscall_start_init_monitor();
         smp_boot_aps();
  
@@ -1593,8 +1684,12 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info, uint64_t st
                 else
                         kprintf("initfs: warning: no init (/linuxrc,/init,/sbin/init,/bin/init) found\n");
         } else {
-                klogprintf("initfs: error: failed, code: %d\n", r);
-                for (;;);
+                klogprintf_level(KLOG_ERR, "initfs: error: failed, code: %d\n", r);
+                /* A disk-root boot deliberately omits the initfs module; the
+                 * temporary ramfs root is enough until ext2 takes over /. */
+                if (!axon_root_dev[0])
+                        for (;;);
+                klogprintf("boot: no initfs; using temporary ramfs root for disk boot\n");
         }
         /* register devfs and mount at /dev so /dev/tty0, /dev/console etc. exist before init/getty */
         if (devfs_register() == 0) {
@@ -1752,62 +1847,7 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info, uint64_t st
         (void)ramfs_mkdir("/var/log/nginx");
         (void)ramfs_mkdir("/srv");
         (void)ramfs_mkdir("/srv/www");
-        {
-                static const char index_html[] = "ok\n";
-                struct fs_file *idx = fs_create_file("/srv/www/index.html");
-                if (!idx) idx = fs_open("/srv/www/index.html");
-                if (idx) {
-                        (void)vfs_ftruncate(idx, 0);
-                        fs_write(idx, index_html, sizeof(index_html) - 1, 0);
-                        fs_file_free(idx);
-                }
-        }
-        /* Linux-default nginx.conf: epoll, sendfile, dual-stack, master/daemon on. */
-        {
-                struct stat st;
-                if (vfs_stat("/etc/nginx/nginx.conf", &st) == 0) {
-                        static const char nginx_conf[] =
-                                "user root;\n"
-                                "worker_processes  1;\n"
-                                "error_log  /var/log/nginx/error.log warn;\n"
-                                "pid                /var/run/nginx.pid;\n"
-                                "\n"
-                                "events {\n"
-                                "        # packaged nginx has no epoll module; kernel epoll ABI is ready\n"
-                                "        use poll;\n"
-                                "        worker_connections  256;\n"
-                                "}\n"
-                                "\n"
-                                "http {\n"
-                                "        include           mime.types;\n"
-                                "        default_type  application/octet-stream;\n"
-                                "        access_log        /var/log/nginx/access.log;\n"
-                                "\n"
-                                "        sendfile                on;\n"
-                                "        keepalive_timeout  65;\n"
-                                "\n"
-                                "        server {\n"
-                                "                listen           80 default_server;\n"
-                                "                listen           [::]:80 default_server;\n"
-                                "                server_name  localhost;\n"
-                                "\n"
-                                "                root   /srv/www;\n"
-                                "                index  index.html index.htm;\n"
-                                "\n"
-                                "                location / {\n"
-                                "                        try_files $uri $uri/ =404;\n"
-                                "                }\n"
-                                "        }\n"
-                                "}\n";
-                        struct fs_file *nf = fs_open("/etc/nginx/nginx.conf");
-                        if (!nf) nf = fs_create_file("/etc/nginx/nginx.conf");
-                        if (nf) {
-                                (void)vfs_ftruncate(nf, 0);
-                                fs_write(nf, nginx_conf, sizeof(nginx_conf) - 1, 0);
-                                fs_file_free(nf);
-                        }
-                }
-        }
+        /* Service configuration and site contents belong to userspace. */
         /* Linux: /run is a tmpfs (often already mounted by initramfs). Pre-mount so
          * OpenRC mountinfo -q /run succeeds and init.sh skips fstabinfo/mount.
          * Never mkdir /var/run — squashfs ships /var/run -> /run.
@@ -1938,45 +1978,21 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info, uint64_t st
         {
                 struct stat st;
                 (void)ramfs_mkdir("/etc/ld.so.conf.d");
-                if (vfs_stat("/etc/ld.so.conf", &st) != 0) {
-                        static const char ldconf[] = "include /etc/ld.so.conf.d/*.conf\n";
-                        struct fs_file *lf = fs_create_file("/etc/ld.so.conf");
-                        if (!lf)
-                                lf = fs_open("/etc/ld.so.conf");
-                        if (lf) {
-                                (void)vfs_ftruncate(lf, 0);
-                                fs_write(lf, ldconf, sizeof(ldconf) - 1, 0);
-                                fs_file_free(lf);
-                        }
-                }
-                if (vfs_stat("/etc/ld.so.conf.d/libc.conf", &st) != 0) {
-                        static const char libc_conf[] =
-                                "# libc default configuration\n"
-                                "/usr/local/lib\n";
-                        struct fs_file *lf = fs_create_file("/etc/ld.so.conf.d/libc.conf");
-                        if (!lf)
-                                lf = fs_open("/etc/ld.so.conf.d/libc.conf");
-                        if (lf) {
-                                (void)vfs_ftruncate(lf, 0);
-                                fs_write(lf, libc_conf, sizeof(libc_conf) - 1, 0);
-                                fs_file_free(lf);
-                        }
-                }
-                if (vfs_stat("/etc/ld.so.conf.d/x86_64-linux-gnu.conf", &st) != 0) {
-                        static const char multi[] =
-                                "# Multiarch support\n"
-                                "/usr/local/lib/x86_64-linux-gnu\n"
-                                "/lib/x86_64-linux-gnu\n"
-                                "/usr/lib/x86_64-linux-gnu\n";
-                        struct fs_file *lf = fs_create_file("/etc/ld.so.conf.d/x86_64-linux-gnu.conf");
-                        if (!lf)
-                                lf = fs_open("/etc/ld.so.conf.d/x86_64-linux-gnu.conf");
-                        if (lf) {
-                                (void)vfs_ftruncate(lf, 0);
-                                fs_write(lf, multi, sizeof(multi) - 1, 0);
-                                fs_file_free(lf);
-                        }
-                }
+                static const char ldconf[] = "include /etc/ld.so.conf.d/*.conf\n";
+                static const char libc_conf[] =
+                        "# libc default configuration\n"
+                        "/usr/local/lib\n";
+                static const char multi[] =
+                        "# Multiarch support\n"
+                        "/usr/local/lib/x86_64-linux-gnu\n"
+                        "/lib/x86_64-linux-gnu\n"
+                        "/usr/lib/x86_64-linux-gnu\n";
+                (void)boot_seed_file_if_missing("/etc/ld.so.conf", ldconf,
+                                                sizeof(ldconf) - 1, 0644);
+                (void)boot_seed_file_if_missing("/etc/ld.so.conf.d/libc.conf", libc_conf,
+                                                sizeof(libc_conf) - 1, 0644);
+                (void)boot_seed_file_if_missing("/etc/ld.so.conf.d/x86_64-linux-gnu.conf",
+                                                multi, sizeof(multi) - 1, 0644);
                 if (vfs_stat("/usr/sbin/ldconfig", &st) == 0) {
                         (void)fs_chmod("/usr/sbin/ldconfig", S_IFREG | 0755);
                         if (vfs_stat("/sbin/ldconfig", &st) != 0) {
@@ -2340,6 +2356,12 @@ void start_kernel(uint32_t multiboot_magic, uint64_t multiboot_info, uint64_t st
         /* Final printk snapshot for /var/log/kernel (ring stays authoritative via /dev/kmsg). */
         klog_sync_varlog();
         boot_load_console_font();
+
+#ifdef EXT2_SUPPORT
+        /* Persistent install: swap the live root for ext2 on axon.root= before
+         * PID 1 starts. Failure leaves the live root in place. */
+        (void)boot_mount_disk_root();
+#endif
 
         // Prefer OpenRC (openrc-init) over BusyBox linuxrc; shell is last resort.
         if (boot_try_run_init() != 0) {
